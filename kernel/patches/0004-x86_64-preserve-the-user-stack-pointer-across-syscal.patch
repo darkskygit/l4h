@@ -1,7 +1,7 @@
 From c7f166f0428514a7ca30d9dddd240463ffb32ab3 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 10:16:20 -0700
-Subject: [PATCH 4/4] x86_64: preserve the user stack pointer across syscalls
+Subject: [PATCH 4/5] x86_64: preserve the user stack pointer across syscalls
 
 The fast syscall path never saved the user RSP and the sysret path
 cleared it, relying on the libsel4 calling convention (RSP kept in RBX).

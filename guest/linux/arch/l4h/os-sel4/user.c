@@ -185,7 +185,13 @@ void l4h_user_deschedule(struct l4h_uctx *u)
 	if (cpu < 0)
 		return;
 	v = &l4h_vcpus[cpu];
-	seL4_SchedContext_UnbindObject(v->sc_u, u->tcb);
+	{
+		int err = seL4_SchedContext_UnbindObject(v->sc_u, u->tcb);
+
+		if (err)
+			printk("l4h: deschedule %lx from vCPU %d SC failed: %d (on vCPU %d)\n",
+			       u->badge, cpu, err, l4h_this_vcpu_id());
+	}
 	__atomic_compare_exchange_n(&v->sc_owner, &(struct l4h_uctx *){ u }, 0, 0,
 				    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 	u->sc_vcpu = -1;
@@ -240,16 +246,51 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	u->regs_dirty = 0;
 
 	if (!(badge & L4H_EP_BADGE_TASK)) {
-		/* An event on the bound notification preempted user mode. */
+		/* An event on the bound notification preempted user mode.  Take
+		 * the scheduling context away right now: otherwise the context
+		 * would run again whenever this vCPU's kernel thread blocks. */
 		__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
-		u->state = L4H_UCTX_PREEMPTED;
-		u->stop = L4H_STOP_INTERRUPT;
-		u->regs_valid = 0;
-		if (read_regs_on_interrupt)
-			l4h_user_sync_regs(u, gp);
-		return u->stop;
+		l4h_user_deschedule(u);
+		/* A signal from another core wakes us before this core switches
+		 * away from the user context, which may fault in between; its
+		 * fault is then queued on the endpoint.  Collect it now. */
+		/* NBRecv prefers the bound notification over queued messages:
+		 * keep draining until it reports neither. */
+		for (;;) {
+			badge = 0;
+			info = seL4_NBRecv(v->ep, &badge, u->reply);
+			if (!badge || (badge & L4H_EP_BADGE_TASK))
+				break;
+			__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+		}
+		if (!(badge & L4H_EP_BADGE_TASK)) {
+			__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+			u->state = L4H_UCTX_PREEMPTED;
+			u->stop = L4H_STOP_INTERRUPT;
+			u->regs_valid = 0;
+			if (read_regs_on_interrupt)
+				l4h_user_sync_regs(u, gp);
+			return u->stop;
+		}
+		/* Report the fault now; the event stays in ntfn_pending. */
 	}
 
+	if (badge != u->badge) {
+		extern void l4h_uctx_describe(unsigned long badge);
+		static int once;
+
+		if (__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL))
+			for (;;)
+				seL4_Yield();
+
+		printk("l4h: vCPU %d: stray fault label %lu from %lx while running %lx\n", v->id,
+		       (unsigned long)seL4_MessageInfo_get_label(info), (unsigned long)badge, u->badge);
+		l4h_uctx_describe(badge);
+		l4h_uctx_describe(u->badge);
+		for (int c = 0; c < (int)l4h_bootinfo->nr_vcpus; c++)
+			printk("vCPU %d sc_owner badge %lx\n", c,
+			       l4h_vcpus[c].sc_owner ? l4h_vcpus[c].sc_owner->badge : 0);
+	}
 	if (badge != u->badge)
 		panic("l4h: fault from unexpected user context %lx (running %lx)\n",
 		      (unsigned long)badge, u->badge);
@@ -281,13 +322,6 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	default:
 		panic("l4h: unexpected user fault label %lu\n",
 		      (unsigned long)seL4_MessageInfo_get_label(info));
-	}
-	if (l4h_debug_user) {
-		seL4_UserContext c;
-		seL4_TCB_ReadRegisters(u->tcb, 0, 0, CTX_WORDS_ALL, &c);
-		printk("l4h-dbg: stop label=%lu badge=%lx addr=%lx tcb rip=%lx rsp=%lx rax=%lx (sent sp=%lx)\n",
-		       (unsigned long)seL4_MessageInfo_get_label(info), (unsigned long)badge, u->fault_addr,
-		       (unsigned long)c.rip, (unsigned long)c.rsp, (unsigned long)c.rax, gp[HOST_SP]);
 	}
 
 	return u->stop;

@@ -42,6 +42,8 @@
 
 #include "um_arch.h"
 
+void l4h_smp_setup(void);
+
 static char __initdata command_line[COMMAND_LINE_SIZE] = { 0 };
 
 struct cpuinfo_um boot_cpu_data = {
@@ -231,6 +233,9 @@ void __init setup_arch(char **cmdline_p)
 	u8 rng_seed[32];
 
 	setup_physmem(uml_physmem, uml_reserved, physmem_size);
+#ifdef CONFIG_SMP
+	l4h_smp_setup();
+#endif
 	l4h_caps_init();
 	l4h_vspace_init();
 	paging_init();
@@ -267,6 +272,15 @@ void apply_fineibt(s32 *start_retpoline, s32 *end_retpoline,
 }
 
 void apply_alternatives(struct alt_instr *start, struct alt_instr *end)
+{
+}
+
+void alternatives_smp_module_add(struct module *mod, char *name, void *locks,
+				 void *locks_end, void *text, void *text_end)
+{
+}
+
+void alternatives_smp_module_del(struct module *mod)
 {
 }
 

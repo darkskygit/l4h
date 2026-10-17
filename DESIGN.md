@@ -172,8 +172,30 @@ patch is roughly 200 lines.
 Unlike Fiasco vCPU mode, we need no new interrupt-injection primitive (§5.4).
 We need no IOMMU, since no device is passed into a guest.
 
-**Decision:** l4h carries E1–E3 as patches in `kernel/patches/` and proposes
-them upstream through the seL4 RFC process. They are designed as independent
+### Found during implementation
+
+- **0004, x86_64 user RSP across syscalls.** seL4's fast `syscall` entry
+  never saved the user RSP, and the `sysretq` path cleared it. Only the
+  libsel4 convention of keeping RSP in RBX made this work. Trapped Linux
+  threads returned with RSP = 0. The patch saves RSP on entry, through a
+  per-node scratch slot, and restores it on `sysretq`. It requires
+  `KernelSkimWindow=OFF`, the Meltdown mitigation. The CPUs l4h targets,
+  such as GCP C3/N4/C4 Sapphire Rapids and later and recent AMD parts, are
+  not affected by Meltdown.
+- **0005, SMP IPI barrier.** `ipi_wait()` reset its arrival counter and
+  released waiters with two unordered plain stores, and GCC emits them in
+  the wrong order. A following remote call (TLB shootdown, remote TCB stall)
+  could then lose arrivals, leaving every core spinning in `ipi_wait()`.
+  This is an upstream bug that SMP l4h guests hit within seconds.
+- E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
+  upstream. Without it, Linux syscalls whose syscall-number register
+  happens to hold a valid seL4 syscall number are executed as seL4
+  syscalls. Several of those (NBSend\*, Yield, SetTLSBase, the debug calls)
+  do not fault without capabilities. `tests/testguest` sweeps all seL4
+  syscall numbers.
+
+**Decision:** l4h carries E1–E3 and the fixes above as patches in
+`kernel/patches/`, and proposes them upstream through the seL4 RFC process. They are designed as independent
 commits, and each has its own sel4test cases.
 
 **Verification note:** the MCS SMP x86_64 configuration is not covered by the
@@ -184,6 +206,19 @@ configuration on x86. aarch64 is the better long-term path to proof coverage.
 ---
 
 ## 5. The guest kernel: `ARCH=l4h`
+
+**Implementation note.** `arch/l4h` is derived from `arch/um` (UML) and
+`arch/x86/um`. UML already provides most of what is needed:
+- the separate-address-space kernel;
+- x86 signal frames, ptrace and the syscall table;
+- software page tables with accessed/dirty emulation and a batched
+  "TLB sync" to the host.
+
+The UML host layer (`os-Linux`) is replaced by `os-sel4`, which is built
+against libsel4. The Kconfig keeps `CONFIG_UML` defined, so generic code
+treats l4h like UML (no hardware AVX paths, and so on). The tree is
+self-contained, and the only change outside `arch/l4h` is a one-line kbuild
+patch.
 
 ### 5.1 Layout in the Linux tree
 
@@ -263,7 +298,18 @@ none.
   parent and child refault their working sets lazily, so fork followed by exec
   stays cheap.
 - **TLB coherence** across cores is seL4's job: unmap shoots down the ASID's
-  TLB entries.
+  TLB entries. With several vCPUs, `flush_tlb_*` syncs synchronously, so a
+  page is never freed while another vCPU can still reach it. The fault-path
+  mapping runs under the PTE lock.
+- **VSpace pool.** x86_64 seL4 has only 4096 ASIDs in total (8 pools of
+  512). Each guest therefore gets a fixed pool of pre-assigned VSpace roots,
+  and the guest kernel recycles them least recently used first. An mm that
+  loses its VSpace simply refaults: every successful page fault installs
+  the PTE directly.
+- **CSpace naming.** A CNode capability held directly in a root slot cannot
+  be named by a 64-bit CPtr, because seL4 keeps resolving through it.
+  Capabilities that must be named, such as the root CNode itself and user
+  threads' CSpaces, live in a "meta" CNode in root slot 1 (see `abi.h`).
 - **Guest RAM.** `l4h-root` allocates guest RAM as 4 KiB frame caps from
   physically contiguous Untyped chunks (at most 8 chunks, 2 MiB aligned).
   GPA→HPA translation is therefore a tiny table, which zero-copy block DMA
@@ -574,10 +620,15 @@ function, such as routing, NAT, DHCP or firewalling, belongs in a VM.
 
 ## 9. Host components
 
-All host components are Rust (no_std, rust-sel4 crates `sel4`, `sel4-root-task`
-and `sel4-shared-ring-buffer`), except the sDDF drivers. The drivers stay C and
-are linked against a small Rust implementation of sDDF's `extern` OS shim
-(`sddf_notify`, `sddf_ppcall`, `sddf_irq_ack`, …).
+All host components are Rust: no_std, using the rust-sel4 crates `sel4` and
+`sel4-root-task`.
+
+**Revised during implementation.** Device drivers are also written in
+Rust, following sDDF's design (shared queues, zero-copy block requests,
+virtualiser/switch components) rather than linking sDDF's C drivers.
+sDDF's components assume a static, Microkit-shaped system, while l4h
+attaches and detaches guests at runtime. A single language and runtime for
+the host keeps that dynamic plumbing simple.
 
 | Component | Instances | Role |
 |-----------|-----------|------|

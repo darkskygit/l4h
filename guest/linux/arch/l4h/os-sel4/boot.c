@@ -30,6 +30,8 @@ static void vcpu_enter(int cpu)
 	l4h_vcpus[cpu].online = 1;
 }
 
+extern char init_task[];
+
 void l4h_boot(const struct l4h_bootinfo *bi)
 {
 	int cpu;
@@ -38,6 +40,7 @@ void l4h_boot(const struct l4h_bootinfo *bi)
 	for (cpu = 0; cpu < L4H_MAX_VCPUS; cpu++)
 		vcpu_init_struct(cpu);
 	vcpu_enter(0);
+	l4h_tls()->current = init_task;
 	if (bi->magic != L4H_BOOTINFO_MAGIC || bi->abi_version != L4H_ABI_VERSION) {
 		static const char msg[] = "l4h: bad boot info / ABI version\n";
 		l4h_console_write(msg, sizeof(msg) - 1);
@@ -51,19 +54,21 @@ void l4h_boot(const struct l4h_bootinfo *bi)
 void l4h_secondary_boot(long cpu)
 {
 	vcpu_enter((int)cpu);
+	l4h_tls()->current = l4h_vcpus[cpu].start_task;
 	l4h_vcpus[cpu].start_fn((int)cpu);
 	l4h_power(L4H_POWER_CRASH);
 }
 
 extern char l4h_secondary_entry[];
 
-int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu))
+int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu), void *task)
 {
 	struct l4h_vcpu *v = &l4h_vcpus[cpu];
 	seL4_UserContext regs = { 0 };
 
 	if (cpu <= 0 || (unsigned long)cpu >= l4h_bootinfo->nr_vcpus)
 		return -1;
+	v->start_task = task;
 	v->start_fn = fn;
 	v->start_sp = sp;
 	regs.rip = (seL4_Word)l4h_secondary_entry;

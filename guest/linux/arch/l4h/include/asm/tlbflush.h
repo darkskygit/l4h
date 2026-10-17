@@ -32,6 +32,17 @@
 
 extern int um_tlb_sync(struct mm_struct *mm);
 
+/*
+ * With several vCPUs, threads of `mm` may be running elsewhere: removed or
+ * downgraded mappings must be gone from the seL4 VSpace before the caller
+ * proceeds (e.g. frees the page), so sync immediately.
+ */
+static inline void l4h_tlb_flush_sync(struct mm_struct *mm)
+{
+	if (IS_ENABLED(CONFIG_SMP))
+		um_tlb_sync(mm);
+}
+
 extern void flush_tlb_all(void);
 extern void flush_tlb_mm(struct mm_struct *mm);
 
@@ -39,12 +50,14 @@ static inline void flush_tlb_page(struct vm_area_struct *vma,
 				  unsigned long address)
 {
 	um_tlb_mark_sync(vma->vm_mm, address, address + PAGE_SIZE);
+	l4h_tlb_flush_sync(vma->vm_mm);
 }
 
 static inline void flush_tlb_range(struct vm_area_struct *vma,
 				   unsigned long start, unsigned long end)
 {
 	um_tlb_mark_sync(vma->vm_mm, start, end);
+	l4h_tlb_flush_sync(vma->vm_mm);
 }
 
 static inline void flush_tlb_kernel_range(unsigned long start,

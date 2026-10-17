@@ -68,6 +68,7 @@ unsigned long alloc_stack(int order, int atomic)
 static inline void set_current(struct task_struct *task)
 {
 	cpu_tasks[task_thread_info(task)->cpu] = task;
+	l4h_set_current(task);
 }
 
 struct task_struct *__switch_to(struct task_struct *from, struct task_struct *to)

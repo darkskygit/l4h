@@ -87,13 +87,14 @@ extern unsigned long end_iomem;
 #define pmd_clear(xp)	do { pmd_val(*(xp)) = _PAGE_NEEDSYNC; } while (0)
 
 #define pmd_needsync(x)   (pmd_val(x) & _PAGE_NEEDSYNC)
-#define pmd_mkuptodate(x) (pmd_val(x) &= ~_PAGE_NEEDSYNC)
+/* Atomic: other vCPUs may update the entry concurrently (bit 1 == _PAGE_NEEDSYNC). */
+#define pmd_mkuptodate(x) clear_bit(1, (unsigned long *)&pmd_val(x))
 
 #define pud_needsync(x)   (pud_val(x) & _PAGE_NEEDSYNC)
-#define pud_mkuptodate(x) (pud_val(x) &= ~_PAGE_NEEDSYNC)
+#define pud_mkuptodate(x) clear_bit(1, (unsigned long *)&pud_val(x))
 
 #define p4d_needsync(x)   (p4d_val(x) & _PAGE_NEEDSYNC)
-#define p4d_mkuptodate(x) (p4d_val(x) &= ~_PAGE_NEEDSYNC)
+#define p4d_mkuptodate(x) clear_bit(1, (unsigned long *)&p4d_val(x))
 
 #define pmd_pfn(pmd) (pmd_val(pmd) >> PAGE_SHIFT)
 #define pmd_page(pmd) phys_to_page(pmd_val(pmd) & PAGE_MASK)
@@ -225,6 +226,9 @@ static inline void set_pte(pte_t *pteptr, pte_t pteval)
 static inline void um_tlb_mark_sync(struct mm_struct *mm, unsigned long start,
 				    unsigned long end)
 {
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&mm->context.sync_lock, flags);
 	if (!mm->context.sync_tlb_range_to) {
 		mm->context.sync_tlb_range_from = start;
 		mm->context.sync_tlb_range_to = end;
@@ -234,6 +238,7 @@ static inline void um_tlb_mark_sync(struct mm_struct *mm, unsigned long start,
 		if (end > mm->context.sync_tlb_range_to)
 			mm->context.sync_tlb_range_to = end;
 	}
+	raw_spin_unlock_irqrestore(&mm->context.sync_lock, flags);
 }
 
 #define set_ptes set_ptes

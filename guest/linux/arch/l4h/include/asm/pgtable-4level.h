@@ -77,7 +77,7 @@ static inline int pgd_needsync(pgd_t pgd)
 	return pgd_val(pgd) & _PAGE_NEEDSYNC;
 }
 
-static inline void pgd_mkuptodate(pgd_t pgd) { pgd_val(pgd) &= ~_PAGE_NEEDSYNC; }
+#define pgd_mkuptodate(pgd) clear_bit(1, (unsigned long *)&pgd_val(pgd))
 
 #define set_pmd(pmdptr, pmdval) (*(pmdptr) = (pmdval))
 

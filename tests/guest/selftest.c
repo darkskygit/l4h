@@ -304,6 +304,124 @@ static void test_files(void)
 	unlink("/tmp/selftest");
 }
 
+/* ---- SMP stress: concurrent faults, mmap/munmap and forks */
+static atomic_int stress_errors;
+
+static void *mm_stress_fn(void *arg)
+{
+	long id = (long)arg;
+	int round;
+
+	for (round = 0; round < 200; round++) {
+		size_t len = (1 + (round % 7)) * 65536;
+		volatile unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+						 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		size_t i;
+
+		if (p == MAP_FAILED) {
+			atomic_fetch_add(&stress_errors, 1);
+			continue;
+		}
+		for (i = 0; i < len; i += 4096)
+			p[i] = (unsigned char)(id + i);
+		for (i = 0; i < len; i += 4096)
+			if (p[i] != (unsigned char)(id + i))
+				atomic_fetch_add(&stress_errors, 1);
+		if (round & 1)
+			mprotect((void *)p, len, PROT_READ);
+		munmap((void *)p, len);
+	}
+	return NULL;
+}
+
+static void test_smp_mm_stress(void)
+{
+	pthread_t th[8];
+	long i;
+
+	atomic_store(&stress_errors, 0);
+	for (i = 0; i < 8; i++)
+		pthread_create(&th[i], NULL, mm_stress_fn, (void *)i);
+	for (i = 0; i < 8; i++)
+		pthread_join(th[i], NULL);
+	CHECK(atomic_load(&stress_errors) == 0, "%d errors", atomic_load(&stress_errors));
+}
+
+/* A use-after-munmap from another thread must fault, not read stale data. */
+static volatile unsigned char *shared_page;
+static atomic_int phase;
+
+static void *unmap_reader(void *arg)
+{
+	struct sigaction sa = { .sa_sigaction = segv_handler, .sa_flags = SA_SIGINFO };
+
+	sigaction(SIGSEGV, &sa, NULL);
+	while (atomic_load(&phase) == 0)
+		(void)shared_page[0];
+	atomic_store(&phase, 2);
+	while (atomic_load(&phase) != 3)
+		;
+	if (sigsetjmp(segv_jmp, 1) == 0) {
+		(void)shared_page[0];
+		atomic_store(&phase, 5);	/* no fault: stale mapping */
+	} else {
+		atomic_store(&phase, 4);
+	}
+	return NULL;
+}
+
+static void test_smp_unmap_visibility(void)
+{
+	pthread_t t;
+
+	shared_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	shared_page[0] = 7;
+	atomic_store(&phase, 0);
+	pthread_create(&t, NULL, unmap_reader, NULL);
+	usleep(10000);
+	atomic_store(&phase, 1);
+	while (atomic_load(&phase) != 2)
+		;
+	munmap((void *)shared_page, 4096);
+	atomic_store(&phase, 3);
+	pthread_join(t, NULL);
+	signal(SIGSEGV, SIG_DFL);
+	CHECK(atomic_load(&phase) == 4, "reader saw a stale mapping after munmap");
+}
+
+static void *fork_storm_fn(void *arg)
+{
+	int i, status;
+
+	for (i = 0; i < 50; i++) {
+		pid_t pid = fork();
+
+		if (pid == 0) {
+			volatile char buf[65536];
+
+			buf[0] = 1;
+			buf[65535] = buf[0];
+			_exit(3);
+		}
+		if (pid < 0 || waitpid(pid, &status, 0) != pid || WEXITSTATUS(status) != 3)
+			atomic_fetch_add(&stress_errors, 1);
+	}
+	return NULL;
+}
+
+static void test_smp_fork_storm(void)
+{
+	pthread_t th[4];
+	long i;
+
+	atomic_store(&stress_errors, 0);
+	for (i = 0; i < 4; i++)
+		pthread_create(&th[i], NULL, fork_storm_fn, NULL);
+	for (i = 0; i < 4; i++)
+		pthread_join(th[i], NULL);
+	CHECK(atomic_load(&stress_errors) == 0, "%d errors", atomic_load(&stress_errors));
+}
+
 struct test {
 	const char *name;
 	void (*fn)(void);
@@ -320,6 +438,9 @@ static const struct test tests[] = {
 	{ "threads", test_threads },
 	{ "futex", test_futex },
 	{ "files", test_files },
+	{ "smp_mm_stress", test_smp_mm_stress },
+	{ "smp_unmap_vis", test_smp_unmap_visibility },
+	{ "smp_fork_storm", test_smp_fork_storm },
 };
 
 int main(int argc, char **argv)

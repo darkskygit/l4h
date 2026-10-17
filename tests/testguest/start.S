@@ -27,8 +27,21 @@ user_prog:
 	/* touch an unmapped address -> VM fault */
 	movq	$0x500000, %rbx
 	movq	(%rbx), %rcx
-	/* exit(rax) */
-	movq	%rax, %rdi
+	/* seL4 issue #477: with every seL4 syscall number in rdx (and the
+	 * aarch64-relevant registers too), each syscall must still trap. */
+	movq	%rax, %r12
+	movq	$-1, %rbx
+3:	movq	$39, %rax
+	movq	%rbx, %rdx
+	movq	%rbx, %r10
+	movq	%rbx, %r8
+	movq	%rbx, %r9
+	syscall
+	decq	%rbx
+	cmpq	$-64, %rbx
+	jge	3b
+	/* exit(saved rax) */
+	movq	%r12, %rdi
 	movq	$60, %rax
 	syscall
 2:	jmp	2b

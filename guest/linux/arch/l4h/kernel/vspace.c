@@ -374,6 +374,7 @@ void l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte, entry;
+	spinlock_t *ptl;
 	int prot;
 
 	pgd = pgd_offset(mm, va);
@@ -388,14 +389,19 @@ void l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	pmd = pmd_offset(pud, va);
 	if (!pmd_present(*pmd))
 		return;
-	pte = pte_offset_kernel(pmd, va);
-	entry = *pte;
-	if (!pte_present(entry) || !pte_young(entry) || !pte_read(entry))
+	/* Hold the PTE lock so that a concurrent unmap on another vCPU cannot
+	 * complete (and sync) between reading the PTE and installing it. */
+	pte = pte_offset_map_lock(mm, pmd, va, &ptl);
+	if (!pte)
 		return;
-	prot = UM_PROT_READ | UM_PROT_EXEC;
-	if (pte_write(entry) && pte_dirty(entry))
-		prot |= UM_PROT_WRITE;
-	map(&mm->context.id, va, PAGE_SIZE, prot, pte_val(entry) & PAGE_MASK);
+	entry = *pte;
+	if (pte_present(entry) && pte_young(entry) && pte_read(entry)) {
+		prot = UM_PROT_READ | UM_PROT_EXEC;
+		if (pte_write(entry) && pte_dirty(entry))
+			prot |= UM_PROT_WRITE;
+		map(&mm->context.id, va, PAGE_SIZE, prot, pte_val(entry) & PAGE_MASK);
+	}
+	pte_unmap_unlock(pte, ptl);
 }
 
 void __init l4h_vspace_init(void)

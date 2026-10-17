@@ -101,6 +101,7 @@ struct l4h_vcpu {
 	/* Stack and entry for secondary vCPU startup. */
 	unsigned long start_sp;
 	void (*start_fn)(int cpu);
+	void *start_task;		/* idle task (struct task_struct *) */
 	unsigned long long tsc_last_idle;
 };
 
@@ -150,6 +151,8 @@ struct l4h_uctx {
 	int fp_state;
 };
 
+
+
 #define L4H_FP_IN_TCB		0	/* only the TCB has it */
 #define L4H_FP_IN_REGS		1	/* copied into regs.fp, unchanged */
 #define L4H_FP_DIRTY		2	/* regs.fp modified, TCB must be updated */
@@ -198,6 +201,6 @@ void __attribute__((noreturn)) l4h_power(int how);
 unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, int n_out);
 
 /* ---- SMP */
-int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu));
+int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu), void *task);
 
 #endif /* __L4H_SYS_H */

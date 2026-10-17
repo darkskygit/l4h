@@ -16,6 +16,7 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/atomic.h>
+#include <linux/xarray.h>
 #include <asm/current.h>
 #include <asm/tlbflush.h>
 #include <as-layout.h>
@@ -32,6 +33,21 @@
 
 unsigned long host_fp_size;
 static atomic64_t uctx_ids = ATOMIC64_INIT(0);
+static DEFINE_XARRAY(uctx_by_badge);
+
+/* Debug helper for os-sel4: describe the user context with `badge`. */
+void l4h_uctx_describe(unsigned long badge)
+{
+	struct task_struct *t = xa_load(&uctx_by_badge, badge & ~L4H_EP_BADGE_TASK);
+
+	if (!t) {
+		pr_err("l4h: no user context with badge %lx\n", badge);
+		return;
+	}
+	pr_err("l4h: uctx@%lx badge %lx (task's uctx badge %lx tcb %lx): pid %d (%s) state=%d stop=%d fault_ep_vcpu=%d sc_vcpu=%d task_cpu=%d on_cpu=%d\n",
+	       (unsigned long)&t->thread.uctx & 0xffffffff, badge, t->thread.uctx.badge, t->thread.uctx.tcb, task_pid_nr(t), t->comm, t->thread.uctx.state, t->thread.uctx.stop,
+	       t->thread.uctx.fault_ep_vcpu, t->thread.uctx.sc_vcpu, task_cpu(t), t->on_cpu);
+}
 
 /* ---- registers */
 
@@ -107,6 +123,7 @@ static int uctx_create(struct task_struct *t)
 	u->tcb = th->utcb_obj.cptr;
 	u->reply = th->reply_obj.cptr;
 	u->badge = L4H_EP_BADGE_TASK | atomic64_inc_return(&uctx_ids);
+	xa_store(&uctx_by_badge, u->badge & ~L4H_EP_BADGE_TASK, t, GFP_ATOMIC);
 	u->fault_ep = 0;
 	u->fault_ep_vcpu = -1;
 	u->sc_vcpu = -1;
@@ -138,6 +155,7 @@ void l4h_uctx_destroy(struct task_struct *t)
 	if (u->state == L4H_UCTX_NONE)
 		return;
 	l4h_user_deschedule(u);
+	xa_erase(&uctx_by_badge, u->badge & ~L4H_EP_BADGE_TASK);
 	if (u->fault_ep)
 		l4h_slot_delete(u->fault_ep);
 	l4h_obj_free(&th->reply_obj);

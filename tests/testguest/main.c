@@ -225,7 +225,27 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 		      seL4_CanRead);
 	seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, 0));
 
-	/* 3: exit(777). */
+	/* 3: 64 syscalls with rdx = -1 .. -64 (all seL4 syscall numbers,
+	 * including non-faulting ones such as Yield, NBSend and SetTLSBase). */
+	for (long n = -1; n >= -64; n--) {
+		info = seL4_Recv(ep, &badge, reply);
+		CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "sweep label=",
+		      seL4_MessageInfo_get_label(info));
+		CHECK(seL4_GetMR(seL4_UnknownSyscall_RDX) == (seL4_Word)n, "sweep rdx=",
+		      seL4_GetMR(seL4_UnknownSyscall_RDX));
+		CHECK(seL4_GetMR(seL4_UnknownSyscall_RAX) == 39, "sweep rax=",
+		      seL4_GetMR(seL4_UnknownSyscall_RAX));
+		seL4_Word r[seL4_UnknownSyscall_Syscall];
+		for (int i = 0; i < seL4_UnknownSyscall_Syscall; i++)
+			r[i] = seL4_GetMR(i);
+		r[seL4_UnknownSyscall_FaultIP] += 2;
+		for (int i = 0; i < seL4_UnknownSyscall_Syscall; i++)
+			seL4_SetMR(i, r[i]);
+		seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, seL4_UnknownSyscall_Syscall));
+	}
+	puts("testguest: E1 traps every seL4 syscall number (seL4 issue #477)\n");
+
+	/* 4: exit(777). */
 	info = seL4_Recv(ep, &badge, reply);
 	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "label3=",
 	      seL4_MessageInfo_get_label(info));

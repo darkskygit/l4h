@@ -46,6 +46,44 @@ void report_enomem(void)
 			"vm.max_map_count has been reached.\n");
 }
 
+static int sync_one_pte(pte_t *pte, unsigned long addr, struct vm_ops *ops)
+{
+	for (;;) {
+		pte_t v = READ_ONCE(*pte);
+		int ret;
+
+		if (!pte_needsync(v))
+			return 0;
+
+		if (pte_present(v)) {
+			unsigned long phys = pte_val(v) & PAGE_MASK;
+			int r, w, x, prot;
+
+			r = pte_read(v);
+			w = pte_write(v);
+			x = pte_exec(v);
+			if (!pte_young(v)) {
+				r = 0;
+				w = 0;
+			} else if (!pte_dirty(v))
+				w = 0;
+
+			prot = (r ? UM_PROT_READ : 0) |
+			       (w ? UM_PROT_WRITE : 0) |
+			       (x ? UM_PROT_EXEC : 0);
+
+			ret = ops->mmap(ops->mm_idp, addr, PAGE_SIZE, prot, phys);
+		} else
+			ret = ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
+		if (ret)
+			return ret;
+		/* Only mark the PTE synced if nobody changed it meanwhile;
+		 * otherwise apply the new value too. */
+		if (try_cmpxchg(&pte_val(*pte), &pte_val(v), pte_val(pte_mkuptodate(v))))
+			return 0;
+	}
+}
+
 static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
 				   unsigned long end,
 				   struct vm_ops *ops)
@@ -55,32 +93,7 @@ static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
 
 	pte = pte_offset_kernel(pmd, addr);
 	do {
-		if (!pte_needsync(*pte))
-			continue;
-
-		if (pte_present(*pte)) {
-			unsigned long phys = pte_val(*pte) & PAGE_MASK;
-			int r, w, x, prot;
-
-			r = pte_read(*pte);
-			w = pte_write(*pte);
-			x = pte_exec(*pte);
-			if (!pte_young(*pte)) {
-				r = 0;
-				w = 0;
-			} else if (!pte_dirty(*pte))
-				w = 0;
-
-			prot = (r ? UM_PROT_READ : 0) |
-			       (w ? UM_PROT_WRITE : 0) |
-			       (x ? UM_PROT_EXEC : 0);
-
-			ret = ops->mmap(ops->mm_idp, addr, PAGE_SIZE,
-					prot, phys);
-		} else
-			ret = ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
-
-		*pte = pte_mkuptodate(*pte);
+		ret = sync_one_pte(pte, addr, ops);
 	} while (pte++, addr += PAGE_SIZE, ((addr < end) && !ret));
 	return ret;
 }
@@ -158,10 +171,17 @@ int um_tlb_sync(struct mm_struct *mm)
 {
 	pgd_t *pgd;
 	struct vm_ops ops;
-	unsigned long addr = mm->context.sync_tlb_range_from, next;
+	unsigned long addr, end, next, flags;
 	int ret = 0;
 
-	if (mm->context.sync_tlb_range_to == 0)
+	/* Take the pending range; marks made from now on go to the next sync. */
+	raw_spin_lock_irqsave(&mm->context.sync_lock, flags);
+	addr = mm->context.sync_tlb_range_from;
+	end = mm->context.sync_tlb_range_to;
+	mm->context.sync_tlb_range_from = 0;
+	mm->context.sync_tlb_range_to = 0;
+	raw_spin_unlock_irqrestore(&mm->context.sync_lock, flags);
+	if (end == 0)
 		return 0;
 
 	ops.mm_idp = &mm->context.id;
@@ -175,7 +195,7 @@ int um_tlb_sync(struct mm_struct *mm)
 
 	pgd = pgd_offset(mm, addr);
 	do {
-		next = pgd_addr_end(addr, mm->context.sync_tlb_range_to);
+		next = pgd_addr_end(addr, end);
 		if (!pgd_present(*pgd)) {
 			if (pgd_needsync(*pgd)) {
 				ret = ops.unmap(ops.mm_idp, addr,
@@ -184,14 +204,10 @@ int um_tlb_sync(struct mm_struct *mm)
 			}
 		} else
 			ret = update_p4d_range(pgd, addr, next, &ops);
-	} while (pgd++, addr = next,
-		 ((addr < mm->context.sync_tlb_range_to) && !ret));
+	} while (pgd++, addr = next, ((addr < end) && !ret));
 
 	if (ret == -ENOMEM)
 		report_enomem();
-
-	mm->context.sync_tlb_range_from = 0;
-	mm->context.sync_tlb_range_to = 0;
 
 	return ret;
 }
@@ -215,4 +231,5 @@ void flush_tlb_mm(struct mm_struct *mm)
 
 	for_each_vma(vmi, vma)
 		um_tlb_mark_sync(mm, vma->vm_start, vma->vm_end);
+	l4h_tlb_flush_sync(mm);
 }

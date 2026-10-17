@@ -28,3 +28,5 @@ generic-y += kprobes.h
 generic-y += mm_hooks.h
 generic-y += vga.h
 generic-y += video.h
+generic-y += qspinlock.h
+generic-y += qrwlock.h

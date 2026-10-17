@@ -46,6 +46,9 @@ const fn parse_usize(s: Option<&str>, default: usize) -> usize {
 }
 const DOM0_MEM_MB: usize = parse_usize(option_env!("L4H_DOM0_MEM_MB"), 256);
 const DOM0_VCPUS: usize = parse_usize(option_env!("L4H_DOM0_VCPUS"), 1);
+/* Seconds between watchdog dumps of guest vCPU state; 0 disables. */
+const WATCHDOG_SECS: usize = parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0);
+const WATCHDOG_BADGE: u64 = 1 << 40;
 
 /// Facts about the host the guests run on.
 pub struct HostInfo {
@@ -112,6 +115,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     );
 
     let hyp_ep = alloc.object_cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
+    // The watchdog timer signals a notification bound to the root TCB, which
+    // wakes the serve loop out of its receive on hyp_ep.
+    let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
+    slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     let reply = alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
     let host = HostInfo {
         cores,
@@ -144,6 +151,41 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     serve(&host, &mut alloc, reply, &mut guests)
 }
 
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
+    ((hi as u64) << 32) | lo as u64
+}
+
+fn arm_watchdog(host: &HostInfo) {
+    if WATCHDOG_SECS == 0 {
+        return;
+    }
+    let deadline = rdtsc() + host.tsc_hz * WATCHDOG_SECS as u64;
+    let tcb = slot::TCB.cap();
+    sel4::with_ipc_buffer_mut(|ipc| {
+        ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, WATCHDOG_BADGE)
+    });
+}
+
+fn watchdog_dump(guests: &[Guest]) {
+    for g in guests {
+        if !g.running {
+            continue;
+        }
+        for (v, vcpu) in g.vcpus.iter().enumerate() {
+            match vcpu.ktcb.tcb_read_all_registers(false) {
+                Ok(r) => sel4::debug_println!(
+                    "l4h-root: watchdog: guest {} vCPU {} rip={:#x} rsp={:#x}",
+                    g.id, v, *r.pc(), *r.sp()
+                ),
+                Err(e) => sel4::debug_println!("l4h-root: watchdog: guest {} vCPU {}: {:?}", g.id, v, e),
+            }
+        }
+    }
+}
+
 fn mr(i: usize) -> u64 {
     sel4::with_ipc_buffer(|b| b.msg_regs()[i])
 }
@@ -159,8 +201,15 @@ fn serve(host: &HostInfo, alloc: &mut Alloc, mut reply: cap::Reply, guests: &mut
     let mut abandon = |reply: &mut cap::Reply| {
         *reply = alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
     };
+    arm_watchdog(host);
     let (mut info, mut badge) = host.hyp_ep.recv(reply);
     loop {
+        if badge & WATCHDOG_BADGE != 0 {
+            watchdog_dump(guests);
+            arm_watchdog(host);
+            (info, badge) = host.hyp_ep.recv(reply);
+            continue;
+        }
         let gid = hyp_badge_guest(badge);
         let vcpu = hyp_badge_vcpu(badge);
         if badge & HYP_BADGE_FAULT != 0 {
