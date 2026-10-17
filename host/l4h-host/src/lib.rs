@@ -68,6 +68,8 @@ pub const ROOT_CALL_GUEST_POWER: u64 = 1; // MR0 = guest id, MR1 = abi POWER_*
 pub const ROOT_CALL_LOG: u64 = 2;
 /// l4h-vmm has initialised the device pages: start the guest (MR0 = guest id).
 pub const ROOT_CALL_VMM_READY: u64 = 3;
+/// dom0's l4h-vmm: execute the control request in dom0's control page.
+pub const ROOT_CALL_CTL: u64 = 4;
 
 /// Badge bit set on every endpoint capability l4h-root gives to a guest
 /// for l4h-vmm's service endpoint; notification badges never have it.
@@ -124,7 +126,9 @@ pub struct VmmConfig {
     /// Slot of the badged (L4H_BADGE_EVENT) notification of vCPU v is
     /// VCPU_NTFN_SLOT_BASE + v; its event page is at event_page_va(v).
     pub dom0: u32,
-    pub reserved: u32,
+    /// Also copy console output to the host serial port (with a prefix
+    /// unless dom0).
+    pub serial: u32,
     pub ram_chunks: [RamChunk; VMM_MAX_RAM_CHUNKS],
     pub devices: [VmmDevice; VMM_MAX_DEVICES],
 }
@@ -136,6 +140,20 @@ pub const fn vmm_event_page_va(v: usize) -> usize {
 pub const fn vmm_device_page_va(d: usize) -> usize {
     SHARED_VA + 0x100_0000 + d * 0x1000
 }
+/// Console output ring of the guest, shared by l4h-vmm (writer) and
+/// l4h-root (reader).
+pub const VMM_CONSOLE_RING_VA: usize = SHARED_VA + 0x80_0000;
+pub const CONSOLE_RING_PAGES: usize = 4;
+pub const CONSOLE_RING_DATA: usize = CONSOLE_RING_PAGES * 4096 - 64;
+
+#[repr(C)]
+pub struct ConsoleRing {
+    /// Total bytes ever written; byte i is at data[i % CONSOLE_RING_DATA].
+    pub head: u64,
+    pub reserved: [u64; 7],
+    pub data: [u8; CONSOLE_RING_DATA],
+}
+
 pub const fn vmm_chan_va(d: usize) -> usize {
     SHARED_VA + 0x1000_0000 + d * 0x100_0000
 }

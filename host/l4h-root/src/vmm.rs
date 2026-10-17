@@ -36,26 +36,23 @@ pub enum Backend {
     },
 }
 
-pub struct Vmm {
-    pub comp: Component,
-}
-
 const SLOT_KICK_BASE: u64 = 32;
 
+/// Create the guest's l4h-vmm (not started) for its devices and backends.
 pub fn spawn(
     g: &mut Guest,
-    backends: &[Backend],
     alloc: &mut Alloc,
     win: &mut Window,
     asids: &mut AsidPools,
     host_info: &HostInfo,
-) -> Vmm {
-    assert_eq!(backends.len(), g.dev_pages.len());
+) -> Component {
+    let backends = core::mem::take(&mut g.backends);
     let mut cfg: alloc::boxed::Box<host::VmmConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
     cfg.guest_id = g.id as u32;
     cfg.nr_vcpus = g.vcpus.len() as u32;
     cfg.ram_size = g.ram.iter().map(|c| c.size).sum::<usize>() as u64;
     cfg.dom0 = g.dom0 as u32;
+    cfg.serial = 1;
     assert!(g.ram.len() <= host::VMM_MAX_RAM_CHUNKS);
     cfg.nr_ram_chunks = g.ram.len() as u32;
     for (i, c) in g.ram.iter().enumerate() {
@@ -63,8 +60,9 @@ pub fn spawn(
     }
     assert!(backends.len() <= host::VMM_MAX_DEVICES);
     cfg.nr_devices = backends.len() as u32;
-    for (d, b) in backends.iter().enumerate() {
-        let dev = &mut cfg.devices[d];
+    for (i, (d, b)) in backends.iter().enumerate() {
+        let d = *d;
+        let dev = &mut cfg.devices[i];
         dev.guest_index = d as u32;
         dev.event = dev_event(d);
         dev.page_va = host::vmm_device_page_va(d) as u64;
@@ -127,11 +125,15 @@ pub fn spawn(
         comp.map_copy(alloc, &mut g.arena.pool, &ev, host::vmm_event_page_va(v), CapRights::read_write(), attrs, keep_slot());
         comp.give_badged(host::VCPU_NTFN_SLOT_BASE + v as u64, vcpu.ntfn, CapRights::write_only(), abi::BADGE_EVENT);
     }
-    for (d, page) in g.dev_pages.iter().enumerate() {
-        let p = crate::component::abs_of(*page);
+    for (d, dev) in g.devices.iter().enumerate() {
+        let p = crate::component::abs_of(dev.page);
         comp.map_copy(alloc, &mut g.arena.pool, &p, host::vmm_device_page_va(d), CapRights::read_write(), attrs, keep_slot());
     }
-    for (d, b) in backends.iter().enumerate() {
+    for (i, f) in g.console_ring.iter().enumerate() {
+        let p = crate::component::abs_of(*f);
+        comp.map_copy(alloc, &mut g.arena.pool, &p, host::VMM_CONSOLE_RING_VA + i * PAGE, CapRights::read_write(), attrs, keep_slot());
+    }
+    for &(d, ref b) in backends.iter() {
         match b {
             Backend::Blk { chan, kick, .. } => {
                 for (i, f) in chan.iter().enumerate() {
@@ -142,5 +144,6 @@ pub fn spawn(
             }
         }
     }
-    Vmm { comp }
+    g.backends = backends;
+    comp
 }

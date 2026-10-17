@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * /dev/l4hctl: dom0's access to the l4h control API (DESIGN.md §9.1).
+ *
+ * ioctl(L4HCTL_IOC_CALL) passes a struct l4h_ctl_req to l4h-root and
+ * returns the struct l4h_ctl_resp.  For L4H_CTL_VM_LOAD, the bytes to load
+ * come from a user buffer: they are staged in a physically contiguous
+ * kernel buffer whose guest-physical address replaces args[2].
+ */
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gfp.h>
+#include <asm/page.h>
+#include <l4h_sys.h>
+
+struct l4hctl_call {
+	__u64 req;      /* struct l4h_ctl_req * */
+	__u64 resp;     /* struct l4h_ctl_resp * */
+	__u64 buf;      /* VM_LOAD: source bytes */
+	__u64 len;
+};
+
+#define L4HCTL_IOC_CALL _IOWR('L', 1, struct l4hctl_call)
+
+static void *ctl_page;
+static void *stage;
+static DEFINE_MUTEX(ctl_lock);
+
+static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct l4h_ctl_req *req = ctl_page;
+	struct l4h_ctl_resp *resp = ctl_page + L4H_CTL_RESP_OFF;
+	struct l4hctl_call call;
+	unsigned long mr = 0;
+	long ret = 0;
+
+	if (cmd != L4HCTL_IOC_CALL)
+		return -ENOTTY;
+	if (copy_from_user(&call, (void __user *)arg, sizeof(call)))
+		return -EFAULT;
+
+	mutex_lock(&ctl_lock);
+	if (copy_from_user(req, u64_to_user_ptr(call.req), sizeof(*req))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (req->op == L4H_CTL_VM_LOAD) {
+		if (call.len > L4H_CTL_LOAD_MAX ||
+		    copy_from_user(stage, u64_to_user_ptr(call.buf), call.len)) {
+			ret = -EFAULT;
+			goto out;
+		}
+		req->args[2] = __pa(stage);
+		req->args[3] = call.len;
+	}
+	memset(resp, 0, sizeof(*resp));
+	l4h_hypercall(L4H_HC_CTL, &mr, 0, 1);
+	if (copy_to_user(u64_to_user_ptr(call.resp), resp, sizeof(*resp)))
+		ret = -EFAULT;
+out:
+	mutex_unlock(&ctl_lock);
+	return ret;
+}
+
+static const struct file_operations l4hctl_fops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = l4hctl_ioctl,
+};
+
+static struct miscdevice l4hctl_dev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "l4hctl",
+	.fops = &l4hctl_fops,
+	.mode = 0600,
+};
+
+static int __init l4hctl_init(void)
+{
+	const struct l4h_bootinfo *bi = l4h_bootinfo;
+	unsigned int i;
+
+	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++)
+		if (bi->devices[i].type == L4H_DEV_CTL)
+			ctl_page = (void *)bi->devices[i].page_va;
+	if (!ctl_page)
+		return 0;
+	stage = (void *)__get_free_pages(GFP_KERNEL, get_order(L4H_CTL_LOAD_MAX));
+	if (!stage)
+		return -ENOMEM;
+	pr_info("l4hctl: control device present\n");
+	return misc_register(&l4hctl_dev);
+}
+device_initcall(l4hctl_init);

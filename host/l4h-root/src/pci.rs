@@ -227,6 +227,16 @@ impl Pci {
         self.write16(d.bus, d.dev, d.func, 4, cmd | 0x2 | 0x4 | 0x400);
     }
 
+    /// Stop the device: no DMA, no memory decoding, MSI-X off.
+    pub fn disable(&self, d: &Device) {
+        let cmd = self.read16(d.bus, d.dev, d.func, 4);
+        self.write16(d.bus, d.dev, d.func, 4, (cmd & !0x6) | 0x400);
+        if let Some(m) = d.msix {
+            let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
+            self.write16(d.bus, d.dev, d.func, m.cap + 2, ctrl & !0x8000);
+        }
+    }
+
     /// Enable MSI-X with all vectors unmasked at the function level.
     pub fn enable_msix(&self, d: &Device) {
         if let Some(m) = d.msix {

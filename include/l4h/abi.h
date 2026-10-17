@@ -17,12 +17,14 @@ typedef __u8 l4h_u8;
 typedef __u16 l4h_u16;
 typedef __u32 l4h_u32;
 typedef __u64 l4h_u64;
+typedef __s64 l4h_s64;
 #else
 #include <stdint.h>
 typedef uint8_t l4h_u8;
 typedef uint16_t l4h_u16;
 typedef uint32_t l4h_u32;
 typedef uint64_t l4h_u64;
+typedef int64_t l4h_s64;
 #endif
 
 #define L4H_ABI_VERSION 1
@@ -253,6 +255,82 @@ enum l4h_virtio_op {
 };
 
 /* ------------------------------------------------------------------------
+ * Console device (L4H_DEV_CONSOLE): input ring written by the host.
+ * Output goes through L4H_HC_CONSOLE_WRITE.
+ */
+#define L4H_CONSOLE_IN_SIZE     4032
+struct l4h_console_page {
+	l4h_u32 in_head;        /* written by the host */
+	l4h_u32 in_tail;        /* written by the guest */
+	l4h_u32 reserved[14];
+	l4h_u8 in[L4H_CONSOLE_IN_SIZE];
+};
+
+/* ------------------------------------------------------------------------
+ * Control device (L4H_DEV_CTL, dom0 only): a request at offset 0 of the
+ * device page and the response at L4H_CTL_RESP_OFF, exchanged with
+ * L4H_HC_CTL.  Bulk data (images) is passed by guest-physical address of a
+ * physically contiguous dom0 buffer.  See DESIGN.md §9.1.
+ */
+#define L4H_CTL_VERSION         1
+#define L4H_CTL_RESP_OFF        2048
+#define L4H_CTL_DATA_MAX        1984
+#define L4H_CTL_LOAD_MAX        (4u << 20)
+#define L4H_CTL_NAME_MAX        32
+
+struct l4h_ctl_req {
+	l4h_u32 op;             /* enum l4h_ctl_op */
+	l4h_u32 version;        /* L4H_CTL_VERSION */
+	l4h_u64 args[6];
+	l4h_u8 data[L4H_CTL_DATA_MAX];
+};
+
+struct l4h_ctl_resp {
+	l4h_s64 status;         /* 0 or -errno */
+	l4h_u64 vals[6];
+	l4h_u8 data[L4H_CTL_DATA_MAX];
+};
+
+enum l4h_ctl_op {
+	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms */
+	L4H_CTL_HOST_INFO = 1,
+	/* args: ram bytes, vcpus, ram_base_va; data: name -> vals[0] = vm */
+	L4H_CTL_VM_CREATE = 2,
+	/* args: vm, dst gpa, src gpa (dom0), len (<= L4H_CTL_LOAD_MAX) */
+	L4H_CTL_VM_LOAD = 3,
+	/* args: vm, entry, kernel_end gpa, initrd gpa, initrd size; data: cmdline */
+	L4H_CTL_VM_START = 4,
+	/* args: vm */
+	L4H_CTL_VM_DESTROY = 5,
+	/* args: first vm -> data: struct l4h_ctl_vm[], vals[0] = count */
+	L4H_CTL_VM_LIST = 6,
+	/* args: vm, disk index, read-only */
+	L4H_CTL_BLK_ATTACH = 7,
+	/* args: vm, offset -> vals[0] = next offset, vals[1] = len,
+	 * vals[2] = bytes lost; data: console output */
+	L4H_CTL_CONSOLE_READ = 8,
+	/* args: vm, len; data: console input */
+	L4H_CTL_CONSOLE_WRITE = 9,
+	/* args: disk index -> vals: bdf, owner vm (or -1), capacity sectors */
+	L4H_CTL_DISK_INFO = 10,
+};
+
+enum l4h_vm_state {
+	L4H_VM_CREATED = 1,
+	L4H_VM_RUNNING = 2,
+	L4H_VM_STOPPED = 3,
+};
+
+struct l4h_ctl_vm {
+	l4h_u32 id;
+	l4h_u32 state;          /* enum l4h_vm_state */
+	l4h_u32 vcpus;
+	l4h_u32 reserved;
+	l4h_u64 ram;
+	char name[L4H_CTL_NAME_MAX];
+};
+
+/* ------------------------------------------------------------------------
  * Hypercalls: seL4_Call(L4H_SLOT_HYP_EP) with the label below, arguments
  * in message registers, result in MR0.
  */
@@ -263,6 +341,7 @@ enum l4h_hypercall {
 	L4H_HC_DEV_READ = 4,        /* MR0 = device index, MR1 = register; returns MR0 */
 	L4H_HC_SET_IRQ_AFFINITY = 5,/* MR0 = device index, MR1 = vCPU */
 	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */
+	L4H_HC_CTL = 7,             /* dom0: execute the request in the control device page */
 };
 #define L4H_HC_CONSOLE_MAX_WORDS 32
 

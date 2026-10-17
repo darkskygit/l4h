@@ -1,6 +1,12 @@
 //! Construction of a guest: its CSpace, guest-kernel VSpace, RAM, vCPUs and
 //! boot info, following `include/l4h/abi.h`.
+//!
+//! A guest is created empty (`create`), gets devices attached and its
+//! image loaded (`write_ram`, `copy_ram`), and is then booted
+//! (`write_boot_info`, `start`).  All its objects come from its arena, so
+//! `destroy` reclaims everything by revoking the arena.
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr;
@@ -11,16 +17,20 @@ use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type
 use l4h_abi as abi;
 use l4h_host as host;
 
-use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
+use crate::component::Component;
 use crate::elf::Elf;
+use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
+use crate::vmm;
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
-use crate::window::Window;
+use crate::window::{Window, Windows};
 use crate::{AsidPools, HostInfo};
 
 const PAGE: usize = 4096;
 const GIB: usize = 1 << 30;
+/// Devices a guest can have (console, control, virtio).
+pub const MAX_GUEST_DEVICES: usize = 16;
 
-/// Badge layout of the root hypercall/fault endpoint.
+/// Badge layout of the root fault endpoint for guest kernels.
 pub const HYP_BADGE_FAULT: u64 = 1 << 24;
 pub fn hyp_badge(guest: usize, vcpu: usize) -> u64 {
     (guest as u64) | ((vcpu as u64) << 16)
@@ -32,23 +42,33 @@ pub fn hyp_badge_vcpu(b: u64) -> usize {
     ((b >> 16) & 0xff) as usize
 }
 
+/// Where l4h-root maps a guest's console and control pages for itself.
+const ROOT_GUEST_VA: usize = 0x0000_7100_0000_0000;
+fn root_guest_va(id: usize) -> usize {
+    ROOT_GUEST_VA + id * 0x10_0000
+}
+
 pub struct GuestConfig<'a> {
     pub name: &'a str,
     pub ram: usize,
     pub vcpus: usize,
     pub untyped_quota: usize,
     pub vspaces: usize,
-    pub kernel: &'a [u8],
-    pub initrd: &'a [u8],
-    pub cmdline: &'a str,
+    /// Guest-virtual address of GPA 0 (from the kernel image).
+    pub ram_base: usize,
     pub dom0: bool,
-    /// virtio devices, by boot info index.
-    pub devices: &'a [GuestDev],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevKind {
+    Console,
+    Ctl,
+    Virtio(u32),
+}
+
 pub struct GuestDev {
-    pub virtio_id: u32,
+    pub kind: DevKind,
+    pub page: cap::Granule,
 }
 
 /// Event line of boot info device `d`.
@@ -71,25 +91,44 @@ pub struct Vcpu {
     pub core: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Created,
+    Running,
+    Stopped,
+}
+
 pub struct Guest {
     pub id: usize,
     pub name: String,
     pub arena: Arena,
+    /// Root slots allocated for this guest; cleaned up by `destroy`.
+    pub slots: BTreeSet<Slot>,
     pub cnode: cap::CNode,
     pub vspace: cap::VSpace,
+    pub ram_base: usize,
     pub ram: Vec<RamChunk>,
     /// RAM CNodes and their radix (bits of frame index they resolve).
     pub ram_cnodes: Vec<(cap::CNode, usize)>,
     pub vcpus: Vec<Vcpu>,
-    pub running: bool,
+    pub state: State,
     pub dom0: bool,
+    untyped: Vec<usize>,
+    vspaces: usize,
+    bootinfo: Vec<cap::Granule>,
+    entry: u64,
     /// Objects l4h-vmm serves the guest with: its endpoint (the guest's
     /// HYP_EP), its bound notification (device kicks) and the device pages.
     pub vmm_ep: cap::Endpoint,
     pub vmm_ntfn: cap::Notification,
-    pub dev_pages: Vec<cap::Granule>,
+    dev_cn: cap::CNode,
     pub devices: Vec<GuestDev>,
-    entry: u64,
+    /// Host side of each virtio device, by device index.
+    pub backends: Vec<(usize, vmm::Backend)>,
+    pub console_ring: Vec<cap::Granule>,
+    pub vmm: Option<Component>,
+    /// Disks (host disk indices) attached to the guest.
+    pub disks: Vec<usize>,
 }
 
 fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -100,15 +139,24 @@ fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
 }
 
+/// Radix of the RAM CNode covering GiB `n` of a guest with `ram` bytes.
+fn ram_cnode_radix(ram: usize, n: usize) -> usize {
+    let frames = (ram - n * GIB).min(GIB) / PAGE;
+    (frames.next_power_of_two().trailing_zeros() as usize).max(1)
+}
+
 impl Guest {
     pub fn ctx<'a>(&'a mut self, alloc: &'a mut Alloc) -> ObjCtx<'a> {
         ObjCtx { slots: &mut alloc.slots, pool: &mut self.arena.pool }
     }
 
+    pub fn ram_size(&self) -> usize {
+        self.ram.iter().map(|c| c.size).sum()
+    }
+
     /// Destination for a capability in the guest's root CNode.
     fn guest_slot(&self, idx: usize) -> sel4::AbsoluteCPtr {
-        self.cnode
-            .absolute_cptr_from_bits_with_depth(idx as u64, abi::ROOT_CNODE_BITS)
+        self.cnode.absolute_cptr_from_bits_with_depth(idx as u64, abi::ROOT_CNODE_BITS)
     }
 
     fn give(&self, idx: usize, src: impl sel4::HasCPtrWithDepth, rights: CapRights) {
@@ -129,65 +177,247 @@ impl Guest {
         cn.absolute_cptr_from_bits_with_depth(((gpa / PAGE) % abi::RAM_CNODE_FRAMES) as u64, radix)
     }
 
+    pub fn valid_gpa(&self, gpa: usize, len: usize) -> bool {
+        gpa.checked_add(len).is_some_and(|end| end <= self.ram_size())
+    }
+
     /// Copy `data` into guest RAM at `gpa`.
-    fn write_ram(&self, win: &mut Window, alloc: &mut Alloc, gpa: usize, data: &[u8]) {
+    pub fn write_ram(&self, win: &mut Window, gpa: usize, data: &[u8]) {
+        assert!(self.valid_gpa(gpa, data.len()));
         let mut off = 0;
         while off < data.len() {
             let page = (gpa + off) & !(PAGE - 1);
             let in_page = (gpa + off) - page;
             let n = (PAGE - in_page).min(data.len() - off);
-            win.with_frame(alloc, &self.ram_frame(page), |p| unsafe {
+            win.with_frame(&self.ram_frame(page), |p| unsafe {
                 ptr::copy_nonoverlapping(data[off..].as_ptr(), p.add(in_page), n);
             });
             off += n;
         }
     }
+
+    /// Copy `len` bytes from `src` RAM at `src_gpa` to ours at `gpa`.
+    pub fn copy_ram(&self, wins: &mut Windows, gpa: usize, src: &Guest, src_gpa: usize, len: usize) -> bool {
+        if !self.valid_gpa(gpa, len) || !src.valid_gpa(src_gpa, len) {
+            return false;
+        }
+        let mut off = 0;
+        while off < len {
+            let (s, d) = (src_gpa + off, gpa + off);
+            let n = (PAGE - s % PAGE).min(PAGE - d % PAGE).min(len - off);
+            let (sp, dp) = (s & !(PAGE - 1), d & !(PAGE - 1));
+            let (wa, wb) = (&mut wins.a, &mut wins.b);
+            wa.with_frame(&src.ram_frame(sp), |from| {
+                wb.with_frame(&self.ram_frame(dp), |to| unsafe {
+                    ptr::copy_nonoverlapping(from.add(s - sp), to.add(d - dp), n);
+                })
+            });
+            off += n;
+        }
+        true
+    }
+
+    /// Add a device: a shared page mapped in the guest at its device area
+    /// and a kick capability (badged notification of l4h-vmm).
+    pub fn add_device(&mut self, alloc: &mut Alloc, kind: DevKind) -> Option<usize> {
+        let d = self.devices.len();
+        if d >= MAX_GUEST_DEVICES || self.state != State::Created {
+            return None;
+        }
+        let page = self.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+        let (vspace, ntfn) = (self.vspace, self.vmm_ntfn);
+        let mut ctx = self.ctx(alloc);
+        // The guest maps a copy; the original is kept for l4h-vmm.
+        let copy = ctx.slots.alloc();
+        abs(root_cap::<cap_type::Null>(copy)).copy(&abs(page), CapRights::all()).expect("device page copy");
+        map_frame(&mut ctx, vspace, root_cap::<cap_type::Granule>(copy), abi::dev_area_va(d) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
+        self.dev_cn
+            .absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS)
+            .mint(&abs(ntfn), CapRights::write_only(), 1 << (host::VMM_BADGE_KICK_SHIFT as usize + d))
+            .expect("device kick cap");
+        // Console and control pages are also used by l4h-root itself.
+        let root_va = match kind {
+            DevKind::Ctl => Some(root_guest_va(self.id)),
+            DevKind::Console => Some(root_guest_va(self.id) + PAGE),
+            DevKind::Virtio(_) => None,
+        };
+        if let Some(va) = root_va {
+            self.map_in_root(alloc, page, va);
+        }
+        self.devices.push(GuestDev { kind, page });
+        Some(d)
+    }
+
+    /// Map (a copy of) one of our frames into the root task.  The paging
+    /// structures are global: the root region is reused by later guests.
+    fn map_in_root(&mut self, alloc: &mut Alloc, frame: cap::Granule, va: usize) {
+        let copy = alloc.slots.alloc();
+        abs(root_cap::<cap_type::Null>(copy)).copy(&abs(frame), CapRights::all()).expect("root map copy");
+        let Alloc { slots, pool, .. } = alloc;
+        slots.global(|slots| {
+            map_frame(&mut ObjCtx { slots, pool }, slot::VSPACE.cap(), root_cap::<cap_type::Granule>(copy), va, CapRights::read_write(), VmAttributes::DEFAULT);
+        });
+    }
+
+    pub fn ctl_page(&self) -> Option<*mut u8> {
+        self.devices.iter().any(|d| d.kind == DevKind::Ctl).then(|| root_guest_va(self.id) as *mut u8)
+    }
+
+    pub fn console_page(&self) -> *mut abi::ConsolePage {
+        (root_guest_va(self.id) + PAGE) as *mut abi::ConsolePage
+    }
+
+    pub fn console_ring(&self) -> *const host::ConsoleRing {
+        (root_guest_va(self.id) + 0x1_0000) as *const host::ConsoleRing
+    }
+
+    /// Write the boot info.  Validates the boot parameters.
+    pub fn write_boot_info(
+        &mut self,
+        win: &mut Window,
+        host_info: &HostInfo,
+        entry: u64,
+        kernel_end: usize,
+        initrd: (usize, usize),
+        cmdline: &[u8],
+    ) -> bool {
+        let ram = self.ram_size();
+        let entry_gpa = (entry as usize).wrapping_sub(self.ram_base);
+        if kernel_end > ram || kernel_end % PAGE != 0 || entry_gpa >= kernel_end || !self.valid_gpa(initrd.0, initrd.1) {
+            return false;
+        }
+        let mut bi: alloc::boxed::Box<abi::BootInfo> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
+        bi.magic = abi::BOOTINFO_MAGIC;
+        bi.abi_version = abi::ABI_VERSION;
+        bi.guest_id = self.id as u64;
+        bi.ram_base_va = self.ram_base as u64;
+        bi.ram_size = ram as u64;
+        bi.kernel_end_gpa = kernel_end as u64;
+        if initrd.1 != 0 {
+            bi.initrd_gpa = initrd.0 as u64;
+            bi.initrd_size = initrd.1 as u64;
+        }
+        bi.nr_vcpus = self.vcpus.len() as u64;
+        bi.tsc_hz = host_info.tsc_hz;
+        bi.nr_untyped = self.untyped.len() as u64;
+        for (i, b) in self.untyped.iter().enumerate() {
+            bi.untyped[i].size_bits = *b as u64;
+        }
+        bi.nr_vspaces = self.vspaces as u64;
+        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
+        bi.nr_devices = self.devices.len() as u64;
+        for (d, dev) in self.devices.iter().enumerate() {
+            let (ty, virtio_id) = match dev.kind {
+                DevKind::Console => (abi::DEV_CONSOLE, 0),
+                DevKind::Ctl => (abi::DEV_CTL, 0),
+                DevKind::Virtio(id) => (abi::DEV_VIRTIO, id),
+            };
+            bi.devices[d] = abi::DevDesc {
+                ty,
+                virtio_id,
+                page_va: abi::dev_area_va(d),
+                page_size: PAGE as u64,
+                event: dev_event(d),
+                kick_slot: d as u32,
+                reserved: [0; 2],
+            };
+        }
+        let n = cmdline.iter().position(|&c| c == 0).unwrap_or(cmdline.len()).min(abi::CMDLINE_SIZE - 1);
+        bi.cmdline[..n].copy_from_slice(&cmdline[..n]);
+
+        let bi_bytes = unsafe {
+            core::slice::from_raw_parts(&*bi as *const abi::BootInfo as *const u8, core::mem::size_of::<abi::BootInfo>())
+        };
+        for (p, frame) in self.bootinfo.iter().enumerate() {
+            let lo = (p * PAGE).min(bi_bytes.len());
+            let hi = ((p + 1) * PAGE).min(bi_bytes.len());
+            let chunk = &bi_bytes[lo..hi];
+            win.with_frame(&abs(*frame), |dst| unsafe {
+                ptr::write_bytes(dst, 0, PAGE);
+                ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len());
+            });
+        }
+        self.entry = entry;
+        true
+    }
+
+    /// Start vCPU 0 at the kernel entry point.
+    pub fn start(&mut self) {
+        let mut regs = sel4::UserContext::default();
+        *regs.pc_mut() = self.entry;
+        *regs.c_param_mut(0) = abi::BOOTINFO_VA;
+        self.vcpus[0].ktcb.tcb_write_all_registers(true, &mut regs).expect("start vCPU 0");
+        self.state = State::Running;
+        sel4::debug_println!("l4h-root: guest {} '{}' started", self.id, self.name);
+    }
+
+    /// Stop all threads of the guest and its VMM.
+    pub fn stop(&mut self) {
+        for v in &self.vcpus {
+            let _ = v.ktcb.tcb_suspend();
+        }
+        if let Some(v) = &self.vmm {
+            let _ = v.tcb.tcb_suspend();
+        }
+        self.state = State::Stopped;
+    }
+
+    /// Destroy the guest and return all its memory and root slots.  The
+    /// caller has detached its devices.
+    pub fn destroy(mut self, alloc: &mut Alloc) {
+        self.stop();
+        alloc.reclaim(self.arena);
+        // Capabilities that do not derive from the arena (badged endpoints,
+        // copies of global objects) are left in their slots.
+        for s in self.slots {
+            if alloc.pinned.contains(&s) {
+                continue;
+            }
+            let _ = abs(root_cap::<cap_type::Null>(s)).delete();
+            alloc.slots.free(s);
+        }
+    }
 }
 
-/// Radix of the RAM CNode covering GiB `n` of a guest with `ram` bytes.
-fn ram_cnode_radix(ram: usize, n: usize) -> usize {
-    let frames = (ram - n * GIB).min(GIB) / PAGE;
-    (frames.next_power_of_two().trailing_zeros() as usize).max(1)
-}
-
-pub fn build(
+/// Create a guest with no image.  Root slots allocated here and in later
+/// operations on the guest must be tracked into `Guest::slots` by the
+/// caller (see `Alloc::slots`).
+pub fn create(
     id: usize,
     cfg: &GuestConfig,
     alloc: &mut Alloc,
-    win: &mut Window,
     asids: &mut AsidPools,
-    host: &HostInfo,
-) -> Guest {
-    let elf = Elf::parse(cfg.kernel).expect("guest kernel");
-    let (lo, hi) = elf.bounds();
-    let ram_base = (lo as usize) & !(PAGE - 1);
-    let kernel_end = ((hi as usize - ram_base) + PAGE - 1) & !(PAGE - 1);
+    host_info: &HostInfo,
+) -> Option<Guest> {
+    let ram_base = cfg.ram_base & !(PAGE - 1);
     let ram = (cfg.ram + PAGE - 1) & !(PAGE - 1);
-    assert!(cfg.vcpus >= 1 && cfg.vcpus <= abi::MAX_VCPUS);
-    assert!(ram <= abi::MAX_RAM_CNODES * GIB);
-    assert!(kernel_end + cfg.initrd.len() + (1 << 20) < ram, "guest RAM too small for kernel+initrd");
-    assert!((ram_base + ram) as u64 <= abi::SPECIAL_BASE);
+    if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || ram < (8 << 20) || ram > abi::MAX_RAM_CNODES * GIB {
+        return None;
+    }
+    if ram_base == 0 || (ram_base + ram) as u64 > abi::SPECIAL_BASE {
+        return None;
+    }
 
     // Host-side objects for this guest: CNodes, paging structures for the
-    // direct map, vCPU objects, VSpace pool, boot info.  Power-of-two
-    // splitting and alignment can waste up to half, hence the factor 2.
+    // direct map, vCPU objects, VSpace pool, boot info, its l4h-vmm.
+    // Power-of-two splitting and alignment can waste up to half, hence the
+    // factor 2.
     let n_cnodes = ram.div_ceil(GIB);
-    let ram_cnode_bytes: usize = (0..n_cnodes)
-        .map(|n| ram_cnode_radix(ram, n))
-        .map(|radix| 32usize << radix)
-        .sum();
+    let ram_cnode_bytes: usize = (0..n_cnodes).map(|n| ram_cnode_radix(ram, n)).map(|radix| 32usize << radix).sum();
     let overhead = 2 * (ram_cnode_bytes
         + (32 << abi::ROOT_CNODE_BITS) * 3
         + ram / 256
         + cfg.vcpus * (64 << 10)
         + cfg.vspaces * PAGE
         + (2 << 20))
-        + crate::vmm::arena_bytes(ram, cfg.vcpus, cfg.devices.len());
-    let arena = alloc.arena(overhead).expect("out of memory for guest arena");
+        + vmm::arena_bytes(ram, cfg.vcpus, MAX_GUEST_DEVICES);
+    if alloc.pool.free_bytes() < overhead + ram + cfg.untyped_quota {
+        return None;
+    }
+    let mut arena = alloc.arena(overhead)?;
 
     // Guest root CNode.
     let cnode_slot = alloc.slots.alloc();
-    let mut arena = arena;
     arena
         .pool
         .retype(&ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS }, 1, Dest::root(cnode_slot))
@@ -200,18 +430,27 @@ pub fn build(
         id,
         name: String::from(cfg.name),
         arena,
+        slots: BTreeSet::new(),
         cnode: root_cap::<cap_type::CNode>(cnode_slot),
         vspace,
+        ram_base,
         ram: Vec::new(),
         ram_cnodes: Vec::new(),
         vcpus: Vec::new(),
-        running: false,
+        state: State::Created,
         dom0: cfg.dom0,
+        untyped: Vec::new(),
+        vspaces: cfg.vspaces,
+        bootinfo: Vec::new(),
+        entry: 0,
         vmm_ep: cap::Endpoint::from_bits(0),
         vmm_ntfn: cap::Notification::from_bits(0),
-        dev_pages: Vec::new(),
-        devices: cfg.devices.to_vec(),
-        entry: elf.entry,
+        dev_cn: cap::CNode::from_bits(0),
+        devices: Vec::new(),
+        backends: Vec::new(),
+        console_ring: Vec::new(),
+        vmm: None,
+        disks: Vec::new(),
     };
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();
@@ -224,7 +463,7 @@ pub fn build(
     g.give(abi::SLOT_VSPACE, g.vspace, CapRights::all());
 
     // ---- RAM: physically contiguous chunks retyped into 4 KiB frames that
-    // live in radix-18 CNodes, one per GiB of guest-physical space.
+    // live in CNodes, one per GiB of guest-physical space.
     for n in 0..n_cnodes {
         let radix = ram_cnode_radix(ram, n);
         let s = alloc.slots.alloc();
@@ -254,54 +493,41 @@ pub fn build(
         let size = 1usize << bits;
         let frames = size / PAGE;
         let (cn, _) = g.ram_cnodes[gpa / GIB];
-        let dest = Dest {
-            cnode: abs(cn),
-            offset: (gpa / PAGE) % abi::RAM_CNODE_FRAMES,
-        };
+        let dest = Dest { cnode: abs(cn), offset: (gpa / PAGE) % abi::RAM_CNODE_FRAMES };
+        let paddr = region.paddr;
         let mut pool = crate::mem::UtPool { regions: ::alloc::vec![region] };
         pool.retype(&FRAME_BP, frames, dest).expect("RAM frames");
-        let paddr = pool.regions[0].paddr;
-        g.arena.slots.push(chunk_slot);
+        g.arena.own(chunk_slot, paddr, bits);
         g.ram.push(RamChunk { gpa, paddr, size });
         gpa += size;
     }
 
     // ---- Direct map of all guest RAM in the guest-kernel VSpace.  The
     // original frame caps are used; the guest maps copies elsewhere.
+    let tmp = alloc.slots.alloc();
     for page in (0..ram).step_by(PAGE) {
-        let s = alloc.slots.alloc();
-        abs(root_cap::<cap_type::Null>(s)).move_(&g.ram_frame(page)).expect("move frame");
-        let frame = root_cap::<cap_type::Granule>(s);
+        abs(root_cap::<cap_type::Null>(tmp)).move_(&g.ram_frame(page)).expect("move frame");
+        let frame = root_cap::<cap_type::Granule>(tmp);
         let vspace = g.vspace;
         map_frame(&mut g.ctx(alloc), vspace, frame, ram_base + page, CapRights::read_write(), VmAttributes::DEFAULT);
         // Put it back so the guest finds it at its ABI location.
         g.ram_frame(page).move_(&abs(frame)).expect("move frame back");
-        alloc.slots.free(s);
     }
-
-    // ---- Kernel image and initrd.
-    for seg in elf.segments() {
-        g.write_ram(win, alloc, seg.vaddr as usize - ram_base, seg.data);
-    }
-    let initrd_gpa = kernel_end + (1 << 20);
-    if !cfg.initrd.is_empty() {
-        g.write_ram(win, alloc, initrd_gpa, cfg.initrd);
-    }
+    alloc.slots.free(tmp);
 
     // ---- Untyped quota for the guest's own kernel objects.
-    let mut untyped = Vec::new();
     let mut remaining = cfg.untyped_quota;
-    while remaining >= PAGE && untyped.len() < abi::MAX_UNTYPED {
+    while remaining >= PAGE && g.untyped.len() < abi::MAX_UNTYPED {
         let bits = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
         let bits = bits.min(28);
         let s = alloc.slots.alloc();
-        if alloc.pool.split(bits, s).is_none() {
+        let Some(r) = alloc.pool.split(bits, s) else {
             alloc.slots.free(s);
             break;
-        }
-        g.arena.slots.push(s);
-        g.give(abi::SLOT_UNTYPED_BASE + untyped.len(), root_cap::<cap_type::Untyped>(s), CapRights::all());
-        untyped.push(bits);
+        };
+        g.arena.own(s, r.paddr, bits);
+        g.give(abi::SLOT_UNTYPED_BASE + g.untyped.len(), root_cap::<cap_type::Untyped>(s), CapRights::all());
+        g.untyped.push(bits);
         remaining -= 1 << bits;
     }
 
@@ -316,10 +542,10 @@ pub fn build(
             .expect("vspace pool copy");
     }
     g.give_badged(abi::SLOT_VSPACE_POOL, pool_cn, CapRights::all(), guard6);
-    let dev_cn = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
-    g.give_badged(abi::SLOT_DEV_CNODE, dev_cn, CapRights::all(), guard6);
+    g.dev_cn = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+    g.give_badged(abi::SLOT_DEV_CNODE, g.dev_cn, CapRights::all(), guard6);
 
-    // ---- Hypercall endpoint (served by l4h-vmm) and devices.
+    // ---- Hypercall endpoint (served by l4h-vmm).
     g.vmm_ep = g.arena.object_cap::<cap_type::Endpoint>(&mut alloc.slots, ObjectBlueprint::Endpoint);
     g.vmm_ntfn = g.arena.object_cap::<cap_type::Notification>(&mut alloc.slots, ObjectBlueprint::Notification);
     g.give_badged(
@@ -328,24 +554,10 @@ pub fn build(
         sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(),
         host::VMM_BADGE_HYPERCALL,
     );
-    for d in 0..cfg.devices.len() {
-        let page = g.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
-        let (vspace, ntfn) = (g.vspace, g.vmm_ntfn);
-        let mut ctx = g.ctx(alloc);
-        // The guest maps a copy; the original is kept for l4h-vmm.
-        let copy = ctx.slots.alloc();
-        abs(root_cap::<cap_type::Null>(copy)).copy(&abs(page), CapRights::all()).expect("device page copy");
-        map_frame(&mut ctx, vspace, root_cap::<cap_type::Granule>(copy), abi::dev_area_va(d) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
-        dev_cn
-            .absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS)
-            .mint(&abs(ntfn), CapRights::write_only(), 1 << (host::VMM_BADGE_KICK_SHIFT as usize + d))
-            .expect("device kick cap");
-        g.dev_pages.push(page);
-    }
 
     // ---- vCPUs.
     for v in 0..cfg.vcpus {
-        let core = (id + v) % host.cores;
+        let core = (id + v) % host_info.cores;
         let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut g.arena.pool };
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
@@ -359,19 +571,19 @@ pub fn build(
         map_frame(&mut ctx, vspace, ipcbuf, abi::vcpu_ipcbuf_va(v) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
         map_frame(&mut ctx, vspace, event, abi::vcpu_event_va(v) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
 
-        let sched_control = host.sched_control(core);
+        let sched_control = host_info.sched_control(core);
         sched_control
-            .sched_control_configure_flags(sc_k, host.timeslice_us, host.timeslice_us, 0, 0, 0)
+            .sched_control_configure_flags(sc_k, host_info.timeslice_us, host_info.timeslice_us, 0, 0, 0)
             .expect("configure SC_K");
         sched_control
-            .sched_control_configure_flags(sc_u, host.timeslice_us, host.timeslice_us, 0, 0, 0)
+            .sched_control_configure_flags(sc_u, host_info.timeslice_us, host_info.timeslice_us, 0, 0, 0)
             .expect("configure SC_U");
 
         ktcb.tcb_configure(g.cnode, CNodeCapData::new(0, abi::ROOT_GUARD_BITS), g.vspace, abi::vcpu_ipcbuf_va(v), ipcbuf)
             .expect("kTCB configure");
         let fault_slot = alloc.slots.alloc();
         abs(root_cap::<cap_type::Null>(fault_slot))
-            .mint(&abs(host.hyp_ep), CapRights::all(), hyp_badge(id, v) | HYP_BADGE_FAULT)
+            .mint(&abs(host_info.hyp_ep), CapRights::all(), hyp_badge(id, v) | HYP_BADGE_FAULT)
             .expect("fault ep");
         ktcb.tcb_set_sched_params(
             slot::TCB.cap(),
@@ -394,72 +606,52 @@ pub fn build(
         g.vcpus.push(Vcpu { ktcb, ntfn, event, core });
     }
 
-    // ---- Boot info.
-    let mut bi: ::alloc::boxed::Box<abi::BootInfo> = unsafe { ::alloc::boxed::Box::new_zeroed().assume_init() };
-    bi.magic = abi::BOOTINFO_MAGIC;
-    bi.abi_version = abi::ABI_VERSION;
-    bi.guest_id = id as u64;
-    bi.ram_base_va = ram_base as u64;
-    bi.ram_size = ram as u64;
-    bi.kernel_end_gpa = kernel_end as u64;
-    if !cfg.initrd.is_empty() {
-        bi.initrd_gpa = initrd_gpa as u64;
-        bi.initrd_size = cfg.initrd.len() as u64;
-    }
-    bi.nr_vcpus = cfg.vcpus as u64;
-    bi.tsc_hz = host.tsc_hz;
-    bi.nr_untyped = untyped.len() as u64;
-    for (i, b) in untyped.iter().enumerate() {
-        bi.untyped[i].size_bits = *b as u64;
-    }
-    bi.nr_vspaces = cfg.vspaces as u64;
-    bi.flags = if cfg.dom0 { abi::BOOT_DOM0 } else { 0 };
-    bi.nr_devices = cfg.devices.len() as u64;
-    for (d, dev) in cfg.devices.iter().enumerate() {
-        bi.devices[d] = abi::DevDesc {
-            ty: abi::DEV_VIRTIO,
-            virtio_id: dev.virtio_id,
-            page_va: abi::dev_area_va(d),
-            page_size: PAGE as u64,
-            event: dev_event(d),
-            kick_slot: d as u32,
-            reserved: [0; 2],
-        };
-    }
-    let n = cfg.cmdline.len().min(abi::CMDLINE_SIZE - 1);
-    bi.cmdline[..n].copy_from_slice(&cfg.cmdline.as_bytes()[..n]);
-
-    let bi_bytes = unsafe {
-        core::slice::from_raw_parts(&*bi as *const abi::BootInfo as *const u8, core::mem::size_of::<abi::BootInfo>())
-    };
+    // ---- Boot info frames (written at boot).
     for p in 0..(abi::BOOTINFO_SIZE as usize / PAGE) {
         let frame = g.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
-        let lo = (p * PAGE).min(bi_bytes.len());
-        let hi = ((p + 1) * PAGE).min(bi_bytes.len());
-        let chunk = &bi_bytes[lo..hi];
-        win.with_frame(alloc, &abs(frame), |dst| unsafe {
-            ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len());
-        });
         let vspace = g.vspace;
         map_frame(&mut g.ctx(alloc), vspace, frame, abi::BOOTINFO_VA as usize + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
+        g.bootinfo.push(frame);
+    }
+
+    // ---- Console (input page, output ring) and, for dom0, control.
+    g.add_device(alloc, DevKind::Console).unwrap();
+    for i in 0..host::CONSOLE_RING_PAGES {
+        let f = g.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+        let va = root_guest_va(id) + 0x1_0000 + i * PAGE;
+        g.map_in_root(alloc, f, va);
+        g.console_ring.push(f);
+    }
+    if cfg.dom0 {
+        g.add_device(alloc, DevKind::Ctl).unwrap();
     }
 
     sel4::debug_println!(
-        "l4h-root: guest {} '{}' built: {} MiB RAM in {} chunk(s) at {:#x}, {} vCPU(s), {} MiB untyped",
-        id, g.name, ram >> 20, g.ram.len(), ram_base, cfg.vcpus,
-        untyped.iter().map(|b| 1usize << b).sum::<usize>() >> 20
+        "l4h-root: guest {} '{}' created: {} MiB RAM in {} chunk(s), {} vCPU(s), {} MiB untyped",
+        id, g.name, ram >> 20, g.ram.len(), cfg.vcpus,
+        g.untyped.iter().map(|b| 1usize << b).sum::<usize>() >> 20
     );
-    g
+    Some(g)
 }
 
-impl Guest {
-    /// Start vCPU 0 at the kernel entry point.
-    pub fn start(&mut self) {
-        let mut regs = sel4::UserContext::default();
-        *regs.pc_mut() = self.entry;
-        *regs.c_param_mut(0) = abi::BOOTINFO_VA;
-        self.vcpus[0].ktcb.tcb_write_all_registers(true, &mut regs).expect("start vCPU 0");
-        self.running = true;
-        sel4::debug_println!("l4h-root: guest {} '{}' started", self.id, self.name);
+/// Load an ELF kernel and initrd embedded in the root task (dom0) and write
+/// the boot info.  Returns false if the image does not fit.
+pub fn load_embedded(g: &mut Guest, win: &mut Window, host_info: &HostInfo, kernel: &[u8], initrd: &[u8], cmdline: &str) -> bool {
+    let Ok(elf) = Elf::parse(kernel) else { return false };
+    let (lo, hi) = elf.bounds();
+    if (lo as usize) & !(PAGE - 1) != g.ram_base {
+        return false;
     }
+    let kernel_end = ((hi as usize - g.ram_base) + PAGE - 1) & !(PAGE - 1);
+    let initrd_gpa = kernel_end + (1 << 20);
+    if !g.valid_gpa(initrd_gpa, initrd.len() + (1 << 20)) {
+        return false;
+    }
+    for seg in elf.segments() {
+        g.write_ram(win, seg.vaddr as usize - g.ram_base, seg.data);
+    }
+    if !initrd.is_empty() {
+        g.write_ram(win, initrd_gpa, initrd);
+    }
+    g.write_boot_info(win, host_info, elf.entry, kernel_end, (initrd_gpa, initrd.len()), cmdline.as_bytes())
 }

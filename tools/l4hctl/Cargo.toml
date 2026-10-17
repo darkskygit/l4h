@@ -1,0 +1,11 @@
+[package]
+name = "l4hctl"
+edition = "2024"
+license = "BSD-2-Clause"
+version = "0.1.0"
+description = "dom0 command-line client of the l4h control API"
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"

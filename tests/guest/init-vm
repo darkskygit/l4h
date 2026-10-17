@@ -1,0 +1,18 @@
+#!/bin/sh
+# Init of guests created by tests/guest/init-ctltest: report, use the disk
+# if there is one, answer one line of console input, power off.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+echo "GUEST: ready, $(nproc) cpus"
+if [ -b /dev/vda ]; then
+    mount -t ext4 /dev/vda /mnt || echo "GUEST: mount failed"
+    n=$(cat /mnt/count 2>/dev/null || echo 0)
+    echo "GUEST: disk count $n"
+    echo $((n + 1)) > /mnt/count
+    sync
+    umount /mnt && echo "GUEST: disk ok"
+fi
+read line
+echo "GUEST: got $line"
+poweroff -f

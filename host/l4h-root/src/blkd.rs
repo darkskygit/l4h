@@ -32,8 +32,23 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-/// MSI vectors handed out so far (seL4 delivers vector n at 0x30 + n).
-static mut NEXT_MSI: u64 = 0;
+/// A virtio-blk PCI device that can be passed through to a guest.
+pub struct Disk {
+    pub pci: pci::Device,
+    /// MSI vector (seL4 delivers vector n at CPU vector 0x30 + n).
+    vector: u64,
+    /// Frames of the BARs the driver uses, carved once.
+    bars: Vec<(u8, Vec<cap::Granule>)>,
+    pub owner: Option<usize>,
+    pub read_only: bool,
+    driver: Option<Blkd>,
+}
+
+impl Disk {
+    pub fn new(pci: pci::Device, vector: u64) -> Self {
+        Disk { pci, vector, bars: Vec::new(), owner: None, read_only: false, driver: None }
+    }
+}
 
 pub fn is_virtio_blk(d: &pci::Device) -> bool {
     d.vendor == VIRTIO_VENDOR
@@ -42,21 +57,22 @@ pub fn is_virtio_blk(d: &pci::Device) -> bool {
         && d.msix.is_some()
 }
 
-pub struct Blkd {
-    pub comp: Component,
-    #[allow(dead_code)]
-    pub arena: Arena,
+struct Blkd {
+    comp: Component,
+    arena: Arena,
+    irq_slot: usize,
 }
 
 fn bdf(d: &pci::Device) -> u32 {
     ((d.bus as u32) << 8) | ((d.dev as u32) << 3) | d.func as u32
 }
 
-/// Create a blkd for `d` serving guest device `dev_index` of `client`.
+/// Start a blkd for `disk` serving guest device `dev_index` of `client`,
+/// and return the backend for the client's l4h-vmm.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn(
+pub fn attach(
     id: u32,
-    d: &pci::Device,
+    disk: &mut Disk,
     pci: &Pci,
     client: &mut Guest,
     dev_index: usize,
@@ -65,7 +81,9 @@ pub fn spawn(
     win: &mut Window,
     asids: &mut AsidPools,
     host_info: &HostInfo,
-) -> (Blkd, vmm::Backend) {
+) -> vmm::Backend {
+    assert!(disk.driver.is_none());
+    let d = &disk.pci;
     let msix = d.msix.unwrap();
     let region = |cfg_type: u8| -> (blk::PciRegion, u32) {
         let c = d
@@ -96,7 +114,7 @@ pub fn spawn(
     UtPool { regions: alloc::vec![dma_region] }
         .retype(&FRAME_BP, n_dma, Dest::root(dma_frames.start))
         .expect("blkd DMA frames");
-    arena.slots.push(dma_slot);
+    arena.own(dma_slot, dma_paddr, DMA_BITS);
 
     // ---- Channel to the client's l4h-vmm, in the client's arena.
     let chan_pages = core::mem::size_of::<blk::Channel>().div_ceil(PAGE);
@@ -106,11 +124,7 @@ pub fn spawn(
 
     let mut cfg: alloc::boxed::Box<blk::BlkdConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
     cfg.pci_bdf = bdf(d);
-    let vector = unsafe {
-        let v = NEXT_MSI;
-        NEXT_MSI += 1;
-        v
-    };
+    let vector = disk.vector;
     cfg.msi_data = 0x30 + vector as u32;
     cfg.common = common;
     cfg.notify = notify;
@@ -160,11 +174,16 @@ pub fn spawn(
     bars.sort();
     bars.dedup();
     for b in bars {
-        let bar = d.bars[b as usize];
-        assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio-blk BAR {} unusable", b);
-        let frames = devmem
-            .frames(&mut alloc.slots, bar.addr as usize, bar.size as usize)
-            .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr));
+        if !disk.bars.iter().any(|(i, _)| *i == b) {
+            let bar = d.bars[b as usize];
+            assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio-blk BAR {} unusable", b);
+            let frames = alloc
+                .slots
+                .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
+                .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr));
+            disk.bars.push((b, frames));
+        }
+        let frames = &disk.bars.iter().find(|(i, _)| *i == b).unwrap().1;
         for (i, f) in frames.iter().enumerate() {
             comp.map_copy(
                 alloc,
@@ -186,7 +205,7 @@ pub fn spawn(
     }
 
     // ---- Interrupt, notifications.
-    let irq_slot = alloc.slots.alloc();
+    let irq_slot = alloc.slots.global(|s| s.alloc());
     slot::IRQ_CONTROL
         .cap()
         .irq_control_get_msi(d.bus as u64, d.dev as u64, d.func as u64, 0, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()))
@@ -209,7 +228,24 @@ pub fn spawn(
 
     pci.enable(d);
     pci.enable_msix(d);
+    component::start(&comp);
 
-    let backend = vmm::Backend::Blk { chan, kick };
-    (Blkd { comp, arena }, backend)
+    disk.owner = Some(client.id);
+    disk.driver = Some(Blkd { comp, arena, irq_slot });
+    vmm::Backend::Blk { chan, kick }
+}
+
+/// Stop the driver of `disk` and free it.  Device DMA is stopped first, so
+/// that the client's memory can be reused afterwards.
+pub fn detach(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc) {
+    pci.disable(&disk.pci);
+    if let Some(b) = disk.driver.take() {
+        let _ = b.comp.tcb.tcb_suspend();
+        let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(b.irq_slot).cap();
+        let _ = irq.irq_handler_clear();
+        abs_of(irq).delete().expect("delete IRQ handler");
+        alloc.slots.free(b.irq_slot);
+        alloc.reclaim(b.arena);
+    }
+    disk.owner = None;
 }

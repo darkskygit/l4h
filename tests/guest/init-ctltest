@@ -1,0 +1,35 @@
+#!/bin/sh
+# dom0 init for tests/run-ctltest.sh: drive the control API with l4hctl.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "CTLTEST: FAIL: $*"; poweroff -f; }
+echo "CTLTEST: start"
+l4hctl info || fail "info"
+l4hctl disks
+free0=""
+for i in 1 2 3; do
+    id=$(l4hctl create vm$i --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --vcpus 2) || fail "create $i"
+    echo "CTLTEST: created vm $id"
+    l4hctl console "$id" --until "GUEST: ready" --timeout 60 >/dev/null || fail "vm $id did not boot"
+    l4hctl list
+    l4hctl send "$id" "ping $i"
+    l4hctl console "$id" --until "GUEST: got ping $i" --timeout 30 >/dev/null || fail "console input"
+    l4hctl destroy "$id" || fail "destroy"
+    free=$(l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p')
+    echo "CTLTEST: round $i ok, $free MiB free"
+    if [ -n "$free0" ] && [ "$free" != "$free0" ]; then fail "memory leak: $free0 -> $free MiB"; fi
+    free0=$free
+done
+# Disk pass-through to a guest, twice: the second sees the first's write.
+for i in 1 2; do
+    id=$(l4hctl create disk$i --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create disk$i"
+    l4hctl console "$id" --until "GUEST: disk ok" --timeout 60 > /tmp/out || fail "disk vm $i"
+    grep -q "GUEST: disk count $((i - 1))" /tmp/out || { cat /tmp/out; fail "disk count"; }
+    l4hctl disks | grep -q "owner vm $id" || fail "disk owner"
+    l4hctl destroy "$id" || fail "destroy disk$i"
+done
+l4hctl disks
+echo "CTLTEST: PASS"
+poweroff -f

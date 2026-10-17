@@ -47,6 +47,35 @@ impl Dev {
     }
 }
 
+/// Guest console output: into the ring l4h-root reads, and optionally to
+/// the serial port, each line prefixed with the guest id (except dom0).
+struct Console {
+    ring: *mut host::ConsoleRing,
+    serial: bool,
+    prefix: Option<u32>,
+    line_start: bool,
+}
+
+impl Console {
+    fn put(&mut self, c: u8) {
+        unsafe {
+            let head = core::ptr::addr_of!((*self.ring).head).read_volatile();
+            core::ptr::addr_of_mut!((*self.ring).data[head as usize % host::CONSOLE_RING_DATA]).write_volatile(c);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::ptr::addr_of_mut!((*self.ring).head).write_volatile(head + 1);
+        }
+        if self.serial {
+            if self.line_start {
+                if let Some(id) = self.prefix {
+                    sel4::debug_print!("[vm{}] ", id);
+                }
+            }
+            sel4::debug_put_char(c);
+            self.line_start = c == b'\n';
+        }
+    }
+}
+
 fn mr(i: usize) -> u64 {
     sel4::with_ipc_buffer(|b| b.msg_regs()[i])
 }
@@ -95,6 +124,12 @@ fn main(info: &'static Info) -> ! {
         by_slot.push(idx);
     }
 
+    let mut console = Console {
+        ring: host::VMM_CONSOLE_RING_VA as *mut host::ConsoleRing,
+        serial: cfg.serial != 0,
+        prefix: if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) },
+        line_start: true,
+    };
     let root_ep = cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP);
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
@@ -106,12 +141,12 @@ fn main(info: &'static Info) -> ! {
     loop {
         if badge & host::VMM_BADGE_HYPERCALL == 0 {
             // Notification: device kicks and backend completions.
-            for (slot, &idx) in by_slot.iter().enumerate() {
+            for &idx in by_slot.iter() {
                 let Some(d) = devs[idx].as_mut() else { continue };
-                if badge & (1 << (host::VMM_BADGE_DONE_SHIFT as usize + slot)) != 0 {
+                if badge & (1 << (host::VMM_BADGE_DONE_SHIFT as usize + idx)) != 0 {
                     d.complete(&mem, &vcpus);
                 }
-                if badge & (1 << (host::VMM_BADGE_KICK_SHIFT as usize + slot)) != 0 {
+                if badge & (1 << (host::VMM_BADGE_KICK_SHIFT as usize + idx)) != 0 {
                     d.poll(&mem, &vcpus);
                 }
             }
@@ -123,8 +158,13 @@ fn main(info: &'static Info) -> ! {
                 let len = (mr(0) as usize).min(abi::HC_CONSOLE_MAX_WORDS * 8);
                 for i in 0..len {
                     let w = mr(1 + i / 8);
-                    sel4::debug_put_char((w >> ((i % 8) * 8)) as u8);
+                    console.put((w >> ((i % 8) * 8)) as u8);
                 }
+                0
+            }
+            abi::HC_CTL if cfg.dom0 != 0 => {
+                set_mr(0, cfg.guest_id as u64);
+                root_ep.call(sel4::MessageInfo::new(host::ROOT_CALL_CTL, 0, 0, 1));
                 0
             }
             abi::HC_POWER => {

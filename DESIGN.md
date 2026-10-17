@@ -697,6 +697,34 @@ versioned structs defined in `l4h-abi`.
   orchestration (a REST or gRPC agent) can be built on it later, in dom0
   userspace and outside the hypervisor.
 
+**Revised during implementation (v1).**
+
+- The `l4hctl` device is a single shared page rather than virtqueues:
+  dom0 writes a fixed-layout request (`struct l4h_ctl_req` in `abi.h`) and
+  issues `L4H_HC_CTL`. dom0's `l4h-vmm` forwards the call to `l4h-root`,
+  which executes it synchronously and writes the response into the same
+  page. Requests are short except image loads, which are bounded at 4 MiB
+  per call.
+- `/dev/l4hctl` takes one ioctl that carries a request, its response and,
+  for `VM_LOAD`, a user buffer. The driver stages the buffer in physically
+  contiguous memory and passes its GPA.
+- `l4hctl` parses the guest kernel ELF in dom0 userspace and loads it with
+  raw `VM_LOAD(vm, gpa, bytes)` writes. `l4h-root` copies page by page from
+  dom0's frames to the new guest's frames and never parses guest images.
+  The lifecycle is `vm_create` → `blk_attach`* → `vm_load`* → `vm_start`
+  (writes the boot info and spawns the guest's `l4h-vmm`) → `vm_destroy`.
+- Console output goes into a per-guest ring that `l4h-vmm` writes and
+  `l4h-root` reads for `console_read`. It is also copied to the serial port
+  with a `[vmN]` line prefix. Console input is a ring in the guest's
+  console device page, which hvc polls.
+- **Reclaim.** Each guest's objects come from its arena: arena Untypeds,
+  RAM chunks, quota and the arenas of its blkds. Root CNode slots allocated
+  on the guest's behalf are tracked. `vm_destroy` stops the attached devices'
+  DMA (clears PCI bus mastering), revokes those Untypeds, returns them to
+  the free pool and deletes the tracked slots. ASIDs are released by the
+  kernel when VSpaces die. Repeated create/destroy leaves free memory
+  unchanged (`tests/run-ctltest.sh`).
+
 **Policy and safety.**
 
 - `l4h-root` enforces resource accounting (memory, cores, disk ownership: a

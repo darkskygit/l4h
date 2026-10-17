@@ -179,12 +179,72 @@ pub const VIRTIO_OP_QUEUE: u64 = 3;
 pub const VIRTIO_OP_CONFIG: u64 = 4;
 pub const VIRTIO_OP_IRQ_VCPU: u64 = 5;
 
+pub const CONSOLE_IN_SIZE: usize = 4032;
+
+#[repr(C)]
+pub struct ConsolePage {
+    pub in_head: u32,
+    pub in_tail: u32,
+    pub reserved: [u32; 14],
+    pub input: [u8; CONSOLE_IN_SIZE],
+}
+
+pub const CTL_VERSION: u32 = 1;
+pub const CTL_RESP_OFF: usize = 2048;
+pub const CTL_DATA_MAX: usize = 1984;
+pub const CTL_LOAD_MAX: u64 = 4 << 20;
+pub const CTL_NAME_MAX: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CtlReq {
+    pub op: u32,
+    pub version: u32,
+    pub args: [u64; 6],
+    pub data: [u8; CTL_DATA_MAX],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CtlResp {
+    pub status: i64,
+    pub vals: [u64; 6],
+    pub data: [u8; CTL_DATA_MAX],
+}
+
+pub const CTL_HOST_INFO: u32 = 1;
+pub const CTL_VM_CREATE: u32 = 2;
+pub const CTL_VM_LOAD: u32 = 3;
+pub const CTL_VM_START: u32 = 4;
+pub const CTL_VM_DESTROY: u32 = 5;
+pub const CTL_VM_LIST: u32 = 6;
+pub const CTL_BLK_ATTACH: u32 = 7;
+pub const CTL_CONSOLE_READ: u32 = 8;
+pub const CTL_CONSOLE_WRITE: u32 = 9;
+pub const CTL_DISK_INFO: u32 = 10;
+
+pub const VM_CREATED: u32 = 1;
+pub const VM_RUNNING: u32 = 2;
+pub const VM_STOPPED: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CtlVm {
+    pub id: u32,
+    pub state: u32,
+    pub vcpus: u32,
+    pub reserved: u32,
+    pub ram: u64,
+    pub name: [u8; CTL_NAME_MAX],
+}
+
 pub const HC_CONSOLE_WRITE: u64 = 1;
 pub const HC_POWER: u64 = 2;
 pub const HC_DEV_WRITE: u64 = 3;
 pub const HC_DEV_READ: u64 = 4;
 pub const HC_SET_IRQ_AFFINITY: u64 = 5;
 pub const HC_GET_TIME: u64 = 6;
+pub const HC_CTL: u64 = 7;
 pub const HC_CONSOLE_MAX_WORDS: usize = 32;
 
 pub const POWER_OFF: u64 = 0;
@@ -200,3 +260,7 @@ const _: () = assert!(
 const _: () = assert!(core::mem::size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() == 88 + 16 * 40);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() <= VIRTIO_CONFIG_OFF);
+const _: () = assert!(core::mem::size_of::<ConsolePage>() == 4096);
+const _: () = assert!(core::mem::size_of::<CtlReq>() <= CTL_RESP_OFF);
+const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
+const _: () = assert!(core::mem::size_of::<CtlVm>() == 56);

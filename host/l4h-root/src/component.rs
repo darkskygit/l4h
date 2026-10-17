@@ -147,7 +147,7 @@ pub fn create(
             if lo < hi {
                 let src = &seg.data[lo - seg_lo..hi - seg_lo];
                 // A mapped frame cannot be mapped again: copy the cap for the window.
-                win.with_frame(alloc, &abs(frame), |p| unsafe {
+                win.with_frame(&abs(frame), |p| unsafe {
                     ptr::copy_nonoverlapping(src.as_ptr(), p.add(lo - page), src.len());
                 });
             }
@@ -176,7 +176,7 @@ pub fn create(
         let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut *pool };
         let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
         map_frame(&mut ctx, vspace, f, host::INFO_VA + i * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
-        win.with_frame(alloc, &abs(f), |p| unsafe {
+        win.with_frame(&abs(f), |p| unsafe {
             ptr::copy_nonoverlapping(chunk.as_ptr(), p, chunk.len());
         });
     }
