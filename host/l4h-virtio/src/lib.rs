@@ -1,6 +1,8 @@
 //! Driver side of a virtio 1.x PCI device ("modern" interface) and its
-//! split virtqueues.  The device structures are mapped uncached by
-//! l4h-root; DMA memory is physically contiguous.
+//! split virtqueues, shared by blkd and netd.  The device structures are
+//! mapped uncached by l4h-root; DMA memory is physically contiguous.
+
+#![no_std]
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};

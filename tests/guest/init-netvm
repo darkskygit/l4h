@@ -1,0 +1,26 @@
+#!/bin/sh
+# Init of guests created by tests/guest/init-nettest.  Configured through
+# kernel command line variables (passed to init as environment):
+#   IP0, IP1   address/prefix of eth0, eth1 (IP0 may list several, comma-separated)
+#   NEWMAC     MAC to set on eth0 before using it
+#   PING PING2 addresses to ping
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+ip link set lo up
+if [ -n "$NEWMAC" ]; then ip link set eth0 address "$NEWMAC"; fi
+if [ -n "$IP0" ]; then
+    for a in $(echo "$IP0" | tr , " "); do ip addr add "$a" dev eth0; done
+    ip link set eth0 up
+fi
+if [ -n "$IP1" ]; then ip addr add "$IP1" dev eth1; ip link set eth1 up; fi
+echo "NETVM: ready"
+for t in $PING $PING2; do
+    if ping -c 3 -W 2 "$t" >/dev/null 2>&1; then
+        echo "NETVM: ping $t ok"
+    else
+        echo "NETVM: ping $t failed"
+    fi
+done
+echo "NETVM: done"
+while true; do sleep 1000; done

@@ -222,6 +222,23 @@ pub const CTL_BLK_ATTACH: u32 = 7;
 pub const CTL_CONSOLE_READ: u32 = 8;
 pub const CTL_CONSOLE_WRITE: u32 = 9;
 pub const CTL_DISK_INFO: u32 = 10;
+pub const CTL_SWITCH_CREATE: u32 = 11;
+pub const CTL_SWITCH_ATTACH_UPLINK: u32 = 12;
+pub const CTL_NIC_CREATE: u32 = 13;
+pub const CTL_SWITCH_INFO: u32 = 14;
+pub const CTL_NIC_INFO: u32 = 15;
+pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CtlPort {
+    pub vm: u32,
+    pub port: u32,
+    pub mac: u64,
+    pub rx_frames: u64,
+    pub tx_frames: u64,
+    pub drops: u64,
+}
 
 pub const VM_CREATED: u32 = 1;
 pub const VM_RUNNING: u32 = 2;

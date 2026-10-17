@@ -129,6 +129,8 @@ pub struct Guest {
     pub vmm: Option<Component>,
     /// Disks (host disk indices) attached to the guest.
     pub disks: Vec<usize>,
+    /// netd ports of its virtio-net devices.
+    pub ports: Vec<usize>,
 }
 
 fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -451,6 +453,7 @@ pub fn create(
         console_ring: Vec::new(),
         vmm: None,
         disks: Vec::new(),
+        ports: Vec::new(),
     };
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();

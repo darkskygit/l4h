@@ -1,21 +1,21 @@
-//! netd (vswitch) <-> client (l4h-vmm) packet queues.
+//! netd: the L2 virtual switches and the uplink NIC drivers.
 //!
-//! A port channel is one shared region with a TX ring (client -> switch)
-//! and an RX ring (switch -> client), each of fixed-size frame slots.
+//! A port channel is one shared region between netd and a client (a
+//! guest's l4h-vmm, one per virtio-net device) with a TX ring (client ->
+//! switch) and an RX ring (switch -> client) of fixed-size frame slots.
 //! Frames are copied into and out of the slots.
 
-pub const RING_SIZE: usize = 256;
+pub const RING_SIZE: usize = 128;
 pub const SLOT_SIZE: usize = 2048;
-/// Prefix carried with each frame (virtio-net header, little-endian).
-pub const HDR_SIZE: usize = 12;
-pub const MAX_FRAME: usize = SLOT_SIZE - HDR_SIZE - 8;
+pub const MAX_FRAME: usize = SLOT_SIZE - 8;
+/// Ethernet header + 1500 bytes of payload.
+pub const MTU_FRAME: usize = 1514;
 
 #[repr(C)]
 pub struct Slot {
     pub len: u32,
     pub reserved: u32,
-    pub hdr: [u8; HDR_SIZE],
-    pub data: [u8; SLOT_SIZE - 8 - HDR_SIZE],
+    pub data: [u8; SLOT_SIZE - 8],
 }
 
 #[repr(C)]
@@ -31,9 +31,66 @@ pub struct Port {
     pub tx: RingIdx,
     pub rx: RingIdx,
     pub mac: [u8; 8],
-    pub mtu: u32,
     pub link_up: u32,
-    pub reserved: [u64; 14],
+    pub reserved: [u32; 13],
     pub tx_slots: [Slot; RING_SIZE],
     pub rx_slots: [Slot; RING_SIZE],
+}
+
+pub const PORT_PAGES: usize = core::mem::size_of::<Port>().div_ceil(4096);
+
+/// Ports netd serves; port p kicks netd with badge bit p.
+pub const MAX_PORTS: usize = 48;
+/// Uplink NICs; NIC n interrupts with badge bit NETD_BADGE_IRQ_SHIFT + n.
+pub const MAX_NICS: usize = 4;
+pub const NETD_BADGE_IRQ_SHIFT: u32 = 48;
+
+/// netd address space: port p at port_va(p); NIC n's BARs and DMA memory.
+pub const fn port_va(p: usize) -> usize {
+    crate::SHARED_VA + p * 0x20_0000
+}
+pub const fn nic_bar_va(n: usize, bar: usize) -> usize {
+    crate::MMIO_VA + n * 0x800_0000 + bar * 0x100_0000
+}
+pub const fn nic_dma_va(n: usize) -> usize {
+    crate::DMA_VA + n * 0x100_0000
+}
+
+/// netd CSpace: IRQ handler of NIC n, notification of the client of port p
+/// (badged with its "done" bit).
+pub const NETD_SLOT_IRQ_BASE: u64 = 32;
+pub const NETD_SLOT_CLIENT_BASE: u64 = 64;
+
+/// Calls from l4h-root to netd's service endpoint.
+/// MR0 = port, MR1 = switch, MR2 = MAC (low 48 bits), MR3 = flags.
+pub const NETD_ADD_PORT: u64 = 1;
+pub const NETD_PORT_MAC_LOCK: u64 = 1 << 0;
+/// MR0 = port.  netd no longer touches the port's memory when this returns.
+pub const NETD_REMOVE_PORT: u64 = 2;
+/// MR0 = NIC, MR1 = switch.
+pub const NETD_ATTACH_UPLINK: u64 = 3;
+/// MR0 = port -> MR0 = rx frames, MR1 = tx frames, MR2 = drops.
+pub const NETD_PORT_STATS: u64 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NicConfig {
+    pub pci_bdf: u32,
+    pub msi_data: u32,
+    pub common: crate::blk::PciRegion,
+    pub notify: crate::blk::PciRegion,
+    pub notify_off_multiplier: u32,
+    pub reserved0: u32,
+    pub isr: crate::blk::PciRegion,
+    pub device: crate::blk::PciRegion,
+    pub msix_table: crate::blk::PciRegion,
+    pub dma_paddr: u64,
+    pub dma_size: u64,
+}
+
+#[repr(C)]
+pub struct NetdConfig {
+    pub nr_nics: u32,
+    pub reserved: u32,
+    pub nics: [NicConfig; MAX_NICS],
 }

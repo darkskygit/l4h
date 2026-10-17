@@ -603,6 +603,24 @@ function, such as routing, NAT, DHCP or firewalling, belongs in a VM.
   as the sDDF client data region. The guest would use a restricted-DMA pool,
   forcing swiotlb for `virtio_net` with `ACCESS_PLATFORM`, so the vswitch
   copies window to window and the VMM copies nothing.
+- **Revised during implementation (v1).**
+  - One component, `netd`, holds every switch and also drives the uplink
+    NICs (virtio-net PCI on QEMU). Uplinks are ports of a switch like any
+    other, so a separate driver component would only add a hop.
+  - A guest vNIC is a netd *port*: a shared region with TX and RX rings of
+    2 KiB frame slots between the guest's `l4h-vmm` and netd. `l4h-root`
+    adds and removes ports with calls to netd (`NETD_ADD_PORT`,
+    `NETD_REMOVE_PORT`); port memory belongs to the guest's arena.
+  - Copies: the VMM copies guest buffers to and from slots, and netd copies
+    slot to slot, or slot to NIC DMA buffer. That is one copy more than the
+    plan above, and it keeps netd's memory independent of every guest.
+  - Offloads are not negotiated yet: guests compute checksums.
+  - MAC learning has 300 s ageing. Unknown unicast, broadcast and multicast
+    are flooded within the switch. Locked ports (the default) drop frames
+    whose source MAC is not the port's MAC.
+  - `tests/run-nettest.sh` covers DHCP and ping over the QEMU user-net
+    uplink, guest-to-guest pings on internal switches, a guest with two
+    vNICs, switch isolation and MAC lock.
 - Offloads: checksum offload and TSO/GSO are passed through as metadata
   (virtio-net header). Software segmentation and checksumming happen at the
   uplink port when the NIC lacks the feature; this is still L2 framing work,

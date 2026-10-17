@@ -1,5 +1,5 @@
 // Embeds the dom0 guest images named by $L4H_DOM0_KERNEL / $L4H_DOM0_INITRD,
-// the host components ($L4H_VMM_ELF, $L4H_BLKD_ELF; built by
+// the host components ($L4H_VMM_ELF, $L4H_BLKD_ELF, $L4H_NETD_ELF; built by
 // tools/build-host.sh) -- empty placeholders when unset -- and the dom0
 // command line.
 use std::{env, fs, path::PathBuf};
@@ -11,6 +11,7 @@ fn main() {
         ("L4H_DOM0_INITRD", "dom0-initrd"),
         ("L4H_VMM_ELF", "l4h-vmm.elf"),
         ("L4H_BLKD_ELF", "l4h-blkd.elf"),
+        ("L4H_NETD_ELF", "l4h-netd.elf"),
     ] {
         println!("cargo:rerun-if-env-changed={var}");
         let data = match env::var(var) {
@@ -29,4 +30,5 @@ fn main() {
     println!("cargo:rerun-if-env-changed=L4H_DOM0_VCPUS");
     println!("cargo:rerun-if-env-changed=L4H_WATCHDOG_SECS");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_DISKS");
+    println!("cargo:rerun-if-env-changed=L4H_DOM0_NICS");
 }

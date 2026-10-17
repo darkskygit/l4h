@@ -292,7 +292,7 @@ struct l4h_ctl_resp {
 };
 
 enum l4h_ctl_op {
-	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms */
+	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs */
 	L4H_CTL_HOST_INFO = 1,
 	/* args: ram bytes, vcpus, ram_base_va; data: name -> vals[0] = vm */
 	L4H_CTL_VM_CREATE = 2,
@@ -313,6 +313,29 @@ enum l4h_ctl_op {
 	L4H_CTL_CONSOLE_WRITE = 9,
 	/* args: disk index -> vals: bdf, owner vm (or -1), capacity sectors */
 	L4H_CTL_DISK_INFO = 10,
+	/* -> vals[0] = switch */
+	L4H_CTL_SWITCH_CREATE = 11,
+	/* args: switch, host NIC index */
+	L4H_CTL_SWITCH_ATTACH_UPLINK = 12,
+	/* args: vm, switch, MAC (low 48 bits, 0 = generate), flags
+	 * (L4H_NIC_*) -> vals[0] = MAC */
+	L4H_CTL_NIC_CREATE = 13,
+	/* args: switch -> vals[0] = ports, vals[1] = uplink NIC (or -1);
+	 * data: struct l4h_ctl_port[] */
+	L4H_CTL_SWITCH_INFO = 14,
+	/* args: NIC index -> vals: bdf, switch (or -1) */
+	L4H_CTL_NIC_INFO = 15,
+};
+
+#define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */
+
+struct l4h_ctl_port {
+	l4h_u32 vm;
+	l4h_u32 port;
+	l4h_u64 mac;
+	l4h_u64 rx_frames;
+	l4h_u64 tx_frames;
+	l4h_u64 drops;
 };
 
 enum l4h_vm_state {

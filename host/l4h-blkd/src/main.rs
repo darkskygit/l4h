@@ -8,7 +8,6 @@
 
 extern crate alloc;
 
-mod virtio_pci;
 
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
@@ -20,7 +19,7 @@ use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
 
-use crate::virtio_pci::{DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Dma, F_INDIRECT_DESC, F_VERSION_1, Mmio, Virtq};
+use l4h_virtio::{DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Dma, F_INDIRECT_DESC, F_VERSION_1, Mmio, Virtq};
 
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
@@ -199,7 +198,7 @@ impl Blkd {
 fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
     let id = info.header().id;
-    let dev = virtio_pci::Device {
+    let dev = l4h_virtio::Device {
         common: Mmio(cfg.common.va as usize),
         notify: Mmio(cfg.notify.va as usize),
         notify_mult: cfg.notify_off_multiplier,

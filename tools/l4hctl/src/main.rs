@@ -22,6 +22,40 @@ const CTL_BLK_ATTACH: u32 = 7;
 const CTL_CONSOLE_READ: u32 = 8;
 const CTL_CONSOLE_WRITE: u32 = 9;
 const CTL_DISK_INFO: u32 = 10;
+const CTL_SWITCH_CREATE: u32 = 11;
+const CTL_SWITCH_ATTACH_UPLINK: u32 = 12;
+const CTL_NIC_CREATE: u32 = 13;
+const CTL_SWITCH_INFO: u32 = 14;
+const CTL_NIC_INFO: u32 = 15;
+const NIC_NO_MAC_LOCK: u64 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CtlPort {
+    vm: u32,
+    port: u32,
+    mac: u64,
+    rx_frames: u64,
+    tx_frames: u64,
+    drops: u64,
+}
+
+fn fmt_mac(m: u64) -> String {
+    let b = m.to_be_bytes();
+    format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", b[2], b[3], b[4], b[5], b[6], b[7])
+}
+
+fn parse_mac(s: &str) -> Result<u64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return err(format!("bad MAC: {s}"));
+    }
+    let mut m = 0u64;
+    for p in parts {
+        m = (m << 8) | u64::from_str_radix(p, 16).map_err(|_| Error(format!("bad MAC: {s}")))?;
+    }
+    Ok(m)
+}
 
 #[repr(C)]
 struct Req {
@@ -189,6 +223,8 @@ struct CreateOpts {
     initrd: Option<String>,
     cmdline: String,
     disks: Vec<(u64, bool)>,
+    /// (switch, MAC or 0, flags)
+    nics: Vec<(u64, u64, u64)>,
 }
 
 fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
@@ -205,6 +241,10 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
     let r = (|| {
         for &(disk, ro) in &o.disks {
             ctl.call(CTL_BLK_ATTACH, &[vm, disk, ro as u64], &[], &[])?;
+        }
+        for &(sw, mac, flags) in &o.nics {
+            let r = ctl.call(CTL_NIC_CREATE, &[vm, sw, mac, flags], &[], &[])?;
+            eprintln!("vm {vm}: nic on switch {sw}, mac {}", fmt_mac(r.vals[0]));
         }
         for (gpa, data) in &k.segments {
             load(ctl, vm, *gpa, data)?;
@@ -267,7 +307,12 @@ const USAGE: &str = "usage: l4hctl <command>
   create NAME --kernel F [--initrd F] [--mem MB] [--vcpus N]
          [--cmdline S] [--disk I[:ro]]...
                                create and start a VM; prints its id
+         [--nic SWITCH[,mac=MAC][,nolock]]...
   destroy VM                   stop a VM and free its resources
+  nics                         host NICs
+  switch-create                create an L2 switch; prints its id
+  uplink SWITCH NIC            make host NIC the uplink of SWITCH
+  switch SWITCH                ports and counters of SWITCH
   console VM [--follow] [--until STR] [--timeout SECS]
                                print the VM's console output
   send VM TEXT                 type TEXT (plus newline) on the VM's console";
@@ -337,6 +382,7 @@ fn run(args: &[String]) -> Result<i32> {
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
+                nics: Vec::new(),
             };
             let mut it = args[2..].iter();
             while let Some(a) = it.next() {
@@ -355,6 +401,23 @@ fn run(args: &[String]) -> Result<i32> {
                         };
                         o.disks.push((parse_num(&d)?, ro));
                     }
+                    "--nic" => {
+                        // SWITCH[,mac=MAC][,nolock]
+                        let v = val()?;
+                        let mut it = v.split(',');
+                        let sw = parse_num(it.next().unwrap())?;
+                        let (mut mac, mut flags) = (0, 0);
+                        for opt in it {
+                            if let Some(m) = opt.strip_prefix("mac=") {
+                                mac = parse_mac(m)?;
+                            } else if opt == "nolock" {
+                                flags |= NIC_NO_MAC_LOCK;
+                            } else {
+                                return err(format!("--nic: unknown option {opt}"));
+                            }
+                        }
+                        o.nics.push((sw, mac, flags));
+                    }
                     _ => return err(format!("create: unknown option {a}")),
                 }
             }
@@ -362,6 +425,39 @@ fn run(args: &[String]) -> Result<i32> {
                 return err("create: --kernel is required");
             }
             println!("{}", cmd_create(&ctl, &o)?);
+        }
+        "nics" => {
+            let n = ctl.call(CTL_HOST_INFO, &[], &[], &[])?.vals[5];
+            for i in 0..n {
+                let r = ctl.call(CTL_NIC_INFO, &[i], &[], &[])?;
+                let bdf = r.vals[0];
+                let sw = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("switch {}", r.vals[1]) };
+                println!("nic {i}: pci {:02x}:{:02x}.{} virtio-net, uplink of {sw}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+            }
+        }
+        "switch-create" => {
+            println!("{}", ctl.call(CTL_SWITCH_CREATE, &[], &[], &[])?.vals[0]);
+        }
+        "uplink" => {
+            let sw = parse_num(args.get(1).ok_or(Error("uplink: missing SWITCH".into()))?)?;
+            let nic = parse_num(args.get(2).ok_or(Error("uplink: missing NIC".into()))?)?;
+            ctl.call(CTL_SWITCH_ATTACH_UPLINK, &[sw, nic], &[], &[])?;
+        }
+        "switch" => {
+            let sw = parse_num(args.get(1).ok_or(Error("switch: missing SWITCH".into()))?)?;
+            let r = ctl.call(CTL_SWITCH_INFO, &[sw], &[], &[])?;
+            if r.vals[1] != u64::MAX {
+                println!("switch {sw}: uplink nic {}", r.vals[1]);
+            } else {
+                println!("switch {sw}: no uplink");
+            }
+            println!("{:>4} {:>3} {:<17} {:>8} {:>8} {:>6}", "PORT", "VM", "MAC", "RX", "TX", "DROPS");
+            for i in 0..r.vals[0] as usize {
+                let p: CtlPort = unsafe {
+                    std::ptr::read_unaligned(r.data.as_ptr().add(i * std::mem::size_of::<CtlPort>()) as *const CtlPort)
+                };
+                println!("{:>4} {:>3} {:<17} {:>8} {:>8} {:>6}", p.port, p.vm, fmt_mac(p.mac), p.rx_frames, p.tx_frames, p.drops);
+            }
         }
         "destroy" => {
             let vm = parse_num(args.get(1).ok_or(Error("destroy: missing VM".into()))?)?;

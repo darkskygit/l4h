@@ -54,7 +54,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 h.total_bytes as u64,
                 h.disks.len() as u64,
                 h.guests.iter().flatten().count() as u64,
-                0,
+                h.netd.nics.len() as u64,
             ];
             Ok(())
         }
@@ -193,6 +193,49 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 addr_of_mut!((*p).in_head).write_volatile(head);
                 resp.vals[0] = n as u64;
             }
+            Ok(())
+        }
+        abi::CTL_SWITCH_CREATE => {
+            resp.vals[0] = h.netd.create_switch() as u64;
+            Ok(())
+        }
+        abi::CTL_SWITCH_ATTACH_UPLINK => h.netd.attach_uplink(a[0] as u32, a[1] as usize),
+        abi::CTL_NIC_CREATE => {
+            let id = vm_arg(a[0])?;
+            if id == caller {
+                return Err(EINVAL);
+            }
+            resp.vals[0] = h.create_nic(id, a[1] as u32, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0)?;
+            Ok(())
+        }
+        abi::CTL_NIC_INFO => {
+            let n = h.netd.nics.get(a[0] as usize).ok_or(ENOENT)?;
+            let p = &n.pci;
+            resp.vals[0] = ((p.bus as u64) << 8) | ((p.dev as u64) << 3) | p.func as u64;
+            resp.vals[1] = n.switch.map_or(u64::MAX, |s| s as u64);
+            Ok(())
+        }
+        abi::CTL_SWITCH_INFO => {
+            let sw = a[0] as u32;
+            if sw >= h.netd.switches {
+                return Err(ENOENT);
+            }
+            let sz = core::mem::size_of::<abi::CtlPort>();
+            let mut n = 0;
+            for (p, info) in h.netd.ports.iter().enumerate() {
+                let Some(info) = info else { continue };
+                if info.switch != sw || (n + 1) * sz > abi::CTL_DATA_MAX {
+                    continue;
+                }
+                let (rx_frames, tx_frames, drops) = h.netd.port_stats(p);
+                let e = abi::CtlPort { vm: info.vm as u32, port: p as u32, mac: info.mac, rx_frames, tx_frames, drops };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(&e as *const abi::CtlPort as *const u8, resp.data.as_mut_ptr().add(n * sz), sz);
+                }
+                n += 1;
+            }
+            resp.vals[0] = n as u64;
+            resp.vals[1] = h.netd.nics.iter().position(|n| n.switch == Some(sw)).map_or(u64::MAX, |i| i as u64);
             Ok(())
         }
         _ => Err(ENOSYS),

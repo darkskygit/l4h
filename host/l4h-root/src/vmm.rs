@@ -34,6 +34,13 @@ pub enum Backend {
         /// Notification of blkd (badged for this client).
         kick: cap::Notification,
     },
+    Net {
+        /// Frames of the netd port, mapped at vmm_chan_va(d).
+        chan: Vec<cap::Granule>,
+        /// Notification of netd (badged for this port).
+        kick: cap::Notification,
+        mac: [u8; 6],
+    },
 }
 
 const SLOT_KICK_BASE: u64 = 32;
@@ -72,6 +79,13 @@ pub fn spawn(
                 dev.chan_va = host::vmm_chan_va(d) as u64;
                 dev.chan_size = (chan.len() * PAGE) as u64;
                 dev.chan_kick_slot = SLOT_KICK_BASE + d as u64;
+            }
+            Backend::Net { chan, mac, .. } => {
+                dev.kind = host::VDEV_NET;
+                dev.chan_va = host::vmm_chan_va(d) as u64;
+                dev.chan_size = (chan.len() * PAGE) as u64;
+                dev.chan_kick_slot = SLOT_KICK_BASE + d as u64;
+                dev.mac[..6].copy_from_slice(mac);
             }
         }
     }
@@ -113,10 +127,10 @@ pub fn spawn(
     }
 
     // ---- Event pages, notifications and device pages.
-    let small = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: 10 });
+    let small = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: 12 });
     let mut small_next = 0u64;
     let mut keep_slot = || {
-        let s = small.absolute_cptr_from_bits_with_depth(small_next, 10);
+        let s = small.absolute_cptr_from_bits_with_depth(small_next, 12);
         small_next += 1;
         s
     };
@@ -135,7 +149,7 @@ pub fn spawn(
     }
     for &(d, ref b) in backends.iter() {
         match b {
-            Backend::Blk { chan, kick, .. } => {
+            Backend::Blk { chan, kick } | Backend::Net { chan, kick, .. } => {
                 for (i, f) in chan.iter().enumerate() {
                     let fc = crate::component::abs_of(*f);
                     comp.map_copy(alloc, &mut g.arena.pool, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, keep_slot());

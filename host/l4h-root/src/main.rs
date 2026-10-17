@@ -14,6 +14,7 @@ mod devmem;
 mod elf;
 mod guest;
 mod mem;
+mod netd;
 mod pci;
 mod vmm;
 mod vspace;
@@ -60,6 +61,8 @@ const DOM0_VCPUS: usize = parse_usize(option_env!("L4H_DOM0_VCPUS"), 1);
 /* Disks passed to dom0 at boot (the first n); the rest are free for the
  * control API. */
 const DOM0_DISKS: usize = parse_usize(option_env!("L4H_DOM0_DISKS"), 64);
+/* vNICs of dom0 on switch 0, which has the first NIC as its uplink. */
+const DOM0_NICS: usize = parse_usize(option_env!("L4H_DOM0_NICS"), 1);
 /* Seconds between watchdog dumps of guest vCPU state; 0 disables. */
 const WATCHDOG_SECS: usize = parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0);
 const WATCHDOG_BADGE: u64 = 1 << 40;
@@ -137,6 +140,7 @@ pub struct Host {
     pub pci: pci::Pci,
     pub devmem: devmem::DevMem,
     pub disks: Vec<Disk>,
+    pub netd: netd::Netd,
     pub guests: Vec<Option<Guest>>,
     pub total_bytes: usize,
 }
@@ -214,9 +218,33 @@ impl Host {
         .ok_or(ctl::ENOENT)?
     }
 
+    /// Give guest `id` (before it starts) a virtio-net device on `switch`.
+    /// Returns the MAC.
+    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool) -> Result<u64, i64> {
+        self.with_guest(id, |h, g| {
+            if g.state != State::Created || g.vmm.is_some() {
+                return Err(ctl::EBUSY);
+            }
+            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(1)).ok_or(ctl::ENOSPC)?;
+            let next = h.netd.ports.iter().position(|p| p.is_none()).unwrap_or(0) as u64;
+            let mac = if mac == 0 { 0x02_4c_34_00_00_00 | ((id as u64) << 8) | next } else { mac & 0xffff_ffff_ffff };
+            if mac >> 40 & 1 != 0 {
+                return Err(ctl::EINVAL);
+            }
+            let (p, backend) = h.netd.add_port(g, d, switch, mac, lock, &mut h.alloc)?;
+            g.backends.push((d, backend));
+            g.ports.push(p);
+            Ok(mac)
+        })
+        .ok_or(ctl::ENOENT)?
+    }
+
     pub fn destroy_guest(&mut self, id: usize) -> Result<(), i64> {
         let mut g = self.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
         g.stop();
+        for &p in &g.ports {
+            self.netd.remove_port(p);
+        }
         for &d in &g.disks {
             blkd::detach(&mut self.disks[d], &self.pci, &mut self.alloc);
         }
@@ -260,6 +288,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // PCI devices: virtio-blk disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc);
     let mut disks = Vec::new();
+    let mut nics = Vec::new();
     for d in pci.enumerate() {
         sel4::debug_println!(
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
@@ -270,9 +299,15 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             pci.disable(&d);
             let v = disks.len() as u64;
             disks.push(Disk::new(d, v));
+        } else if netd::is_virtio_net(&d) {
+            pci.disable(&d);
+            nics.push(d);
         }
     }
-    let devmem = devmem::DevMem::from_bootinfo(bootinfo);
+    let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
+    let mut wins = wins;
+    let mut asids = asids;
+    let netd = netd::spawn(nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
         info,
@@ -282,6 +317,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         pci,
         devmem,
         disks,
+        netd,
         guests: Vec::new(),
         total_bytes,
     };
@@ -308,6 +344,14 @@ fn boot_dom0(h: &mut Host) {
     let id = h.create_guest(&cfg).expect("cannot create dom0");
     for d in 0..h.disks.len().min(DOM0_DISKS) {
         h.attach_disk(id, d, false).expect("attach disk to dom0");
+    }
+    // Switch 0, with the first NIC (if any) as its uplink.
+    let sw = h.netd.create_switch();
+    if !h.netd.nics.is_empty() {
+        h.netd.attach_uplink(sw, 0).expect("uplink");
+    }
+    for _ in 0..DOM0_NICS {
+        h.create_nic(id, sw, 0, true).expect("dom0 NIC");
     }
     h.with_guest(id, |h, g| {
         assert!(

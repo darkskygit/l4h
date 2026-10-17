@@ -138,11 +138,20 @@ name = "l4h-blkd"
 version = "0.1.0"
 dependencies = [
  "l4h-rt",
+ "l4h-virtio",
 ]
 
 [[package]]
 name = "l4h-host"
 version = "0.1.0"
+
+[[package]]
+name = "l4h-netd"
+version = "0.1.0"
+dependencies = [
+ "l4h-rt",
+ "l4h-virtio",
+]
 
 [[package]]
 name = "l4h-root"
@@ -166,6 +175,10 @@ dependencies = [
  "sel4-panicking-env",
  "sel4-runtime-common",
 ]
+
+[[package]]
+name = "l4h-virtio"
+version = "0.1.0"
 
 [[package]]
 name = "l4h-vmm"

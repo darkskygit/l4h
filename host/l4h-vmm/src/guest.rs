@@ -27,6 +27,12 @@ impl GuestMem {
         unsafe { self.ptr::<T>(gpa).read_volatile() }
     }
 
+    /// Pointer to `len` bytes of guest RAM, which must be valid.
+    pub fn bytes(&self, gpa: u64, len: usize) -> *mut u8 {
+        assert!(self.valid(gpa, len as u64), "guest access out of range: {:#x}+{:#x}", gpa, len);
+        (host::GUEST_RAM_VA + gpa as usize) as *mut u8
+    }
+
     pub fn write<T: Copy>(&self, gpa: u64, v: T) {
         unsafe { self.ptr::<T>(gpa).write_volatile(v) }
     }

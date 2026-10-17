@@ -1,0 +1,49 @@
+#!/bin/sh
+# dom0 init for tests/run-nettest.sh.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "NETTEST: FAIL: $*"; poweroff -f; }
+echo "NETTEST: start"
+l4hctl nics
+# dom0's eth0 is on switch 0, whose uplink is the QEMU user-mode NIC.
+ip link set lo up
+ip link set eth0 up
+udhcpc -i eth0 -n -q -t 5 -s /bin/udhcpc.script >/dev/null 2>&1 || fail "dhcp over the uplink"
+echo "NETTEST: dhcp: $(ip -4 addr show eth0 | sed -n 's/.*inet \([0-9.\/]*\).*/\1/p')"
+ping -c 3 -W 2 10.0.2.2 >/dev/null || fail "ping the uplink gateway"
+echo "NETTEST: uplink ok"
+
+K="--kernel /bin/vmlinux --initrd /bin/netvm.cpio.gz --mem 96"
+sw1=$(l4hctl switch-create) && sw2=$(l4hctl switch-create) || fail "switch-create"
+run() { # name expect-pattern create-args...
+    name=$1; pat=$2; shift 2
+    id=$(l4hctl create "$name" $K "$@") || fail "create $name"
+    l4hctl console "$id" --until "NETVM: done" --timeout 60 > /tmp/$name || fail "$name did not finish"
+    for p in $pat; do
+        grep -q "NETVM: ping $p" /tmp/$name || { cat /tmp/$name; fail "$name: expected ping $p"; }
+    done
+    echo "NETTEST: $name ok"
+    eval "vm_$name=$id"
+}
+# A: two NICs, one per switch.
+run a "" --nic "$sw1" --nic "$sw2" --cmdline "console=hvc0 IP0=192.168.1.1/24 IP1=192.168.2.1/24"
+run b "" --nic "$sw1" --cmdline "console=hvc0 IP0=192.168.1.2/24 PING=192.168.1.1" 2>/dev/null
+grep -q "ping 192.168.1.1 ok" /tmp/b || fail "b -> a"
+# C is on the other switch: reaches A's second NIC but not B.
+run c "" --nic "$sw2" --cmdline "console=hvc0 IP0=192.168.2.2/24,192.168.1.3/24 PING=192.168.2.1 PING2=192.168.1.2"
+grep -q "ping 192.168.2.1 ok" /tmp/c || fail "c -> a's second NIC"
+grep -q "ping 192.168.1.2 failed" /tmp/c || fail "switches are not isolated"
+# D spoofs its MAC on a locked port: dropped.
+run d "" --nic "$sw1" --cmdline "console=hvc0 IP0=192.168.1.4/24 NEWMAC=02:00:00:00:00:99 PING=192.168.1.1"
+grep -q "ping 192.168.1.1 failed" /tmp/d || fail "MAC lock"
+# E does the same on an unlocked port: forwarded.
+run e "" --nic "$sw1,nolock" --cmdline "console=hvc0 IP0=192.168.1.5/24 NEWMAC=02:00:00:00:00:98 PING=192.168.1.1"
+grep -q "ping 192.168.1.1 ok" /tmp/e || fail "unlocked port"
+l4hctl switch "$sw1"
+l4hctl switch "$sw2"
+l4hctl list
+for v in $vm_a $vm_b $vm_c $vm_d $vm_e; do l4hctl destroy "$v" || fail "destroy $v"; done
+echo "NETTEST: PASS"
+poweroff -f

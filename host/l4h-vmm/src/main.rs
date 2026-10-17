@@ -10,6 +10,7 @@ extern crate alloc;
 mod blk;
 mod dev;
 mod guest;
+mod net;
 mod virtq;
 
 use alloc::vec::Vec;
@@ -25,24 +26,28 @@ use crate::guest::{GuestMem, Vcpus};
 
 enum Dev {
     Blk(Device<blk::Blk>),
+    Net(Device<net::Net>),
 }
 
 impl Dev {
     fn op(&mut self, mem: &GuestMem, vcpus: &Vcpus, op: u64, a: u64, b: u64) -> u64 {
         match self {
             Dev::Blk(d) => d.op(mem, vcpus, op, a, b),
+            Dev::Net(d) => d.op(mem, vcpus, op, a, b),
         }
     }
 
     fn poll(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
         match self {
             Dev::Blk(d) => d.poll(mem, vcpus, 0),
+            Dev::Net(d) => d.poll(mem, vcpus, 0),
         }
     }
 
     fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
         match self {
             Dev::Blk(d) => d.complete(mem, vcpus),
+            Dev::Net(d) => d.complete(mem, vcpus),
         }
     }
 }
@@ -116,6 +121,15 @@ fn main(info: &'static Info) -> ! {
                 blk::Blk::new(
                     d.chan_va as usize,
                     cap::<cap_type::Notification>(d.chan_kick_slot),
+                ),
+            )),
+            host::VDEV_NET => Dev::Net(Device::new(
+                d.page_va as usize,
+                d.event,
+                net::Net::new(
+                    d.chan_va as usize,
+                    cap::<cap_type::Notification>(d.chan_kick_slot),
+                    d.mac[..6].try_into().unwrap(),
                 ),
             )),
             k => panic!("l4h-vmm: unsupported device kind {}", k),
