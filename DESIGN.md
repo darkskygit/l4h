@@ -498,6 +498,42 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   Ballooning (virtio-balloon to revoke frames) and free-page reporting come
   later.
 
+**Revised during implementation (v1).**
+
+- **Placement and balancing.** New guests are placed round-robin. Every
+  100 ms `l4h-root` reads `SchedContext_Consumed` for both SCs of every
+  vCPU.
+  - A vCPU is *busy* if it got at least half of its fair share among the
+    vCPUs active on its core. Measuring this way still counts a starved
+    vCPU on a crowded core.
+  - The balancer evens out the number of busy vCPUs per core. It moves one
+    vCPU per period from the core with the most to the core with the
+    fewest, and only when that strictly lowers the maximum.
+  - It prefers guests with no vCPU on the target core. A moved vCPU stays
+    put for 1 s.
+  - The interval is measured, not assumed: root work such as building a
+    guest can delay a period.
+- **CPU caps** (`vm_set_sched`, `l4hctl sched`) set the budget of both SCs
+  to a percentage of the 5 ms period. Weights and steal-time reporting
+  are not implemented yet. `l4hctl top` shows each VM's CPU use over the
+  last period.
+- **Memory.** Free memory is a set of untouched power-of-two Untyped
+  blocks, managed buddy-style without coalescing. An allocation splits
+  the smallest block that fits, so guest RAM chunks never lose memory to
+  alignment. Reclaimed guest memory returns as blocks. A 256 MiB guest
+  costs about 317 MiB:
+  - its RAM;
+  - its seL4 object quota, by default 16 MiB plus RAM/16, used for its
+    processes' mapping slots and page tables;
+  - about 30 MiB of host objects, including its `l4h-vmm`.
+- **dom0 restart.** If dom0 reboots or crashes, `l4h-root` destroys it and
+  boots it again from the boot image. Other guests keep running, and the
+  new dom0 sees them through the control API (`tests/run-m6test.sh`).
+- **Density gate.** `tests/run-density.sh` runs 30 guests of 256 MiB on 4
+  cores (16 GiB QEMU) with 15 of them spinning. All 30 boot in about 45 s,
+  every guest answers on its console within 0.5 s, worst case, and
+  destroying them returns all memory.
+
 ---
 
 ## 8. Devices

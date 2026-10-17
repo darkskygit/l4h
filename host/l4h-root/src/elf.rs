@@ -13,11 +13,9 @@ pub struct Segment<'a> {
     pub memsz: u64,
     pub data: &'a [u8],
     pub writable: bool,
-    pub executable: bool,
 }
 
 const PT_LOAD: u32 = 1;
-const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
 fn u16_at(d: &[u8], o: usize) -> u16 {
@@ -64,7 +62,6 @@ impl<'a> Elf<'a> {
                 memsz,
                 data: &d[offset..offset + filesz],
                 writable: flags & PF_W != 0,
-                executable: flags & PF_X != 0,
             })
         })
     }

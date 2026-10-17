@@ -294,7 +294,8 @@ struct l4h_ctl_resp {
 enum l4h_ctl_op {
 	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs */
 	L4H_CTL_HOST_INFO = 1,
-	/* args: ram bytes, vcpus, ram_base_va; data: name -> vals[0] = vm */
+	/* args: ram bytes, vcpus, ram_base_va, seL4 object quota bytes (0 =
+	 * default); data: name -> vals[0] = vm */
 	L4H_CTL_VM_CREATE = 2,
 	/* args: vm, dst gpa, src gpa (dom0), len (<= L4H_CTL_LOAD_MAX) */
 	L4H_CTL_VM_LOAD = 3,
@@ -325,6 +326,14 @@ enum l4h_ctl_op {
 	L4H_CTL_SWITCH_INFO = 14,
 	/* args: NIC index -> vals: bdf, switch (or -1) */
 	L4H_CTL_NIC_INFO = 15,
+	/* args: vm, CPU cap per vCPU in percent of a core (0 = none) */
+	L4H_CTL_VM_SET_SCHED = 16,
+	/* args: vm -> vals[0..] = core of each vCPU (up to 6), vals[5] = number
+	 * of vCPUs if more */
+	L4H_CTL_VM_INFO = 17,
+	/* args: vm -> vals[0] = CPU used in the last 100 ms (permille of a core,
+	 * all vCPUs), vals[1] = CPU cap (percent per vCPU, 0 = none) */
+	L4H_CTL_VM_STATS = 18,
 };
 
 #define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */

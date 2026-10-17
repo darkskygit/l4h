@@ -89,7 +89,7 @@ pub fn spawn(
         let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } =
             virtio_regions(d, |b| net::nic_bar_va(n, b as usize));
         let s = alloc.slots.alloc();
-        let region = alloc.pool.split(NIC_DMA_BITS, s).expect("NIC DMA memory");
+        let region = alloc.split(NIC_DMA_BITS, s).expect("NIC DMA memory");
         let paddr = region.paddr;
         let frames = alloc.slots.alloc_range((1 << NIC_DMA_BITS) / PAGE);
         UtPool { regions: alloc::vec![region] }
@@ -203,7 +203,7 @@ impl Netd {
         let p = self.ports.iter().position(|p| p.is_none()).ok_or(ctl::ENOSPC)?;
         // Port memory comes from the guest: it is reclaimed with it.
         let s = alloc.slots.alloc();
-        let region = alloc.pool.split(PORT_BITS, s).ok_or(ctl::ENOMEM)?;
+        let region = alloc.split(PORT_BITS, s).ok_or(ctl::ENOMEM)?;
         g.arena.own(s, region.paddr, PORT_BITS);
         let mut pool = UtPool { regions: alloc::vec![region] };
         let frames = alloc.slots.alloc_range(net::PORT_PAGES);

@@ -1,0 +1,51 @@
+#!/bin/sh
+# dom0 init for tests/run-density.sh: start $N guests, half of them busy,
+# then check that every guest answers on its console.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "DENSITY: FAIL: $*"; poweroff -f; }
+N=$(sed -n 's/.*DENS_N=\([0-9]*\).*/\1/p' /proc/cmdline)
+MEM=$(sed -n 's/.*DENS_MEM=\([0-9]*\).*/\1/p' /proc/cmdline)
+echo "DENSITY: start, $N guests of $MEM MiB"
+l4hctl info
+free_before=$(l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p')
+t0=$(date +%s)
+ids=""
+i=1
+while [ "$i" -le "$N" ]; do
+    hog=$((i % 2))
+    [ -n "$(sed -n 's/.*DENS_ALLHOG=1.*/y/p' /proc/cmdline)" ] && hog=1
+    id=$(l4hctl create "d$i" --kernel /bin/vmlinux --initrd /bin/densvm.cpio.gz --mem "$MEM" \
+        --cmdline "console=hvc0 quiet HOG=$hog") || fail "create guest $i"
+    ids="$ids $id"
+    i=$((i + 1))
+done
+echo "DENSITY: created $N guests in $(( $(date +%s) - t0 ))s"
+for id in $ids; do
+    l4hctl console "$id" --until "DENSVM: ready" --timeout 120 >/dev/null || fail "guest $id did not boot"
+done
+echo "DENSITY: all booted after $(( $(date +%s) - t0 ))s"
+sleep 5
+hogs=""
+i=1
+for id in $ids; do
+    [ $((i % 2)) = 1 ] || [ -n "$(sed -n "s/.*DENS_ALLHOG=1.*/y/p" /proc/cmdline)" ] && hogs="$hogs $(l4hctl cores "$id")"
+    i=$((i + 1))
+done
+echo "DENSITY: busy guests per core:$(for c in 0 1 2 3; do printf ' %s' "$(echo $hogs | tr ' ' '\n' | grep -c "^$c$")"; done)"
+l4hctl info
+for round in 1 2 3; do
+    : > /tmp/rtt
+    for id in $ids; do
+        l4hctl send "$id" --wait "DENSVM: pong r$round" "r$round" >> /tmp/rtt || fail "guest $id unresponsive"
+    done
+    echo "DENSITY: round $round: all $N answered, console round trip ms: $(sort -n /tmp/rtt | tr '\n' ' ' | sed 's/ ms//g')"
+done
+for id in $ids; do l4hctl destroy "$id" || fail "destroy $id"; done
+l4hctl info
+free=$(l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p')
+[ "$free" -ge $((free_before - 8)) ] || fail "memory not reclaimed: $free_before -> $free MiB"
+echo "DENSITY: PASS"
+poweroff -f

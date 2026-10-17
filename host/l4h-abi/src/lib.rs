@@ -227,6 +227,9 @@ pub const CTL_SWITCH_ATTACH_UPLINK: u32 = 12;
 pub const CTL_NIC_CREATE: u32 = 13;
 pub const CTL_SWITCH_INFO: u32 = 14;
 pub const CTL_NIC_INFO: u32 = 15;
+pub const CTL_VM_SET_SCHED: u32 = 16;
+pub const CTL_VM_INFO: u32 = 17;
+pub const CTL_VM_STATS: u32 = 18;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 
 #[repr(C)]

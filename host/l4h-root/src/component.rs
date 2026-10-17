@@ -128,7 +128,15 @@ pub fn create(
 
     let c = Component { id: args.id, tcb, cnode, vspace, ntfn, service_ep };
 
-    // ---- Load the ELF image, one fresh frame per page.
+    // ---- Load the ELF image, one fresh frame per page; pages are writable
+    // only if a writable segment covers them.
+    let mut writable: BTreeMap<usize, bool> = BTreeMap::new();
+    for seg in elf.segments() {
+        let start = (seg.vaddr as usize) & !(PAGE - 1);
+        for page in (start..(seg.vaddr + seg.memsz) as usize).step_by(PAGE) {
+            *writable.entry(page).or_default() |= seg.writable;
+        }
+    }
     let mut pages: BTreeMap<usize, cap::Granule> = BTreeMap::new();
     for seg in elf.segments() {
         let start = (seg.vaddr as usize) & !(PAGE - 1);
@@ -137,7 +145,8 @@ pub fn create(
             let frame = *pages.entry(page).or_insert_with(|| {
                 let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut *pool };
                 let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
-                map_frame(&mut ctx, vspace, f, page, CapRights::read_write(), VmAttributes::DEFAULT);
+                let rights = if writable[&page] { CapRights::read_write() } else { CapRights::read_only() };
+                map_frame(&mut ctx, vspace, f, page, rights, VmAttributes::DEFAULT);
                 f
             });
             // Copy the part of the segment's file data that lies in this page.

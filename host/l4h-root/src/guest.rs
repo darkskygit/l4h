@@ -88,7 +88,13 @@ pub struct Vcpu {
     pub ktcb: cap::Tcb,
     pub ntfn: cap::Notification,
     pub event: cap::Granule,
+    pub sc_k: cap::SchedContext,
+    pub sc_u: cap::SchedContext,
     pub core: usize,
+    /// Balancer periods before the vCPU may move again.
+    pub cooldown: u32,
+    /// CPU used in the last balancer period, in permille of a core.
+    pub usage: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +133,8 @@ pub struct Guest {
     pub backends: Vec<(usize, vmm::Backend)>,
     pub console_ring: Vec<cap::Granule>,
     pub vmm: Option<Component>,
+    /// CPU cap per vCPU in percent of a core (0 = none).
+    pub cpu_cap_pct: u32,
     /// Disks (host disk indices) attached to the guest.
     pub disks: Vec<usize>,
     /// netd ports of its virtio-net devices.
@@ -372,9 +380,6 @@ impl Guest {
         // Capabilities that do not derive from the arena (badged endpoints,
         // copies of global objects) are left in their slots.
         for s in self.slots {
-            if alloc.pinned.contains(&s) {
-                continue;
-            }
             let _ = abs(root_cap::<cap_type::Null>(s)).delete();
             alloc.slots.free(s);
         }
@@ -413,7 +418,7 @@ pub fn create(
         + cfg.vspaces * PAGE
         + (2 << 20))
         + vmm::arena_bytes(ram, cfg.vcpus, MAX_GUEST_DEVICES);
-    if alloc.pool.free_bytes() < overhead + ram + cfg.untyped_quota {
+    if alloc.free_bytes() < overhead + ram + cfg.untyped_quota {
         return None;
     }
     let mut arena = alloc.arena(overhead)?;
@@ -452,6 +457,7 @@ pub fn create(
         backends: Vec::new(),
         console_ring: Vec::new(),
         vmm: None,
+        cpu_cap_pct: 0,
         disks: Vec::new(),
         ports: Vec::new(),
     };
@@ -487,7 +493,7 @@ pub fn create(
         bits = bits.min(30);
         let chunk_slot = alloc.slots.alloc();
         let region = loop {
-            if let Some(r) = alloc.pool.split(bits, chunk_slot) {
+            if let Some(r) = alloc.split(bits, chunk_slot) {
                 break r;
             }
             assert!(bits > 21, "out of memory for guest RAM");
@@ -524,7 +530,7 @@ pub fn create(
         let bits = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
         let bits = bits.min(28);
         let s = alloc.slots.alloc();
-        let Some(r) = alloc.pool.split(bits, s) else {
+        let Some(r) = alloc.split(bits, s) else {
             alloc.slots.free(s);
             break;
         };
@@ -560,7 +566,7 @@ pub fn create(
 
     // ---- vCPUs.
     for v in 0..cfg.vcpus {
-        let core = (id + v) % host_info.cores;
+        let core = (host_info.next_core() + v) % host_info.cores;
         let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut g.arena.pool };
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
@@ -606,7 +612,7 @@ pub fn create(
         g.give_badged(base + abi::VCPU_IPI, ntfn, CapRights::write_only(), abi::BADGE_IPI);
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.push(Vcpu { ktcb, ntfn, event, core });
+        g.vcpus.push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0 });
     }
 
     // ---- Boot info frames (written at boot).

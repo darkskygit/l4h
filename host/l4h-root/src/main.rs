@@ -16,6 +16,7 @@ mod guest;
 mod mem;
 mod netd;
 mod pci;
+mod sched;
 mod vmm;
 mod vspace;
 mod window;
@@ -31,7 +32,7 @@ use l4h_host as host;
 use crate::blkd::Disk;
 use crate::component::ROOT_BADGE_COMPONENT;
 use crate::guest::{Guest, GuestConfig, HYP_BADGE_FAULT, State, hyp_badge_guest, hyp_badge_vcpu};
-use crate::mem::{Alloc, Slots, UtPool};
+use crate::mem::{Alloc, Slots};
 use crate::window::{Window, Windows};
 
 pub const RETYPE_FAN_OUT: usize = 16384;
@@ -65,7 +66,7 @@ const DOM0_DISKS: usize = parse_usize(option_env!("L4H_DOM0_DISKS"), 64);
 const DOM0_NICS: usize = parse_usize(option_env!("L4H_DOM0_NICS"), 1);
 /* Seconds between watchdog dumps of guest vCPU state; 0 disables. */
 const WATCHDOG_SECS: usize = parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0);
-const WATCHDOG_BADGE: u64 = 1 << 40;
+const TIMER_BADGE: u64 = 1 << 40;
 
 /// Facts about the host the guests run on.
 pub struct HostInfo {
@@ -74,9 +75,18 @@ pub struct HostInfo {
     pub hyp_ep: cap::Endpoint,
     sched_control_base: usize,
     pub timeslice_us: u64,
+    /// Round-robin placement of new guests.
+    placement: core::cell::Cell<usize>,
 }
 
 impl HostInfo {
+    /// Core for the next guest's vCPU 0.
+    pub fn next_core(&self) -> usize {
+        let c = self.placement.get();
+        self.placement.set(c + 1);
+        c % self.cores
+    }
+
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
         sel4::init_thread::Slot::<cap_type::SchedControl>::from_index(self.sched_control_base + core).cap()
     }
@@ -109,7 +119,7 @@ impl AsidPools {
             }
         }
         let (ut_slot, pool_slot) = alloc.slots.global(|slots| (slots.alloc(), slots.alloc()));
-        let ut = alloc.pool.split(sel4::sys::seL4_ASIDPoolBits as usize, ut_slot).expect("ASID pool memory");
+        let ut = alloc.split(sel4::sys::seL4_ASIDPoolBits as usize, ut_slot).expect("ASID pool memory");
         slot::ASID_CONTROL
             .cap()
             .asid_control_make_pool(ut.cap, &slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(pool_slot).cap()))
@@ -252,7 +262,7 @@ impl Host {
         g.destroy(&mut self.alloc);
         sel4::debug_println!(
             "l4h-root: guest {} '{}' destroyed, {} MiB free",
-            id, name, self.alloc.pool.free_bytes() >> 20
+            id, name, self.alloc.free_bytes() >> 20
         );
         Ok(())
     }
@@ -261,12 +271,8 @@ impl Host {
 #[root_task(heap_size = 32 * 1024 * 1024)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let cores = bootinfo.inner().numNodes as usize;
-    let mut alloc = Alloc {
-        slots: Slots::new(bootinfo.empty().range()),
-        pool: UtPool::from_bootinfo(bootinfo),
-        pinned: Default::default(),
-    };
-    let total_bytes = alloc.pool.free_bytes();
+    let mut alloc = Alloc::new(Slots::new(bootinfo.empty().range()), bootinfo);
+    let total_bytes = alloc.free_bytes();
     sel4::debug_println!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
 
     let hyp_ep = alloc.object_cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
@@ -281,6 +287,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
         timeslice_us: 5000,
+        placement: core::cell::Cell::new(0),
     };
     let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)] };
     let wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
@@ -345,10 +352,13 @@ fn boot_dom0(h: &mut Host) {
     for d in 0..h.disks.len().min(DOM0_DISKS) {
         h.attach_disk(id, d, false).expect("attach disk to dom0");
     }
-    // Switch 0, with the first NIC (if any) as its uplink.
-    let sw = h.netd.create_switch();
-    if !h.netd.nics.is_empty() {
-        h.netd.attach_uplink(sw, 0).expect("uplink");
+    // Switch 0, with the first NIC (if any) as its uplink (on first boot).
+    let sw = 0;
+    if h.netd.switches == 0 {
+        h.netd.create_switch();
+        if !h.netd.nics.is_empty() {
+            h.netd.attach_uplink(sw, 0).expect("uplink");
+        }
     }
     for _ in 0..DOM0_NICS {
         h.create_nic(id, sw, 0, true).expect("dom0 NIC");
@@ -362,6 +372,14 @@ fn boot_dom0(h: &mut Host) {
     h.start_guest(id).expect("start dom0");
 }
 
+/// dom0 rebooted or crashed: replace it.  Other guests keep running; the
+/// new dom0 finds them with the control API.
+fn restart_dom0(h: &mut Host, id: usize) {
+    sel4::debug_println!("l4h-root: restarting dom0");
+    let _ = h.destroy_guest(id);
+    boot_dom0(h);
+}
+
 fn rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
@@ -369,13 +387,11 @@ fn rdtsc() -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-fn arm_watchdog(info: &HostInfo) {
-    if WATCHDOG_SECS == 0 {
-        return;
-    }
-    let deadline = rdtsc() + info.tsc_hz * WATCHDOG_SECS as u64;
+/// The root task's periodic timer: balancer and watchdog.
+fn arm_timer(info: &HostInfo) {
+    let deadline = rdtsc() + info.tsc_hz * sched::BALANCE_MS / 1000;
     let tcb = slot::TCB.cap();
-    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, WATCHDOG_BADGE));
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
 }
 
 fn watchdog_dump(h: &Host) {
@@ -406,12 +422,21 @@ pub fn set_mr(i: usize, v: u64) {
 /// Serve calls from host components and faults of guest kernels.
 fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
     let hyp_ep = h.info.hyp_ep;
-    arm_watchdog(&h.info);
+    arm_timer(&h.info);
+    let mut next_watchdog = rdtsc() + h.info.tsc_hz * WATCHDOG_SECS as u64;
+    let mut last_balance = rdtsc();
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
-        let resp = if badge & WATCHDOG_BADGE != 0 {
-            watchdog_dump(h);
-            arm_watchdog(&h.info);
+        h.alloc.refill();
+        let resp = if badge & TIMER_BADGE != 0 {
+            let now = rdtsc();
+            sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
+            last_balance = now;
+            if WATCHDOG_SECS != 0 && rdtsc() >= next_watchdog {
+                watchdog_dump(h);
+                next_watchdog = rdtsc() + h.info.tsc_hz * WATCHDOG_SECS as u64;
+            }
+            arm_timer(&h.info);
             None
         } else if badge & ROOT_BADGE_COMPONENT != 0 {
             component_call(h, badge, &info)
@@ -420,7 +445,9 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             let vcpu = hyp_badge_vcpu(badge);
             let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
             sel4::debug_println!("l4h-root: guest {} vCPU {} kernel fault: {:x?}", gid, vcpu, fault);
-            if let Some(Some(g)) = h.guests.get_mut(gid) {
+            if h.guest(gid).is_some_and(|g| g.dom0) {
+                restart_dom0(h, gid);
+            } else if let Some(Some(g)) = h.guests.get_mut(gid) {
                 g.stop();
             }
             None
@@ -436,7 +463,7 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             None => {
                 // A reply object left unanswered (a faulted or stopped
                 // thread) stays bound to its caller: use a fresh one.
-                if badge & WATCHDOG_BADGE == 0 {
+                if badge & TIMER_BADGE == 0 {
                     reply = h.alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
                 }
                 (info, badge) = hyp_ep.recv(reply);
@@ -462,7 +489,13 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
             Some(0)
         }
         host::ROOT_CALL_GUEST_POWER if is_vmm => {
-            sel4::debug_println!("l4h-root: guest {} power request {}", id, mr(1));
+            let how = mr(1);
+            sel4::debug_println!("l4h-root: guest {} power request {}", id, how);
+            if how != l4h_abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
+                // The caller (dom0's VMM) is destroyed: no reply.
+                restart_dom0(h, id);
+                return None;
+            }
             if let Some(Some(g)) = h.guests.get_mut(id) {
                 for v in &g.vcpus {
                     let _ = v.ktcb.tcb_suspend();

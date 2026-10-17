@@ -91,7 +91,7 @@ pub fn attach(
 
     // ---- DMA memory: one physically contiguous chunk.
     let dma_slot = alloc.slots.alloc();
-    let dma_region = alloc.pool.split(DMA_BITS, dma_slot).expect("blkd DMA memory");
+    let dma_region = alloc.split(DMA_BITS, dma_slot).expect("blkd DMA memory");
     let dma_paddr = dma_region.paddr;
     let n_dma = (1 << DMA_BITS) / PAGE;
     let dma_frames = alloc.slots.alloc_range(n_dma);

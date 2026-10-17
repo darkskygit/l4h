@@ -50,7 +50,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
         abi::CTL_HOST_INFO => {
             resp.vals = [
                 h.info.cores as u64,
-                h.alloc.pool.free_bytes() as u64,
+                h.alloc.free_bytes() as u64,
                 h.total_bytes as u64,
                 h.disks.len() as u64,
                 h.guests.iter().flatten().count() as u64,
@@ -75,7 +75,9 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 name,
                 ram,
                 vcpus,
-                untyped_quota: (32 << 20) + ram / 8,
+                // seL4 objects of the guest kernel: mostly mapping slots
+                // and page tables of its processes.
+                untyped_quota: if a[3] != 0 { a[3] as usize } else { (16 << 20) + ram / 16 },
                 vspaces: 64,
                 ram_base: a[2] as usize,
                 dom0: false,
@@ -236,6 +238,26 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             }
             resp.vals[0] = n as u64;
             resp.vals[1] = h.netd.nics.iter().position(|n| n.switch == Some(sw)).map_or(u64::MAX, |i| i as u64);
+            Ok(())
+        }
+        abi::CTL_VM_SET_SCHED => {
+            let id = vm_arg(a[0])?;
+            if a[1] > 100 {
+                return Err(EINVAL);
+            }
+            if crate::sched::set_cap(h, id, a[1] as u32) { Ok(()) } else { Err(ENOENT) }
+        }
+        abi::CTL_VM_STATS => {
+            let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
+            resp.vals[0] = g.vcpus.iter().map(|v| v.usage as u64).sum();
+            resp.vals[1] = g.cpu_cap_pct as u64;
+            Ok(())
+        }
+        abi::CTL_VM_INFO => {
+            let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
+            for (v, vcpu) in g.vcpus.iter().take(6).enumerate() {
+                resp.vals[v] = vcpu.core as u64;
+            }
             Ok(())
         }
         _ => Err(ENOSYS),

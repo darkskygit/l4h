@@ -1,0 +1,36 @@
+#!/bin/sh
+# dom0 init for tests/run-m6test.sh.  First boot: start a busy guest and
+# reboot dom0.  Second boot (the guest is still there): check it survived,
+# then cap its CPU use.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "M6TEST: FAIL: $*"; poweroff -f; }
+cpu() { l4hctl top | awk -v n="$1" '$2 == n { split($3, a, "."); print a[1] }'; }
+if ! l4hctl list | grep -q " hog "; then
+    id=$(l4hctl create hog --kernel /bin/vmlinux --initrd /bin/densvm.cpio.gz --mem 128 \
+        --cmdline "console=hvc0 quiet HOG=1") || fail "create"
+    l4hctl console "$id" --until "DENSVM: ready" --timeout 60 >/dev/null || fail "guest boot"
+    echo "M6TEST: rebooting dom0"
+    reboot -f
+fi
+echo "M6TEST: dom0 restarted"
+l4hctl list
+id=$(l4hctl list | awk '$2 == "hog" { print $1 }')
+l4hctl send "$id" --wait "DENSVM: pong alive" alive >/dev/null || fail "guest lost across dom0 restart"
+echo "M6TEST: guest $id survived"
+sleep 2
+before=$(cpu hog)
+echo "M6TEST: uncapped: ${before}%"
+[ "$before" -ge 80 ] || fail "busy guest uses only ${before}%"
+l4hctl sched "$id" 25 || fail "sched"
+sleep 2
+after=$(cpu hog)
+echo "M6TEST: capped at 25%: ${after}%"
+[ "$after" -ge 15 ] && [ "$after" -le 35 ] || fail "cap not applied (${after}%)"
+l4hctl sched "$id" 0
+sleep 2
+echo "M6TEST: uncapped again: $(cpu hog)%"
+l4hctl destroy "$id"
+echo "M6TEST: PASS"
+poweroff -f

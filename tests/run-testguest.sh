@@ -3,8 +3,8 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 make -s -C "$root/tests/testguest"
-(cd "$root/host" && L4H_DOM0_KERNEL="$root/build/testguest/testguest.elf" L4H_DOM0_MEM_MB=64 \
-    cargo build -q)
+L4H_DOM0_KERNEL="$root/build/testguest/testguest.elf" L4H_DOM0_INITRD= L4H_DOM0_MEM_MB=64 \
+    "$root/tools/build-host.sh"
 log=$root/build/testguest/qemu.log
 timeout 60 "$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
     </dev/null >"$log" 2>&1 || true

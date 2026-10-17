@@ -28,6 +28,9 @@ const CTL_NIC_CREATE: u32 = 13;
 const CTL_SWITCH_INFO: u32 = 14;
 const CTL_NIC_INFO: u32 = 15;
 const NIC_NO_MAC_LOCK: u64 = 1;
+const CTL_VM_SET_SCHED: u32 = 16;
+const CTL_VM_INFO: u32 = 17;
+const CTL_VM_STATS: u32 = 18;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -223,6 +226,8 @@ struct CreateOpts {
     initrd: Option<String>,
     cmdline: String,
     disks: Vec<(u64, bool)>,
+    /// seL4 object quota (0: default).
+    quota_mb: u64,
     /// (switch, MAC or 0, flags)
     nics: Vec<(u64, u64, u64)>,
 }
@@ -236,7 +241,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
     let mut name = [0u8; CTL_NAME_MAX];
     let n = o.name.len().min(CTL_NAME_MAX - 1);
     name[..n].copy_from_slice(&o.name.as_bytes()[..n]);
-    let resp = ctl.call(CTL_VM_CREATE, &[o.mem_mb << 20, o.vcpus, k.ram_base], &name, &[])?;
+    let resp = ctl.call(CTL_VM_CREATE, &[o.mem_mb << 20, o.vcpus, k.ram_base, o.quota_mb << 20], &name, &[])?;
     let vm = resp.vals[0];
     let r = (|| {
         for &(disk, ro) in &o.disks {
@@ -309,13 +314,18 @@ const USAGE: &str = "usage: l4hctl <command>
                                create and start a VM; prints its id
          [--nic SWITCH[,mac=MAC][,nolock]]...
   destroy VM                   stop a VM and free its resources
+  sched VM CAP                 cap each vCPU of VM at CAP% of a core (0: none)
+  cores VM                     host core of each vCPU of VM
+  top                          CPU use of each VM
   nics                         host NICs
   switch-create                create an L2 switch; prints its id
   uplink SWITCH NIC            make host NIC the uplink of SWITCH
   switch SWITCH                ports and counters of SWITCH
   console VM [--follow] [--until STR] [--timeout SECS]
                                print the VM's console output
-  send VM TEXT                 type TEXT (plus newline) on the VM's console";
+  send VM [--wait PAT [--timeout SECS]] TEXT
+                               type TEXT (plus newline) on the VM's console;
+                               with --wait, print the time until PAT appears";
 
 fn run(args: &[String]) -> Result<i32> {
     let Some(cmd) = args.first() else {
@@ -382,6 +392,7 @@ fn run(args: &[String]) -> Result<i32> {
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
+                quota_mb: 0,
                 nics: Vec::new(),
             };
             let mut it = args[2..].iter();
@@ -392,6 +403,7 @@ fn run(args: &[String]) -> Result<i32> {
                     "--initrd" => o.initrd = Some(val()?),
                     "--mem" => o.mem_mb = parse_num(&val()?)?,
                     "--vcpus" => o.vcpus = parse_num(&val()?)?,
+                    "--quota" => o.quota_mb = parse_num(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
                         let v = val()?;
@@ -425,6 +437,50 @@ fn run(args: &[String]) -> Result<i32> {
                 return err("create: --kernel is required");
             }
             println!("{}", cmd_create(&ctl, &o)?);
+        }
+        "sched" => {
+            let vm = parse_num(args.get(1).ok_or(Error("sched: missing VM".into()))?)?;
+            let cap = parse_num(args.get(2).ok_or(Error("sched: missing CAP".into()))?)?;
+            ctl.call(CTL_VM_SET_SCHED, &[vm, cap], &[], &[])?;
+        }
+        "top" => {
+            // CPU use of every VM over the last balancer period.
+            let mut first = 0u64;
+            println!("{:>3} {:<16} {:>6} {:>5}", "ID", "NAME", "CPU%", "CAP%");
+            loop {
+                let r = ctl.call(CTL_VM_LIST, &[first], &[], &[])?;
+                let n = r.vals[0] as usize;
+                if n == 0 {
+                    break;
+                }
+                for i in 0..n {
+                    let vm: CtlVm = unsafe {
+                        std::ptr::read_unaligned(r.data.as_ptr().add(i * std::mem::size_of::<CtlVm>()) as *const CtlVm)
+                    };
+                    let s = ctl.call(CTL_VM_STATS, &[vm.id as u64], &[], &[])?;
+                    let name_len = vm.name.iter().position(|&c| c == 0).unwrap_or(CTL_NAME_MAX);
+                    println!(
+                        "{:>3} {:<16} {:>6.1} {:>5}",
+                        vm.id,
+                        String::from_utf8_lossy(&vm.name[..name_len]),
+                        s.vals[0] as f64 / 10.0,
+                        s.vals[1]
+                    );
+                    first = vm.id as u64 + 1;
+                }
+            }
+        }
+        "cores" => {
+            let vm = parse_num(args.get(1).ok_or(Error("cores: missing VM".into()))?)?;
+            let r = ctl.call(CTL_VM_INFO, &[vm], &[], &[])?;
+            let n = ctl.call(CTL_VM_LIST, &[vm], &[], &[])?;
+            let vcpus = if n.vals[0] > 0 {
+                unsafe { std::ptr::read_unaligned(n.data.as_ptr() as *const CtlVm) }.vcpus as usize
+            } else {
+                0
+            };
+            let cores: Vec<String> = r.vals[..vcpus.min(6)].iter().map(|c| c.to_string()).collect();
+            println!("{}", cores.join(" "));
         }
         "nics" => {
             let n = ctl.call(CTL_HOST_INFO, &[], &[], &[])?.vals[5];
@@ -485,7 +541,35 @@ fn run(args: &[String]) -> Result<i32> {
         }
         "send" => {
             let vm = parse_num(args.get(1).ok_or(Error("send: missing VM".into()))?)?;
-            let mut text = args[2..].join(" ").into_bytes();
+            // send VM [--wait PATTERN [--timeout SECS]] TEXT...
+            let mut rest = &args[2..];
+            let (mut wait, mut timeout) = (None, Duration::from_secs(30));
+            loop {
+                match rest.first().map(|s| s.as_str()) {
+                    Some("--wait") if rest.len() > 1 => {
+                        wait = Some(rest[1].clone());
+                        rest = &rest[2..];
+                    }
+                    Some("--timeout") if rest.len() > 1 => {
+                        timeout = Duration::from_secs(parse_num(&rest[1])?);
+                        rest = &rest[2..];
+                    }
+                    _ => break,
+                }
+            }
+            // Skip output so far, so that only the answer is matched.
+            let mut con = 0u64;
+            if wait.is_some() {
+                loop {
+                    let r = ctl.call(CTL_CONSOLE_READ, &[vm, con], &[], &[])?;
+                    con = r.vals[0];
+                    if r.vals[1] == 0 {
+                        break;
+                    }
+                }
+            }
+            let start = Instant::now();
+            let mut text = rest.join(" ").into_bytes();
             text.push(b'\n');
             let mut off = 0;
             while off < text.len() {
@@ -494,6 +578,25 @@ fn run(args: &[String]) -> Result<i32> {
                 off += r.vals[0] as usize;
                 if r.vals[0] == 0 {
                     std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            if let Some(pat) = wait {
+                let mut seen = Vec::new();
+                loop {
+                    let r = ctl.call(CTL_CONSOLE_READ, &[vm, con], &[], &[])?;
+                    con = r.vals[0];
+                    seen.extend_from_slice(&r.data[..r.vals[1] as usize]);
+                    if seen.windows(pat.len()).any(|w| w == pat.as_bytes()) {
+                        println!("{:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
+                        break;
+                    }
+                    if start.elapsed() > timeout {
+                        eprintln!("l4hctl: timed out");
+                        return Ok(1);
+                    }
+                    if r.vals[1] == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                 }
             }
         }

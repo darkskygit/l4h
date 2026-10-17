@@ -1,0 +1,15 @@
+#!/bin/sh
+# Init of guests created by tests/guest/init-density: optionally burn CPU
+# (HOG=n background loops), answer every console line with a pong.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+i=0
+while [ "$i" -lt "${HOG:-0}" ]; do
+    (while :; do :; done) &
+    i=$((i + 1))
+done
+echo "DENSVM: ready hog=${HOG:-0}"
+while read line; do
+    echo "DENSVM: pong $line"
+done
