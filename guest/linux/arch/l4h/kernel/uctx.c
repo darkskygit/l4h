@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * User execution and kernel threads of the l4h guest.
+ *
+ * userspace() is the l4h version of UML's main loop for a thread in user
+ * mode: run the thread's seL4 user context until it traps (syscall, page
+ * fault, exception) or the vCPU receives an event, handle that, repeat.
+ *
+ * Kernel thread switching keeps UML's setjmp/longjmp scheme.
+ */
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/sched/task.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task_stack.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/atomic.h>
+#include <asm/current.h>
+#include <asm/tlbflush.h>
+#include <as-layout.h>
+#include <kern_util.h>
+#include <arch.h>
+#include <os.h>
+#include <skas.h>
+#include <registers.h>
+#include <l4h_sys.h>
+#include <l4h_caps.h>
+#include <l4h_vspace.h>
+
+#define EMPTY_CNODE	L4H_CPTR2(L4H_SLOT_META, L4H_META_DYN_BASE)
+
+unsigned long host_fp_size;
+static atomic64_t uctx_ids = ATOMIC64_INIT(0);
+
+/* ---- registers */
+
+/* Initial register state of a fresh thread: zero GPRs and the x87/SSE
+ * init state in XSAVE format. */
+void get_safe_registers(unsigned long *regs, unsigned long *fp_regs)
+{
+	memset(regs, 0, sizeof(unsigned long) * MAX_REG_NR);
+	if (fp_regs) {
+		u8 *fp = (u8 *)fp_regs;
+
+		memset(fp, 0, host_fp_size);
+		*(u16 *)(fp + 0) = 0x37f;	/* FCW */
+		*(u32 *)(fp + 24) = 0x1f80;	/* MXCSR */
+	}
+}
+
+/* Make current->thread.regs.regs.fp hold the thread's FPU state. */
+void l4h_fpu_fetch(struct task_struct *t)
+{
+	struct l4h_uctx *u = &t->thread.uctx;
+
+	if (u->fp_state != L4H_FP_IN_TCB)
+		return;
+	if (u->state == L4H_UCTX_NONE || u->state == L4H_UCTX_FRESH) {
+		u->fp_state = L4H_FP_IN_REGS;
+		return;
+	}
+	WARN_ON(l4h_fpu_read(u, t->thread.regs.regs.fp, host_fp_size));
+	u->fp_state = L4H_FP_IN_REGS;
+}
+
+/* The kernel changed regs.regs.fp; the TCB must be updated before the
+ * thread runs again. */
+void l4h_fpu_dirty(struct task_struct *t)
+{
+	t->thread.uctx.fp_state = L4H_FP_DIRTY;
+}
+
+/* Make the general registers in thread.regs current (they may only be in
+ * the TCB after a page fault, exception or preemption). */
+void l4h_sync_regs(struct task_struct *t)
+{
+	l4h_user_sync_regs(&t->thread.uctx, t->thread.regs.regs.gp);
+}
+
+/* fs/gs base were changed by the kernel (arch_prctl, CLONE_SETTLS). */
+void l4h_seg_dirty(struct task_struct *t)
+{
+	l4h_user_mark_dirty(&t->thread.uctx, 1);
+}
+
+/* fs/gs base may have been changed by user code; refresh them. */
+void l4h_sync_seg(struct task_struct *t)
+{
+	l4h_user_sync_seg(&t->thread.uctx, t->thread.regs.regs.gp);
+}
+
+/* ---- user contexts */
+
+static int uctx_create(struct task_struct *t)
+{
+	struct thread_struct *th = &t->thread;
+	struct l4h_uctx *u = &th->uctx;
+	int err;
+
+	err = l4h_obj_alloc(L4H_OBJ_TCB, 0, &th->utcb_obj);
+	if (err)
+		return err;
+	err = l4h_obj_alloc(L4H_OBJ_REPLY, 0, &th->reply_obj);
+	if (err)
+		goto fail_tcb;
+	u->tcb = th->utcb_obj.cptr;
+	u->reply = th->reply_obj.cptr;
+	u->badge = L4H_EP_BADGE_TASK | atomic64_inc_return(&uctx_ids);
+	u->fault_ep = 0;
+	u->fault_ep_vcpu = -1;
+	u->sc_vcpu = -1;
+	u->vspace = 0;
+	err = l4h_tcb_set_flags(u->tcb, 1 /* fpuDisabled */, 2 /* trapSyscalls */);
+	if (err)
+		goto fail_reply;
+	u->state = L4H_UCTX_FRESH;
+	u->regs_valid = 1;
+	if (u->fp_state != L4H_FP_DIRTY) {
+		/* The kernel-side copy is authoritative for a new context. */
+		u->fp_state = L4H_FP_DIRTY;
+	}
+	return 0;
+
+fail_reply:
+	l4h_obj_free(&th->reply_obj);
+fail_tcb:
+	l4h_obj_free(&th->utcb_obj);
+	u->tcb = 0;
+	return -ENOMEM;
+}
+
+void l4h_uctx_destroy(struct task_struct *t)
+{
+	struct thread_struct *th = &t->thread;
+	struct l4h_uctx *u = &th->uctx;
+
+	if (u->state == L4H_UCTX_NONE)
+		return;
+	l4h_user_deschedule(u);
+	if (u->fault_ep)
+		l4h_slot_delete(u->fault_ep);
+	l4h_obj_free(&th->reply_obj);
+	l4h_obj_free(&th->utcb_obj);
+	u->state = L4H_UCTX_NONE;
+	u->tcb = 0;
+	u->fault_ep = 0;
+	u->fault_ep_vcpu = -1;
+}
+
+/* Account `t` as possibly executing user code of `mm`. */
+static void mm_running_enter(struct task_struct *t, struct mm_struct *mm)
+{
+	if (t->thread.mm_running)
+		return;
+	atomic_inc(&mm->context.l4h.running);
+	t->thread.mm_running = 1;
+}
+
+/* Called when `t` stops being current on its vCPU. */
+void l4h_uctx_switch_out(struct task_struct *t)
+{
+	struct l4h_uctx *u = &t->thread.uctx;
+
+	if (!t->thread.mm_running)
+		return;
+	/* A preempted context would keep running on the vCPU's SC_U once the
+	 * kernel thread blocks; take the SC away. */
+	if (u->state == L4H_UCTX_PREEMPTED)
+		l4h_user_deschedule(u);
+	if (t->mm)
+		atomic_dec(&t->mm->context.l4h.running);
+	t->thread.mm_running = 0;
+}
+
+static void prepare_user(struct task_struct *t)
+{
+	struct thread_struct *th = &t->thread;
+	struct l4h_uctx *u = &th->uctx;
+	struct mm_struct *mm = t->mm;
+	int cpu = smp_processor_id();
+	unsigned long root;
+	u64 gen;
+
+	if (u->state == L4H_UCTX_NONE && uctx_create(t))
+		panic("l4h: out of seL4 objects creating a user context\n");
+
+	if (u->fault_ep_vcpu != cpu) {
+		if (u->fault_ep)
+			l4h_slot_delete(u->fault_ep);
+		u->fault_ep = l4h_cap_mint_root(L4H_SLOT_VCPU(cpu) + L4H_VCPU_EP,
+						L4H_RIGHTS_ALL, u->badge);
+		if (!u->fault_ep)
+			panic("l4h: out of capability slots\n");
+		u->fault_ep_vcpu = cpu;
+		/* Force SC_U (and with it the fault endpoint) to be rebound. */
+		if (u->sc_vcpu >= 0)
+			l4h_user_deschedule(u);
+	}
+
+	mm_running_enter(t, mm);
+	root = l4h_mm_activate(mm, &gen);
+	if (u->vspace != root || th->vs_gen != gen) {
+		int err;
+
+		if (u->state == L4H_UCTX_FRESH && !u->vspace)
+			err = l4h_tcb_configure_user(u->tcb, EMPTY_CNODE, root);
+		else
+			err = l4h_tcb_set_space(u->tcb, u->fault_ep, EMPTY_CNODE, root);
+		if (err)
+			panic("l4h: binding user context to VSpace failed: %d\n", err);
+		u->vspace = root;
+		th->vs_gen = gen;
+	}
+
+	if (u->fp_state == L4H_FP_DIRTY) {
+		if (l4h_fpu_write(u, th->regs.regs.fp, host_fp_size))
+			panic("l4h: WriteFPU failed\n");
+		u->fp_state = L4H_FP_IN_REGS;
+	}
+}
+
+/* Map an seL4 user exception to a Linux signal, as the x86 trap handlers
+ * would. */
+static void handle_exception(struct uml_pt_regs *regs, struct l4h_uctx *u)
+{
+	struct faultinfo *fi = &current->thread.arch.faultinfo;
+	int sig = SIGSEGV, code = SI_KERNEL;
+	void __user *addr = (void __user *)u->fault_ip;
+
+	fi->trap_no = u->exc_number;
+	fi->error_code = u->fault_code;
+	fi->cr2 = 0;
+	switch (u->exc_number) {
+	case 0:		/* #DE */
+		sig = SIGFPE;
+		code = FPE_INTDIV;
+		break;
+	case 1:		/* #DB */
+	case 3:		/* #BP */
+		sig = SIGTRAP;
+		code = (u->exc_number == 3) ? SI_KERNEL : TRAP_BRKPT;
+		break;
+	case 4:		/* #OF */
+		code = SI_KERNEL;
+		break;
+	case 5:		/* #BR */
+		code = SI_KERNEL;
+		break;
+	case 6:		/* #UD */
+		sig = SIGILL;
+		code = ILL_ILLOPN;
+		break;
+	case 16:	/* #MF */
+	case 19:	/* #XM */
+		sig = SIGFPE;
+		code = FPE_FLTINV;
+		break;
+	case 17:	/* #AC */
+		sig = SIGBUS;
+		code = BUS_ADRALN;
+		break;
+	case 13:	/* #GP (also int $0x80 without a gate) */
+	default:
+		sig = SIGSEGV;
+		code = SI_KERNEL;
+		addr = NULL;
+		break;
+	}
+	if (code == SI_KERNEL)
+		force_sig(sig);
+	else
+		force_sig_fault(sig, code, addr);
+}
+
+static void handle_page_fault_stop(struct uml_pt_regs *regs, struct l4h_uctx *u)
+{
+	struct faultinfo fi = {
+		.error_code = u->fault_code | 4 /* user */,
+		.cr2 = u->fault_addr,
+		.trap_no = 14,
+	};
+
+	regs->faultinfo = fi;
+	segv(fi, u->fault_ip, 1, regs, NULL);
+}
+
+void userspace(struct uml_pt_regs *regs)
+{
+	struct task_struct *t = current;
+	struct l4h_uctx *u = &t->thread.uctx;
+	int stop;
+
+	/* Handle any immediate reschedules or signals */
+	interrupt_end();
+
+	while (1) {
+		current_mm_sync();
+		prepare_user(t);
+
+		stop = l4h_user_run(u, regs->gp, 0);
+		/* The TCB now owns the FPU state again. */
+		if (u->fp_state == L4H_FP_IN_REGS)
+			u->fp_state = L4H_FP_IN_TCB;
+		regs->is_user = 1;
+		UPT_SYSCALL_NR(regs) = -1;
+
+		switch (stop) {
+		case L4H_STOP_SYSCALL:
+			handle_syscall(regs);
+			break;
+		case L4H_STOP_PAGEFAULT:
+			handle_page_fault_stop(regs, u);
+			break;
+		case L4H_STOP_EXCEPTION:
+			l4h_sync_regs(t);
+			handle_exception(regs, u);
+			break;
+		case L4H_STOP_INTERRUPT:
+			l4h_dispatch_pending();
+			break;
+		}
+
+		if (read_thread_flags() & _TIF_WORK_MASK)
+			l4h_sync_regs(t);
+		interrupt_end();
+
+		/* Avoid -ERESTARTSYS handling in host */
+		if (PT_SYSCALL_NR_OFFSET != PT_SYSCALL_RET_OFFSET)
+			PT_SYSCALL_NR(regs->gp) = -1;
+	}
+}
+
+/* ---- kernel threads (UML os-Linux/skas/process.c) */
+
+unsigned long get_thread_reg(int reg, jmp_buf *buf)
+{
+	switch (reg) {
+	case HOST_IP:
+		return buf[0]->JB_IP;
+	case HOST_SP:
+		return buf[0]->JB_SP;
+	case HOST_BP:
+		return buf[0]->JB_BP;
+	default:
+		return 0;
+	}
+}
+
+void new_thread(void *stack, jmp_buf *buf, void (*handler)(void))
+{
+	(*buf)[0].JB_IP = (unsigned long) handler;
+	(*buf)[0].JB_SP = (unsigned long) stack + UM_THREAD_SIZE - sizeof(void *);
+}
+
+#define INIT_JMP_NEW_THREAD 0
+#define INIT_JMP_CALLBACK 1
+#define INIT_JMP_HALT 2
+#define INIT_JMP_REBOOT 3
+
+void switch_threads(jmp_buf *me, jmp_buf *you)
+{
+	if (UML_SETJMP(me) == 0)
+		UML_LONGJMP(you, 1);
+}
+
+static jmp_buf initial_jmpbuf;
+
+static void (*cb_proc)(void *arg);
+static void *cb_arg;
+static jmp_buf *cb_back;
+
+int start_idle_thread(void *stack, jmp_buf *switch_buf)
+{
+	int n;
+
+	n = setjmp(initial_jmpbuf);
+	switch (n) {
+	case INIT_JMP_NEW_THREAD:
+		(*switch_buf)[0].JB_IP = (unsigned long) uml_finishsetup;
+		(*switch_buf)[0].JB_SP = (unsigned long) stack +
+			UM_THREAD_SIZE - sizeof(void *);
+		break;
+	case INIT_JMP_CALLBACK:
+		(*cb_proc)(cb_arg);
+		longjmp(*cb_back, 1);
+		break;
+	case INIT_JMP_HALT:
+		kmalloc_ok = 0;
+		return 0;
+	case INIT_JMP_REBOOT:
+		kmalloc_ok = 0;
+		return 1;
+	default:
+		panic("Bad sigsetjmp return in %s - %d\n", __func__, n);
+	}
+	longjmp(*switch_buf, 1);
+
+	/* unreachable */
+	panic("impossible long jump!");
+	return 0;
+}
+
+void initial_thread_cb_skas(void (*proc)(void *), void *arg)
+{
+	jmp_buf here;
+
+	cb_proc = proc;
+	cb_arg = arg;
+	cb_back = &here;
+
+	block_signals_trace();
+	if (UML_SETJMP(&here) == 0)
+		UML_LONGJMP(&initial_jmpbuf, INIT_JMP_CALLBACK);
+	unblock_signals_trace();
+
+	cb_proc = NULL;
+	cb_arg = NULL;
+	cb_back = NULL;
+}
+
+void halt_skas(void)
+{
+	block_signals_trace();
+	UML_LONGJMP(&initial_jmpbuf, INIT_JMP_HALT);
+}
+
+void reboot_skas(void)
+{
+	block_signals_trace();
+	UML_LONGJMP(&initial_jmpbuf, INIT_JMP_REBOOT);
+}
+
+void __init l4h_uctx_init(void)
+{
+	host_fp_size = l4h_fpu_state_size();
+}

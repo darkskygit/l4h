@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# ARCH=l4h: Linux as a paravirtualised guest of the l4h hypervisor (seL4).
+# Derived from ARCH=um; the guest kernel runs as an seL4 user-level program
+# and guest processes run in their own seL4 address spaces.
+#
+# We keep CONFIG_UML defined: generic code uses it to mean "not running on
+# bare hardware" (no x86 FPU kernel APIs, no hardware AVX paths, etc.),
+# which is equally true for l4h.
+
+menu "l4h guest options"
+
+config UML
+	bool
+	default y
+	select ARCH_WANTS_DYNAMIC_TASK_STRUCT
+	select ARCH_HAS_CACHE_LINE_SIZE
+	select ARCH_HAS_CPU_FINALIZE_INIT
+	select ARCH_HAS_STRNCPY_FROM_USER
+	select ARCH_HAS_STRNLEN_USER
+	select HAVE_ARCH_AUDITSYSCALL
+	select HAVE_ARCH_SECCOMP_FILTER
+	select HAVE_UID16
+	select HAVE_DEBUG_KMEMLEAK
+	select HAVE_DEBUG_BUGVERBOSE
+	select HAVE_PAGE_SIZE_4KB
+	select NO_DMA
+	select GENERIC_IRQ_SHOW
+	select GENERIC_CPU_DEVICES
+	select TRACE_IRQFLAGS_SUPPORT
+	select HAVE_ARCH_TRACEHOOK
+	select HAVE_SYSCALL_TRACEPOINTS
+	select THREAD_INFO_IN_TASK
+	select HAVE_EXIT_THREAD
+	select GENERIC_SCHED_CLOCK
+	select SPARSE_IRQ
+	select IRQ_DOMAIN
+	select GENERIC_IRQ_IPI if SMP
+	select GENERIC_SMP_IDLE_THREAD
+	select ARCH_USE_QUEUED_SPINLOCKS
+	select ARCH_USE_QUEUED_RWLOCKS
+
+config L4H
+	def_bool y
+
+config MMU
+	bool
+	default y
+
+config NO_IOMEM
+	def_bool y
+
+config ISA
+	bool
+
+config SBUS
+	bool
+
+config LOCKDEP_SUPPORT
+	bool
+	default y
+
+config STACKTRACE_SUPPORT
+	bool
+	default y
+	select STACKTRACE
+
+config GENERIC_CALIBRATE_DELAY
+	bool
+	default y
+
+config SMP
+	bool "Symmetric multi-processing support"
+	default y
+	help
+	  Support guests with more than one vCPU.
+
+config NR_CPUS
+	int "Maximum number of vCPUs" if SMP
+	range 2 64 if SMP
+	range 1 1 if !SMP
+	default 64 if SMP
+	default 1
+
+config HOTPLUG_CPU
+	def_bool y
+	depends on SMP
+
+source "kernel/Kconfig.hz"
+
+source "arch/l4h/x86/Kconfig"
+
+config KERNEL_STACK_ORDER
+	int "Kernel stack size order"
+	default 2
+	range 2 10
+	help
+	  Kernel stacks are 1 << order pages.
+
+config PGTABLE_LEVELS
+	int
+	default 4
+
+config L4H_HVC_CONSOLE
+	bool "l4h hypercall console (hvc0)"
+	default y
+	select HVC_DRIVER
+	select TTY
+	help
+	  Console on the l4h hypercall channel. Say Y.
+
+config L4H_VIRTIO
+	bool "virtio-l4h transport"
+	default y
+	select VIRTIO
+	help
+	  Paravirtual transport for virtio devices provided by l4h-vmm.
+
+config L4H_CTL
+	bool "l4h control channel (dom0)"
+	default y
+	depends on L4H_VIRTIO
+	help
+	  Expose the l4h host control API to dom0 userspace as /dev/l4hctl.
+
+endmenu
+
+config ARCH_SUSPEND_POSSIBLE
+	def_bool n

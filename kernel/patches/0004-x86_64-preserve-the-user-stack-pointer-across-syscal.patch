@@ -1,0 +1,105 @@
+From c7f166f0428514a7ca30d9dddd240463ffb32ab3 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sat, 17 Oct 2026 10:16:20 -0700
+Subject: [PATCH 4/4] x86_64: preserve the user stack pointer across syscalls
+
+The fast syscall path never saved the user RSP and the sysret path
+cleared it, relying on the libsel4 calling convention (RSP kept in RBX).
+Threads running foreign code (seL4_TCBFlag_trapSyscalls) do not follow
+that convention: their syscalls are delivered as faults and must return
+with RSP intact.
+
+Save the user RSP into the user context on 'syscall' entry (through a
+per-node scratch slot) and restore it on sysret.  This makes the RSP of
+syscall-entered threads accurate in fault messages and ReadRegisters.
+Only supported without the SKIM window.
+---
+ include/arch/x86/arch/64/mode/model/smp.h |  7 ++++++-
+ src/arch/x86/64/c_traps.c                 |  5 +++++
+ src/arch/x86/64/model/statedata.c         |  5 +++++
+ src/arch/x86/64/traps.S                   | 18 ++++++++++++++++++
+ 4 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/include/arch/x86/arch/64/mode/model/smp.h b/include/arch/x86/arch/64/mode/model/smp.h
+index 76d6421ac..61a420d87 100644
+--- a/include/arch/x86/arch/64/mode/model/smp.h
++++ b/include/arch/x86/arch/64/mode/model/smp.h
+@@ -25,8 +25,13 @@ typedef struct nodeInfo {
+      */
+     word_t currentThreadUserContext;
+     cpu_id_t index;
+-    PAD_TO_NEXT_CACHE_LN(sizeof(void *) + sizeof(void *) + sizeof(word_t) + sizeof(cpu_id_t));
++    /* Scratch slot for the user RSP on 'syscall' entry, which is copied
++     * into the user context (see handle_fastsyscall). */
++    word_t syscallUserRSP;
++    PAD_TO_NEXT_CACHE_LN(sizeof(void *) + sizeof(void *) + sizeof(word_t) + sizeof(cpu_id_t) +
++                         sizeof(word_t));
+ } nodeInfo_t;
++compile_assert(nodeInfoSyscallUserRSPOffset, OFFSETOF(nodeInfo_t, syscallUserRSP) == 32)
+ compile_assert(nodeInfoIsCacheSized, (sizeof(nodeInfo_t) % L1_CACHE_LINE_SIZE) == 0)
+ 
+ extern nodeInfo_t node_info[CONFIG_MAX_NUM_NODES] ALIGN(L1_CACHE_LINE_SIZE);
+diff --git a/src/arch/x86/64/c_traps.c b/src/arch/x86/64/c_traps.c
+index 9f359db32..46745e1ea 100644
+--- a/src/arch/x86/64/c_traps.c
++++ b/src/arch/x86/64/c_traps.c
+@@ -361,8 +361,13 @@ void VISIBLE NORETURN restore_user_context(void)
+                 "movq %%rsp, %%cr3\n"
+ #endif /* CONFIG_KERNEL_SKIM_WINDOW */
+ #endif /* defined(ENABLE_SMP_SUPPORT) && defined(CONFIG_KERNEL_SKIM_WINDOW) */
++#ifdef CONFIG_KERNEL_SKIM_WINDOW
+                 // clear RSP to not leak information to the user
+                 "xor %%rsp, %%rsp\n"
++#else
++                // restore the thread's RSP (saved on syscall entry)
++                "movq 8(%%rsp), %%rsp\n"
++#endif
+                 // More register but we can ignore and are done restoring
+                 // enable interrupt disabled by sysenter
+                 "sysretq\n"
+diff --git a/src/arch/x86/64/model/statedata.c b/src/arch/x86/64/model/statedata.c
+index 7460595e3..1fb6935a7 100644
+--- a/src/arch/x86/64/model/statedata.c
++++ b/src/arch/x86/64/model/statedata.c
+@@ -29,3 +29,8 @@ UP_STATE_DEFINE(cr3_t, x64KSCurrentCR3);
+ #endif
+ 
+ word_t x64KSIRQStack[CONFIG_MAX_NUM_NODES][IRQ_STACK_SIZE + 2] ALIGN(64) VISIBLE SKIM_BSS;
++
++#if !defined(ENABLE_SMP_SUPPORT) && !defined(CONFIG_KERNEL_SKIM_WINDOW)
++/* Scratch slot for the user RSP on 'syscall' entry (see traps.S). */
++word_t x64KSSyscallUserRSP VISIBLE;
++#endif
+diff --git a/src/arch/x86/64/traps.S b/src/arch/x86/64/traps.S
+index f477325ec..ce11edfad 100644
+--- a/src/arch/x86/64/traps.S
++++ b/src/arch/x86/64/traps.S
+@@ -596,7 +596,25 @@ END_FUNC(kernel_exception)
+ BEGIN_FUNC(handle_fastsyscall)
+     LOAD_KERNEL_AS(rsp)
+     MAYBE_SWAPGS
++#ifndef CONFIG_KERNEL_SKIM_WINDOW
++    /* Save the user RSP, which 'syscall' leaves untouched, into the RSP
++     * slot of the user context so that the thread's stack pointer is
++     * known to fault handlers and restored on return (threads that do
++     * not follow the seL4 calling convention rely on this). */
++#ifdef ENABLE_SMP_SUPPORT
++    movq    %rsp, %gs:32
++    LOAD_USER_CONTEXT
++    addq    $8, %rsp
++    pushq   %gs:32          # RSP
++#else
++    movq    %rsp, x64KSSyscallUserRSP
+     LOAD_USER_CONTEXT
++    addq    $8, %rsp
++    pushq   x64KSSyscallUserRSP
++#endif
++#else
++    LOAD_USER_CONTEXT
++#endif
+     pushq   $-1             # set Error -1 to mean entry via syscall
+     push    %rcx            # save NextIP
+     push    %r11            # save RFLAGS
+-- 
+2.47.3
+

@@ -15,7 +15,9 @@ set(KernelSupportPCID ON CACHE BOOL "")
 set(KernelLAPICMode "X2APIC" CACHE STRING "")
 set(KernelIOMMU OFF CACHE BOOL "")
 set(KernelVTX OFF CACHE BOOL "")
-set(KernelSkimWindow ON CACHE BOOL "")
+# The Meltdown "skim window" is incompatible with preserving user RSP across
+# syscalls (patch 0004); l4h targets CPUs that are not affected by Meltdown.
+set(KernelSkimWindow OFF CACHE BOOL "")
 set(KernelRootCNodeSizeBits "19" CACHE STRING "")
 set(KernelMaxNumBootinfoUntypedCaps "230" CACHE STRING "")
 set(KernelRetypeFanOutLimit "16384" CACHE STRING "")

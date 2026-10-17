@@ -1,7 +1,7 @@
 From 0afc0ce71c34af9f5e7e71cf6dd361f5d893afcc Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:30:23 -0700
-Subject: [PATCH 2/3] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
+Subject: [PATCH 2/4] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
 
 Allow a holder of a TCB capability to read or replace the thread's
 floating point / vector register state via a frame it owns. This is

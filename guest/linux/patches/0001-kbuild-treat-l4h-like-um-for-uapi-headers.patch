@@ -1,0 +1,14 @@
+--- a/scripts/Makefile.asm-headers	2026-10-17 09:37:12.646111470 -0700
++++ b/scripts/Makefile.asm-headers	2026-10-17 09:37:12.650111470 -0700
+@@ -28,8 +28,9 @@
+ syshdr := $(srctree)/scripts/syscallhdr.sh
+ systbl := $(srctree)/scripts/syscalltbl.sh
+ 
+-# $(generic)/Kbuild lists mandatory-y. Exclude um since it is a special case.
+-ifneq ($(SRCARCH),um)
++# $(generic)/Kbuild lists mandatory-y. Exclude um and l4h: they use the
++# uapi headers of their host architecture.
++ifeq ($(filter um l4h,$(SRCARCH)),)
+ include $(srctree)/$(generic)/Kbuild
+ endif
+ 

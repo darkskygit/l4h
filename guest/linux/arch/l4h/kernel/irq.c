@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Interrupts of the l4h guest.
+ *
+ * os-sel4 collects the pending events of a vCPU (timer expiry, IPIs and the
+ * device event lines of the event page) and calls l4h_deliver_events(),
+ * which runs the corresponding Linux interrupt handlers.  Event lines are
+ * exposed as an IRQ domain; drivers get their Linux IRQ number with
+ * l4h_event_irq().
+ */
+
+#include <linux/cpumask.h>
+#include <linux/hardirq.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <asm/irq.h>
+#include <irq_kern.h>
+#include <kern_util.h>
+#include <os.h>
+#include <l4h_sys.h>
+
+extern void l4h_timer_interrupt(void);
+extern void l4h_handle_ipi(unsigned long reasons);
+
+static struct irq_domain *event_domain;
+
+static void l4h_event_noop(struct irq_data *d)
+{
+}
+
+static struct irq_chip l4h_event_chip = {
+	.name		= "l4h-event",
+	.irq_mask	= l4h_event_noop,
+	.irq_unmask	= l4h_event_noop,
+	.irq_ack	= l4h_event_noop,
+};
+
+static int event_domain_map(struct irq_domain *d, unsigned int virq, irq_hw_number_t hw)
+{
+	irq_set_chip_and_handler(virq, &l4h_event_chip, handle_simple_irq);
+	return 0;
+}
+
+static const struct irq_domain_ops event_domain_ops = {
+	.map	= event_domain_map,
+	.xlate	= irq_domain_xlate_onecell,
+};
+
+int l4h_event_irq(unsigned int event)
+{
+	if (event >= L4H_NR_EVENTS)
+		return -EINVAL;
+	return irq_create_mapping(event_domain, event);
+}
+EXPORT_SYMBOL_GPL(l4h_event_irq);
+
+void l4h_deliver_events(int timer, unsigned long ipi, unsigned long *events)
+{
+	struct pt_regs *old_regs = set_irq_regs(&current->thread.regs);
+	unsigned int w;
+
+	irq_enter();
+	if (timer)
+		l4h_timer_interrupt();
+	if (ipi)
+		l4h_handle_ipi(ipi);
+	for (w = 0; w < L4H_NR_EVENTS / 64; w++) {
+		unsigned long bits = events[w];
+
+		while (bits) {
+			unsigned int b = __ffs(bits);
+
+			bits &= bits - 1;
+			if (generic_handle_domain_irq(event_domain, w * 64 + b))
+				pr_warn_ratelimited("l4h: spurious event %u\n", w * 64 + b);
+		}
+	}
+	irq_exit();
+	set_irq_regs(old_regs);
+}
+
+void __init init_IRQ(void)
+{
+	irq_set_chip_and_handler(TIMER_IRQ, &dummy_irq_chip, handle_percpu_irq);
+	irq_set_chip_and_handler(IPI_IRQ, &dummy_irq_chip, handle_percpu_irq);
+	event_domain = irq_domain_create_simple(NULL, L4H_NR_EVENTS, L4H_FIRST_EVENT_IRQ,
+						&event_domain_ops, NULL);
+	if (!event_domain)
+		panic("l4h: cannot create the event IRQ domain\n");
+}
+
+int __init arch_probe_nr_irqs(void)
+{
+	return NR_IRQS;
+}
+
+#ifndef CONFIG_SMP
+void l4h_handle_ipi(unsigned long reasons)
+{
+}
+#endif
+
+void sigio_run_timetravel_handlers(void)
+{
+}

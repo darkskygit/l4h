@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Interrupt emulation for the l4h guest kernel.
+ *
+ * "Interrupts" are events signalled to the vCPU's bound notification:
+ *   - the E3 deadline timer (badge L4H_BADGE_TIMER),
+ *   - IPIs from other vCPUs (L4H_BADGE_IPI, reasons in vcpu->ipi_pending),
+ *   - device events from l4h-vmm (L4H_BADGE_EVENT, bits in the event page).
+ * They are delivered when the vCPU blocks (in user execution or idle) or,
+ * while running kernel code, at the points where interrupts are re-enabled.
+ * Detection there is a few memory reads; only real events cost a syscall.
+ */
+#include "l4h_os.h"
+
+unsigned long long l4h_rdtsc(void)
+{
+	uint32_t lo, hi;
+
+	__asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+	return ((unsigned long long)hi << 32) | lo;
+}
+
+void l4h_timer_arm(unsigned long long deadline)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+
+	v->timer_deadline = deadline;
+	seL4_TCB_SetTimer(v->ktcb, deadline, L4H_BADGE_TIMER);
+}
+
+static int evt_any(struct l4h_vcpu *v)
+{
+	unsigned int i;
+
+	for (i = 0; i < L4H_NR_EVENTS / 64; i++)
+		if (__atomic_load_n(&v->evt->pending[i], __ATOMIC_RELAXED))
+			return 1;
+	return 0;
+}
+
+/* Cheap check used on every interrupt-enable. */
+int l4h_events_pending(void)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	unsigned long long dl = v->timer_deadline;
+
+	return v->ipi_pending || v->ntfn_pending || (dl && l4h_rdtsc() >= dl) || evt_any(v);
+}
+
+int l4h_collect_events(int *timer, unsigned long *ipi, unsigned long *events)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	unsigned long long dl;
+	unsigned long word;
+	unsigned int i;
+	int any = 0;
+
+	/* Drain the notification word so that the next blocking call does not
+	 * wake up for events we are handling now. */
+	word = __atomic_exchange_n(&v->ntfn_pending, 0, __ATOMIC_ACQ_REL);
+	if (!word) {
+		seL4_Word badge = 0;
+
+		seL4_Poll(v->ntfn, &badge);
+		word = badge;
+	}
+
+	*timer = 0;
+	dl = v->timer_deadline;
+	if (dl && l4h_rdtsc() >= dl) {
+		v->timer_deadline = 0;
+		*timer = 1;
+		any = 1;
+	}
+	*ipi = __atomic_exchange_n(&v->ipi_pending, 0, __ATOMIC_ACQ_REL);
+	if (*ipi)
+		any = 1;
+	for (i = 0; i < L4H_NR_EVENTS / 64; i++) {
+		events[i] = __atomic_exchange_n(&v->evt->pending[i], 0, __ATOMIC_ACQ_REL);
+		if (events[i])
+			any = 1;
+	}
+	(void)word;
+	return any;
+}
+
+void l4h_idle_wait(void)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	seL4_Word badge = 0;
+
+	if (l4h_events_pending())
+		return;
+	/* A signal sent between the check above and the wait leaves the
+	 * notification active, so the wait returns immediately: no lost
+	 * wakeups. */
+	seL4_Wait(v->ntfn, &badge);
+	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+}
+
+void l4h_send_ipi(int cpu, unsigned long reasons)
+{
+	struct l4h_vcpu *t = &l4h_vcpus[cpu];
+
+	__atomic_or_fetch(&t->ipi_pending, reasons, __ATOMIC_RELEASE);
+	seL4_Signal(L4H_CPTR(L4H_SLOT_VCPU(cpu) + L4H_VCPU_IPI));
+}
+
+/* ---- interrupt masking ("signals" in UML terms) */
+
+void l4h_dispatch_pending(void);
+
+int um_set_signals(int enable)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	int old = v->irqs_enabled;
+
+	if (old == enable)
+		return old;
+	if (!enable) {
+		v->irqs_enabled = 0;
+		return old;
+	}
+	v->irqs_enabled = 1;
+	if (!v->in_irq && l4h_events_pending())
+		l4h_dispatch_pending();
+	return old;
+}
+
+int um_set_signals_trace(int enable)
+{
+	return um_set_signals(enable);
+}
+
+void block_signals(void)
+{
+	l4h_this_vcpu()->irqs_enabled = 0;
+}
+
+void unblock_signals(void)
+{
+	um_set_signals(1);
+}
+
+int l4h_irqs_enabled(void)
+{
+	return l4h_this_vcpu()->irqs_enabled;
+}
+
+/* Deliver pending events now.  Called with interrupts enabled from
+ * um_set_signals, or explicitly from the user loop and idle. */
+void l4h_dispatch_pending(void)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	unsigned long events[L4H_NR_EVENTS / 64];
+	unsigned long ipi;
+	int timer;
+
+	if (v->in_irq)
+		return;
+	v->in_irq = 1;
+	while (l4h_collect_events(&timer, &ipi, events)) {
+		v->irqs_enabled = 0;
+		l4h_deliver_events(timer, ipi, events);
+		v->irqs_enabled = 1;
+	}
+	v->in_irq = 0;
+}
