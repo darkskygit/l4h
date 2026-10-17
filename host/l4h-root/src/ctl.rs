@@ -63,6 +63,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             let p = &d.pci;
             resp.vals[0] = ((p.bus as u64) << 8) | ((p.dev as u64) << 3) | p.func as u64;
             resp.vals[1] = d.owner.map_or(u64::MAX, |o| o as u64);
+            resp.vals[3] = d.kind as u64;
             Ok(())
         }
         abi::CTL_VM_CREATE => {
@@ -161,7 +162,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if id == caller {
                 return Err(EINVAL);
             }
-            h.attach_disk(id, a[1] as usize, a[2] != 0)
+            h.attach_disk(id, a[1] as usize, a[2] != 0, a[3], a[4])
         }
         abi::CTL_CONSOLE_READ => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;

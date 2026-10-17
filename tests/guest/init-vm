@@ -6,6 +6,7 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 echo "GUEST: ready, $(nproc) cpus"
 if [ -b /dev/vda ]; then
+    echo "GUEST: vda size $(cat /sys/block/vda/size) ro $(cat /sys/block/vda/ro)"
     mount -t ext4 /dev/vda /mnt || echo "GUEST: mount failed"
     n=$(cat /mnt/count 2>/dev/null || echo 0)
     echo "GUEST: disk count $n"

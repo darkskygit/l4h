@@ -30,6 +30,14 @@ for i in 1 2; do
     l4hctl disks | grep -q "owner vm $id" || fail "disk owner"
     l4hctl destroy "$id" || fail "destroy disk$i"
 done
+# A read-only window of the disk.
+id=$(l4hctl create window --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
+    --disk 0,ro,start=8192,sectors=16384) || fail "create window"
+l4hctl console "$id" --until "GUEST: vda size" --timeout 60 > /tmp/out || fail "window vm"
+sleep 1
+l4hctl console "$id" > /tmp/out
+grep -q "GUEST: vda size 16384 ro 1" /tmp/out || { cat /tmp/out; fail "disk window"; }
+l4hctl destroy "$id" || fail "destroy window"
 l4hctl disks
 echo "CTLTEST: PASS"
 poweroff -f

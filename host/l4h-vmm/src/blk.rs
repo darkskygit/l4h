@@ -35,6 +35,8 @@ pub struct Blk {
     kick: sel4::cap::Notification,
     capacity: u64,
     read_only: bool,
+    /// Logical block size of the disk: the guest aligns requests to it.
+    block_size: u32,
     /// Requests submitted to blkd, by chain head.
     inflight: [Option<Inflight>; QUEUE_SIZE as usize],
     /// Bumped on reset, so completions of earlier requests are dropped.
@@ -48,15 +50,20 @@ impl Blk {
     /// The channel must be ready.
     pub fn new(chan_va: usize, kick: sel4::cap::Notification) -> Self {
         let chan = chan_va as *mut Channel;
-        let (capacity, read_only) = unsafe {
+        let (capacity, read_only, block_size) = unsafe {
             fence(Ordering::Acquire);
-            (addr_of!((*chan).capacity_sectors).read_volatile(), addr_of!((*chan).read_only).read_volatile() != 0)
+            (
+                addr_of!((*chan).capacity_sectors).read_volatile(),
+                addr_of!((*chan).read_only).read_volatile() != 0,
+                addr_of!((*chan).block_size).read_volatile().max(512),
+            )
         };
         Blk {
             chan,
             kick,
             capacity,
             read_only,
+            block_size,
             inflight: [None; QUEUE_SIZE as usize],
             generation: 0,
             stalled: None,
@@ -210,7 +217,7 @@ impl Backend for Blk {
         config[0..8].copy_from_slice(&self.capacity.to_le_bytes());
         // seg_max: leave room for data sharing the header/status buffers.
         config[12..16].copy_from_slice(&(blk::MAX_SEGS as u32 - 2).to_le_bytes());
-        config[20..24].copy_from_slice(&512u32.to_le_bytes());
+        config[20..24].copy_from_slice(&self.block_size.to_le_bytes());
     }
 
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool {

@@ -137,7 +137,7 @@ pub fn spawn(
     let mut nic_list = Vec::new();
     for (n, d) in nics.into_iter().enumerate() {
         let mut bars = Vec::new();
-        map_bars(&comp, alloc, &mut arena.pool, devmem, &d, &mut bars, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bars(&comp, alloc, &mut arena.pool, devmem, &d, &mut bars, &crate::blkd::virtio_bars(&d), |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena.pool, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());

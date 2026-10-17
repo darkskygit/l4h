@@ -66,7 +66,9 @@ pub struct Channel {
     pub capacity_sectors: u64,
     pub read_only: u32,
     pub ready: u32,
-    pub reserved: [u32; 12],
+    /// Logical block size in bytes (512 or 4096); requests must be aligned.
+    pub block_size: u32,
+    pub reserved: [u32; 11],
     pub reqs: [Req; RING_SIZE],
     pub resps: [Resp; RING_SIZE],
 }
@@ -91,10 +93,22 @@ pub struct PciRegion {
 
 pub const BLKD_MAX_RAM_CHUNKS: usize = 16;
 
-/// Configuration of a blkd driving one virtio-blk-pci device for one
-/// client.
+pub const BLKD_VIRTIO: u32 = 0;
+pub const BLKD_NVME: u32 = 1;
+
+/// Configuration of a blkd driving one disk (virtio-blk or NVMe PCI
+/// device) for one client.
 #[repr(C)]
 pub struct BlkdConfig {
+    pub kind: u32,
+    /// Refuse writes (in addition to a read-only device).
+    pub read_only: u32,
+    /// The client sees sectors [lba_start, lba_start + lba_count) of the
+    /// disk (512-byte units); lba_count 0 means up to the end.
+    pub lba_start: u64,
+    pub lba_count: u64,
+    /// NVMe: BAR0 (controller registers and doorbells).
+    pub bar0: PciRegion,
     pub pci_bdf: u32,
     /// MSI data of MSI-X table entry 0 (the queue interrupt).
     pub msi_data: u32,

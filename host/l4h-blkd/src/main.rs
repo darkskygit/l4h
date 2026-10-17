@@ -1,14 +1,18 @@
-//! blkd: drives one virtio-blk PCI device for one client (a guest's
-//! l4h-vmm).  Requests carry guest-physical segments, which are validated
-//! against the client's RAM and handed to the device by physical address:
-//! the device reads and writes guest memory directly.  See DESIGN.md §8.2.
+//! blkd: drives one disk (virtio-blk or NVMe PCI device) for one client (a
+//! guest's l4h-vmm).  Requests carry guest-physical segments, which are
+//! validated against the client's RAM and its LBA window and handed to the
+//! device by physical address: the device reads and writes guest memory
+//! directly.  See DESIGN.md §8.2.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+mod nvme;
+mod virtio;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
@@ -19,51 +23,71 @@ use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
 
-use l4h_virtio::{DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Dma, F_INDIRECT_DESC, F_VERSION_1, Mmio, Virtq};
+/// A physically contiguous piece of a request's data.
+#[derive(Clone, Copy, Debug)]
+pub struct Seg {
+    pub pa: u64,
+    pub len: u32,
+}
 
-const VIRTIO_BLK_F_RO: u64 = 1 << 5;
-const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
+/// Pieces of one request: each guest segment may split at a RAM chunk
+/// boundary.
+pub const MAX_PIECES: usize = 2 * blk::MAX_SEGS;
 
-/// Descriptors per request: header, data segments (each split at most once
-/// at a chunk boundary), status.
-const MAX_DESCS: usize = 2 + 2 * blk::MAX_SEGS;
-const SLOT_TABLE: usize = MAX_DESCS * 16;
+pub struct DevInfo {
+    /// In 512-byte sectors.
+    pub capacity: u64,
+    pub block_size: u32,
+    pub read_only: bool,
+    pub flush: bool,
+}
 
-struct Slot {
-    id: u64,
-    busy: bool,
-    /// Indirect table, request header and status byte.
-    table_va: usize,
-    table_pa: u64,
-    hdr_va: usize,
-    hdr_pa: u64,
+/// A disk driver.  Requests are identified by the caller's tag.
+pub trait Driver {
+    fn info(&self) -> DevInfo;
+    /// Room for one more request.
+    fn can_start(&self) -> bool;
+    /// Start a request: `op` is blk::OP_READ, OP_WRITE or OP_FLUSH,
+    /// `sector` in 512-byte units, already checked against the capacity
+    /// and aligned to the block size.  Errors are blk::STATUS_*.
+    fn start(&mut self, tag: u64, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32>;
+    /// Tell the device about started requests.
+    fn kick(&mut self);
+    /// Report completed requests.
+    fn reap(&mut self, done: &mut dyn FnMut(u64, u32));
 }
 
 struct Blkd {
     chan: *mut Channel,
     ram: Vec<RamChunk>,
-    vq: Virtq,
-    slots: Vec<Slot>,
-    free: Vec<u16>,
-    done: sel4::cap::Notification,
+    drv: Box<dyn Driver>,
+    lba_start: u64,
+    /// Size of the client's window in sectors.
+    sectors: u64,
+    block_size: u32,
     read_only: bool,
     flush: bool,
+    done: sel4::cap::Notification,
 }
 
 impl Blkd {
-    /// Translate a guest-physical segment into physical pieces.
-    fn translate(&self, gpa: u64, len: u64, out: &mut impl FnMut(u64, u32) -> bool) -> bool {
-        let (mut gpa, mut len) = (gpa, len);
-        while len > 0 {
-            let Some(c) = self.ram.iter().find(|c| gpa >= c.gpa && gpa < c.gpa + c.size) else {
-                return false;
-            };
-            let n = len.min(c.gpa + c.size - gpa);
-            if !out(c.paddr + (gpa - c.gpa), n as u32) {
-                return false;
+    /// Translate guest-physical segments into physical pieces.
+    fn translate(&self, req: &blk::Req, out: &mut Vec<Seg>) -> bool {
+        out.clear();
+        for s in &req.segs[..req.nr_segs as usize] {
+            let (mut gpa, mut len) = (s.gpa, s.len as u64);
+            while len > 0 {
+                let Some(c) = self.ram.iter().find(|c| gpa >= c.gpa && gpa < c.gpa + c.size) else {
+                    return false;
+                };
+                let n = len.min(c.gpa + c.size - gpa);
+                if out.len() == MAX_PIECES {
+                    return false;
+                }
+                out.push(Seg { pa: c.paddr + (gpa - c.gpa), len: n as u32 });
+                gpa += n;
+                len -= n;
             }
-            gpa += n;
-            len -= n;
         }
         true
     }
@@ -77,77 +101,44 @@ impl Blkd {
         }
     }
 
-    /// Start one request on the device.  Returns the immediate status for
-    /// requests that are rejected without reaching it.
-    fn start(&mut self, req: &blk::Req) -> Result<(), u32> {
-        let ty = match req.op {
-            blk::OP_READ | blk::OP_GET_ID => req.op,
-            blk::OP_WRITE if self.read_only => return Err(blk::STATUS_IOERR),
-            blk::OP_WRITE => req.op,
-            blk::OP_FLUSH if !self.flush => return Err(blk::STATUS_OK),
-            blk::OP_FLUSH => req.op,
-            _ => return Err(blk::STATUS_UNSUPP),
-        };
+    /// Validate and start one request.
+    fn start(&mut self, req: &blk::Req, pieces: &mut Vec<Seg>) -> Result<(), u32> {
         if req.nr_segs as usize > blk::MAX_SEGS {
             return Err(blk::STATUS_IOERR);
         }
-        let s = self.free.pop().ok_or(blk::STATUS_IOERR)?;
-        let slot = &self.slots[s as usize];
-        let (table, hdr_va, hdr_pa) = (Mmio(slot.table_va), slot.hdr_va, slot.hdr_pa);
-        let hdr = Mmio(hdr_va);
-        hdr.w32(0, ty);
-        hdr.w32(4, 0);
-        hdr.w64(8, req.sector);
-        hdr.w8(16, 0xff);
-
-        // (address, length, flags) of each descriptor of the chain.
-        let mut descs = [(0u64, 0u32, 0u16); MAX_DESCS];
-        let mut n = 0usize;
-        descs[n] = (hdr_pa, 16, 0);
-        n += 1;
-        let mut ok = true;
-        for seg in &req.segs[..req.nr_segs as usize] {
-            let flags = if seg.flags & blk::SEG_WRITE != 0 { DESC_F_WRITE } else { 0 };
-            ok &= self.translate(seg.gpa, seg.len as u64, &mut |pa, len| {
-                if n + 1 >= MAX_DESCS {
-                    return false;
-                }
-                descs[n] = (pa, len, flags);
-                n += 1;
-                true
-            });
-        }
-        if !ok {
-            self.free.push(s);
+        let device_writes = match req.op {
+            blk::OP_READ => true,
+            blk::OP_WRITE if self.read_only => return Err(blk::STATUS_IOERR),
+            blk::OP_WRITE => false,
+            blk::OP_FLUSH if !self.flush => return Err(blk::STATUS_OK),
+            blk::OP_FLUSH => return self.drv.start(req.id, blk::OP_FLUSH, 0, &[]),
+            _ => return Err(blk::STATUS_UNSUPP),
+        };
+        let segs = &req.segs[..req.nr_segs as usize];
+        // Data direction must match the operation.
+        if segs.iter().any(|s| (s.flags & blk::SEG_WRITE != 0) != device_writes) {
             return Err(blk::STATUS_IOERR);
         }
-        descs[n] = (hdr_pa + 16, 1, DESC_F_WRITE);
-        n += 1;
-        for (i, &(addr, len, flags)) in descs[..n].iter().enumerate() {
-            let d = Mmio(table.0 + 16 * i);
-            let last = i + 1 == n;
-            d.w64(0, addr);
-            d.w32(8, len);
-            d.w16(12, if last { flags } else { flags | DESC_F_NEXT });
-            d.w16(14, if last { 0 } else { (i + 1) as u16 });
+        let bytes: u64 = segs.iter().map(|s| s.len as u64).sum();
+        let bs = self.block_size as u64;
+        if bytes == 0 || bytes % bs != 0 || (req.sector * 512) % bs != 0 {
+            return Err(blk::STATUS_IOERR);
         }
-
-        let slot = &mut self.slots[s as usize];
-        slot.id = req.id;
-        slot.busy = true;
-        self.vq.set_desc(s, slot.table_pa, (16 * n) as u32, DESC_F_INDIRECT, 0);
-        self.vq.submit(s);
-        Ok(())
+        if req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
+            return Err(blk::STATUS_IOERR);
+        }
+        if !self.translate(req, pieces) {
+            return Err(blk::STATUS_IOERR);
+        }
+        self.drv.start(req.id, req.op, self.lba_start + req.sector, pieces)
     }
 
-    /// Take requests from the channel while device slots are free.
+    /// Take requests from the channel while the device has room.
     fn submit(&mut self) -> bool {
         let mut started = false;
         let mut responded = false;
-        loop {
-            if self.free.is_empty() {
-                break;
-            }
+        let mut pieces = Vec::with_capacity(MAX_PIECES);
+        while self.drv.can_start() {
             let req = unsafe {
                 let tail = addr_of!((*self.chan).sq.tail).read_volatile();
                 if tail == addr_of!((*self.chan).sq.head).read_volatile() {
@@ -158,7 +149,7 @@ impl Blkd {
                 addr_of_mut!((*self.chan).sq.tail).write_volatile(tail.wrapping_add(1));
                 r
             };
-            match self.start(&req) {
+            match self.start(&req, &mut pieces) {
                 Ok(()) => started = true,
                 Err(status) => {
                     self.respond(req.id, status);
@@ -167,100 +158,67 @@ impl Blkd {
             }
         }
         if started {
-            self.vq.notify();
+            self.drv.kick();
         }
         responded
     }
 
     /// Reap completed requests.
     fn reap(&mut self) -> bool {
-        let mut any = false;
-        while let Some((id, _len)) = self.vq.pop_used() {
-            let Some(slot) = self.slots.get_mut(id as usize) else { continue };
-            if !slot.busy {
-                continue;
-            }
-            slot.busy = false;
-            let status = match Mmio(slot.hdr_va).r8(16) {
-                0 => blk::STATUS_OK,
-                2 => blk::STATUS_UNSUPP,
-                _ => blk::STATUS_IOERR,
-            };
-            let rid = slot.id;
-            self.free.push(id as u16);
-            self.respond(rid, status);
-            any = true;
+        let mut done = Vec::new();
+        self.drv.reap(&mut |tag, status| done.push((tag, status)));
+        for &(tag, status) in &done {
+            self.respond(tag, status);
         }
-        any
+        !done.is_empty()
     }
 }
 
 fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
     let id = info.header().id;
-    let dev = l4h_virtio::Device {
-        common: Mmio(cfg.common.va as usize),
-        notify: Mmio(cfg.notify.va as usize),
-        notify_mult: cfg.notify_off_multiplier,
-        device: Mmio(cfg.device.va as usize),
+    let drv: Box<dyn Driver> = match cfg.kind {
+        blk::BLKD_NVME => Box::new(nvme::Nvme::new(id, cfg)),
+        _ => Box::new(virtio::VirtioBlk::new(id, cfg)),
     };
-    let mut dma = Dma::new(cfg.dma_va as usize, cfg.dma_paddr, cfg.dma_size as usize);
-
-    dev.reset();
-    let offered = dev.features();
-    let want = F_VERSION_1 | F_INDIRECT_DESC;
-    if offered & want != want {
-        dev.fail();
-        panic!("blkd {:#x}: device lacks VERSION_1/INDIRECT_DESC (features {:#x})", id, offered);
+    let dev = drv.info();
+    let lba_start = cfg.lba_start.min(dev.capacity);
+    let mut sectors = dev.capacity - lba_start;
+    if cfg.lba_count != 0 {
+        sectors = sectors.min(cfg.lba_count);
     }
-    let features = want | (offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH));
-    if !dev.set_features(features) {
-        dev.fail();
-        panic!("blkd {:#x}: features rejected", id);
-    }
-    // MSI-X table entry 0 -> our interrupt, unmasked.
-    let msix = Mmio(cfg.msix_table.va as usize);
-    msix.w32(0, 0xfee0_0000);
-    msix.w32(4, 0);
-    msix.w32(8, cfg.msi_data);
-    msix.w32(12, 0);
-    let vq = dev.setup_queue(&mut dma, 0, blk::RING_SIZE as u16, 0).expect("blkd: queue 0");
-    let capacity = dev.device.r64(0);
-
-    let mut slots = Vec::new();
-    for _ in 0..vq.num {
-        let (table_va, table_pa) = dma.alloc(SLOT_TABLE, 16);
-        let (hdr_va, hdr_pa) = dma.alloc(32, 32);
-        slots.push(Slot { id: 0, busy: false, table_va, table_pa, hdr_va, hdr_pa });
-    }
+    let read_only = dev.read_only || cfg.read_only != 0;
     let chan = cfg.chan_va as *mut Channel;
     unsafe {
-        addr_of_mut!((*chan).capacity_sectors).write_volatile(capacity);
-        addr_of_mut!((*chan).read_only).write_volatile((features & VIRTIO_BLK_F_RO != 0) as u32);
+        addr_of_mut!((*chan).capacity_sectors).write_volatile(sectors);
+        addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
+        addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
         fence(Ordering::Release);
         addr_of_mut!((*chan).ready).write_volatile(1);
     }
-    let mut b = Blkd {
-        chan,
-        ram: cfg.ram_chunks[..cfg.nr_ram_chunks as usize].to_vec(),
-        free: (0..vq.num).rev().collect(),
-        vq,
-        slots,
-        done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE),
-        read_only: features & VIRTIO_BLK_F_RO != 0,
-        flush: features & VIRTIO_BLK_F_FLUSH != 0,
-    };
-    dev.driver_ok();
     sel4::debug_println!(
-        "blkd {:#x}: {:02x}:{:02x}.{}: {} MiB{}, queue size {}",
+        "blkd {:#x}: {:02x}:{:02x}.{} {}: {} MiB from sector {}, {}-byte blocks{}",
         id,
         cfg.pci_bdf >> 8,
         (cfg.pci_bdf >> 3) & 0x1f,
         cfg.pci_bdf & 7,
-        capacity >> 11,
-        if b.read_only { " read-only" } else { "" },
-        b.vq.num
+        if cfg.kind == blk::BLKD_NVME { "nvme" } else { "virtio-blk" },
+        sectors >> 11,
+        lba_start,
+        dev.block_size,
+        if read_only { ", read-only" } else { "" }
     );
+    let mut b = Blkd {
+        chan,
+        ram: cfg.ram_chunks[..cfg.nr_ram_chunks as usize].to_vec(),
+        drv,
+        lba_start,
+        sectors,
+        block_size: dev.block_size,
+        read_only,
+        flush: dev.flush,
+        done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE),
+    };
 
     let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
     let irq = cap::<cap_type::IrqHandler>(blk::BLKD_SLOT_IRQ);

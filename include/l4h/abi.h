@@ -305,14 +305,16 @@ enum l4h_ctl_op {
 	L4H_CTL_VM_DESTROY = 5,
 	/* args: first vm -> data: struct l4h_ctl_vm[], vals[0] = count */
 	L4H_CTL_VM_LIST = 6,
-	/* args: vm, disk index, read-only */
+	/* args: vm, disk index, read-only, first sector, sectors (0 = to the
+	 * end of the disk); sectors are 512 bytes */
 	L4H_CTL_BLK_ATTACH = 7,
 	/* args: vm, offset -> vals[0] = next offset, vals[1] = len,
 	 * vals[2] = bytes lost; data: console output */
 	L4H_CTL_CONSOLE_READ = 8,
 	/* args: vm, len; data: console input */
 	L4H_CTL_CONSOLE_WRITE = 9,
-	/* args: disk index -> vals: bdf, owner vm (or -1), capacity sectors */
+	/* args: disk index -> vals: bdf, owner vm (or -1), -, kind (0 virtio-blk,
+	 * 1 NVMe) */
 	L4H_CTL_DISK_INFO = 10,
 	/* -> vals[0] = switch */
 	L4H_CTL_SWITCH_CREATE = 11,

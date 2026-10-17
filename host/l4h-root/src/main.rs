@@ -184,8 +184,9 @@ impl Host {
         Some(id)
     }
 
-    /// Pass host disk `disk` through to guest `id` (before it starts).
-    pub fn attach_disk(&mut self, id: usize, disk: usize, read_only: bool) -> Result<(), i64> {
+    /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
+    /// of it; 0 = to the end) through to guest `id` before it starts.
+    pub fn attach_disk(&mut self, id: usize, disk: usize, read_only: bool, lba_start: u64, lba_count: u64) -> Result<(), i64> {
         if self.disks.get(disk).ok_or(ctl::ENOENT)?.owner.is_some() {
             return Err(ctl::EBUSY);
         }
@@ -200,6 +201,7 @@ impl Host {
                 &h.pci,
                 g,
                 d,
+                (read_only, lba_start, lba_count),
                 &mut h.devmem,
                 &mut h.alloc,
                 &mut h.wins.a,
@@ -301,7 +303,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
             d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
         );
-        if blkd::is_virtio_blk(&d) {
+        if blkd::is_disk(&d) {
             // Stop whatever the firmware left running.
             pci.disable(&d);
             let v = disks.len() as u64;
@@ -350,7 +352,7 @@ fn boot_dom0(h: &mut Host) {
     };
     let id = h.create_guest(&cfg).expect("cannot create dom0");
     for d in 0..h.disks.len().min(DOM0_DISKS) {
-        h.attach_disk(id, d, false).expect("attach disk to dom0");
+        h.attach_disk(id, d, false, 0, 0).expect("attach disk to dom0");
     }
     // Switch 0, with the first NIC (if any) as its uplink (on first boot).
     let sw = 0;

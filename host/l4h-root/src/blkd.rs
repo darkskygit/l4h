@@ -22,7 +22,7 @@ use crate::{AsidPools, HostInfo};
 static BLKD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-blkd.elf"));
 
 const PAGE: usize = 4096;
-const DMA_BITS: usize = 18;
+const DMA_BITS: usize = 21;
 /// Each BAR is mapped at MMIO_VA + bar * BAR_STRIDE.
 const BAR_STRIDE: usize = 0x100_0000;
 
@@ -35,6 +35,7 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 /// A virtio-blk PCI device that can be passed through to a guest.
 pub struct Disk {
     pub pci: pci::Device,
+    pub kind: u32,
     /// MSI vector (seL4 delivers vector n at CPU vector 0x30 + n).
     vector: u64,
     /// Frames of the BARs the driver uses, carved once.
@@ -46,7 +47,8 @@ pub struct Disk {
 
 impl Disk {
     pub fn new(pci: pci::Device, vector: u64) -> Self {
-        Disk { pci, vector, bars: Vec::new(), owner: None, read_only: false, driver: None }
+        let kind = if is_nvme(&pci) { blk::BLKD_NVME } else { blk::BLKD_VIRTIO };
+        Disk { pci, kind, vector, bars: Vec::new(), owner: None, read_only: false, driver: None }
     }
 }
 
@@ -55,6 +57,15 @@ pub fn is_virtio_blk(d: &pci::Device) -> bool {
         && (d.device == 0x1042 || d.device == 0x1001)
         && d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG)
         && d.msix.is_some()
+}
+
+pub fn is_nvme(d: &pci::Device) -> bool {
+    d.class == 0x01 && d.subclass == 0x08 && d.prog_if == 0x02 && d.msix.is_some() && d.bars[0].size >= 0x2000
+}
+
+/// Disks l4h can pass through.
+pub fn is_disk(d: &pci::Device) -> bool {
+    is_virtio_blk(d) || is_nvme(d)
 }
 
 struct Blkd {
@@ -76,6 +87,7 @@ pub fn attach(
     pci: &Pci,
     client: &mut Guest,
     dev_index: usize,
+    window: (bool, u64, u64),
     devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
@@ -85,7 +97,17 @@ pub fn attach(
     assert!(disk.driver.is_none());
     let d = &disk.pci;
     let bar_va = |b: u8| host::MMIO_VA + b as usize * BAR_STRIDE;
-    let VirtioRegions { common, notify, notify_mult: mult, isr, device, msix_table } = virtio_regions(d, bar_va);
+    let msix = d.msix.unwrap();
+    let msix_table = blk::PciRegion {
+        va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
+        len: msix.table_size as u64 * 16,
+    };
+    let (regions, mut bar_list) = if disk.kind == blk::BLKD_NVME {
+        (None, alloc::vec![0u8])
+    } else {
+        (Some(virtio_regions(d, bar_va)), virtio_bars(d))
+    };
+    bar_list.push(msix.table_bar);
 
     let mut arena = alloc.arena(8 << 20).expect("blkd arena");
 
@@ -107,14 +129,21 @@ pub fn attach(
         .collect();
 
     let mut cfg: alloc::boxed::Box<blk::BlkdConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
+    cfg.kind = disk.kind;
+    cfg.read_only = window.0 as u32;
+    cfg.lba_start = window.1;
+    cfg.lba_count = window.2;
+    cfg.bar0 = blk::PciRegion { va: bar_va(0) as u64, len: d.bars[0].size };
     cfg.pci_bdf = bdf(d);
     let vector = disk.vector;
     cfg.msi_data = 0x30 + vector as u32;
-    cfg.common = common;
-    cfg.notify = notify;
-    cfg.notify_off_multiplier = mult;
-    cfg.isr = isr;
-    cfg.device = device;
+    if let Some(VirtioRegions { common, notify, notify_mult, isr, device, .. }) = regions {
+        cfg.common = common;
+        cfg.notify = notify;
+        cfg.notify_off_multiplier = notify_mult;
+        cfg.isr = isr;
+        cfg.device = device;
+    }
     cfg.msix_table = msix_table;
     cfg.dma_va = host::DMA_VA as u64;
     cfg.dma_paddr = dma_paddr as u64;
@@ -153,7 +182,7 @@ pub fn attach(
     };
 
     // ---- Device BARs (uncached).
-    map_bars(&comp, alloc, &mut arena.pool, devmem, d, &mut disk.bars, bar_va, &mut keep_slot);
+    map_bars(&comp, alloc, &mut arena.pool, devmem, d, &mut disk.bars, &bar_list, bar_va, &mut keep_slot);
     for i in 0..n_dma {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
         comp.map_copy(alloc, &mut arena.pool, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -243,6 +272,15 @@ pub fn virtio_regions(d: &pci::Device, bar_va: impl Fn(u8) -> usize) -> VirtioRe
     }
 }
 
+/// BARs holding a virtio device's common, notify, ISR and device
+/// structures (types 1-4; PCI config access and shared memory are unused)
+/// and its MSI-X table.
+pub fn virtio_bars(d: &pci::Device) -> Vec<u8> {
+    let mut bars: Vec<u8> = d.virtio_caps.iter().filter(|c| (1..=4).contains(&c.cfg_type)).map(|c| c.bar).collect();
+    bars.extend(d.msix.map(|m| m.table_bar));
+    bars
+}
+
 /// Map the BARs holding `d`'s virtio structures and MSI-X table into
 /// `comp`, uncached.  BAR frames are carved once and cached in `cache`.
 #[allow(clippy::too_many_arguments)]
@@ -253,13 +291,11 @@ pub fn map_bars(
     devmem: &mut DevMem,
     d: &pci::Device,
     cache: &mut Vec<(u8, Vec<cap::Granule>)>,
+    bars: &[u8],
     bar_va: impl Fn(u8) -> usize,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
 ) {
-    // The common, notify, ISR and device structures (types 1-4); others
-    // (PCI config access, shared memory) are not used.
-    let mut bars: Vec<u8> = d.virtio_caps.iter().filter(|c| (1..=4).contains(&c.cfg_type)).map(|c| c.bar).collect();
-    bars.extend(d.msix.map(|m| m.table_bar));
+    let mut bars = bars.to_vec();
     bars.sort();
     bars.dedup();
     for b in bars {

@@ -225,7 +225,8 @@ struct CreateOpts {
     kernel: String,
     initrd: Option<String>,
     cmdline: String,
-    disks: Vec<(u64, bool)>,
+    /// (disk, read-only, first sector, sectors)
+    disks: Vec<(u64, bool, u64, u64)>,
     /// seL4 object quota (0: default).
     quota_mb: u64,
     /// (switch, MAC or 0, flags)
@@ -244,8 +245,8 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
     let resp = ctl.call(CTL_VM_CREATE, &[o.mem_mb << 20, o.vcpus, k.ram_base, o.quota_mb << 20], &name, &[])?;
     let vm = resp.vals[0];
     let r = (|| {
-        for &(disk, ro) in &o.disks {
-            ctl.call(CTL_BLK_ATTACH, &[vm, disk, ro as u64], &[], &[])?;
+        for &(disk, ro, start, sectors) in &o.disks {
+            ctl.call(CTL_BLK_ATTACH, &[vm, disk, ro as u64, start, sectors], &[], &[])?;
         }
         for &(sw, mac, flags) in &o.nics {
             let r = ctl.call(CTL_NIC_CREATE, &[vm, sw, mac, flags], &[], &[])?;
@@ -310,7 +311,7 @@ const USAGE: &str = "usage: l4hctl <command>
   disks                        host disks and their owners
   list                         VMs
   create NAME --kernel F [--initrd F] [--mem MB] [--vcpus N]
-         [--cmdline S] [--disk I[:ro]]...
+         [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
                                create and start a VM; prints its id
          [--nic SWITCH[,mac=MAC][,nolock]]...
   destroy VM                   stop a VM and free its resources
@@ -347,7 +348,8 @@ fn run(args: &[String]) -> Result<i32> {
                 let r = ctl.call(CTL_DISK_INFO, &[d], &[], &[])?;
                 let bdf = r.vals[0];
                 let owner = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("vm {}", r.vals[1]) };
-                println!("disk {d}: pci {:02x}:{:02x}.{} virtio-blk, owner {owner}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+                let kind = if r.vals[3] == 1 { "nvme" } else { "virtio-blk" };
+                println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
             }
         }
         "list" => {
@@ -406,12 +408,23 @@ fn run(args: &[String]) -> Result<i32> {
                     "--quota" => o.quota_mb = parse_num(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
-                        let v = val()?;
-                        let (d, ro) = match v.strip_suffix(":ro") {
-                            Some(d) => (d.to_string(), true),
-                            None => (v, false),
-                        };
-                        o.disks.push((parse_num(&d)?, ro));
+                        // DISK[,ro][,start=SECTOR][,sectors=N] (or DISK:ro)
+                        let v = val()?.replace(":ro", ",ro");
+                        let mut it = v.split(',');
+                        let d = parse_num(it.next().unwrap())?;
+                        let (mut ro, mut start, mut sectors) = (false, 0, 0);
+                        for opt in it {
+                            if opt == "ro" {
+                                ro = true;
+                            } else if let Some(n) = opt.strip_prefix("start=") {
+                                start = parse_num(n)?;
+                            } else if let Some(n) = opt.strip_prefix("sectors=") {
+                                sectors = parse_num(n)?;
+                            } else {
+                                return err(format!("--disk: unknown option {opt}"));
+                            }
+                        }
+                        o.disks.push((d, ro, start, sectors));
                     }
                     "--nic" => {
                         // SWITCH[,mac=MAC][,nolock]

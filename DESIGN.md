@@ -588,6 +588,26 @@ and no copy.
   per-guest IOPS and bandwidth limits using token buckets.
 - Multi-queue: one virtqueue per guest vCPU (`VIRTIO_BLK_F_MQ`), and one sDDF
   queue pair per guest.
+- **Revised during implementation (v1).**
+  - One `blkd` per attached disk, with no blk-mux: a disk, or a window of
+    one, belongs to exactly one guest.
+  - blkd has two drivers behind one trait:
+    - virtio-blk PCI, which uses an indirect descriptor table per request;
+    - NVMe, with one I/O queue pair and namespace 1. Its 4 KiB pages and
+      PRP lists are sized to the controller's MDTS. A request is split
+      into several commands when its pieces cannot share one PRP list.
+  - The common part checks every request:
+    - each segment's GPA lies in the client's RAM;
+    - the data direction matches the operation;
+    - the request is aligned to the logical block size, which is passed to
+      the guest as virtio `blk_size`;
+    - it stays within the LBA window (`start`/`sectors`).
+    Writes are refused on read-only attachments.
+  - There is still a single queue: no `VIRTIO_BLK_F_MQ`, discard or write
+    zeroes yet.
+  - Tested with QEMU NVMe at 512-byte and 4 KiB LBAs
+    (`BLKTEST_DEV=nvme tests/run-blktest.sh`), and with a read-only window
+    in `tests/run-ctltest.sh`.
 
 ### 8.3 Network: L2 virtual switches only
 
