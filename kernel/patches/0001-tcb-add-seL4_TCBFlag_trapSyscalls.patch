@@ -1,0 +1,202 @@
+From 21cea7fd1a3d681a0cab2d69c661e54793285d63 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sat, 17 Oct 2026 08:29:02 -0700
+Subject: [PATCH 1/3] tcb: add seL4_TCBFlag_trapSyscalls
+
+When set on a TCB, every syscall instruction executed by that thread is
+delivered to its fault handler as seL4_Fault_UnknownSyscall, regardless of
+the syscall number register. This allows running user code with a foreign
+system call ABI (e.g. Linux processes under a paravirtualised Linux kernel),
+where the seL4 syscall-number register (rdx on x86_64, x7 on aarch64) holds
+an arbitrary user value.
+
+The check is done on the slowpath and before dispatching to any fastpath on
+x86, Arm and RISC-V. Debug and benchmark syscalls are not interpreted for
+trapping threads.
+---
+ include/api/syscall.h                     |  3 +++
+ libsel4/include/interfaces/object-api.xml |  6 +++++-
+ libsel4/include/sel4/constants.h          |  5 +++++
+ src/api/syscall.c                         | 10 ++++++++++
+ src/arch/arm/c_traps.c                    | 12 +++++++++++-
+ src/arch/riscv/c_traps.c                  |  9 ++++++++-
+ src/arch/x86/c_traps.c                    |  7 +++++--
+ 7 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/include/api/syscall.h b/include/api/syscall.h
+index 42cb8fb5e..ab818621b 100644
+--- a/include/api/syscall.h
++++ b/include/api/syscall.h
+@@ -30,6 +30,9 @@
+ #endif
+ 
+ exception_t handleSyscall(syscall_t syscall);
++
++/* True if every syscall from the thread must be delivered as a fault. */
++#define threadTrapsSyscalls(_t) (!!((_t)->tcbFlags & seL4_TCBFlag_trapSyscalls))
+ exception_t handleInterruptEntry(void);
+ exception_t handleUnknownSyscall(word_t w);
+ exception_t handleUserLevelFault(word_t w_a, word_t w_b);
+diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
+index c5b1f1267..37885cbb0 100644
+--- a/libsel4/include/interfaces/object-api.xml
++++ b/libsel4/include/interfaces/object-api.xml
+@@ -840,7 +840,11 @@
+             </brief>
+             <description>
+                 A newly created TCB has all flags cleared.
+-                Currently the only flag supported is <texttt text="seL4_TCBFlag_fpuDisabled"/>.
++                Supported flags are <texttt text="seL4_TCBFlag_fpuDisabled"/> and
++                <texttt text="seL4_TCBFlag_trapSyscalls"/>. When <texttt text="seL4_TCBFlag_trapSyscalls"/>
++                is set, every system call instruction executed by the thread raises an unknown-syscall
++                fault (see <autoref label="sec:faults"/>) regardless of the syscall number, allowing
++                user code that follows a different system call ABI to be run under a fault handler.
+                 The flags are cleared and set in the given order, i.e. when a flag is both cleared and set, it will be set.
+                 Unknown flags are ignored. Use zero for both clear and set to retrieve the current flags value.
+             </description>
+diff --git a/libsel4/include/sel4/constants.h b/libsel4/include/sel4/constants.h
+index 921eff675..c356a1395 100644
+--- a/libsel4/include/sel4/constants.h
++++ b/libsel4/include/sel4/constants.h
+@@ -73,9 +73,14 @@ typedef enum {
+ typedef enum {
+     seL4_TCBFlag_NoFlag = 0x0,
+     seL4_TCBFlag_fpuDisabled = 0x1,
++    /* Every syscall instruction executed by the thread raises an
++     * seL4_Fault_UnknownSyscall instead of being interpreted as an seL4
++     * system call. Used to run foreign-ABI (e.g. Linux) user code. */
++    seL4_TCBFlag_trapSyscalls = 0x2,
+ 
+     SEL4_FORCE_LONG_ENUM(seL4_TCBFlag),
+     seL4_TCBFlag_MASK = seL4_TCBFlag_NoFlag
++                        | seL4_TCBFlag_trapSyscalls
+ #ifdef CONFIG_HAVE_FPU
+                         | seL4_TCBFlag_fpuDisabled
+ #endif
+diff --git a/src/api/syscall.c b/src/api/syscall.c
+index ec8880760..dc17ee69f 100644
+--- a/src/api/syscall.c
++++ b/src/api/syscall.c
+@@ -96,6 +96,16 @@ exception_t handleInterruptEntry(void)
+ 
+ exception_t handleUnknownSyscall(word_t w)
+ {
++    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++        MCS_DO_IF_BUDGET({
++            current_fault = seL4_Fault_UnknownSyscall_new(w);
++            handleFault(NODE_STATE(ksCurThread));
++        })
++        schedule();
++        activateThread();
++        return EXCEPTION_NONE;
++    }
++
+ #ifdef CONFIG_PRINTING
+     if (w == SysDebugPutChar) {
+         kernel_putchar(getRegister(NODE_STATE(ksCurThread), capRegister));
+diff --git a/src/arch/arm/c_traps.c b/src/arch/arm/c_traps.c
+index 8104d73df..ba14e9169 100644
+--- a/src/arch/arm/c_traps.c
++++ b/src/arch/arm/c_traps.c
+@@ -101,7 +101,8 @@ void VISIBLE NORETURN c_handle_interrupt(void)
+ 
+ void NORETURN slowpath(syscall_t syscall)
+ {
+-    if (unlikely(syscall < SYSCALL_MIN || syscall > SYSCALL_MAX)) {
++    if (unlikely(syscall < SYSCALL_MIN || syscall > SYSCALL_MAX ||
++                 threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
+ #ifdef TRACK_KERNEL_ENTRIES
+         ksKernelEntry.path = Entry_UnknownSyscall;
+         /* ksKernelEntry.word word is already set to syscall */
+@@ -142,6 +143,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
+     NODE_LOCK_SYS;
+ 
+     c_entry_hook();
++    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++        slowpath(SysCall);
++    }
+ #ifdef TRACK_KERNEL_ENTRIES
+     benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
+     ksKernelEntry.is_fastpath = 1;
+@@ -159,6 +163,9 @@ void VISIBLE c_handle_fastpath_signal(word_t cptr, word_t msgInfo)
+     NODE_LOCK_SYS;
+ 
+     c_entry_hook();
++    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++        slowpath(SysSend);
++    }
+ #ifdef TRACK_KERNEL_ENTRIES
+     benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
+     ksKernelEntry.is_fastpath = 1;
+@@ -179,6 +186,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
+     NODE_LOCK_SYS;
+ 
+     c_entry_hook();
++    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++        slowpath(SysReplyRecv);
++    }
+ #ifdef TRACK_KERNEL_ENTRIES
+     benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
+     ksKernelEntry.is_fastpath = 1;
+diff --git a/src/arch/riscv/c_traps.c b/src/arch/riscv/c_traps.c
+index bae151662..e6609fdf9 100644
+--- a/src/arch/riscv/c_traps.c
++++ b/src/arch/riscv/c_traps.c
+@@ -141,7 +141,8 @@ void VISIBLE NORETURN c_handle_exception(void)
+ 
+ void VISIBLE NORETURN slowpath(syscall_t syscall)
+ {
+-    if (unlikely(syscall < SYSCALL_MIN || syscall > SYSCALL_MAX)) {
++    if (unlikely(syscall < SYSCALL_MIN || syscall > SYSCALL_MAX ||
++                 threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
+ #ifdef TRACK_KERNEL_ENTRIES
+         ksKernelEntry.path = Entry_UnknownSyscall;
+ #endif /* TRACK_KERNEL_ENTRIES */
+@@ -171,6 +172,9 @@ void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
+     NODE_LOCK_SYS;
+ 
+     c_entry_hook();
++    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++        slowpath(SysReplyRecv);
++    }
+ #ifdef TRACK_KERNEL_ENTRIES
+     benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
+     ksKernelEntry.is_fastpath = 1;
+@@ -189,6 +193,9 @@ void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
+     NODE_LOCK_SYS;
+ 
+     c_entry_hook();
++    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++        slowpath(SysCall);
++    }
+ #ifdef TRACK_KERNEL_ENTRIES
+     benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
+     ksKernelEntry.is_fastpath = 1;
+diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
+index 99ffc2a61..a2e04c9ad 100644
+--- a/src/arch/x86/c_traps.c
++++ b/src/arch/x86/c_traps.c
+@@ -115,7 +115,8 @@ void NORETURN slowpath(syscall_t syscall)
+     }
+ #endif
+     /* check for undefined syscall */
+-    if (unlikely(syscall < SYSCALL_MIN || syscall > SYSCALL_MAX)) {
++    if (unlikely(syscall < SYSCALL_MIN || syscall > SYSCALL_MAX ||
++                 threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
+ #ifdef TRACK_KERNEL_ENTRIES
+         ksKernelEntry.path = Entry_UnknownSyscall;
+         /* ksKernelEntry.word word is already set to syscall */
+@@ -167,7 +168,9 @@ void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t sy
+ #endif /* TRACK_KERNEL_ENTRIES */
+ 
+ #ifdef CONFIG_FASTPATH
+-    if (syscall == (syscall_t)SysCall) {
++    if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++        /* handled as a fault by slowpath */
++    } else if (syscall == (syscall_t)SysCall) {
+         fastpath_call(cptr, msgInfo);
+         UNREACHABLE();
+     } else if (syscall == (syscall_t)SysReplyRecv) {
+-- 
+2.47.3
+

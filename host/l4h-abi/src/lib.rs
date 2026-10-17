@@ -1,0 +1,156 @@
+//! Rust mirror of `include/l4h/abi.h`, the l4h guest <-> host ABI.
+//!
+//! The C header is authoritative; the layout assertions at the bottom of
+//! this file catch drift.
+
+#![no_std]
+
+pub const ABI_VERSION: u64 = 1;
+
+pub const ROOT_CNODE_BITS: usize = 12;
+pub const L2_INDEX_BITS: usize = 18;
+pub const ROOT_GUARD_BITS: usize = 64 - ROOT_CNODE_BITS - L2_INDEX_BITS;
+
+pub const fn cptr2(root: usize, idx: usize) -> u64 {
+    ((root as u64) << L2_INDEX_BITS) | idx as u64
+}
+pub const fn cptr(root: usize) -> u64 {
+    cptr2(root, 0)
+}
+
+pub const SLOT_META: usize = 1;
+pub const CNODE_CPTR: u64 = cptr2(SLOT_META, 0);
+pub const ROOT_DEPTH: usize = ROOT_GUARD_BITS + ROOT_CNODE_BITS;
+pub const SLOT_VSPACE: usize = 2;
+pub const SLOT_HYP_EP: usize = 3;
+
+pub const SLOT_UNTYPED_BASE: usize = 16;
+pub const MAX_UNTYPED: usize = 48;
+
+pub const SLOT_VCPU_BASE: usize = 64;
+pub const VCPU_STRIDE: usize = 8;
+pub const MAX_VCPUS: usize = 64;
+pub const fn slot_vcpu(v: usize) -> usize {
+    SLOT_VCPU_BASE + v * VCPU_STRIDE
+}
+pub const VCPU_KTCB: usize = 0;
+pub const VCPU_EP: usize = 1;
+pub const VCPU_NTFN: usize = 2;
+pub const VCPU_SC_U: usize = 4;
+pub const VCPU_IPI: usize = 5;
+pub const VCPU_IPCBUF: usize = 6;
+pub const VCPU_EVENT: usize = 7;
+
+pub const SLOT_RAM_CNODE_BASE: usize = 576;
+pub const MAX_RAM_CNODES: usize = 64;
+pub const RAM_CNODE_FRAMES: usize = 1 << L2_INDEX_BITS;
+
+pub const SLOT_VSPACE_POOL: usize = 640;
+pub const SLOT_DEV_CNODE: usize = 641;
+pub const SLOT_DYN_BASE: usize = 1024;
+
+pub const SPECIAL_BASE: u64 = 0x0000_7ff0_0000_0000;
+pub const BOOTINFO_VA: u64 = SPECIAL_BASE;
+pub const BOOTINFO_SIZE: u64 = 0x4000;
+pub const fn vcpu_area_va(v: usize) -> u64 {
+    SPECIAL_BASE + 0x10_0000 + v as u64 * 0x4000
+}
+pub const fn vcpu_ipcbuf_va(v: usize) -> u64 {
+    vcpu_area_va(v)
+}
+pub const fn vcpu_event_va(v: usize) -> u64 {
+    vcpu_area_va(v) + 0x1000
+}
+pub const FPU_SCRATCH_OFFSET: usize = 2048;
+pub const fn dev_area_va(d: usize) -> u64 {
+    SPECIAL_BASE + 0x1000_0000 + d as u64 * 0x1_0000
+}
+pub const SPECIAL_END: u64 = SPECIAL_BASE + 0x4000_0000;
+
+pub const PRIO_KERNEL: u64 = 100;
+pub const PRIO_USER: u64 = 99;
+
+pub const BADGE_TIMER: u64 = 1 << 0;
+pub const BADGE_IPI: u64 = 1 << 1;
+pub const BADGE_EVENT: u64 = 1 << 2;
+pub const EP_BADGE_TASK: u64 = 1 << 62;
+
+pub const NR_EVENTS: usize = 512;
+
+#[repr(C)]
+pub struct EventPage {
+    pub pending: [u64; NR_EVENTS / 64],
+    pub steal_ns: u64,
+    pub reserved: [u64; 503],
+}
+
+pub const BOOTINFO_MAGIC: u64 = 0x3154_4f4f_4248_344c;
+pub const MAX_DEVICES: usize = 64;
+pub const CMDLINE_SIZE: usize = 2048;
+
+pub const DEV_NONE: u32 = 0;
+pub const DEV_VIRTIO: u32 = 1;
+pub const DEV_CONSOLE: u32 = 2;
+pub const DEV_CTL: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DevDesc {
+    pub ty: u32,
+    pub virtio_id: u32,
+    pub page_va: u64,
+    pub page_size: u64,
+    pub event: u32,
+    pub kick_slot: u32,
+    pub reserved: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct UntypedDesc {
+    pub size_bits: u64,
+}
+
+#[repr(C)]
+pub struct BootInfo {
+    pub magic: u64,
+    pub abi_version: u64,
+    pub guest_id: u64,
+    pub ram_base_va: u64,
+    pub ram_size: u64,
+    pub kernel_end_gpa: u64,
+    pub initrd_gpa: u64,
+    pub initrd_size: u64,
+    pub nr_vcpus: u64,
+    pub tsc_hz: u64,
+    pub nr_untyped: u64,
+    pub nr_vspaces: u64,
+    pub nr_devices: u64,
+    pub flags: u64,
+    pub reserved: [u64; 18],
+    pub untyped: [UntypedDesc; MAX_UNTYPED],
+    pub devices: [DevDesc; MAX_DEVICES],
+    pub cmdline: [u8; CMDLINE_SIZE],
+}
+
+pub const BOOT_DOM0: u64 = 1 << 0;
+
+pub const HC_CONSOLE_WRITE: u64 = 1;
+pub const HC_POWER: u64 = 2;
+pub const HC_DEV_WRITE: u64 = 3;
+pub const HC_DEV_READ: u64 = 4;
+pub const HC_SET_IRQ_AFFINITY: u64 = 5;
+pub const HC_GET_TIME: u64 = 6;
+pub const HC_CONSOLE_MAX_WORDS: usize = 32;
+
+pub const POWER_OFF: u64 = 0;
+pub const POWER_REBOOT: u64 = 1;
+pub const POWER_CRASH: u64 = 2;
+
+const _: () = assert!(core::mem::size_of::<EventPage>() == 4096);
+const _: () = assert!(core::mem::size_of::<DevDesc>() == 48);
+const _: () = assert!(
+    core::mem::size_of::<BootInfo>()
+        == 32 * 8 + MAX_UNTYPED * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE
+);
+const _: () = assert!(core::mem::size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);

@@ -1,0 +1,262 @@
+From bbc385271f651808b2ddd1549a072370fa7b13d9 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sat, 17 Oct 2026 08:32:05 -0700
+Subject: [PATCH 3/3] mcs: add per-TCB deadline timers (seL4_TCB_SetTimer)
+
+Allow user level to arm a one-shot, absolute deadline timer that signals a
+badge to the TCB's bound notification when it expires. Armed timers are
+kept in a per-core queue sorted by deadline, and the queue head is taken
+into account when programming the MCS kernel's one-shot timer, so no
+additional hardware timer is needed.
+
+This gives user-level OS personalities (e.g. paravirtualised guest
+kernels) a cheap clock-event device on platforms without a spare timer
+device such as cloud VMs without HPET.
+---
+ include/kernel/thread.h                   |  4 ++
+ include/model/statedata.h                 |  1 +
+ include/object/structures.h               |  9 +++
+ libsel4/include/interfaces/object-api.xml | 21 +++++++
+ src/kernel/thread.c                       | 68 +++++++++++++++++++++++
+ src/model/statedata.c                     |  2 +
+ src/object/objecttype.c                   |  1 +
+ src/object/tcb.c                          | 24 ++++++++
+ 8 files changed, 130 insertions(+)
+
+diff --git a/include/kernel/thread.h b/include/kernel/thread.h
+index 4a828f6bc..da4ce5bbc 100644
+--- a/include/kernel/thread.h
++++ b/include/kernel/thread.h
+@@ -307,6 +307,10 @@ void setNextInterrupt(void);
+ 
+ /* Wake any periodic threads that are ready for budget recharge */
+ void awaken(void);
++
++/* Deadline timers (seL4_TCB_SetTimer) */
++void timerQueueRemove(tcb_t *tcb);
++void timerQueueInsert(tcb_t *tcb, ticks_t deadline, word_t badge);
+ /* Place the thread bound to this scheduling context in the release queue
+  * of periodic threads waiting for budget recharge */
+ void postpone(sched_context_t *sc);
+diff --git a/include/model/statedata.h b/include/model/statedata.h
+index e1b4830ac..64f3de48f 100644
+--- a/include/model/statedata.h
++++ b/include/model/statedata.h
+@@ -65,6 +65,7 @@ NODE_STATE_DECLARE(tcb_t, *ksSchedulerAction);
+ 
+ #ifdef CONFIG_KERNEL_MCS
+ NODE_STATE_DECLARE(tcb_queue_t, ksReleaseQueue);
++NODE_STATE_DECLARE(tcb_t *, ksTimerQueue);
+ NODE_STATE_DECLARE(ticks_t, ksConsumed);
+ NODE_STATE_DECLARE(ticks_t, ksCurTime);
+ NODE_STATE_DECLARE(bool_t, ksReprogram);
+diff --git a/include/object/structures.h b/include/object/structures.h
+index 340f24e60..5023c7031 100644
+--- a/include/object/structures.h
++++ b/include/object/structures.h
+@@ -274,6 +274,15 @@ struct tcb {
+ 
+     /* scheduling context that this tcb yielded to */
+     sched_context_t *tcbYieldTo;
++
++    /* Deadline timer (seL4_TCB_SetTimer): absolute deadline in timer ticks,
++     * or 0 if disarmed; the badge signalled to the bound notification; the
++     * core whose timer queue holds the TCB; and the queue links. */
++    ticks_t tcbTimerDeadline;
++    word_t tcbTimerBadge;
++    word_t tcbTimerCore;
++    struct tcb *tcbTimerNext;
++    struct tcb *tcbTimerPrev;
+ #else
+     /* Timeslice remaining, 1 word */
+     word_t tcbTimeSlice;
+diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
+index 1f433596e..705c27010 100644
+--- a/libsel4/include/interfaces/object-api.xml
++++ b/libsel4/include/interfaces/object-api.xml
+@@ -916,6 +916,27 @@
+                 </description>
+             </error>
+         </method>
++        <method id="TCBSetTimer" name="SetTimer" manual_name="Set Deadline Timer" manual_label="tcb_settimer">
++            <condition><config var="CONFIG_KERNEL_MCS"/></condition>
++            <brief>
++                Arm or disarm a one-shot deadline timer that signals the TCB's bound notification.
++            </brief>
++            <description>
++                When the kernel's timer reaches <texttt text="deadline"/> the given badge is signalled
++                to the notification bound to the target TCB (if any) and the timer is disarmed. The
++                deadline is absolute and expressed in the kernel timer's ticks, which on x86 is the
++                TSC and on Arm the generic timer counter, so it can be computed from a user-level
++                read of the same counter. Re-arming replaces any previous deadline; a deadline of
++                zero disarms the timer. Only available on MCS kernels.
++            </description>
++            <param dir="in" name="deadline" type="seL4_Uint64" description="Absolute deadline in timer ticks, or 0 to disarm."/>
++            <param dir="in" name="badge" type="seL4_Word" description="Badge to signal to the bound notification."/>
++            <error name="seL4_IllegalOperation">
++                <description>
++                    The <texttt text="_service"/> is a CPtr to a capability of the wrong type.
++                </description>
++            </error>
++        </method>
+     </interface>
+ 
+     <interface name="seL4_CNode" manual_name="CNode">
+diff --git a/src/kernel/thread.c b/src/kernel/thread.c
+index 581327f64..4435fff24 100644
+--- a/src/kernel/thread.c
++++ b/src/kernel/thread.c
+@@ -619,6 +619,11 @@ void setNextInterrupt(void)
+         next_interrupt = MIN(rlq_head_refill.rTime, next_interrupt);
+     }
+ 
++    tcb_t *timer_head = NODE_STATE(ksTimerQueue);
++    if (timer_head != NULL) {
++        next_interrupt = MIN(next_interrupt, MAX(timer_head->tcbTimerDeadline, NODE_STATE(ksCurTime)));
++    }
++
+     /* We should never be attempting to schedule anything earlier than ksCurTime */
+     assert(next_interrupt >= NODE_STATE(ksCurTime));
+ 
+@@ -743,8 +748,71 @@ static void tcbReleaseDequeue(void)
+     possibleSwitchTo(awakened);
+ }
+ 
++void timerQueueRemove(tcb_t *tcb)
++{
++    if (tcb->tcbTimerDeadline == 0) {
++        return;
++    }
++    if (tcb->tcbTimerPrev) {
++        tcb->tcbTimerPrev->tcbTimerNext = tcb->tcbTimerNext;
++    } else {
++        NODE_STATE_ON_CORE(ksTimerQueue, tcb->tcbTimerCore) = tcb->tcbTimerNext;
++    }
++    if (tcb->tcbTimerNext) {
++        tcb->tcbTimerNext->tcbTimerPrev = tcb->tcbTimerPrev;
++    }
++    tcb->tcbTimerNext = NULL;
++    tcb->tcbTimerPrev = NULL;
++    tcb->tcbTimerDeadline = 0;
++}
++
++void timerQueueInsert(tcb_t *tcb, ticks_t deadline, word_t badge)
++{
++    timerQueueRemove(tcb);
++    if (deadline == 0) {
++        return;
++    }
++
++    tcb_t *prev = NULL;
++    tcb_t *next = NODE_STATE(ksTimerQueue);
++    while (next != NULL && next->tcbTimerDeadline <= deadline) {
++        prev = next;
++        next = next->tcbTimerNext;
++    }
++
++    tcb->tcbTimerDeadline = deadline;
++    tcb->tcbTimerBadge = badge;
++    tcb->tcbTimerCore = getCurrentCPUIndex();
++    tcb->tcbTimerPrev = prev;
++    tcb->tcbTimerNext = next;
++    if (prev) {
++        prev->tcbTimerNext = tcb;
++    } else {
++        NODE_STATE(ksTimerQueue) = tcb;
++        NODE_STATE(ksReprogram) = true;
++    }
++    if (next) {
++        next->tcbTimerPrev = tcb;
++    }
++}
++
++static void fireTimers(void)
++{
++    while (NODE_STATE(ksTimerQueue) != NULL &&
++           NODE_STATE(ksTimerQueue)->tcbTimerDeadline <= NODE_STATE(ksCurTime) + getTimerPrecision()) {
++        tcb_t *tcb = NODE_STATE(ksTimerQueue);
++        word_t badge = tcb->tcbTimerBadge;
++        timerQueueRemove(tcb);
++        if (tcb->tcbBoundNotification) {
++            sendSignal(tcb->tcbBoundNotification, badge);
++        }
++        NODE_STATE(ksReprogram) = true;
++    }
++}
++
+ void awaken(void)
+ {
++    fireTimers();
+     while (unlikely(release_q_non_empty_and_ready())) {
+         tcbReleaseDequeue();
+     }
+diff --git a/src/model/statedata.c b/src/model/statedata.c
+index 6b238fb90..568548723 100644
+--- a/src/model/statedata.c
++++ b/src/model/statedata.c
+@@ -28,6 +28,8 @@ compile_assert(ksReadyQueuesL1BitmapBigEnough, (L2_BITMAP_SIZE - 1) <= wordBits)
+ #ifdef CONFIG_KERNEL_MCS
+ /* Head of the queue of threads waiting for their budget to be replenished */
+ UP_STATE_DEFINE(tcb_queue_t, ksReleaseQueue);
++/* Armed deadline timers on this core, sorted by deadline */
++UP_STATE_DEFINE(tcb_t *, ksTimerQueue);
+ #endif
+ 
+ /* Current thread TCB pointer */
+diff --git a/src/object/objecttype.c b/src/object/objecttype.c
+index e6c603623..82ea3041c 100644
+--- a/src/object/objecttype.c
++++ b/src/object/objecttype.c
+@@ -190,6 +190,7 @@ finaliseCap_ret_t finaliseCap(cap_t cap, bool_t final, bool_t exposed)
+             cte_ptr = TCB_PTR_CTE_PTR(tcb, tcbCTable);
+             unbindNotification(tcb);
+ #ifdef CONFIG_KERNEL_MCS
++            timerQueueRemove(tcb);
+             sched_context_t *sc = SC_PTR(tcb->tcbSchedContext);
+             if (sc) {
+                 schedContext_unbindTCB(sc);
+diff --git a/src/object/tcb.c b/src/object/tcb.c
+index dde25aee9..6bb2503e0 100644
+--- a/src/object/tcb.c
++++ b/src/object/tcb.c
+@@ -925,6 +925,25 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
+ }
+ #endif /* CONFIG_HAVE_FPU */
+ 
++#ifdef CONFIG_KERNEL_MCS
++static exception_t decodeSetTimer(cap_t cap, word_t length, word_t *buffer)
++{
++    if (length < TIME_ARG_SIZE + 1) {
++        userError("TCB SetTimer: Truncated message.");
++        current_syscall_error.type = seL4_TruncatedMessage;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++
++    ticks_t deadline = mode_parseTimeArg(0, buffer);
++    word_t badge = getSyscallArg(TIME_ARG_SIZE, buffer);
++    tcb_t *thread = TCB_PTR(cap_thread_cap_get_capTCBPtr(cap));
++
++    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
++    timerQueueInsert(thread, deadline, badge);
++    return EXCEPTION_NONE;
++}
++#endif /* CONFIG_KERNEL_MCS */
++
+ /* The following functions sit in the syscall error monad, but include the
+  * exception cases for the preemptible bottom end, as they call the invoke
+  * functions directly.  This is a significant deviation from the Haskell
+@@ -1021,6 +1040,11 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+     case TCBSetFlags:
+         return decodeSetFlags(cap, length, call, buffer);
+ 
++#ifdef CONFIG_KERNEL_MCS
++    case TCBSetTimer:
++        return decodeSetTimer(cap, length, buffer);
++#endif
++
+ #ifdef CONFIG_HAVE_FPU
+     case TCBReadFPU:
+         return decodeFPUTransfer(cap, length, buffer, true);
+-- 
+2.47.3
+
