@@ -1,0 +1,25 @@
+#!/bin/sh
+# Block pass-through test: /dev/vda is an ext4 image prepared by
+# tests/run-blktest.sh with /hello.txt; write /guest.txt back.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+echo "BLKTEST: start"
+fail() { echo "BLKTEST: FAIL: $*"; poweroff -f; }
+[ -b /dev/vda ] || fail "no /dev/vda"
+echo "BLKTEST: vda $(cat /sys/block/vda/size) sectors"
+dd if=/dev/vda of=/dev/null bs=1M count=16 2>/dev/null || fail "raw read"
+mount -t ext4 /dev/vda /mnt || fail "mount"
+grep -q "hello from the host" /mnt/hello.txt || fail "hello.txt content"
+# Write a few MiB with a known pattern and read it back after a remount.
+dd if=/dev/urandom of=/tmp/pat bs=1M count=8 2>/dev/null
+cp /tmp/pat /mnt/pat || fail "write"
+echo "written by the l4h guest" > /mnt/guest.txt
+sync
+umount /mnt || fail "umount"
+echo 3 > /proc/sys/vm/drop_caches
+mount -t ext4 /dev/vda /mnt || fail "remount"
+cmp /tmp/pat /mnt/pat || fail "readback mismatch"
+umount /mnt
+echo "BLKTEST: PASS"
+poweroff -f

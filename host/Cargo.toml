@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["l4h-abi", "l4h-root"]
+members = ["l4h-abi", "l4h-host", "l4h-rt", "l4h-root", "l4h-vmm", "l4h-blkd"]
+default-members = ["l4h-root"]
 
 [workspace.package]
 edition = "2024"

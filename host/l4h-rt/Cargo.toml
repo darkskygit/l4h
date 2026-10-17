@@ -1,0 +1,17 @@
+[package]
+name = "l4h-rt"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+sel4.workspace = true
+l4h-host = { path = "../l4h-host" }
+one-shot-mutex = "0.2.1"
+sel4-dlmalloc = { path = "../../third_party/rust-sel4/crates/sel4-dlmalloc" }
+sel4-panicking-env = { path = "../../third_party/rust-sel4/crates/sel4-panicking/env" }
+sel4-runtime-common = { path = "../../third_party/rust-sel4/crates/sel4-runtime-common", features = ["sel4"] }
+
+[dependencies.sel4-panicking]
+path = "../../third_party/rust-sel4/crates/sel4-panicking"
+features = ["personality", "panic-handler", "alloc"]

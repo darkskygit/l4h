@@ -6,9 +6,14 @@
 
 extern crate alloc;
 
-mod mem;
+mod blkd;
+mod component;
+mod devmem;
 mod elf;
 mod guest;
+mod mem;
+mod pci;
+mod vmm;
 mod vspace;
 mod window;
 
@@ -18,9 +23,10 @@ use sel4::init_thread::slot;
 use sel4::{ObjectBlueprint, cap, cap_type};
 use sel4_root_task::{Never, root_task};
 
-use l4h_abi as abi;
+use l4h_host as host;
 
 use crate::mem::{Alloc, Slots, UtPool};
+use crate::component::ROOT_BADGE_COMPONENT;
 use crate::guest::{Guest, GuestConfig, HYP_BADGE_FAULT, hyp_badge_guest, hyp_badge_vcpu};
 
 pub const RETYPE_FAN_OUT: usize = 16384;
@@ -130,7 +136,20 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let mut asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)] };
     let mut win = window::Window::new(&mut alloc);
 
+    // PCI devices.  For now every virtio-blk device is passed to dom0.
+    let pci = pci::Pci::new(&mut alloc);
+    let pci_devs = pci.enumerate();
+    for d in &pci_devs {
+        sel4::debug_println!(
+            "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
+            d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
+        );
+    }
+    let blk_devs: Vec<&pci::Device> = pci_devs.iter().filter(|d| blkd::is_virtio_blk(d)).collect();
+    let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
+
     let mut guests: Vec<Guest> = Vec::new();
+    let mut drivers = Vec::new();
     if DOM0_KERNEL.is_empty() {
         sel4::debug_println!("l4h-root: no dom0 kernel embedded, nothing to do");
     } else {
@@ -144,8 +163,21 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             initrd: DOM0_INITRD,
             cmdline: DOM0_CMDLINE.trim(),
             dom0: true,
+            devices: &blk_devs.iter().map(|_| guest::GuestDev { virtio_id: 2 }).collect::<Vec<_>>(),
         };
-        guests.push(guest::build(0, &cfg, &mut alloc, &mut win, &mut asids, &host));
+        let mut g = guest::build(0, &cfg, &mut alloc, &mut win, &mut asids, &host);
+        let mut backends = Vec::new();
+        for (i, d) in blk_devs.iter().enumerate() {
+            let (b, backend) = blkd::spawn(
+                0x100 + i as u32, d, &pci, &mut g, i, &mut devmem, &mut alloc, &mut win, &mut asids, &host,
+            );
+            component::start(&b.comp);
+            drivers.push(b);
+            backends.push(backend);
+        }
+        let v = vmm::spawn(&mut g, &backends, &mut alloc, &mut win, &mut asids, &host);
+        component::start(&v.comp);
+        guests.push(g);
     }
 
     serve(&host, &mut alloc, reply, &mut guests)
@@ -222,37 +254,58 @@ fn serve(host: &HostInfo, alloc: &mut Alloc, mut reply: cap::Reply, guests: &mut
             (info, badge) = host.hyp_ep.recv(reply);
             continue;
         }
-        let resp = match info.label() {
-            abi::HC_CONSOLE_WRITE => {
-                let len = (mr(0) as usize).min(abi::HC_CONSOLE_MAX_WORDS * 8);
-                for i in 0..len {
-                    let w = mr(1 + i / 8);
-                    sel4::debug_put_char((w >> ((i % 8) * 8)) as u8);
+        if badge & ROOT_BADGE_COMPONENT != 0 {
+            let resp = component_call(badge, &info, guests);
+            match resp {
+                Some(v) => {
+                    set_mr(0, v);
+                    (info, badge) = host.hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 1), reply);
                 }
-                0
-            }
-            abi::HC_POWER => {
-                sel4::debug_println!("l4h-root: guest {} power request {}", gid, mr(0));
-                if let Some(g) = guests.get_mut(gid) {
-                    for v in &g.vcpus {
-                        let _ = v.ktcb.tcb_suspend();
-                    }
-                    g.running = false;
+                None => {
+                    abandon(&mut reply);
+                    (info, badge) = host.hyp_ep.recv(reply);
                 }
-                if guests.iter().all(|g| !g.running) {
-                    sel4::debug_println!("l4h-root: all guests stopped");
+            }
+            continue;
+        }
+        sel4::debug_println!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
+        abandon(&mut reply);
+        (info, badge) = host.hyp_ep.recv(reply);
+    }
+}
+
+/// A call or fault from a host component.  Returns the reply value, or
+/// None to leave the caller blocked.
+fn component_call(badge: u64, info: &sel4::MessageInfo, guests: &mut [Guest]) -> Option<u64> {
+    let id = (badge & 0xffff) as usize;
+    if badge & HYP_BADGE_FAULT != 0 {
+        let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
+        sel4::debug_println!("l4h-root: component {:#x} fault: {:x?}", id, fault);
+        return None;
+    }
+    match info.label() {
+        host::ROOT_CALL_VMM_READY => {
+            let g = guests.get_mut(mr(0) as usize)?;
+            g.start();
+            Some(0)
+        }
+        host::ROOT_CALL_GUEST_POWER => {
+            let gid = mr(0) as usize;
+            sel4::debug_println!("l4h-root: guest {} power request {}", gid, mr(1));
+            if let Some(g) = guests.get_mut(gid) {
+                for v in &g.vcpus {
+                    let _ = v.ktcb.tcb_suspend();
                 }
-                abandon(&mut reply);
-                (info, badge) = host.hyp_ep.recv(reply);
-                continue;
+                g.running = false;
             }
-            abi::HC_GET_TIME => 0,
-            other => {
-                sel4::debug_println!("l4h-root: guest {} unknown hypercall {}", gid, other);
-                u64::MAX
+            if guests.iter().all(|g| !g.running) {
+                sel4::debug_println!("l4h-root: all guests stopped");
             }
-        };
-        set_mr(0, resp);
-        (info, badge) = host.hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 1), reply);
+            Some(0)
+        }
+        other => {
+            sel4::debug_println!("l4h-root: component {:#x}: unknown call {}", id, other);
+            Some(u64::MAX)
+        }
     }
 }

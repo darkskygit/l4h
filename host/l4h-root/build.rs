@@ -1,10 +1,17 @@
-// Embeds the dom0 guest images named by $L4H_DOM0_KERNEL / $L4H_DOM0_INITRD
-// (empty placeholders when unset) and the dom0 command line.
+// Embeds the dom0 guest images named by $L4H_DOM0_KERNEL / $L4H_DOM0_INITRD,
+// the host components ($L4H_VMM_ELF, $L4H_BLKD_ELF; built by
+// tools/build-host.sh) -- empty placeholders when unset -- and the dom0
+// command line.
 use std::{env, fs, path::PathBuf};
 
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for (var, file) in [("L4H_DOM0_KERNEL", "dom0-kernel"), ("L4H_DOM0_INITRD", "dom0-initrd")] {
+    for (var, file) in [
+        ("L4H_DOM0_KERNEL", "dom0-kernel"),
+        ("L4H_DOM0_INITRD", "dom0-initrd"),
+        ("L4H_VMM_ELF", "l4h-vmm.elf"),
+        ("L4H_BLKD_ELF", "l4h-blkd.elf"),
+    ] {
         println!("cargo:rerun-if-env-changed={var}");
         let data = match env::var(var) {
             Ok(path) if !path.is_empty() => {

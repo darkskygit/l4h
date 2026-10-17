@@ -135,6 +135,50 @@ pub struct BootInfo {
 
 pub const BOOT_DOM0: u64 = 1 << 0;
 
+pub const VIRTIO_MAGIC: u32 = 0x7634_686c;
+pub const VIRTIO_MAX_QUEUES: usize = 16;
+pub const VIRTIO_CONFIG_OFF: usize = 2048;
+pub const VIRTIO_CONFIG_SIZE: usize = 2048;
+pub const VIRTIO_ISR_VRING: u32 = 1;
+pub const VIRTIO_ISR_CONFIG: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VirtqRegs {
+    pub num_max: u32,
+    pub num: u32,
+    pub ready: u32,
+    pub reserved: u32,
+    pub desc: u64,
+    pub driver: u64,
+    pub device: u64,
+}
+
+#[repr(C)]
+pub struct VirtioRegs {
+    pub magic: u32,
+    pub version: u32,
+    pub device_id: u32,
+    pub vendor_id: u32,
+    pub device_features: u64,
+    pub driver_features: u64,
+    pub status: u32,
+    pub config_generation: u32,
+    pub num_queues: u32,
+    pub isr: u32,
+    pub kick: u64,
+    pub irq_vcpu: u32,
+    pub reserved0: u32,
+    pub reserved: [u64; 3],
+    pub queues: [VirtqRegs; VIRTIO_MAX_QUEUES],
+}
+
+pub const VIRTIO_OP_STATUS: u64 = 1;
+pub const VIRTIO_OP_FEATURES: u64 = 2;
+pub const VIRTIO_OP_QUEUE: u64 = 3;
+pub const VIRTIO_OP_CONFIG: u64 = 4;
+pub const VIRTIO_OP_IRQ_VCPU: u64 = 5;
+
 pub const HC_CONSOLE_WRITE: u64 = 1;
 pub const HC_POWER: u64 = 2;
 pub const HC_DEV_WRITE: u64 = 3;
@@ -154,3 +198,5 @@ const _: () = assert!(
         == 32 * 8 + MAX_UNTYPED * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE
 );
 const _: () = assert!(core::mem::size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
+const _: () = assert!(core::mem::size_of::<VirtioRegs>() == 88 + 16 * 40);
+const _: () = assert!(core::mem::size_of::<VirtioRegs>() <= VIRTIO_CONFIG_OFF);

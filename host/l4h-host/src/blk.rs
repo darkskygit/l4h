@@ -1,0 +1,117 @@
+//! blkd <-> client (l4h-vmm) block request queue.
+//!
+//! A channel is one shared region: a header, a submission ring and a
+//! completion ring of fixed-size entries.  Data is never copied: requests
+//! carry guest-physical segments, which blkd validates against the
+//! client's RAM chunks (configured by l4h-root) and translates for DMA.
+
+pub const MAX_SEGS: usize = 16;
+pub const RING_SIZE: usize = 128;
+
+pub const OP_READ: u32 = 0;
+pub const OP_WRITE: u32 = 1;
+pub const OP_FLUSH: u32 = 4;
+pub const OP_DISCARD: u32 = 11;
+pub const OP_WRITE_ZEROES: u32 = 13;
+pub const OP_GET_ID: u32 = 8;
+
+pub const STATUS_OK: u32 = 0;
+pub const STATUS_IOERR: u32 = 1;
+pub const STATUS_UNSUPP: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Seg {
+    pub gpa: u64,
+    pub len: u32,
+    /// SEG_WRITE: the device writes this segment (reads from the disk).
+    pub flags: u32,
+}
+
+pub const SEG_WRITE: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Req {
+    pub id: u64,
+    pub op: u32,
+    pub nr_segs: u32,
+    pub sector: u64,
+    pub segs: [Seg; MAX_SEGS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Resp {
+    pub id: u64,
+    pub status: u32,
+    pub reserved: u32,
+}
+
+/// Single-producer single-consumer ring indices.  `head` is written by the
+/// producer, `tail` by the consumer; both increase monotonically.
+#[repr(C)]
+pub struct RingIdx {
+    pub head: u32,
+    pub pad0: [u32; 15],
+    pub tail: u32,
+    pub pad1: [u32; 15],
+}
+
+#[repr(C)]
+pub struct Channel {
+    pub sq: RingIdx,
+    pub cq: RingIdx,
+    /// Written by blkd before it sets `ready`.
+    pub capacity_sectors: u64,
+    pub read_only: u32,
+    pub ready: u32,
+    pub reserved: [u32; 12],
+    pub reqs: [Req; RING_SIZE],
+    pub resps: [Resp; RING_SIZE],
+}
+
+/// Notification badges of blkd: the client kicked the channel, the device
+/// interrupted.
+pub const BLKD_BADGE_KICK: u64 = 1 << 0;
+pub const BLKD_BADGE_IRQ: u64 = 1 << 1;
+
+/// blkd CSpace slots (beyond the common ones).
+pub const BLKD_SLOT_IRQ: u64 = 16;
+/// Notification of the client, badged with its "done" bit.
+pub const BLKD_SLOT_CLIENT_DONE: u64 = 17;
+
+/// A virtio-pci structure: BAR-relative location, mapped by l4h-root.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PciRegion {
+    pub va: u64,
+    pub len: u64,
+}
+
+pub const BLKD_MAX_RAM_CHUNKS: usize = 16;
+
+/// Configuration of a blkd driving one virtio-blk-pci device for one
+/// client.
+#[repr(C)]
+pub struct BlkdConfig {
+    pub pci_bdf: u32,
+    /// MSI data of MSI-X table entry 0 (the queue interrupt).
+    pub msi_data: u32,
+    pub common: PciRegion,
+    pub notify: PciRegion,
+    pub notify_off_multiplier: u32,
+    pub reserved0: u32,
+    pub isr: PciRegion,
+    pub device: PciRegion,
+    pub msix_table: PciRegion,
+    /// DMA memory: physically contiguous, mapped at dma_va.
+    pub dma_va: u64,
+    pub dma_paddr: u64,
+    pub dma_size: u64,
+    /// The client's channel and its guest RAM (GPA -> physical address).
+    pub chan_va: u64,
+    pub nr_ram_chunks: u32,
+    pub reserved1: u32,
+    pub ram_chunks: [crate::RamChunk; BLKD_MAX_RAM_CHUNKS],
+}

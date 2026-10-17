@@ -134,12 +134,45 @@ name = "l4h-abi"
 version = "0.1.0"
 
 [[package]]
+name = "l4h-blkd"
+version = "0.1.0"
+dependencies = [
+ "l4h-rt",
+]
+
+[[package]]
+name = "l4h-host"
+version = "0.1.0"
+
+[[package]]
 name = "l4h-root"
 version = "0.1.0"
 dependencies = [
  "l4h-abi",
+ "l4h-host",
  "sel4",
  "sel4-root-task",
+]
+
+[[package]]
+name = "l4h-rt"
+version = "0.1.0"
+dependencies = [
+ "l4h-host",
+ "one-shot-mutex",
+ "sel4",
+ "sel4-dlmalloc",
+ "sel4-panicking",
+ "sel4-panicking-env",
+ "sel4-runtime-common",
+]
+
+[[package]]
+name = "l4h-vmm"
+version = "0.1.0"
+dependencies = [
+ "l4h-abi",
+ "l4h-rt",
 ]
 
 [[package]]
@@ -193,6 +226,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "one-shot-mutex"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbb10614a03e671fcbb7f1421656788f9a761aab44563b83b07140c354fa9334"
+dependencies = [
+ "lock_api",
 ]
 
 [[package]]

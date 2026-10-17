@@ -198,13 +198,68 @@ struct l4h_bootinfo {
 #define L4H_BOOT_DOM0           (1ull << 0)
 
 /* ------------------------------------------------------------------------
+ * virtio-l4h: the shared device page of an L4H_DEV_VIRTIO device.
+ *
+ * The guest reads registers directly.  Fields with side effects (status,
+ * driver features, queue setup, config writes) are written to the page and
+ * then committed with L4H_HC_DEV_WRITE(device index, L4H_VIRTIO_OP_*).
+ * Queue notifications: the guest atomically sets bit q in `kick` and then
+ * signals the device's kick notification (L4H_SLOT_DEV_CNODE[kick_slot]).
+ * Interrupts: the host atomically sets bits in `isr` and raises the
+ * device's event line on the vCPU in `irq_vcpu`.
+ */
+#define L4H_VIRTIO_MAGIC        0x7634686cu /* "lh4v" */
+#define L4H_VIRTIO_MAX_QUEUES   16
+#define L4H_VIRTIO_CONFIG_OFF   2048
+#define L4H_VIRTIO_CONFIG_SIZE  2048
+
+#define L4H_VIRTIO_ISR_VRING    1u
+#define L4H_VIRTIO_ISR_CONFIG   2u
+
+struct l4h_virtq_regs {
+	l4h_u32 num_max;        /* RO: maximum queue size, 0 if absent */
+	l4h_u32 num;            /* RW: queue size chosen by the driver */
+	l4h_u32 ready;          /* RW: committed with L4H_VIRTIO_OP_QUEUE */
+	l4h_u32 reserved;
+	l4h_u64 desc;           /* RW: guest-physical addresses */
+	l4h_u64 driver;
+	l4h_u64 device;
+};
+
+struct l4h_virtio_regs {
+	l4h_u32 magic;
+	l4h_u32 version;        /* 1 */
+	l4h_u32 device_id;      /* VIRTIO_ID_* */
+	l4h_u32 vendor_id;
+	l4h_u64 device_features;
+	l4h_u64 driver_features;
+	l4h_u32 status;
+	l4h_u32 config_generation;
+	l4h_u32 num_queues;
+	l4h_u32 isr;
+	l4h_u64 kick;
+	l4h_u32 irq_vcpu;
+	l4h_u32 reserved0;
+	l4h_u64 reserved[3];
+	struct l4h_virtq_regs queues[L4H_VIRTIO_MAX_QUEUES];
+};
+
+enum l4h_virtio_op {
+	L4H_VIRTIO_OP_STATUS = 1,       /* status written (0 = reset) */
+	L4H_VIRTIO_OP_FEATURES = 2,     /* driver_features written */
+	L4H_VIRTIO_OP_QUEUE = 3,        /* MR2 = queue index: ready/num/addresses */
+	L4H_VIRTIO_OP_CONFIG = 4,       /* MR2 = offset, MR3 = length written */
+	L4H_VIRTIO_OP_IRQ_VCPU = 5,     /* irq_vcpu written */
+};
+
+/* ------------------------------------------------------------------------
  * Hypercalls: seL4_Call(L4H_SLOT_HYP_EP) with the label below, arguments
  * in message registers, result in MR0.
  */
 enum l4h_hypercall {
 	L4H_HC_CONSOLE_WRITE = 1,   /* MR0 = len (<= 8*L4H_HC_CONSOLE_MAX_WORDS), MR1.. = bytes */
 	L4H_HC_POWER = 2,           /* MR0 = L4H_POWER_* */
-	L4H_HC_DEV_WRITE = 3,       /* MR0 = device index, MR1 = register, MR2 = value */
+	L4H_HC_DEV_WRITE = 3,       /* MR0 = device index, MR1 = L4H_VIRTIO_OP_*, MR2.. = args */
 	L4H_HC_DEV_READ = 4,        /* MR0 = device index, MR1 = register; returns MR0 */
 	L4H_HC_SET_IRQ_AFFINITY = 5,/* MR0 = device index, MR1 = vCPU */
 	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */

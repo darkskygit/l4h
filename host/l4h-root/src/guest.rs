@@ -9,6 +9,7 @@ use sel4::init_thread::slot;
 use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
+use l4h_host as host;
 
 use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
 use crate::elf::Elf;
@@ -41,6 +42,18 @@ pub struct GuestConfig<'a> {
     pub initrd: &'a [u8],
     pub cmdline: &'a str,
     pub dom0: bool,
+    /// virtio devices, by boot info index.
+    pub devices: &'a [GuestDev],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GuestDev {
+    pub virtio_id: u32,
+}
+
+/// Event line of boot info device `d`.
+pub fn dev_event(d: usize) -> u32 {
+    16 + d as u32
 }
 
 /// A physically contiguous range of guest RAM.
@@ -54,6 +67,7 @@ pub struct RamChunk {
 pub struct Vcpu {
     pub ktcb: cap::Tcb,
     pub ntfn: cap::Notification,
+    pub event: cap::Granule,
     pub core: usize,
 }
 
@@ -68,6 +82,14 @@ pub struct Guest {
     pub ram_cnodes: Vec<(cap::CNode, usize)>,
     pub vcpus: Vec<Vcpu>,
     pub running: bool,
+    pub dom0: bool,
+    /// Objects l4h-vmm serves the guest with: its endpoint (the guest's
+    /// HYP_EP), its bound notification (device kicks) and the device pages.
+    pub vmm_ep: cap::Endpoint,
+    pub vmm_ntfn: cap::Notification,
+    pub dev_pages: Vec<cap::Granule>,
+    pub devices: Vec<GuestDev>,
+    entry: u64,
 }
 
 fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -79,7 +101,7 @@ fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
 }
 
 impl Guest {
-    fn ctx<'a>(&'a mut self, alloc: &'a mut Alloc) -> ObjCtx<'a> {
+    pub fn ctx<'a>(&'a mut self, alloc: &'a mut Alloc) -> ObjCtx<'a> {
         ObjCtx { slots: &mut alloc.slots, pool: &mut self.arena.pool }
     }
 
@@ -102,7 +124,7 @@ impl Guest {
     }
 
     /// The frame capability backing guest-physical address `gpa`.
-    fn ram_frame(&self, gpa: usize) -> sel4::AbsoluteCPtr {
+    pub fn ram_frame(&self, gpa: usize) -> sel4::AbsoluteCPtr {
         let (cn, radix) = self.ram_cnodes[gpa / GIB];
         cn.absolute_cptr_from_bits_with_depth(((gpa / PAGE) % abi::RAM_CNODE_FRAMES) as u64, radix)
     }
@@ -159,7 +181,8 @@ pub fn build(
         + ram / 256
         + cfg.vcpus * (64 << 10)
         + cfg.vspaces * PAGE
-        + (2 << 20));
+        + (2 << 20))
+        + crate::vmm::arena_bytes(ram, cfg.vcpus, cfg.devices.len());
     let arena = alloc.arena(overhead).expect("out of memory for guest arena");
 
     // Guest root CNode.
@@ -183,6 +206,12 @@ pub fn build(
         ram_cnodes: Vec::new(),
         vcpus: Vec::new(),
         running: false,
+        dom0: cfg.dom0,
+        vmm_ep: cap::Endpoint::from_bits(0),
+        vmm_ntfn: cap::Notification::from_bits(0),
+        dev_pages: Vec::new(),
+        devices: cfg.devices.to_vec(),
+        entry: elf.entry,
     };
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();
@@ -290,8 +319,29 @@ pub fn build(
     let dev_cn = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
     g.give_badged(abi::SLOT_DEV_CNODE, dev_cn, CapRights::all(), guard6);
 
-    // ---- Hypercall endpoint.
-    g.give_badged(abi::SLOT_HYP_EP, host.hyp_ep, sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(), hyp_badge(id, 0));
+    // ---- Hypercall endpoint (served by l4h-vmm) and devices.
+    g.vmm_ep = g.arena.object_cap::<cap_type::Endpoint>(&mut alloc.slots, ObjectBlueprint::Endpoint);
+    g.vmm_ntfn = g.arena.object_cap::<cap_type::Notification>(&mut alloc.slots, ObjectBlueprint::Notification);
+    g.give_badged(
+        abi::SLOT_HYP_EP,
+        g.vmm_ep,
+        sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(),
+        host::VMM_BADGE_HYPERCALL,
+    );
+    for d in 0..cfg.devices.len() {
+        let page = g.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+        let (vspace, ntfn) = (g.vspace, g.vmm_ntfn);
+        let mut ctx = g.ctx(alloc);
+        // The guest maps a copy; the original is kept for l4h-vmm.
+        let copy = ctx.slots.alloc();
+        abs(root_cap::<cap_type::Null>(copy)).copy(&abs(page), CapRights::all()).expect("device page copy");
+        map_frame(&mut ctx, vspace, root_cap::<cap_type::Granule>(copy), abi::dev_area_va(d) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
+        dev_cn
+            .absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS)
+            .mint(&abs(ntfn), CapRights::write_only(), 1 << (host::VMM_BADGE_KICK_SHIFT as usize + d))
+            .expect("device kick cap");
+        g.dev_pages.push(page);
+    }
 
     // ---- vCPUs.
     for v in 0..cfg.vcpus {
@@ -341,7 +391,7 @@ pub fn build(
         g.give_badged(base + abi::VCPU_IPI, ntfn, CapRights::write_only(), abi::BADGE_IPI);
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.push(Vcpu { ktcb, ntfn, core });
+        g.vcpus.push(Vcpu { ktcb, ntfn, event, core });
     }
 
     // ---- Boot info.
@@ -364,6 +414,18 @@ pub fn build(
     }
     bi.nr_vspaces = cfg.vspaces as u64;
     bi.flags = if cfg.dom0 { abi::BOOT_DOM0 } else { 0 };
+    bi.nr_devices = cfg.devices.len() as u64;
+    for (d, dev) in cfg.devices.iter().enumerate() {
+        bi.devices[d] = abi::DevDesc {
+            ty: abi::DEV_VIRTIO,
+            virtio_id: dev.virtio_id,
+            page_va: abi::dev_area_va(d),
+            page_size: PAGE as u64,
+            event: dev_event(d),
+            kick_slot: d as u32,
+            reserved: [0; 2],
+        };
+    }
     let n = cfg.cmdline.len().min(abi::CMDLINE_SIZE - 1);
     bi.cmdline[..n].copy_from_slice(&cfg.cmdline.as_bytes()[..n]);
 
@@ -382,17 +444,22 @@ pub fn build(
         map_frame(&mut g.ctx(alloc), vspace, frame, abi::BOOTINFO_VA as usize + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
     }
 
-    // ---- Start vCPU 0 at the kernel entry point.
-    let mut regs = sel4::UserContext::default();
-    *regs.pc_mut() = elf.entry;
-    *regs.c_param_mut(0) = abi::BOOTINFO_VA;
-    g.vcpus[0].ktcb.tcb_write_all_registers(true, &mut regs).expect("start vCPU 0");
-    g.running = true;
-
     sel4::debug_println!(
-        "l4h-root: guest {} '{}' started: {} MiB RAM in {} chunk(s) at {:#x}, {} vCPU(s), {} MiB untyped",
+        "l4h-root: guest {} '{}' built: {} MiB RAM in {} chunk(s) at {:#x}, {} vCPU(s), {} MiB untyped",
         id, g.name, ram >> 20, g.ram.len(), ram_base, cfg.vcpus,
         untyped.iter().map(|b| 1usize << b).sum::<usize>() >> 20
     );
     g
+}
+
+impl Guest {
+    /// Start vCPU 0 at the kernel entry point.
+    pub fn start(&mut self) {
+        let mut regs = sel4::UserContext::default();
+        *regs.pc_mut() = self.entry;
+        *regs.c_param_mut(0) = abi::BOOTINFO_VA;
+        self.vcpus[0].ktcb.tcb_write_all_registers(true, &mut regs).expect("start vCPU 0");
+        self.running = true;
+        sel4::debug_println!("l4h-root: guest {} '{}' started", self.id, self.name);
+    }
 }
