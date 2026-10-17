@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["l4h-root"]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause"
+version = "0.1.0"
+
+[workspace.dependencies]
+sel4 = { path = "../third_party/rust-sel4/crates/sel4" }
+sel4-root-task = { path = "../third_party/rust-sel4/crates/sel4-root-task" }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+debug = true

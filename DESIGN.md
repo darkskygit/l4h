@@ -767,9 +767,9 @@ l4h/
 **Test environment.** This machine has KVM, so QEMU uses it only as a fast
 CPU to mimic a cloud VM. The guest CPU is `-cpu host,-vmx -smp 4`, with
 `virtio-blk-pci`, `nvme` and `virtio-net-pci` devices, and UEFI via OVMF or
-plain multiboot. seL4 never uses VT-x. Note that this dev box has only about
-2 GiB of RAM, so the 30-guest test uses tiny busybox guests of about 32 MiB
-each.
+plain multiboot. seL4 never uses VT-x. The dev box has 32 GiB of RAM, which
+is reported as less because of host ballooning. The 30-guest test therefore
+uses a 16 GiB QEMU machine and guests of 256–512 MiB.
 
 **Milestones:**
 

@@ -1,0 +1,9 @@
+[package]
+name = "l4h-root"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+sel4.workspace = true
+sel4-root-task.workspace = true

@@ -1,0 +1,9 @@
+[submodule "kernel/seL4"]
+	path = kernel/seL4
+	url = https://github.com/seL4/seL4.git
+[submodule "third_party/sddf"]
+	path = third_party/sddf
+	url = https://github.com/au-ts/sddf.git
+[submodule "third_party/rust-sel4"]
+	path = third_party/rust-sel4
+	url = https://github.com/seL4/rust-sel4.git
