@@ -131,13 +131,15 @@ static inline uint64_t rdtsc(void)
 #define FPU_V0_OFFSET		160
 #endif
 
-/* ---- object allocation from the untyped quota into dynamic root slots */
+/* ---- object allocation into dynamic root slots, from the first block of
+ * RAM the host gives us as an Untyped (DESIGN.md §15.2) */
 static seL4_Word next_slot = L4H_SLOT_DYN_BASE;
+#define OBJ_UT		L4H_BLOCK_CPTR(bi->boot_blocks)
 
 static seL4_CPtr alloc_obj(seL4_Word type, seL4_Word size_bits)
 {
 	seL4_Word slot = next_slot++;
-	int err = seL4_Untyped_Retype(L4H_CPTR(L4H_SLOT_UNTYPED_BASE), type, size_bits,
+	int err = seL4_Untyped_Retype(OBJ_UT, type, size_bits,
 				      L4H_CNODE_CPTR, 0, 0, slot, 1);
 	CHECK(err == 0, "retype err=", err);
 	return L4H_CPTR(slot);
@@ -207,8 +209,8 @@ extern char user_prog[], user_debug[];
 /* ---- seL4 semantics of Untyped copies (DESIGN.md §15.2)
  *
  * l4h-root keeps the original Untyped of each 2 MiB block of guest RAM and
- * gives the guest a copy.  Check, on a 2 MiB Untyped `orig` with a copy
- * `copy` (playing l4h-root's and the guest's caps):
+ * gives the guest a copy.  Check, on a 1 MiB Untyped `orig` (a child of a
+ * block) with a copy `copy`, playing l4h-root's and the guest's caps:
  *   - while the copy exists, the original cannot be retyped;
  *   - objects retyped from the copy can be revoked through the copy;
  *   - a retype from a copy without children starts again at its base and
@@ -230,25 +232,28 @@ static void ut_map(seL4_CPtr frame, seL4_Word va)
 	map_user_page(L4H_CPTR(L4H_SLOT_VSPACE), frame, va, seL4_ReadWrite);
 }
 
+#define UT_BITS		20
+#define UT_FRAMES	(1 << (UT_BITS - 12))
+
 static void untyped_copy_test(seL4_CPtr quota)
 {
 	seL4_Word orig_slot = next_slot++, copy_slot = next_slot++;
 	seL4_CPtr orig = L4H_CPTR(orig_slot), copy = L4H_CPTR(copy_slot);
 	int err;
 
-	err = seL4_Untyped_Retype(quota, seL4_UntypedObject, 21, L4H_CNODE_CPTR, 0, 0, orig_slot, 1);
-	CHECK(err == 0, "2 MiB untyped err=", err);
+	err = seL4_Untyped_Retype(quota, seL4_UntypedObject, UT_BITS, L4H_CNODE_CPTR, 0, 0, orig_slot, 1);
+	CHECK(err == 0, "1 MiB untyped err=", err);
 	err = seL4_CNode_Copy(L4H_CNODE_CPTR, copy_slot, L4H_ROOT_DEPTH, L4H_CNODE_CPTR, orig_slot,
 			      L4H_ROOT_DEPTH, seL4_AllRights);
 	CHECK(err == 0, "untyped copy err=", err);
 
 	/* Frames from the copy, the last one mapped and written. */
 	seL4_Word f0 = next_slot;
-	next_slot += 512;
-	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 512);
+	next_slot += UT_FRAMES;
+	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, UT_FRAMES);
 	CHECK(err == 0, "frames from the copy err=", err);
 	volatile uint64_t *p = (volatile uint64_t *)UT_TEST_VA;
-	ut_map(L4H_CPTR(f0 + 511), UT_TEST_VA);
+	ut_map(L4H_CPTR(f0 + UT_FRAMES - 1), UT_TEST_VA);
 	p[0] = 0x1234567890abcdefull;
 	CHECK(p[0] == 0x1234567890abcdefull, "frame write", p[0]);
 
@@ -263,20 +268,20 @@ static void untyped_copy_test(seL4_CPtr quota)
 	/* Revoking the copy deletes its frames and their mappings. */
 	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, copy_slot, L4H_ROOT_DEPTH);
 	CHECK(err == 0, "revoke copy err=", err);
-	err = ut_unmap(L4H_CPTR(f0 + 511));
+	err = ut_unmap(L4H_CPTR(f0 + UT_FRAMES - 1));
 	CHECK(err == seL4_InvalidCapability, "frame after revoke err=", err);
 
 	/* The copy has no children: the next retype resets it.  A CNode
 	 * that fills the whole block fits again, so the free index went back
 	 * to 0; then frames again, which must read as zero. */
 	seL4_Word cn = next_slot++;
-	err = seL4_Untyped_Retype(copy, seL4_CapTableObject, 21 - seL4_SlotBits, L4H_CNODE_CPTR, 0, 0, cn, 1);
-	CHECK(err == 0, "2 MiB CNode from the reset copy err=", err);
+	err = seL4_Untyped_Retype(copy, seL4_CapTableObject, UT_BITS - seL4_SlotBits, L4H_CNODE_CPTR, 0, 0, cn, 1);
+	CHECK(err == 0, "CNode filling the reset copy err=", err);
 	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, copy_slot, L4H_ROOT_DEPTH);
 	CHECK(err == 0, "revoke copy (CNode) err=", err);
-	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 512);
+	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, UT_FRAMES);
 	CHECK(err == 0, "frames again err=", err);
-	ut_map(L4H_CPTR(f0 + 511), UT_TEST_VA);
+	ut_map(L4H_CPTR(f0 + UT_FRAMES - 1), UT_TEST_VA);
 	CHECK(p[0] == 0, "reset memory not zeroed: ", p[0]);
 
 	/* Revoking the original (teardown by l4h-root) deletes the copy and
@@ -285,12 +290,55 @@ static void untyped_copy_test(seL4_CPtr quota)
 	CHECK(err == 0, "revoke original err=", err);
 	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, next_slot, 1);
 	CHECK(err == seL4_InvalidCapability, "copy after revoke of the original err=", err);
-	err = ut_unmap(L4H_CPTR(f0 + 511));
+	err = ut_unmap(L4H_CPTR(f0 + UT_FRAMES - 1));
 	CHECK(err == seL4_InvalidCapability, "frame after revoke of the original err=", err);
 	/* And the original is usable again. */
 	err = seL4_Untyped_Retype(orig, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 1);
 	CHECK(err == 0, "original after revoke err=", err);
 	puts("testguest: Untyped copies: retype/revoke through a copy, reset, teardown by the original: ok\n");
+}
+
+/* The RAM the host gives us: boot blocks have frames and no Untyped, the
+ * others an Untyped we can retype into frames, revoke and reset. */
+static void ram_blocks_test(void)
+{
+	uint64_t b = bi->boot_blocks + 2;
+	seL4_CPtr ut = L4H_BLOCK_CPTR(b);
+	int err;
+
+	CHECK(bi->nr_blocks * L4H_BLOCK_SIZE == bi->ram_size, "nr_blocks=", bi->nr_blocks);
+	CHECK(bi->boot_blocks > 0 && bi->boot_blocks + 3 <= bi->nr_blocks, "boot_blocks=", bi->boot_blocks);
+	puthex("testguest: RAM blocks: ", bi->nr_blocks);
+	puthex("testguest: boot blocks: ", bi->boot_blocks);
+	err = seL4_Untyped_Retype(L4H_BLOCK_CPTR(0), UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, next_slot, 1);
+	CHECK(err != 0, "boot block has an Untyped", 0);
+	/* Frames of a whole block, mapped and written. */
+	seL4_Word f0 = next_slot;
+	next_slot += 512;
+	err = seL4_Untyped_Retype(ut, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 512);
+	CHECK(err == 0, "block frames err=", err);
+	volatile uint64_t *p = (volatile uint64_t *)UT_TEST_VA;
+	ut_map(L4H_CPTR(f0 + 511), UT_TEST_VA);
+	p[0] = 0xfeedfacecafebeefull;
+	/* Our copy cannot be copied while it has children. */
+	err = seL4_CNode_Copy(L4H_CNODE_CPTR, next_slot, L4H_ROOT_DEPTH, L4H_CNODE_CPTR, ut, 64, seL4_AllRights);
+	CHECK(err != 0, "copy of a block with children", 0);
+	/* Revoke, then the whole block as one CNode (the Untyped was reset),
+	 * then frames again, zeroed. */
+	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, ut, 64);
+	CHECK(err == 0, "block revoke err=", err);
+	seL4_Word cn = next_slot++;
+	err = seL4_Untyped_Retype(ut, seL4_CapTableObject, L4H_BLOCK_SHIFT - seL4_SlotBits, L4H_CNODE_CPTR, 0, 0, cn, 1);
+	CHECK(err == 0, "block CNode err=", err);
+	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, ut, 64);
+	CHECK(err == 0, "block revoke err=", err);
+	err = seL4_Untyped_Retype(ut, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 512);
+	CHECK(err == 0, "block frames again err=", err);
+	ut_map(L4H_CPTR(f0 + 511), UT_TEST_VA);
+	CHECK(p[0] == 0, "reset block not zeroed: ", p[0]);
+	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, ut, 64);
+	CHECK(err == 0, "block revoke err=", err);
+	puts("testguest: RAM blocks: boot frames, Untyped copies retyped, revoked and reset: ok\n");
 }
 
 /* ---- the I/O pool, from a hostile driver's point of view
@@ -510,7 +558,7 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 	seL4_CPtr reply = alloc_obj(seL4_ReplyObject, 0);
 	seL4_CPtr fault_ep = mint_cap(vcpu + L4H_VCPU_EP, seL4_AllRights, L4H_EP_BADGE_TASK | 1);
 	/* User threads get an empty CSpace; with trapSyscalls it is never used. */
-	err = seL4_Untyped_Retype(L4H_CPTR(L4H_SLOT_UNTYPED_BASE), seL4_CapTableObject, 1,
+	err = seL4_Untyped_Retype(OBJ_UT, seL4_CapTableObject, 1,
 				  L4H_CNODE_CPTR, L4H_SLOT_META, L4H_ROOT_DEPTH, L4H_META_DYN_BASE, 1);
 	CHECK(err == 0, "empty cnode err=", err);
 	seL4_CPtr empty_cnode = L4H_CPTR2(L4H_SLOT_META, L4H_META_DYN_BASE);
@@ -654,7 +702,8 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 	puthex("testguest: E3 timer fired, latency ticks=", t1 - deadline);
 
 	io_pool_test();
-	untyped_copy_test(L4H_CPTR(L4H_SLOT_UNTYPED_BASE));
+	untyped_copy_test(L4H_BLOCK_CPTR(bi->boot_blocks + 1));
+	ram_blocks_test();
 
 	puts("TESTGUEST: PASS\n");
 	power(L4H_POWER_OFF);
