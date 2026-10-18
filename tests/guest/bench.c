@@ -22,6 +22,41 @@ static void report(const char *what, double per, const char *unit)
 	printf("BENCH: %-22s %10.2f %s\n", what, per, unit);
 }
 
+/* CPU time of all vCPUs from /proc/stat, in clock ticks: busy (everything
+ * but idle, iowait and steal) and elapsed (everything but steal). */
+static void cpu_ticks(unsigned long long *busy, unsigned long long *all)
+{
+	unsigned long long v[8] = { 0 };
+	FILE *f = fopen("/proc/stat", "r");
+
+	*busy = *all = 0;
+	if (!f)
+		return;
+	if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3],
+		   &v[4], &v[5], &v[6], &v[7]) == 8) {
+		*busy = v[0] + v[1] + v[2] + v[5] + v[6];
+		*all = *busy + v[3] + v[4];
+	}
+	fclose(f);
+}
+
+static unsigned long long cpu_busy0, cpu_all0;
+
+static void cpu_start(void)
+{
+	cpu_ticks(&cpu_busy0, &cpu_all0);
+}
+
+/* Share of the guest's CPU time that was busy since cpu_start(). */
+static void cpu_report(const char *what)
+{
+	unsigned long long busy, all;
+
+	cpu_ticks(&busy, &all);
+	if (all > cpu_all0)
+		report(what, 100.0 * (busy - cpu_busy0) / (all - cpu_all0), "% CPU");
+}
+
 static void bench_syscall(void)
 {
 	int n = 200000;
@@ -88,17 +123,21 @@ static void bench_disk(const char *dev)
 		return;
 	}
 	memset(buf, 0x5a, bs);
+	cpu_start();
 	double t = now();
 	for (size_t o = 0; o < total; o += bs)
 		if (pwrite(fd, buf, bs, o) != (ssize_t)bs)
 			break;
 	fsync(fd);
 	report("disk write (1 MiB, direct)", total / (now() - t) / 1e6, "MB/s");
+	cpu_report("disk write busy");
+	cpu_start();
 	t = now();
 	for (size_t o = 0; o < total; o += bs)
 		if (pread(fd, buf, bs, o) != (ssize_t)bs)
 			break;
 	report("disk read (1 MiB, direct)", total / (now() - t) / 1e6, "MB/s");
+	cpu_report("disk read busy");
 	int n = 2000;
 	t = now();
 	for (int i = 0; i < n; i++)
