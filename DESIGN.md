@@ -174,6 +174,17 @@ We need no IOMMU, since no device is passed into a guest.
 
 ### Found during implementation
 
+- **Patch 0006 (performance): no timer reprogram for a later deadline.**
+  - `setNextInterrupt()` wrote IA32_TSC_DEADLINE on every
+    scheduling-context change. Each write is a VM exit when seL4 runs
+    virtualised.
+  - The kernel now keeps a still-pending earlier deadline. The interrupt
+    then fires early, causing at most one spurious timer interrupt and a
+    reprogram.
+  - Most switches only move the deadline later, so most writes
+    disappear: trapped syscalls got 16× faster under nested KVM.
+
+
 - **0004, x86_64 user RSP across syscalls.** seL4's fast `syscall` entry
   never saved the user RSP, and the `sysretq` path cleared it. Only the
   libsel4 convention of keeping RSP in RBX made this work. Trapped Linux
@@ -916,6 +927,29 @@ Rules that keep the port cheap:
 | fork+exec | baseline | 1.5–3× | Lazy refault. |
 | disk I/O | | near native | Zero-copy; the main overhead is two queue hops. |
 | network | | ~2 copies per direction | Needs the I/O-window optimization to compete. |
+
+**Measured (v1, `tests/run-bench.sh`).** The test machine is unusual: the
+dev box is itself a Hyper-V VM, so QEMU/KVM runs *nested*. Every VM exit
+of seL4 (timer MSR writes, IPIs, EOIs, HLT wakeups) costs tens of
+microseconds, against roughly one on a single-level cloud hypervisor.
+Figures dominated by exits are therefore pessimistic here.
+
+| Operation | l4h, nested KVM | Notes |
+|-----------|-----------------|-------|
+| getpid | 1.3–1.5 µs | Was 20 µs before kernel patch 0006. MCS reprogrammed the TSC deadline, a VM exit, on every scheduling-context switch. It now keeps an earlier armed deadline. |
+| page fault (first touch) | 5–6.5 µs | |
+| pipe round trip | 10 µs (same vCPU) | 37 µs between 2 vCPUs, which needs cross-core IPIs. |
+| fork+exit+wait | 340–450 µs | |
+| disk, 1 MiB direct | 830 MB/s write, 1.2–1.9 GB/s read | Zero-copy, close to the QEMU backend's own speed. |
+| disk, 4 KiB read latency | ~200 µs | Two cross-core wakeups: guest → VMM → blkd and back. |
+| guest↔guest ping | 1.4 ms | Four component hops per direction, with cross-core wakeups. |
+| guest↔guest TCP | ~30 MB/s | Limited per frame (~140 µs, i.e. wakeups), not by copying. Checksum offload and TSO pass through the switch. |
+
+Next steps for I/O latency:
+- place each guest's VMM, blkd and netd work on the guest's core, or use
+  passive servers on the caller's scheduling context;
+- poll briefly before blocking, which trades CPU for wakeups;
+- measure on GCE, where exits are about 20× cheaper.
 
 The design prioritizes I/O and idle density, the cloud workload, over
 syscall-heavy microbenchmarks. Benchmarks: lmbench lat_syscall/lat_ctx/

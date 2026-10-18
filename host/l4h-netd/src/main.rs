@@ -52,11 +52,44 @@ struct Switch {
     fdb: BTreeMap<[u8; 6], (PortId, u64)>,
 }
 
+/// Complete a checksum the sender left to the device (NEEDS_CSUM): the
+/// ones'-complement sum from csum_start, stored at csum_start + csum_offset
+/// (which holds the pseudo-header sum already).
+fn complete_csum(frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
+    if hdr[0] & net::HDR_F_NEEDS_CSUM == 0 {
+        return;
+    }
+    let start = u16::from_le_bytes([hdr[6], hdr[7]]) as usize;
+    let at = start + u16::from_le_bytes([hdr[8], hdr[9]]) as usize;
+    if at + 2 <= frame.len() && start < frame.len() {
+        let mut sum: u32 = 0;
+        let mut i = start;
+        while i + 1 < frame.len() {
+            sum += u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < frame.len() {
+            sum += (frame[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        frame[at..at + 2].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    }
+    hdr[0] &= !net::HDR_F_NEEDS_CSUM;
+}
+
+fn is_gso(hdr: &[u8; net::HDR_SIZE]) -> bool {
+    hdr[1] != net::GSO_NONE
+}
+
 struct Netd {
     ports: Vec<Option<GuestPort>>,
     nics: Vec<Nic>,
     switches: BTreeMap<u32, Switch>,
     tsc_hz: u64,
+    /// Frame being switched.
+    buf: Vec<u8>,
 }
 
 fn rdtsc() -> u64 {
@@ -93,10 +126,20 @@ impl Netd {
         v
     }
 
-    fn deliver(&mut self, to: PortId, frame: &[u8]) {
+    fn deliver(&mut self, to: PortId, frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
         match to {
             PortId::Guest(i) => {
                 let Some(p) = self.ports[i].as_mut() else { return };
+                let (rx_csum, rx_gso) = unsafe {
+                    (addr_of!((*p.chan).rx_csum).read_volatile() != 0, addr_of!((*p.chan).rx_gso).read_volatile() != 0)
+                };
+                if is_gso(hdr) && !rx_gso {
+                    p.drops += 1;
+                    return;
+                }
+                if !rx_csum {
+                    complete_csum(frame, hdr);
+                }
                 unsafe {
                     let head = addr_of!((*p.chan).rx.head).read_volatile();
                     let tail = addr_of!((*p.chan).rx.tail).read_volatile();
@@ -106,6 +149,7 @@ impl Netd {
                     }
                     let slot = addr_of_mut!((*p.chan).rx_slots[head as usize % net::RING_SIZE]);
                     core::ptr::copy_nonoverlapping(frame.as_ptr(), addr_of_mut!((*slot).data) as *mut u8, frame.len());
+                    addr_of_mut!((*slot).hdr).write_volatile(*hdr);
                     addr_of_mut!((*slot).len).write_volatile(frame.len() as u32);
                     fence(Ordering::Release);
                     addr_of_mut!((*p.chan).rx.head).write_volatile(head.wrapping_add(1));
@@ -113,12 +157,21 @@ impl Netd {
                 p.rx_frames += 1;
                 p.signal = true;
             }
-            PortId::Uplink(n) => self.nics[n].transmit(frame),
+            PortId::Uplink(n) => {
+                let nic = &mut self.nics[n];
+                if is_gso(hdr) && !nic.tso {
+                    return;
+                }
+                if !nic.csum {
+                    complete_csum(frame, hdr);
+                }
+                nic.transmit(frame, hdr);
+            }
         }
     }
 
     /// Switch one frame that arrived on port `from`.
-    fn forward(&mut self, from: PortId, frame: &[u8]) {
+    fn forward(&mut self, from: PortId, frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
         if frame.len() < 14 {
             return;
         }
@@ -153,10 +206,10 @@ impl Netd {
         };
         match known {
             Some(to) if to == from => {}
-            Some(to) if self.switch_of(to) == Some(switch) => self.deliver(to, frame),
+            Some(to) if self.switch_of(to) == Some(switch) => self.deliver(to, frame, hdr),
             _ => {
                 for to in self.members(switch, from) {
-                    self.deliver(to, frame);
+                    self.deliver(to, frame, hdr);
                 }
             }
         }
@@ -166,9 +219,9 @@ impl Netd {
     fn port_tx(&mut self, i: usize) {
         let Some(p) = self.ports[i].as_ref() else { return };
         let chan = p.chan;
-        let mut frame = [0u8; net::MAX_FRAME];
+        let mut frame = core::mem::take(&mut self.buf);
         loop {
-            let n = unsafe {
+            let (n, mut hdr) = unsafe {
                 let tail = addr_of!((*chan).tx.tail).read_volatile();
                 if tail == addr_of!((*chan).tx.head).read_volatile() {
                     break;
@@ -177,24 +230,28 @@ impl Netd {
                 let slot = addr_of!((*chan).tx_slots[tail as usize % net::RING_SIZE]);
                 let n = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
                 core::ptr::copy_nonoverlapping(addr_of!((*slot).data) as *const u8, frame.as_mut_ptr(), n);
+                let hdr = addr_of!((*slot).hdr).read_volatile();
                 fence(Ordering::Release);
                 addr_of_mut!((*chan).tx.tail).write_volatile(tail.wrapping_add(1));
-                n
+                (n, hdr)
             };
-            self.forward(PortId::Guest(i), &frame[..n]);
+            self.forward(PortId::Guest(i), &mut frame[..n], &mut hdr);
         }
+        self.buf = frame;
         if let Some(p) = self.ports[i].as_mut() {
             p.signal = true;
         }
     }
 
     fn nic_rx(&mut self, n: usize) {
-        let mut frame = [0u8; net::MAX_FRAME];
+        let mut frame = core::mem::take(&mut self.buf);
         while let Some(len) = self.nics[n].receive(&mut frame) {
             if self.nics[n].switch.is_some() {
-                self.forward(PortId::Uplink(n), &frame[..len]);
+                let mut hdr = [0u8; net::HDR_SIZE];
+                self.forward(PortId::Uplink(n), &mut frame[..len], &mut hdr);
             }
         }
+        self.buf = frame;
         self.nics[n].reap_tx();
     }
 
@@ -231,6 +288,7 @@ fn main(info: &'static Info) -> ! {
         nics: Vec::new(),
         switches: BTreeMap::new(),
         tsc_hz: info.header().tsc_hz,
+        buf: alloc::vec![0u8; net::MAX_FRAME],
     };
     for (n, c) in cfg.nics[..cfg.nr_nics as usize].iter().enumerate() {
         d.nics.push(Nic::new(n, c));
@@ -317,4 +375,4 @@ fn main(info: &'static Info) -> ! {
     }
 }
 
-l4h_rt::component!(main, heap_size = 2 * 1024 * 1024);
+l4h_rt::component!(main, heap_size = 4 * 1024 * 1024);

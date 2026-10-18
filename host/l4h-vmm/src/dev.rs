@@ -31,6 +31,8 @@ pub trait Backend {
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool;
     /// The driver reset the device.
     fn reset(&mut self);
+    /// The driver accepted `features` (FEATURES_OK).
+    fn features_accepted(&mut self, _features: u64) {}
 }
 
 pub struct Device<B: Backend> {
@@ -120,6 +122,8 @@ impl<B: Backend> Device<B> {
                     let drv = unsafe { addr_of!((*self.regs).driver_features).read_volatile() };
                     if drv & !self.features != 0 || drv & VIRTIO_F_VERSION_1 == 0 {
                         self.set_status(s & !STATUS_FEATURES_OK);
+                    } else {
+                        self.backend.features_accepted(drv);
                     }
                 }
                 if s & STATUS_DRIVER_OK != 0 && s & STATUS_FAILED == 0 {

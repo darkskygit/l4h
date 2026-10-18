@@ -227,6 +227,7 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 
 	/* 3: 64 syscalls with rdx = -1 .. -64 (all seL4 syscall numbers,
 	 * including non-faulting ones such as Yield, NBSend and SetTLSBase). */
+	uint64_t sweep_t0 = rdtsc();
 	for (long n = -1; n >= -64; n--) {
 		info = seL4_Recv(ep, &badge, reply);
 		CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "sweep label=",
@@ -244,6 +245,7 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 		seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, seL4_UnknownSyscall_Syscall));
 	}
 	puts("testguest: E1 traps every seL4 syscall number (seL4 issue #477)\n");
+	puthex("testguest: trapped syscall round trip, ticks=", (rdtsc() - sweep_t0) / 64);
 
 	/* 4: exit(777). */
 	info = seL4_Recv(ep, &badge, reply);

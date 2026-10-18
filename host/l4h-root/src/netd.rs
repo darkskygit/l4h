@@ -23,10 +23,10 @@ use crate::{AsidPools, HostInfo, ctl, mr, set_mr};
 static NETD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-netd.elf"));
 
 const PAGE: usize = 4096;
-const NIC_DMA_BITS: usize = 20;
+const NIC_DMA_BITS: usize = 22;
 /// Port memory: the channel plus the CNode keeping netd's mappings of it.
-const PORT_BITS: usize = 20;
-const PORT_KEEP_BITS: usize = 8;
+const PORT_BITS: usize = 22;
+const PORT_KEEP_BITS: usize = 10;
 /// MSI vectors of NICs start here (disks use the ones below).
 const NIC_MSI_BASE: u64 = 16;
 const NETD_ID: u32 = 0x200;
@@ -208,9 +208,11 @@ impl Netd {
         let mut pool = UtPool { regions: alloc::vec![region] };
         let frames = alloc.slots.alloc_range(net::PORT_PAGES);
         pool.retype(&FRAME_BP, frames.len(), Dest::root(frames.start)).expect("port frames");
-        let keep_slot = alloc.slots.alloc();
-        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 1, Dest::root(keep_slot)).expect("port CNode");
-        let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slot).cap();
+        // CNodes keeping netd's and the VMM's mappings of the port.
+        let keep_slots = alloc.slots.alloc_range(2);
+        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 2, Dest::root(keep_slots.start)).expect("port CNodes");
+        let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slots.start).cap();
+        let vmm_keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slots.start + 1).cap();
         let chan: Vec<cap::Granule> =
             frames.map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(i).cap()).collect();
         for (i, f) in chan.iter().enumerate() {
@@ -231,7 +233,7 @@ impl Netd {
         call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]);
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
         let mac_bytes = mac.to_be_bytes();
-        Ok((p, vmm::Backend::Net { chan, kick, mac: mac_bytes[2..8].try_into().unwrap() }))
+        Ok((p, vmm::Backend::Net { chan, kick, mac: mac_bytes[2..8].try_into().unwrap(), keep: vmm_keep }))
     }
 
     /// Disconnect port `p`; netd stops using its memory.

@@ -1,5 +1,6 @@
-//! virtio-net device backed by a netd port.  Frames are copied between
-//! guest buffers and the port's slots.
+//! virtio-net device backed by a netd port.  Frames and their virtio-net
+//! headers are copied between guest buffers and the port's slots; the
+//! offload metadata in the header (checksum, TSO) passes through.
 
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
@@ -13,12 +14,17 @@ use crate::guest::GuestMem;
 use crate::virtq::{Buf, Queue};
 
 const VIRTIO_ID_NET: u32 = 1;
+const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
+const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
 const VIRTIO_NET_F_MTU: u64 = 1 << 3;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+const VIRTIO_NET_F_GUEST_TSO4: u64 = 1 << 7;
+const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
+const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
+const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
 const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 const VIRTIO_NET_S_LINK_UP: u16 = 1;
-/// struct virtio_net_hdr_v1.
-const HDR: usize = 12;
+const HDR: usize = net::HDR_SIZE;
 const RX: usize = 0;
 const TX: usize = 1;
 const QUEUE_SIZE: u32 = 256;
@@ -56,25 +62,30 @@ impl Net {
                 unsafe {
                     let h = addr_of!((*self.chan).tx.head).read_volatile();
                     let slot = addr_of_mut!((*self.chan).tx_slots[h as usize % net::RING_SIZE]);
+                    let hdr = addr_of_mut!((*slot).hdr) as *mut u8;
                     let data = addr_of_mut!((*slot).data) as *mut u8;
-                    // Skip the virtio-net header, gather the frame.
-                    let (mut skip, mut n) = (HDR, 0usize);
+                    // The header first, then the frame.
+                    let (mut off, mut n) = (0usize, 0usize);
                     let mut ok = true;
                     for b in bufs.iter().filter(|b| !b.write) {
-                        let mut gpa = b.gpa;
+                        let src = mem.bytes(b.gpa, b.len as usize);
                         let mut len = b.len as usize;
-                        let s = skip.min(len);
-                        skip -= s;
-                        gpa += s as u64;
-                        len -= s;
+                        let mut s = 0;
+                        if off < HDR {
+                            let h = (HDR - off).min(len);
+                            core::ptr::copy_nonoverlapping(src, hdr.add(off), h);
+                            off += h;
+                            s = h;
+                            len -= h;
+                        }
                         if n + len > net::MAX_FRAME {
                             ok = false;
                             break;
                         }
-                        core::ptr::copy_nonoverlapping(mem.bytes(gpa, len), data.add(n), len);
+                        core::ptr::copy_nonoverlapping(src.add(s), data.add(n), len);
                         n += len;
                     }
-                    if ok && n >= 14 {
+                    if ok && off == HDR && n >= 14 {
                         addr_of_mut!((*slot).len).write_volatile(n as u32);
                         fence(Ordering::Release);
                         addr_of_mut!((*self.chan).tx.head).write_volatile(h.wrapping_add(1));
@@ -108,21 +119,21 @@ impl Net {
                     let slot = addr_of!((*self.chan).rx_slots[tail as usize % net::RING_SIZE]);
                     let len = (addr_of!((*slot).len).read_volatile() as usize).min(net::MAX_FRAME);
                     let data = addr_of!((*slot).data) as *const u8;
-                    // Header: all zero except num_buffers = 1.
-                    let mut hdr = [0u8; HDR];
+                    // The slot's header, with num_buffers = 1.
+                    let mut hdr = addr_of!((*slot).hdr).read_volatile();
                     hdr[10] = 1;
+                    hdr[11] = 0;
                     let total = HDR + len;
                     for b in bufs.iter().filter(|b| b.write) {
                         let n = (b.len as usize).min(total - written);
                         let dst = mem.bytes(b.gpa, n);
-                        for i in 0..n {
-                            let k = written + i;
-                            if k >= HDR {
-                                // The rest is frame data: copy it at once.
-                                core::ptr::copy_nonoverlapping(data.add(k - HDR), dst.add(i), n - i);
-                                break;
-                            }
-                            *dst.add(i) = hdr[k];
+                        let mut i = 0;
+                        while i < n && written + i < HDR {
+                            *dst.add(i) = hdr[written + i];
+                            i += 1;
+                        }
+                        if i < n {
+                            core::ptr::copy_nonoverlapping(data.add(written + i - HDR), dst.add(i), n - i);
                         }
                         written += n;
                         if written == total {
@@ -153,7 +164,15 @@ impl Backend for Net {
     }
 
     fn features(&self) -> u64 {
-        VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_NET_F_MTU
+        VIRTIO_NET_F_MAC
+            | VIRTIO_NET_F_STATUS
+            | VIRTIO_NET_F_MTU
+            | VIRTIO_NET_F_CSUM
+            | VIRTIO_NET_F_GUEST_CSUM
+            | VIRTIO_NET_F_HOST_TSO4
+            | VIRTIO_NET_F_HOST_TSO6
+            | VIRTIO_NET_F_GUEST_TSO4
+            | VIRTIO_NET_F_GUEST_TSO6
     }
 
     fn num_queues(&self) -> usize {
@@ -168,6 +187,14 @@ impl Backend for Net {
         config[0..6].copy_from_slice(&self.mac);
         config[6..8].copy_from_slice(&VIRTIO_NET_S_LINK_UP.to_le_bytes());
         config[10..12].copy_from_slice(&((net::MTU_FRAME - 14) as u16).to_le_bytes());
+    }
+
+    fn features_accepted(&mut self, f: u64) {
+        let gso = f & (VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6) == (VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6);
+        unsafe {
+            addr_of_mut!((*self.chan).rx_csum).write_volatile((f & VIRTIO_NET_F_GUEST_CSUM != 0) as u32);
+            addr_of_mut!((*self.chan).rx_gso).write_volatile((gso && f & VIRTIO_NET_F_GUEST_CSUM != 0) as u32);
+        }
     }
 
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool {
@@ -199,5 +226,10 @@ impl Backend for Net {
         returned
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        unsafe {
+            addr_of_mut!((*self.chan).rx_csum).write_volatile(0);
+            addr_of_mut!((*self.chan).rx_gso).write_volatile(0);
+        }
+    }
 }

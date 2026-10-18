@@ -3,19 +3,29 @@
 //! A port channel is one shared region between netd and a client (a
 //! guest's l4h-vmm, one per virtio-net device) with a TX ring (client ->
 //! switch) and an RX ring (switch -> client) of fixed-size frame slots.
-//! Frames are copied into and out of the slots.
+//! Frames are copied into and out of the slots.  Each frame carries its
+//! virtio-net header (struct virtio_net_hdr_v1): offloads (checksum, TSO)
+//! travel through the switch as metadata, so a slot holds a whole 64 KiB
+//! TSO frame.
 
-pub const RING_SIZE: usize = 128;
-pub const SLOT_SIZE: usize = 2048;
-pub const MAX_FRAME: usize = SLOT_SIZE - 8;
+pub const RING_SIZE: usize = 24;
+pub const SLOT_SIZE: usize = 68 * 1024;
+pub const HDR_SIZE: usize = 12;
+pub const MAX_FRAME: usize = SLOT_SIZE - 32;
 /// Ethernet header + 1500 bytes of payload.
 pub const MTU_FRAME: usize = 1514;
+
+/// virtio_net_hdr_v1 flags and GSO types.
+pub const HDR_F_NEEDS_CSUM: u8 = 1;
+pub const GSO_NONE: u8 = 0;
 
 #[repr(C)]
 pub struct Slot {
     pub len: u32,
     pub reserved: u32,
-    pub data: [u8; SLOT_SIZE - 8],
+    pub hdr: [u8; HDR_SIZE],
+    pub pad: [u8; 12],
+    pub data: [u8; MAX_FRAME],
 }
 
 #[repr(C)]
@@ -32,7 +42,12 @@ pub struct Port {
     pub rx: RingIdx,
     pub mac: [u8; 8],
     pub link_up: u32,
-    pub reserved: [u32; 13],
+    /// Set by the client: its guest accepts frames with checksum offload
+    /// (NEEDS_CSUM) and TSO (GSO types); otherwise netd completes the
+    /// checksum and drops TSO frames for it.
+    pub rx_csum: u32,
+    pub rx_gso: u32,
+    pub reserved: [u32; 11],
     pub tx_slots: [Slot; RING_SIZE],
     pub rx_slots: [Slot; RING_SIZE],
 }
@@ -47,7 +62,7 @@ pub const NETD_BADGE_IRQ_SHIFT: u32 = 48;
 
 /// netd address space: port p at port_va(p); NIC n's BARs and DMA memory.
 pub const fn port_va(p: usize) -> usize {
-    crate::SHARED_VA + p * 0x20_0000
+    crate::SHARED_VA + p * 0x40_0000
 }
 pub const fn nic_bar_va(n: usize, bar: usize) -> usize {
     crate::MMIO_VA + n * 0x800_0000 + bar * 0x100_0000
@@ -94,3 +109,5 @@ pub struct NetdConfig {
     pub reserved: u32,
     pub nics: [NicConfig; MAX_NICS],
 }
+
+const _: () = assert!(PORT_PAGES * 4096 <= 0x40_0000 - 0x1_0000);

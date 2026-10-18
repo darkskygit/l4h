@@ -40,6 +40,8 @@ pub enum Backend {
         /// Notification of netd (badged for this port).
         kick: cap::Notification,
         mac: [u8; 6],
+        /// CNode (radix 10) for the VMM's mapping capabilities of the port.
+        keep: cap::CNode,
     },
 }
 
@@ -149,10 +151,18 @@ pub fn spawn(
     }
     for &(d, ref b) in backends.iter() {
         match b {
-            Backend::Blk { chan, kick } | Backend::Net { chan, kick, .. } => {
+            Backend::Blk { chan, kick } => {
                 for (i, f) in chan.iter().enumerate() {
                     let fc = crate::component::abs_of(*f);
                     comp.map_copy(alloc, &mut g.arena.pool, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, keep_slot());
+                }
+                comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
+            }
+            Backend::Net { chan, kick, keep, .. } => {
+                for (i, f) in chan.iter().enumerate() {
+                    let fc = crate::component::abs_of(*f);
+                    let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, 10);
+                    comp.map_copy(alloc, &mut g.arena.pool, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
                 }
                 comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
             }

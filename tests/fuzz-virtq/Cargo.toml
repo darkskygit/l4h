@@ -1,0 +1,11 @@
+[package]
+name = "fuzz-virtq"
+edition = "2024"
+version = "0.1.0"
+description = "Randomised test of l4h-vmm's virtqueue parsing against hostile guests"
+
+[dependencies]
+
+[profile.release]
+debug-assertions = true
+overflow-checks = true

@@ -1,7 +1,7 @@
 From b62eca6ed66e0fa9eb1ccc17c886b863f0ea0f2b Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 14:11:59 -0700
-Subject: [PATCH 5/5] smp: reset the IPI barrier count before releasing waiters
+Subject: [PATCH 5/6] smp: reset the IPI barrier count before releasing waiters
 
 ipi_wait() resets the arrival counter and bumps globalsense with plain
 stores followed by a release fence.  Nothing orders the two stores with
