@@ -18,30 +18,14 @@ pub fn read_ns(alloc: &mut Alloc) -> u64 {
         return 0;
     }
     let port = s as u64;
-    let read = |reg: u8| -> u8 {
-        sel4::with_ipc_buffer_mut(|ipc| {
-            ipc.inner_mut().seL4_X86_IOPort_Out8(port, CMOS as u64, reg as u64);
-            ipc.inner_mut().seL4_X86_IOPort_In8(port, CMOS + 1).result as u8
-        })
-    };
-    // Read until two consecutive reads agree, outside of updates.
-    let sample = || {
-        while read(0x0a) & 0x80 != 0 {}
-        [read(0x00), read(0x02), read(0x04), read(0x07), read(0x08), read(0x09), read(0x32)]
-    };
-    let mut t = sample();
-    loop {
-        let u = sample();
-        if u == t {
-            break;
-        }
-        t = u;
-    }
+    let t = sample(port);
     let _ = dst.delete();
     alloc.slots.free(s);
-    let b = read(0x0b);
+    let Some([sec, min, hour_raw, day, mon, year, century, b]) = t else {
+        sel4::debug_println!("l4h-root: cannot read the RTC");
+        return 0;
+    };
     let bcd = |v: u8| if b & 0x04 == 0 { (v & 0x0f) + (v >> 4) * 10 } else { v };
-    let [sec, min, hour_raw, day, mon, year, century] = t;
     let pm = b & 0x02 == 0 && hour_raw & 0x80 != 0;
     let mut hour = bcd(hour_raw & 0x7f) as u64;
     if b & 0x02 == 0 {
@@ -67,6 +51,38 @@ pub fn read_ns(alloc: &mut Alloc) -> u64 {
 pub fn read_ns(_alloc: &mut Alloc) -> u64 {
     let _ = (CMOS, days_from_civil);
     0
+}
+
+/// The RTC registers read_ns uses, status register B last, through I/O
+/// port capability `port`; None if a port access fails.
+#[cfg(target_arch = "x86_64")]
+fn sample(port: u64) -> Option<[u8; 8]> {
+    let read = |reg: u8| -> Option<u8> {
+        sel4::with_ipc_buffer_mut(|ipc| {
+            if ipc.inner_mut().seL4_X86_IOPort_Out8(port, CMOS as u64, reg as u64) != 0 {
+                return None;
+            }
+            let r = ipc.inner_mut().seL4_X86_IOPort_In8(port, CMOS + 1);
+            if r.error != 0 { None } else { Some(r.result as u8) }
+        })
+    };
+    // Read outside of updates, until two consecutive reads agree.
+    let once = || -> Option<[u8; 8]> {
+        while read(0x0a)? & 0x80 != 0 {}
+        let mut v = [0u8; 8];
+        for (x, reg) in v.iter_mut().zip([0x00, 0x02, 0x04, 0x07, 0x08, 0x09, 0x32, 0x0b]) {
+            *x = read(reg)?;
+        }
+        Some(v)
+    };
+    let mut t = once()?;
+    loop {
+        let u = once()?;
+        if u == t {
+            return Some(t);
+        }
+        t = u;
+    }
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
