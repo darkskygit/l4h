@@ -5,10 +5,11 @@
 # Usage: run-objtest.sh [vcpus]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/guest-env.sh"
 out=$root/build/guest
 mkdir -p "$out"
-gcc -O2 -static -o "$out/objtest" "$root/tests/guest/objtest.c"
-gcc -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
+"$l4h_cc" -O2 -static -o "$out/objtest" "$root/tests/guest/objtest.c"
+"$l4h_cc" -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
 "$root/tools/mkinitramfs.sh" "$out/objtest.cpio.gz" "$root/tests/guest/init-objtest" \
     "$out/objtest" "$out/selftest" >/dev/null
 L4H_DOM0_VCPUS=${1:-4} L4H_DOM0_MEM_MB=${OBJTEST_MEM_MB:-256} \

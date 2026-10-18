@@ -2,7 +2,7 @@
 # Prepare a fresh Debian 13 (trixie) system, run as root, to build and test
 # l4h: packages, Rust toolchains, the seL4 Python environment and the Linux
 # source.  Used by .github/workflows/test.yml; also works in a container.
-# Usage: ci-setup.sh [x86_64|debian]...   (default: x86_64)
+# Usage: ci-setup.sh [x86_64|aarch64|debian]...   (default: x86_64)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # Downloads are pinned by checksum.
@@ -18,6 +18,7 @@ pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
     flex bison bc libelf-dev libssl-dev cpio rsync ccache
     busybox-static e2fsprogs
     qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin mtools fdisk)
+[[ $want == *" aarch64 "* ]] && pkgs+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-system-arm)
 [[ $want == *" debian "* ]] && pkgs+=(debootstrap debian-archive-keyring)
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
@@ -38,6 +39,17 @@ fi
 export PATH=$HOME/.cargo/bin:$PATH
 rustup toolchain install stable --profile minimal
 (cd "$root/host" && rustup toolchain install)
+
+if [[ $want == *" aarch64 "* ]]; then
+    rustup target add --toolchain stable aarch64-unknown-linux-gnu
+    # Extract the foreign BusyBox without replacing the build host's binary.
+    dpkg --add-architecture arm64
+    apt-get update -q
+    busybox_pkg=$(mktemp -d)
+    (cd "$busybox_pkg" && apt-get download busybox-static:arm64)
+    dpkg-deb -x "$busybox_pkg"/busybox-static_*_arm64.deb "$root/build/busybox-aarch64"
+    rm -rf "$busybox_pkg"
+fi
 
 # seL4's build tools.
 [ -x "$root/.venv/bin/python" ] || python3 -m venv "$root/.venv"

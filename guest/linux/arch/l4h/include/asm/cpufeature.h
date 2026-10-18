@@ -1,3 +1,6 @@
+#ifdef CONFIG_UML_ARM64
+#include <asm/processor.h>
+#else
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _ASM_UM_CPUFEATURE_H
 #define _ASM_UM_CPUFEATURE_H
@@ -139,3 +142,5 @@ t_no:
 
 #endif /* defined(__KERNEL__) && !defined(__ASSEMBLER__) */
 #endif /* _ASM_UM_CPUFEATURE_H */
+
+#endif

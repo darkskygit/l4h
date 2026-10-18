@@ -57,8 +57,8 @@ impl VirtioBlk {
         }
         // MSI-X table entry 0 -> our interrupt, unmasked.
         let msix = Mmio(cfg.msix_table.va as usize);
-        msix.w32(0, 0xfee0_0000);
-        msix.w32(4, 0);
+        msix.w32(0, cfg.msi_address as u32);
+        msix.w32(4, (cfg.msi_address >> 32) as u32);
         msix.w32(8, cfg.msi_data);
         msix.w32(12, 0);
         let vq = dev.setup_queue(&mut dma, 0, blk::RING_SIZE as u16, 0).expect("blkd: queue 0");

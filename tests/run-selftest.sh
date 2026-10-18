@@ -5,10 +5,16 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/guest
 mkdir -p "$out"
-gcc -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
+cc=gcc
+test_timeout=120
+if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then
+    cc=aarch64-linux-gnu-gcc
+    test_timeout=600
+fi
+"$cc" -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
 "$root/tools/mkinitramfs.sh" "$out/selftest.cpio.gz" "$root/tests/guest/init-selftest" \
     "$out/selftest" >/dev/null
-L4H_DOM0_VCPUS=${1:-1} "$root/tools/run-dom0.sh" "$out/selftest.cpio.gz" "console=hvc0" "${SELFTEST_TIMEOUT:-120}" \
+L4H_DOM0_VCPUS=${1:-1} "$root/tools/run-dom0.sh" "$out/selftest.cpio.gz" "console=hvc0" "${L4H_TEST_TIMEOUT:-${SELFTEST_TIMEOUT:-$test_timeout}}" \
     | sed -n '/SELFTEST: start/,/SELFTEST: \(PASS\|FAIL\)/p'
 grep -q "SELFTEST: PASS" "$root/build/qemu.log"
 ! grep -q 'deschedule .* SC failed\|SchedContext UnbindObject: object not bound' "$root/build/qemu.log"

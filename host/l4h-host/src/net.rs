@@ -97,6 +97,7 @@ pub const NETD_NIC_MAC: u64 = 5;
 pub struct NicConfig {
     pub pci_bdf: u32,
     pub msi_data: u32,
+    pub msi_address: u64,
     pub common: crate::blk::PciRegion,
     pub notify: crate::blk::PciRegion,
     pub notify_off_multiplier: u32,

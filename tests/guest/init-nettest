@@ -1,4 +1,5 @@
 #!/bin/sh
+slow=${L4H_TEST_SLOW:-1}
 # dom0 init for tests/run-nettest.sh.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
@@ -20,7 +21,7 @@ sw1=$(l4hctl switch-create) && sw2=$(l4hctl switch-create) || fail "switch-creat
 run() { # name expect-pattern create-args...
     name=$1; pat=$2; shift 2
     id=$(l4hctl create "$name" $K "$@") || fail "create $name"
-    l4hctl console "$id" --until "NETVM: done" --timeout 60 > /tmp/$name || fail "$name did not finish"
+    l4hctl console "$id" --until "NETVM: done" --timeout "$((60 * slow))" > /tmp/$name || fail "$name did not finish"
     for p in $pat; do
         grep -q "NETVM: ping $p" /tmp/$name || { cat /tmp/$name; fail "$name: expected ping $p"; }
     done

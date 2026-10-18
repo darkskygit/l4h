@@ -1,4 +1,5 @@
 #!/bin/sh
+slow=${L4H_TEST_SLOW:-1}
 # dom0 init for tests/run-ctltest.sh: drive the control API with l4hctl.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
@@ -12,10 +13,10 @@ free0=""
 for i in 1 2 3; do
     id=$(l4hctl create vm$i --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --vcpus 2) || fail "create $i"
     echo "CTLTEST: created vm $id"
-    l4hctl console "$id" --until "GUEST: ready" --timeout 60 >/dev/null || fail "vm $id did not boot"
+    l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null || fail "vm $id did not boot"
     l4hctl list
     l4hctl send "$id" "ping $i"
-    l4hctl console "$id" --until "GUEST: got ping $i" --timeout 30 >/dev/null || fail "console input"
+    l4hctl console "$id" --until "GUEST: got ping $i" --timeout "$((30 * slow))" >/dev/null || fail "console input"
     l4hctl destroy "$id" || fail "destroy"
     free=$(l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p')
     echo "CTLTEST: round $i ok, $free MiB free"
@@ -25,16 +26,16 @@ done
 # Disk pass-through to a guest, twice: the second sees the first's write.
 for i in 1 2; do
     id=$(l4hctl create disk$i --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create disk$i"
-    l4hctl console "$id" --until "GUEST: disk ok" --timeout 60 > /tmp/out || fail "disk vm $i"
+    l4hctl console "$id" --until "GUEST: disk ok" --timeout "$((60 * slow))" > /tmp/out || fail "disk vm $i"
     grep -q "GUEST: disk count $((i - 1))" /tmp/out || { cat /tmp/out; fail "disk count"; }
     l4hctl disks > /tmp/disks && grep -q "owner vm $id" /tmp/disks || fail "disk owner"
     l4hctl destroy "$id" || fail "destroy disk$i"
 done
 # Clean shutdown on request.
 id=$(l4hctl create shut --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128) || fail "create shut"
-l4hctl console "$id" --until "GUEST: ready" --timeout 60 >/dev/null || fail "shut vm boot"
+l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null || fail "shut vm boot"
 l4hctl shutdown "$id" || fail "shutdown request"
-l4hctl console "$id" --until "GUEST: shutting down" --timeout 30 >/dev/null || fail "guest ignored shutdown"
+l4hctl console "$id" --until "GUEST: shutting down" --timeout "$((30 * slow))" >/dev/null || fail "guest ignored shutdown"
 i=0
 until l4hctl list | grep -q "shut .* stopped"; do
     i=$((i + 1)); [ $i -lt 100 ] || fail "guest did not stop"; sleep 0.1
@@ -44,7 +45,7 @@ l4hctl destroy "$id"
 # A read-only window of the disk.
 id=$(l4hctl create window --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
     --disk 0,ro,start=8192,sectors=16384) || fail "create window"
-l4hctl console "$id" --until "GUEST: vda size" --timeout 60 > /tmp/out || fail "window vm"
+l4hctl console "$id" --until "GUEST: vda size" --timeout "$((60 * slow))" > /tmp/out || fail "window vm"
 sleep 1
 l4hctl console "$id" > /tmp/out
 grep -q "GUEST: vda size 16384 ro 1" /tmp/out || { cat /tmp/out; fail "disk window"; }
@@ -67,11 +68,11 @@ echo "CTLTEST: unaligned windows refused"
 for d in 1 2 1 2; do
     id=$(l4hctl create dmaload --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --disk $d \
         --cmdline "console=hvc0 l4htest=dmaload") || fail "create dmaload $d"
-    l4hctl console "$id" --until "GUEST: dma busy" --timeout 60 >/dev/null || fail "dmaload $d"
+    l4hctl console "$id" --until "GUEST: dma busy" --timeout "$((60 * slow))" >/dev/null || fail "dmaload $d"
     l4hctl destroy "$id" || fail "destroy dmaload $d"
     id=$(l4hctl create dmacheck --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
         --cmdline "console=hvc0 l4htest=dmacheck") || fail "create dmacheck"
-    l4hctl console "$id" --until "GUEST: stale bytes" --timeout 90 > /tmp/out || fail "dmacheck"
+    l4hctl console "$id" --until "GUEST: stale bytes" --timeout "$((90 * slow))" > /tmp/out || fail "dmacheck"
     grep -q "GUEST: stale bytes 0" /tmp/out || { cat /tmp/out; fail "disk $d DMA into reused memory"; }
     l4hctl destroy "$id" || fail "destroy dmacheck"
     echo "CTLTEST: disk $d destroyed under I/O, no stale DMA"

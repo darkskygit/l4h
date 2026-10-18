@@ -1,6 +1,6 @@
 /*
  * l4h guest self-test: exercises the Linux user ABI as implemented by the
- * l4h guest kernel.  Built as a static x86_64 binary and run inside a
+ * l4h guest kernel.  Built as a static native-ISA binary and run inside a
  * guest; prints "SELFTEST: PASS" or "SELFTEST: FAIL <test>".
  */
 #define _GNU_SOURCE
@@ -25,7 +25,13 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __x86_64__
 #include <asm/prctl.h>
+#else
+#include <asm/ptrace.h>
+#include <sys/uio.h>
+#include <elf.h>
+#endif
 #include <linux/futex.h>
 
 static int failures;
@@ -51,6 +57,16 @@ static double now(void)
 /* ---- syscalls and registers */
 static void test_syscall_regs(void)
 {
+#ifdef __aarch64__
+ register long x0 asm("x0") = -1;
+ register long x1 asm("x1") = 0x11111111;
+ register long x6 asm("x6") = 0x66666666;
+ register long x8 asm("x8") = SYS_getpid;
+ register long x19 asm("x19") = 0x19191919;
+ asm volatile("svc #0" : "+r"(x0), "+r"(x1), "+r"(x6), "+r"(x8), "+r"(x19) :: "memory", "cc");
+ CHECK(x0 == getpid(), "getpid returned %ld", x0);
+ CHECK(x1 == 0x11111111 && x6 == 0x66666666 && x19 == 0x19191919, "registers clobbered");
+#else
 	/* getpid through the raw syscall path with all argument registers
 	 * holding sentinel values. */
 	long r;
@@ -67,7 +83,35 @@ static void test_syscall_regs(void)
 	CHECK(rbx_after == rbx_before, "rbx clobbered");
 	CHECK(r10 == 0x1010101010101010 && r8 == 0x0808080808080808 && r9 == 0x0909090909090909,
 	      "argument registers clobbered");
+#endif
 }
+
+#ifdef __aarch64__
+static void test_arm_exceptions(void)
+{
+	const int expected[] = { SIGILL, SIGTRAP, SIGBUS };
+	for (int which = 0; which < 3; which++) {
+		int status;
+		pid_t pid = fork();
+		CHECK(pid >= 0, "exception fork");
+		if (!pid) {
+			if (which == 0)
+				asm volatile(".inst 0x00000000");
+			else if (which == 1)
+				asm volatile("brk #0");
+			else
+				/* PC alignment faults on every CPU, including CPUs
+				 * which support unaligned atomic loads. */
+				asm volatile("adr x9, .+2\n\tbr x9" ::: "x9");
+			_exit(99);
+		}
+		CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+		      WTERMSIG(status) == expected[which],
+		      "exception %d: status %#x, expected signal %d",
+		      which, status, expected[which]);
+	}
+}
+#endif
 
 /* ---- memory */
 static void test_mmap(void)
@@ -232,8 +276,14 @@ static void test_nx(void)
 	int (*fn)(void) = (int (*)(void))p;
 
 	CHECK(p != MAP_FAILED, "mmap: %s", strerror(errno));
+#ifdef __aarch64__
+ const uint32_t code[] = { 0x52800540, 0xd65f03c0 }; /* mov w0, #42; ret */
+ memcpy(p, code, sizeof(code));
+ __builtin___clear_cache((char *)p, (char *)p + sizeof(code));
+#else
 	/* mov $42, %eax; ret */
 	memcpy(p, "\xb8\x2a\x00\x00\x00\xc3", 6);
+#endif
 	sigaction(SIGSEGV, &sa, NULL);
 	segv_addr = NULL;
 	if (sigsetjmp(segv_jmp, 1) == 0) {
@@ -288,6 +338,7 @@ static void test_fork(void)
 }
 
 /* ---- ptrace */
+#ifdef __x86_64__
 #define PT_GS1 0x12345000UL
 #define PT_GS2 0x6789a000UL
 #define PT_GS3 0x2468a000UL
@@ -425,6 +476,95 @@ static void test_ptrace(void)
 	}
 }
 
+
+#else
+static void test_ptrace(void)
+{
+ pid_t pid = fork();
+ int status;
+ if (!pid) { ptrace(PTRACE_TRACEME, 0, NULL, NULL); raise(SIGSTOP); _exit(0); }
+ CHECK(waitpid(pid, &status, 0) == pid && WIFSTOPPED(status), "tracee stop");
+ struct user_pt_regs regs;
+ struct iovec iov = { &regs, sizeof(regs) };
+ CHECK(ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0 && iov.iov_len == sizeof(regs), "GETREGSET");
+ CHECK((regs.pc & 3) == 0 && (regs.sp & 15) == 0, "unaligned user registers");
+ unsigned long tls = 0;
+ iov = (struct iovec){ &tls, sizeof(tls) };
+ CHECK(ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_TLS, &iov) == 0 && tls != 0, "GETREGSET TLS");
+ unsigned long saved = tls;
+ tls += 0x1000;
+ CHECK(ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_TLS, &iov) == 0, "SETREGSET TLS");
+ tls = 0;
+ CHECK(ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_TLS, &iov) == 0 && tls == saved + 0x1000, "TLS round trip");
+ tls = saved;
+ CHECK(ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_TLS, &iov) == 0, "restore TLS");
+ CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "CONT");
+ CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, "tracee exit: %x", status);
+}
+
+static void test_ptrace_syscall(void)
+{
+	int fds[2], status, entering = 1, changed = 0, skipped = 0;
+	char c;
+	pid_t pid;
+
+	CHECK(pipe(fds) == 0, "trace pipe");
+	pid = fork();
+	CHECK(pid >= 0, "trace fork");
+	if (!pid) {
+		ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+		raise(SIGSTOP);
+		if (syscall(SYS_write, (long)-1, "R", 1UL) != 1)
+			_exit(10);
+		if (syscall(SYS_getpid) != 1234)
+			_exit(11);
+		_exit(0);
+	}
+	close(fds[1]);
+	CHECK(waitpid(pid, &status, 0) == pid && WIFSTOPPED(status), "trace stop");
+	CHECK(ptrace(PTRACE_SETOPTIONS, pid, NULL,
+		     (void *)(uintptr_t)PTRACE_O_TRACESYSGOOD) == 0, "trace options");
+	for (;;) {
+		struct user_pt_regs regs;
+		struct iovec iov = { &regs, sizeof(regs) };
+
+		CHECK(ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == 0, "trace resume");
+		CHECK(waitpid(pid, &status, 0) == pid, "trace wait");
+		if (WIFEXITED(status))
+			break;
+		CHECK(WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80),
+		      "syscall stop: %#x", status);
+		CHECK(ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0,
+		      "syscall registers");
+		if (entering && regs.regs[8] == SYS_write) {
+			CHECK(regs.regs[0] == (unsigned long)-1, "entry x0: %#llx",
+			      (unsigned long long)regs.regs[0]);
+			regs.regs[0] = fds[1];
+			iov = (struct iovec){ &regs, sizeof(regs) };
+			CHECK(ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0,
+			      "change first syscall argument");
+			changed++;
+		} else if (entering && regs.regs[8] == SYS_getpid) {
+			int nr = -1;
+			iov = (struct iovec){ &nr, sizeof(nr) };
+			CHECK(ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov) == 0,
+			      "skip syscall");
+			regs.regs[0] = 1234;
+			iov = (struct iovec){ &regs, sizeof(regs) };
+			CHECK(ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0,
+			      "set skipped return value");
+			skipped++;
+		}
+		entering = !entering;
+	}
+	CHECK(WEXITSTATUS(status) == 0 && changed == 1 && skipped == 1,
+	      "trace result: status %#x, edits %d, skips %d", status, changed, skipped);
+	CHECK(read(fds[0], &c, 1) == 1 && c == 'R', "modified write");
+	close(fds[0]);
+}
+
+#endif
+
 static void test_many_forks(void)
 {
 	int i, status;
@@ -500,6 +640,34 @@ static void test_timers(void)
 	while (sig_count != 1000 && now() - t0 < 2.0)
 		;
 	CHECK(sig_count == 1000, "SIGALRM did not interrupt a busy loop");
+}
+
+/* A restarted read must restore its original argument in x0 on AArch64. */
+static void test_syscall_restart(void)
+{
+ int fd[2], status;
+ char c = 0;
+ struct sigaction sa = { .sa_handler = usr1_handler, .sa_flags = SA_RESTART };
+ CHECK(pipe(fd) == 0, "pipe");
+ sigemptyset(&sa.sa_mask);
+ sigaction(SIGUSR1, &sa, NULL);
+ sig_count = 0;
+ pid_t child = fork();
+ CHECK(child >= 0, "fork");
+ if (!child) {
+  close(fd[0]);
+  usleep(20000);
+  kill(getppid(), SIGUSR1);
+  usleep(20000);
+  write(fd[1], "R", 1);
+  _exit(0);
+ }
+ close(fd[1]);
+ CHECK(read(fd[0], &c, 1) == 1 && c == 'R', "restarted read: %s", strerror(errno));
+ CHECK(sig_count == 1, "restart handler count %d", sig_count);
+ CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "restart child");
+ close(fd[0]);
+ signal(SIGUSR1, SIG_DFL);
 }
 
 /* ---- threads, futexes, TLS */
@@ -873,6 +1041,9 @@ struct test {
 
 static const struct test tests[] = {
 	{ "syscall_regs", test_syscall_regs },
+#ifdef __aarch64__
+	{ "arm_exceptions", test_arm_exceptions },
+#endif
 	{ "mmap", test_mmap },
 	{ "segv", test_segv },
 	{ "nx", test_nx },
@@ -880,8 +1051,12 @@ static const struct test tests[] = {
 	{ "fork", test_fork },
 	{ "many_forks", test_many_forks },
 	{ "ptrace", test_ptrace },
+#ifdef __aarch64__
+	{ "ptrace_syscall", test_ptrace_syscall },
+#endif
 	{ "signals_fpu", test_signals_fpu },
 	{ "timers", test_timers },
+	{ "syscall_restart", test_syscall_restart },
 	{ "threads", test_threads },
 	{ "futex", test_futex },
 	{ "futex_wake_op", test_futex_wake_op },

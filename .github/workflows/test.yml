@@ -150,3 +150,67 @@ jobs:
           path: |
             build/*.log
             build/*/*.log
+
+  aarch64:
+    name: aarch64 (QEMU/TCG)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: debian:trixie
+    env:
+      L4H_ARCH: aarch64
+      L4H_LINUX_CC: ccache aarch64-linux-gnu-gcc
+      L4H_TEST_TIMEOUT: 600
+      NETTEST_TIMEOUT: 600
+      CTLTEST_TIMEOUT: 1800
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: true
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: build/dl
+          key: linux-${{ env.LINUX_VERSION }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .ccache
+          key: ccache-aarch64-${{ github.sha }}
+          restore-keys: ccache-aarch64-
+      - name: Set up
+        run: tools/ci-setup.sh aarch64
+      - name: Build seL4 and loader
+        run: tools/build-kernel-aarch64.sh && tools/build-loader-aarch64.sh
+      - name: Build Linux
+        run: tools/build-linux.sh vmlinux
+      - name: Guest ABI and PCI (EL1)
+        run: tests/run-testguest-aarch64.sh
+      - name: Guest ABI (EL2 entry)
+        run: L4H_QEMU_VIRTUALIZATION=on tests/run-testguest-aarch64.sh
+      - name: Linux self-test, 1 vCPU
+        run: tests/run-selftest.sh 1
+      - name: Linux self-test, 4 vCPUs
+        run: tests/run-selftest.sh 4
+      - name: Kernel modules
+        run: tests/run-modtest.sh
+      - name: Block pass-through (virtio-blk and NVMe)
+        run: tests/run-blktest.sh && BLKTEST_DEV=nvme tests/run-blktest.sh
+      - name: Control API
+        run: tests/run-ctltest.sh
+      - name: Network
+        run: tests/run-nettest.sh
+      - name: Serial monitor
+        run: tests/run-monitor.sh
+      - name: CPU caps, steal time and dom0 restart
+        run: tests/run-m6test.sh
+      - name: Resource limits
+        run: tests/run-limits.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: logs-aarch64
+          path: |
+            build/*.log
+            build/*/*.log

@@ -1,0 +1,164 @@
+--- a/crates/sel4-kernel-loader/asm/aarch64/head.S
++++ b/crates/sel4-kernel-loader/asm/aarch64/head.S
+@@ -59,6 +59,10 @@
+ 
+     bl      clean_and_invalideate_dcache
+ 
++    mrs     x8, CurrentEL
++    cmp     x8, #4
++    b.eq    init_core_state_el1
++
+     disable_mmu sctlr_el2, x8
+ 
+     bl      invalidate_icache
+@@ -106,4 +110,40 @@
+ 
+     ldp     x29, x30, [sp], #16
+     ret
++/* EL1 entry, including secondary CPUs started through PSCI at EL1. */
++init_core_state_el1:
++    mov     x8, #(3 << 20)
++    msr     cpacr_el1, x8
++    isb
++    disable_mmu sctlr_el1, x8
++    bl      invalidate_icache
++    ldr     x5, =MAIR(0x00, MT_DEVICE_nGnRnE) | \
++                 MAIR(0x04, MT_DEVICE_nGnRE) | \
++                 MAIR(0x0c, MT_DEVICE_GRE) | \
++                 MAIR(0x44, MT_NORMAL_NC) | \
++                 MAIR(0xff, MT_NORMAL) | \
++                 MAIR(0xaa, MT_NORMAL_WT)
++    msr     mair_el1, x5
++    ldr     x8, =(16 | (1 << 8) | (1 << 10) | (3 << 12) | \
++                  (16 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | (2 << 30))
++    mrs     x9, id_aa64mmfr0_el1
++    and     x9, x9, #7
++    orr     x8, x8, x9, lsl #32
++    msr     tcr_el1, x8
++    ldr     x8, =loader_level_0_table
++    ldr     x8, [x8]
++    msr     ttbr0_el1, x8
++    msr     ttbr1_el1, x8
++    isb
++    tlbi    vmalle1is
++    dsb     ish
++    isb
++    enable_mmu sctlr_el1, x8
++    adrp    x8, arm_vector_table
++    msr     vbar_el1, x8
++    ic      ialluis
++    dsb     ish
++    isb
++    ldp     x29, x30, [sp], #16
++    ret
+ END_FUNC(init_core_state)
+--- a/crates/sel4-kernel-loader/asm/aarch64/tail.S
++++ b/crates/sel4-kernel-loader/asm/aarch64/tail.S
+@@ -55,6 +55,11 @@
+  * the data cache.
+  */
+ BEGIN_FUNC(enter_kernel_el1)
++    mrs     x8, CurrentEL
++    cmp     x8, #4
++    b.ne    1f
++    disable_mmu sctlr_el1, x8
++1:
+     ldr     x8, =MAIR(0x00, MT_DEVICE_nGnRnE) | \
+                  MAIR(0x04, MT_DEVICE_nGnRE) | \
+                  MAIR(0x0c, MT_DEVICE_GRE) | \
+@@ -72,6 +77,9 @@
+     msr     tcr_el1, x8
+     msr     ttbr0_el1, x7
+     msr     ttbr1_el1, x7
++    mrs     x8, CurrentEL
++    cmp     x8, #4
++    b.eq    2f
+     /* EL1 is AArch64; no stage 2, no traps of timers, FP or system
+      * registers. */
+     mov     x8, #(1 << 31)
+@@ -82,6 +90,7 @@
+     mov     x8, #0x33ff
+     msr     cptr_el2, x8
+     msr     hstr_el2, xzr
++2:
+     /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
+     ldr     x8, =0x30d01805
+     msr     sctlr_el1, x8
+@@ -89,6 +98,11 @@
+     tlbi    vmalle1is
+     dsb     ish
+     isb
++    mrs     x8, CurrentEL
++    cmp     x8, #4
++    b.ne    3f
++    br      x6
++3:
+     /* EL1h with interrupts masked. */
+     mov     x8, #0x3c5
+     msr     spsr_el2, x8
+--- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
++++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
+@@ -68,7 +68,9 @@
+         };
+ 
+         let current_el = get_current_el();
+-        assert!(current_el == Some(CurrentEL::EL::Value::EL2));
++        assert!(current_el == Some(CurrentEL::EL::Value::EL2)
++            || (!sel4_config::sel4_cfg_bool!(ARM_HYPERVISOR_SUPPORT)
++                && current_el == Some(CurrentEL::EL::Value::EL1)));
+ 
+         unsafe {
+             set_tpidr(core_id);
+@@ -127,7 +129,7 @@
+ 
+ #[inline(never)]
+ pub(crate) unsafe fn reset_cntvoff() {
+-    unsafe {
+-        asm!("msr cntvoff_el2, xzr");
++    if get_current_el() == Some(CurrentEL::EL::Value::EL2) {
++        unsafe { asm!("msr cntvoff_el2, xzr"); }
+     }
+ }
+--- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs
++++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/exception_handler.rs
+@@ -20,8 +20,15 @@
+     let mut far;
+     let mut tpidr_el1;
+     unsafe {
+-        asm!("mrs {}, esr_el2", out(reg) esr);
+-        asm!("mrs {}, far_el2", out(reg) far);
++        let el: usize;
++        asm!("mrs {}, CurrentEL", out(reg) el);
++        if el == 4 {
++            asm!("mrs {}, esr_el1", out(reg) esr);
++            asm!("mrs {}, far_el1", out(reg) far);
++        } else {
++            asm!("mrs {}, esr_el2", out(reg) esr);
++            asm!("mrs {}, far_el2", out(reg) far);
++        }
+         asm!("mrs {}, tpidr_el1", out(reg) tpidr_el1);
+     }
+     let exception = Exception {
+--- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/drivers/psci.rs
++++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/drivers/psci.rs
+@@ -8,12 +8,14 @@
+ 
+ pub(crate) fn start_secondary_core(core_id: usize, sp: usize) {
+     let start = psci_secondary_entry as *const PsciSecondaryEntryFn as usize;
+-    smccc::psci::cpu_on::<smccc::Smc>(
+-        core_id.try_into().unwrap(),
+-        start.try_into().unwrap(),
+-        sp.try_into().unwrap(),
+-    )
+-    .unwrap();
++    let args = (core_id.try_into().unwrap(), start.try_into().unwrap(), sp.try_into().unwrap());
++    let result = if super::super::get_current_el() == Some(aarch64_cpu::registers::CurrentEL::EL::Value::EL1) {
++        // QEMU virt exposes PSCI through HVC when booting without EL2.
++        smccc::psci::cpu_on::<smccc::Hvc>(args.0, args.1, args.2)
++    } else {
++        smccc::psci::cpu_on::<smccc::Smc>(args.0, args.1, args.2)
++    };
++    result.unwrap();
+ }
+ 
+ type PsciSecondaryEntryFn = extern "C" fn() -> !;

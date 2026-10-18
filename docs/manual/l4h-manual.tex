@@ -171,9 +171,10 @@ and a guest kernel that does not accept
 
 This is version 0.1. Before you depend on it, note the following.
 \begin{itemize}
-  \item The Linux guest runs on x86\_64 only. On aarch64, seL4, the host
-        components and a freestanding test guest run on QEMU \texttt{virt};
-        the Linux guest, PCI, disks and NICs are not ported yet.
+  \item Linux guests run on x86\_64 and AArch64. The AArch64 platform
+        is QEMU \texttt{virt} with GICv2m, including SMP, PCI virtio disks
+        and NICs, NVMe, the RTC and serial monitor. QEMU virtualization
+        is disabled; the loader starts directly at EL1.
   \item The UEFI image has been tested locally under QEMU with OVMF and on
         GCE \texttt{n2-standard-4} instances with virtio-net. gVNIC,
         which C3, C4 and N4 machines require, is not supported.
@@ -206,8 +207,9 @@ A Linux x86\_64 build machine with:
   \item for UEFI images: GRUB EFI (\texttt{grub-efi-amd64-bin}), mtools,
         sfdisk and OVMF;
   \item for Debian guests: debootstrap and sudo;
-  \item for aarch64: \texttt{gcc-aarch64-linux-gnu} and
-        \texttt{qemu-system-arm}.
+  \item for aarch64: \texttt{gcc-aarch64-linux-gnu}, cross libc headers,
+        \texttt{qemu-system-arm} and a static AArch64 BusyBox.
+        \cmd{tools/ci-setup.sh aarch64} prepares these on Debian 13.
 \end{itemize}
 KVM serves only as a fast CPU for QEMU. The run scripts hide VMX from the
 emulated machine, so seL4 runs exactly as it would on a cloud VM without
@@ -224,6 +226,33 @@ python3 -m venv .venv && .venv/bin/pip install sel4-deps   # seL4's build tools
 Linux itself is not a submodule. Extract a Linux 6.18 tree into
 \file{build/linux-6.18}. The build links \file{guest/linux/arch/l4h} into it
 and applies the patches in \file{guest/linux/patches} once.
+
+\section{AArch64}
+
+Build seL4 and the loader once, then set \texttt{L4H\_ARCH=aarch64}
+for the guest build, initramfs, run and integration-test scripts:
+\begin{lstlisting}[language=bash]
+tools/build-kernel-aarch64.sh
+tools/build-loader-aarch64.sh
+L4H_ARCH=aarch64 tests/run-selftest.sh 4
+L4H_ARCH=aarch64 tests/run-blktest.sh
+L4H_ARCH=aarch64 tests/run-nettest.sh
+\end{lstlisting}
+Linux output is in \file{build/linux-l4h-aarch64}. Initramfs creation uses
+\file{build/busybox-aarch64/usr/bin/busybox}, or the binary named by
+\texttt{L4H\_BUSYBOX}. The existing UEFI and GCE image scripts are
+specific to x86\_64. Set \texttt{L4H\_QEMU\_VIRTUALIZATION=on} to test
+the alternative loader path that starts at EL2 and drops to EL1.
+
+An assembled \file{build/l4h-aarch64.img} also boots directly on Apple
+Silicon macOS using QEMU (\cmd{brew install qemu}):
+\begin{lstlisting}[language=bash]
+tools/run-image-aarch64.sh build/l4h-aarch64.img
+\end{lstlisting}
+The script selects HVF and an emulated GICv2
+(\texttt{kernel-irqchip=off}); no intermediate Linux VM is needed.
+Tart's EFI machine requires a separate platform port.
+
 
 \section{Build steps}
 
@@ -883,7 +912,8 @@ A vCPU's guest kernel and user code share its budget. Every 100\,ms, if
 either used at least 90\% of its share, the host adjusts the split in
 proportion to the CPU time each consumed. Each part keeps at least
 200\,$\mu$s, so caps below 8\% use a period longer than the usual 5\,ms
-(40\,ms at 1\%). Reconfiguring an idle or unbound scheduling context can
+(40\,ms at 1\%). AArch64 caps use at least a 40\,ms period to
+amortize emulated GIC timer delivery. Reconfiguring an idle or unbound scheduling context can
 grant a fresh budget, allowing up to one extra period's budget per
 adjustment. A workload that alternates between kernel and user code may
 use less than its cap when one part runs out before the other.

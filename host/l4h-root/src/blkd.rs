@@ -151,7 +151,8 @@ pub fn attach(
     cfg.bar0 = blk::PciRegion { va: bar_va(0) as u64, len: d.bars[0].size };
     cfg.pci_bdf = bdf(d);
     let vector = disk.vector;
-    cfg.msi_data = 0x30 + vector as u32;
+    cfg.msi_data = pci::msi_data(vector);
+    cfg.msi_address = pci::msi_address();
     if let Some(VirtioRegions { common, notify, notify_mult, isr, device, .. }) = regions {
         cfg.common = common;
         cfg.notify = notify;

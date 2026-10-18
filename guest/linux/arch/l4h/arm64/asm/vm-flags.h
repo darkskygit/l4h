@@ -1,0 +1,2 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#define VM_STACK_DEFAULT_FLAGS (VM_GROWSDOWN | VM_DATA_FLAGS_NON_EXEC)

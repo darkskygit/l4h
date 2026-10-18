@@ -6,7 +6,10 @@
 #   L4H_SEL4_INCLUDE  libsel4 include directory of the l4h seL4 build
 #   L4H_ABI_INCLUDE   directory containing l4h/abi.h
 
-SUBARCH := x86_64
+SUBARCH ?= x86_64
+ifeq ($(SUBARCH),aarch64)
+include $(srctree)/arch/l4h/arm64/Makefile.arch
+else
 KBUILD_DEFCONFIG := defconfig
 
 ARCH_DIR := arch/l4h
@@ -86,4 +89,5 @@ LDFLAGS_vmlinux := -z noexecstack -z max-page-size=4096 --no-warn-rwx-segments
 archclean:
 	$(Q)$(MAKE) -f $(srctree)/Makefile ARCH=$(HEADER_ARCH) clean
 
+endif
 export HEADER_ARCH SUBARCH USER_CFLAGS SEL4_CFLAGS

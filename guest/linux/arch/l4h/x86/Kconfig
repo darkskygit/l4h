@@ -1,3 +1,4 @@
+if !UML_ARM64
 # SPDX-License-Identifier: GPL-2.0
 
 menu "Host processor type and features"
@@ -26,3 +27,5 @@ config ARCH_REUSE_HOST_VSYSCALL_AREA
 
 config GENERIC_HWEIGHT
 	def_bool y
+
+endif

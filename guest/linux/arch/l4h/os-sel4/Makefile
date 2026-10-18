@@ -4,6 +4,10 @@
 
 obj-y := head.o sys.o boot.o events.o user.o
 
+ifeq ($(SUBARCH),aarch64)
+obj-y := head-arm64.o sys.o boot.o events.o user.o
+endif
+
 SEL4_OBJS := sys.o boot.o events.o user.o
 
 include $(srctree)/arch/l4h/scripts/Makefile.rules

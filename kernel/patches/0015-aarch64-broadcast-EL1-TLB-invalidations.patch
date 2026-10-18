@@ -1,0 +1,61 @@
+From 56a2a8ccac32188dede1547df6e6d231742db1dc Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Sun, 18 Oct 2026 14:13:52 -0700
+Subject: [PATCH] aarch64: broadcast EL1 TLB invalidations in the SMP domain
+
+Use the architectural inner-shareable TLBI operations, bracketed by DSB and ISB, for the global EL1 invalidation APIs. Page mapping, unmapping and ASID eviction otherwise rendezvous with every CPU through software IPIs, causing severe latency under emulation. Preserve local operations and the existing EL2 and AArch32 paths.
+---
+ include/arch/arm/arch/machine/tlb.h | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/include/arch/arm/arch/machine/tlb.h b/include/arch/arm/arch/machine/tlb.h
+index 7235672db..345276e47 100644
+--- a/include/arch/arm/arch/machine/tlb.h
++++ b/include/arch/arm/arch/machine/tlb.h
+@@ -37,19 +37,43 @@ static inline void invalidateTranslationAllLocal(void)
+ 
+ static inline void invalidateTranslationSingle(vptr_t vptr)
+ {
++#if defined(CONFIG_ARCH_AARCH64) && !defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(ENABLE_SMP_SUPPORT)
++    /* EL1 translations are shared by the SMP domain. Broadcast maintenance
++     * avoids a synchronous software IPI rendezvous for every page mapping. */
++    dsb();
++    asm volatile("tlbi vae1is, %0" : : "r"(vptr) : "memory");
++    dsb();
++    isb();
++#else
+     invalidateTranslationSingleLocal(vptr);
+     SMP_COND_STATEMENT(doRemoteInvalidateTranslationSingle(vptr, MASK(CONFIG_MAX_NUM_NODES)));
++#endif
+ }
+ 
+ static inline void invalidateTranslationASID(hw_asid_t hw_asid)
+ {
++#if defined(CONFIG_ARCH_AARCH64) && !defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(ENABLE_SMP_SUPPORT)
++    assert(hw_asid < BIT(16));
++    dsb();
++    asm volatile("tlbi aside1is, %0" : : "r"((word_t)hw_asid << 48) : "memory");
++    dsb();
++    isb();
++#else
+     invalidateTranslationASIDLocal(hw_asid);
+     SMP_COND_STATEMENT(doRemoteInvalidateTranslationASID(hw_asid, MASK(CONFIG_MAX_NUM_NODES)));
++#endif
+ }
+ 
+ static inline void invalidateTranslationAll(void)
+ {
++#if defined(CONFIG_ARCH_AARCH64) && !defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(ENABLE_SMP_SUPPORT)
++    dsb();
++    asm volatile("tlbi vmalle1is" : : : "memory");
++    dsb();
++    isb();
++#else
+     invalidateTranslationAllLocal();
+     SMP_COND_STATEMENT(doRemoteInvalidateTranslationAll(MASK(CONFIG_MAX_NUM_NODES)));
++#endif
+ }
+ 
+-- 
+2.47.3
+

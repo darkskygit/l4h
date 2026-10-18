@@ -2,19 +2,20 @@
 # The l4h-root serial monitor: list guests and restart dom0 from COM1.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/guest-env.sh"
 out=$root/build/guest
 mkdir -p "$out"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
+"$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
-L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" L4H_DOM0_INITRD="$out/vm.cpio.gz" \
-    L4H_DOM0_CMDLINE=console=hvc0 "$root/tools/build-host.sh"
+L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/vm.cpio.gz" \
+    L4H_DOM0_CMDLINE=console=hvc0 "$l4h_host_build"
 log=$root/build/qemu-monitor.log
 fifo=$(mktemp -u)
 mkfifo "$fifo"
 trap 'rm -f "$fifo"' EXIT
-"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" <"$fifo" >"$log" 2>&1 &
+"$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" <"$fifo" >"$log" 2>&1 &
 qemu=$!
 exec 3>"$fifo"
 wait_for() { # pattern count timeout

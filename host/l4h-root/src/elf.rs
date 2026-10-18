@@ -36,6 +36,13 @@ impl<'a> Elf<'a> {
         if data[4] != 2 || data[5] != 1 {
             return Err("not a little-endian ELF64 file");
         }
+        #[cfg(target_arch = "x86_64")]
+        const MACHINE: u16 = 62;
+        #[cfg(target_arch = "aarch64")]
+        const MACHINE: u16 = 183;
+        if u16_at(data, 18) != MACHINE {
+            return Err("ELF architecture does not match the host");
+        }
         let phoff = u64_at(data, 32) as usize;
         let phentsize = u16_at(data, 54) as usize;
         let phnum = u16_at(data, 56) as usize;

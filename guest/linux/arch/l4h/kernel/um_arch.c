@@ -27,7 +27,9 @@
 #include <asm/cpufeature.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
+#ifdef CONFIG_UML_X86
 #include <asm/text-patching.h>
+#endif
 #include <as-layout.h>
 #include <arch.h>
 #include <init.h>
@@ -57,18 +59,25 @@ static char host_info[(__NEW_UTS_LEN + 1) * 5];
 
 static int show_cpuinfo(struct seq_file *m, void *v)
 {
-	int i, cpu = (struct cpuinfo_um *)v - &boot_cpu_data;
+	int cpu = (struct cpuinfo_um *)v - &boot_cpu_data;
+#ifdef CONFIG_UML_X86
+	int i;
+#endif
 
 	seq_printf(m, "processor\t: %d\n", cpu);
 	seq_printf(m, "vendor_id\t: l4h\n");
 	seq_printf(m, "model name\t: l4h paravirtual vCPU\n");
 	seq_printf(m, "host\t\t: %s\n", host_info);
+#ifdef CONFIG_UML_X86
 	seq_printf(m, "fpu\t\t: %s\n", str_yes_no(cpu_has(&boot_cpu_data, X86_FEATURE_FPU)));
 	seq_printf(m, "flags\t\t:");
 	for (i = 0; i < 32*NCAPINTS; i++)
 		if (cpu_has(&boot_cpu_data, i) && (x86_cap_flags[i] != NULL))
 			seq_printf(m, " %s", x86_cap_flags[i]);
 	seq_printf(m, "\n");
+#else
+	seq_printf(m, "Features\t: fp asimd\n");
+#endif
 	seq_printf(m, "cache_alignment\t: %d\n", boot_cpu_data.cache_alignment);
 	seq_printf(m, "bogomips\t: %lu.%02lu\n\n",
 		   loops_per_jiffy/(500000/HZ),
@@ -156,6 +165,7 @@ void uml_finishsetup(void)
 	new_thread_handler();
 }
 
+#ifdef CONFIG_UML_X86
 static void __init cpuid(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d)
 {
 	asm volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
@@ -223,9 +233,21 @@ static void __init l4h_cpu_features(void)
 	l4h_mask_xsave_features();
 }
 
+#else
+static void __init l4h_cpu_features(void)
+{
+	/* seL4 saves the base FP/ASIMD state; no SVE state is enabled. */
+	elf_aux_hwcap = HWCAP_FP | HWCAP_ASIMD;
+}
+#endif
+
 void __init setup_machinename(char *machine_out)
 {
+#ifdef CONFIG_UML_ARM64
+	strcpy(machine_out, "aarch64");
+#else
 	strcpy(machine_out, "x86_64");
+#endif
 }
 
 void __init setup_hostinfo(char *buf, int len)
@@ -286,6 +308,7 @@ void __init arch_cpu_finalize_init(void)
 	arch_check_bugs();
 }
 
+#ifdef CONFIG_UML_X86
 void apply_seal_endbr(s32 *start, s32 *end)
 {
 }
@@ -331,6 +354,8 @@ void smp_text_poke_sync_each_cpu(void)
 {
 }
 
+#endif
+
 /* ---- misc host services */
 
 static void os_vprint(const char *prefix, const char *fmt, va_list ap)
@@ -373,6 +398,9 @@ void um_early_printk(const char *s, unsigned int n)
 
 ssize_t os_getrandom(void *buf, size_t len, unsigned int flags)
 {
+#ifdef CONFIG_UML_ARM64
+	return -ENOSYS;
+#else
 	size_t i;
 
 	if (!cpu_has(&boot_cpu_data, X86_FEATURE_RDRAND))
@@ -390,4 +418,5 @@ ssize_t os_getrandom(void *buf, size_t len, unsigned int flags)
 		memcpy(buf + i, &v, min(sizeof(v), len - i));
 	}
 	return len;
+#endif
 }

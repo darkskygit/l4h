@@ -375,22 +375,22 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     let reply = alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
+    let mut wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
+    let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
     let info = HostInfo {
         cores,
         tsc_hz: tsc_hz(bootinfo),
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
         timeslice_us: 5000,
-        epoch_ns: rtc::read_ns(&mut alloc),
+        epoch_ns: rtc::read_ns(&mut alloc, &mut devmem, &mut wins.a),
         epoch_ticks: rdtsc(),
         placement: core::cell::Cell::new(0),
     };
     let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
-    let mut wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
 
     // PCI devices: virtio-blk disks can be passed through to guests.
-    let pci = pci::Pci::new(&mut alloc);
-    let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
+    let pci = pci::Pci::new(&mut alloc, &mut devmem);
     let mut disks = Vec::new();
     let mut nics = Vec::new();
     for d in pci.enumerate() {
@@ -442,7 +442,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         monitor: None,
         dashboard: None,
     };
-    h.monitor = monitor::Monitor::new(&mut h.alloc, wd_ntfn);
+    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem);
 
     if DOM0_KERNEL.is_empty() {

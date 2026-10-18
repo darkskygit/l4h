@@ -9,8 +9,8 @@ never emulates an instruction.
 
 Status: **v0.1 implemented on x86_64**, including SMP Linux guests,
 block and network I/O, dom0 control, CPU caps and balancing, and GCE N2
-bring-up. On aarch64, the host and ABI test guest run on QEMU `virt`;
-Linux guests and PCI drivers remain to be ported (§11). The original
+bring-up. AArch64 runs the host and native Linux guests on QEMU `virt`,
+including SMP and PCI block/network drivers, with virtualization disabled (§11). The original
 review decisions are recorded in §14. Future work is identified below;
 §15 records the implemented guest-owned memory design.
 
@@ -322,18 +322,22 @@ arch/l4h/
   os-sel4/  freestanding boot, event and user-thread operations against libsel4
   drivers/  virtio_l4h transport, hvc console, l4hctl
   include/  kernel, shared and UAPI headers
-  x86/      ISA-specific signal frames, TLS, syscall table, vDSO and register glue
+  x86/      x86_64 signal frames, TLS, syscall table, vDSO and register glue
+  arm64/    native AArch64 ABI, atomics, context switching and module relocations
   configs/defconfig
 guest/linux/patches/              changes outside arch/l4h
 ```
 
-`tools/build-linux.sh` builds with `ARCH=l4h`; the architecture Makefile
-sets `SUBARCH=x86_64` and uses headers from the seL4 build. The
-**userspace ABI is exactly the native x86_64 Linux ABI**: the same uapi
-headers, `syscall_64.tbl`, signal frame layout and vDSO. Unmodified distro
-userlands therefore run. We maintain the code as a patch series against the
-current Linux LTS (6.18 at the time of writing), rebased once per LTS.
-The aarch64 Linux port remains future work.
+`tools/build-linux.sh` builds with `ARCH=l4h`, using `SUBARCH=x86_64`
+by default or `SUBARCH=aarch64` when `L4H_ARCH=aarch64`. Each subarchitecture
+uses its native UAPI headers, syscall table and signal-frame layout. AArch64
+exports FP/ASIMD HWCAPs, preserves TPIDR_EL0 and all 31 general registers,
+and supplies a versioned vDSO with the signal-return trampoline. Its first
+syscall argument is saved separately from the x0 return value, including
+across restarted syscalls. Executable mappings receive instruction-cache
+maintenance through seL4. Both ISAs use the common memory, scheduling and
+virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
+`guest/linux/patches`.
 
 ### 5.2 Address spaces
 
@@ -518,7 +522,7 @@ The clockevent is a per-vCPU one-shot deadline armed with
 
 *Revised (v1):* the wall clock at boot comes from `L4H_HC_GET_TIME`:
 `l4h-root` reads the CMOS RTC once at boot, and each VMM adds the TSC time
-since. Guests may correct it with NTP. Without an RTC (aarch64 for now) it
+since. Guests may correct it with NTP. Without an RTC it
 is 0, the epoch.
 
 **Signals.** The kernel builds the native x86 `rt_sigframe` in user memory
@@ -637,6 +641,8 @@ including pool addresses, device indices and lifecycle state.
   implemented.
   - Each SC needs at least 200 µs, well above seL4's minimum budget, so
     caps below 8% get a longer period: 1% is 400 µs every 40 ms.
+    AArch64 capped vCPUs use at least a 40 ms period to amortize emulated
+    GIC timer delivery: 25% gets a shared 10 ms budget every 40 ms.
   - The split adapts. When, in a balancer period, either SC used at
     least 90% of its part, the budget is split in proportion to what each
     used (each keeps at least 200 µs). A user-bound vCPU capped at 25%
@@ -661,7 +667,8 @@ including pool addresses, device indices and lifecycle state.
   - seL4 keeps the sliding-window limit of a reconfigured SC whose
     thread is runnable; an SC that is idle or unbound starts afresh with
     its new budget. Since the split changes at most once per balancer
-    period, that is at most one period's budget (5% of the cap) extra.
+    period, that is at most one period's budget extra per change
+    (5% of the cap at a 5 ms period, 40% at a 40 ms period).
     Samples covering more CPU time than elapsed (consumption reported
     late when the root task ran late) do not move the split.
   - seL4 refuses to bind an SC whose budget is exhausted to a blocked
@@ -1079,8 +1086,8 @@ external orchestration can run in dom0.
 | TLS | `fs_base` | `TPIDR_EL0` (`seL4_TCB_SetTLSBase`) |
 | Timer (E3) | LAPIC TSC-deadline or countdown | ARM generic timer |
 | vDSO clock | `rdtsc` | `cntvct_el0` |
-| Drivers | Rust virtio-net/blk PCI, NVMe | PCI/ECAM and hardware drivers not ported yet |
-| Boot | multiboot2 | seL4 elfloader / UEFI |
+| Drivers | Rust virtio-net/blk PCI, NVMe | Same drivers; ECAM, BAR assignment and GICv2m MSI-X |
+| Boot | multiboot2 / UEFI | rust-sel4 loader, entry at EL1 or EL2 |
 
 Rules that keep the port cheap:
 
@@ -1104,21 +1111,38 @@ Rules that keep the port cheap:
     in x7, and x8 is not otherwise part of the fault message.
   - FaultIP points at the `svc` instruction, so the guest advances it by
     4 (x86_64: by 2).
+  - Patch 0015 uses inner-shareable broadcast TLB maintenance at EL1.
+    Patch 0016 reads the architectural counter frequency at boot for MCS
+    budget and consumed-time conversions; the same image handles TCG's
+    62.5 MHz counter and Apple M4 HVF's 24 MHz counter.
 - **Boot.** rust-sel4's kernel loader only entered EL2 kernels.
   `third_party/patches/rust-sel4/0001` adds the EL1 path: it drops from EL2
   with the EL1 translation regime set up and no traps.
   `tools/build-loader-aarch64.sh` applies the patch and builds the loader.
-  Booting at EL1 directly, as cloud VMs do, still needs loader work.
-- **Host.** l4h-root and all components build for aarch64
-  (`tools/build-host-aarch64.sh`). The ISA-specific pieces are page tables
-  (`vspace.rs`), the time counter (`l4h_host::ticks`: TSC or `cntvct_el0`)
-  and PCI. PCI (ECAM, GIC interrupts) is not implemented on aarch64 yet,
-  so no host devices exist there.
-- **Test.** `tests/run-testguest-aarch64.sh` passes on 4 TCG cores: dom0
-  is the ABI test guest, served by its l4h-vmm. The test covers E1 with
-  an x7 sweep (#477), E2 on v0, user page faults and E3.
-- **Not done.** The Linux side (`arch/l4h` for arm64) and the aarch64
-  PCI/ECAM drivers.
+  Patch 0002 also supports direct EL1 entry, initializes the EL1 translation
+  regime and selects QEMU's HVC PSCI conduit when EL2 is unavailable.
+  The run script disables virtualization by default; its optional
+  `L4H_QEMU_VIRTUALIZATION=on` tests the EL2 path.
+- **Host.** All components build for AArch64. QEMU `virt` uses GICv2,
+  `highmem-ecam=off,highmem-mmio=off`, a 16 MiB ECAM at 0x3f000000 and
+  the 32-bit PCI memory aperture. The root assigns memory BARs before starting devices. GICv2m
+  supplies 64 MSI interrupts (SPIs 80–143), divided between NICs and up to
+  48 disks. MSI address/data are passed explicitly to the common drivers.
+  The PL031 supplies wall time and the PL011 receives serial monitor input.
+- **Linux.** The native AArch64 ABI, signals and FPSIMD context records,
+  ptrace register sets, TLS, SMP, atomics, setjmp/longjmp, syscall restart,
+  instruction-cache maintenance and module relocations are implemented.
+  Modules use the large code model, like the guest kernel.
+- **Tests.** `run-testguest-aarch64.sh` covers the ABI with an attached
+  PCI disk. `L4H_ARCH=aarch64` selects the Linux integration tests, including
+  1/4-vCPU self-tests, modules, virtio-blk/NVMe, VM lifecycle, networking and
+  the serial monitor. CI has a QEMU/TCG job for these paths. The assembled
+  image also runs directly on Apple Silicon macOS using QEMU/HVF with
+  `kernel-irqchip=off`; 1/4-vCPU self-tests pass on an Apple M4.
+  `tools/run-image-aarch64.sh` selects HVF on macOS.
+- **Platform scope.** This configuration targets QEMU `virt` with GICv2m.
+  The existing UEFI/GCE images target x86_64; other ARM boards require their
+  own platform description and interrupt routing.
 
 ---
 
@@ -1204,9 +1228,8 @@ uses a 16 GiB QEMU machine and guests of 256–512 MiB.
 **Original milestones and gates.** These record the development plan,
 not a claim that every proposed gate or feature has been completed.
 M0–M6 have working v1 implementations, with the tests and limitations
-described above. M7 has reached N2; gVNIC remains. M8 has aarch64 host/ABI
-bring-up and virtqueue fuzzing, while the Linux port, upcall injection and
-paravirtual spinlocks remain future work.
+described above. M7 has reached N2; gVNIC remains. M8 includes AArch64 Linux/PCI support and virtqueue fuzzing; upcall
+injection and paravirtual spinlocks remain future work.
 
 1. **M0, platform.**
    - Toolchains and the seL4 MCS SMP build.
@@ -1249,7 +1272,7 @@ paravirtual spinlocks remain future work.
    - The upcall-injection backstop (future), the host-owned I/O pool
      (implemented, §15.1), and fuzzing of the VMM, switch and control-API
      parsers (virtqueue and pool fuzzing implemented).
-   - aarch64 bring-up on QEMU virt.
+   - AArch64 Linux and PCI on QEMU virt (implemented, §11).
 
 ---
 
@@ -1423,10 +1446,8 @@ memory the guest can retype.
   next retype of a merged parent makes seL4 clear everything its children
   used, and merging eagerly up to GiB blocks made every guest create clear
   a GiB of memory (create took 470 ms instead of 150).
-- aarch64: the host side (l4h-root) is ISA-independent and builds the same
-  blocks; the aarch64 test guest uses them. The Linux guest, and so the
-  guest's side of phases 2 and 3, is x86_64 only, like the rest of the
-  Linux port.
+- AArch64 uses the same host and Linux guest RAM-block conversion and
+  reclamation paths. Only its paging-object operations differ.
 - **Measured** (`tests/run-vmbench.sh`, nested QEMU/KVM, debug builds;
   host memory beyond a booted guest's RAM, and median latencies):
 
@@ -1523,5 +1544,5 @@ memory the guest can retype.
   12 MiB stay in chunks that long-lived objects pin, against 3.5 MiB
   before it. Compaction (rebuilding VSpace mirrors into fresh blocks)
   remains future work.
-- aarch64 has no Linux guest yet, so phase 3 is x86_64 only; nothing in it
-  is ISA-specific except the paging-structure types.
+- Phase 3 is shared by x86_64 and AArch64; only the paging-structure
+  operations differ. The measurements above are from x86_64.

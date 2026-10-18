@@ -7,7 +7,24 @@
 #![no_std]
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::Ordering;
+#[cfg(not(target_arch = "aarch64"))]
+use core::sync::atomic::fence;
+
+/// Order coherent DMA memory against device registers and completion writes.
+/// ARM devices can sit outside the CPU inner-shareable domain.
+pub fn dma_fence(ordering: Ordering) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        match ordering {
+            Ordering::Release => core::arch::asm!("dmb oshst", options(nostack)),
+            Ordering::Acquire => core::arch::asm!("dmb oshld", options(nostack)),
+            _ => core::arch::asm!("dmb osh", options(nostack)),
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    fence(ordering);
+}
 
 pub const STATUS_ACK: u8 = 1;
 pub const STATUS_DRIVER: u8 = 2;
@@ -229,13 +246,13 @@ impl Virtq {
     pub fn submit(&mut self, head: u16) {
         let a = Mmio(self.avail);
         a.w16(4 + 2 * (self.avail_idx % self.num) as usize, head);
-        fence(Ordering::Release);
+        dma_fence(Ordering::Release);
         self.avail_idx = self.avail_idx.wrapping_add(1);
         a.w16(2, self.avail_idx);
     }
 
     pub fn notify(&self) {
-        fence(Ordering::SeqCst);
+        dma_fence(Ordering::SeqCst);
         if let Some(n) = self.notify {
             n.w16(0, self.idx);
         }
@@ -247,7 +264,7 @@ impl Virtq {
         if u.r16(2) == self.last_used {
             return None;
         }
-        fence(Ordering::Acquire);
+        dma_fence(Ordering::Acquire);
         let slot = (self.last_used % self.num) as usize;
         let id = u.r32(4 + 8 * slot);
         let len = u.r32(8 + 8 * slot);

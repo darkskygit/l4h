@@ -47,12 +47,18 @@ pub const K_SHARE_INIT: u32 = 500;
 /// period, so that the vCPU as a whole never exceeds its cap; SC_K gets
 /// `k_share` permille of it.  Each SC needs at least MIN_BUDGET_US, so a
 /// small cap stretches the period instead (1% runs 400 µs every 40 ms).
+/// ARM virtual platforms use at least 40 ms under caps to amortize GIC
+/// timer delivery latency.
 pub fn budgets(timeslice_us: u64, cap_pct: u32, k_share: u32) -> (u64, u64, u64) {
     if cap_pct == 0 || cap_pct >= 100 {
         return (timeslice_us, timeslice_us, timeslice_us);
     }
     let cap = cap_pct as u64;
-    let period = timeslice_us.max((2 * MIN_BUDGET_US * 100).div_ceil(cap));
+    // ARM virtual platforms deliver the GIC timer through a userspace
+    // interrupt controller. Short periods lose useful runtime to that
+    // delivery latency; retain a useful quota even after splitting it.
+    let min_period = if cfg!(target_arch = "aarch64") { 40_000 } else { 0 };
+    let period = timeslice_us.max(min_period).max((2 * MIN_BUDGET_US * 100).div_ceil(cap));
     let total = period * cap / 100;
     let k = (total * k_share as u64 / 1000).clamp(MIN_BUDGET_US, total - MIN_BUDGET_US);
     (period, k, total - k)

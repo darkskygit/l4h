@@ -39,7 +39,9 @@ void handle_syscall(struct uml_pt_regs *r)
 
 	/* Initialize the syscall number and default return value. */
 	UPT_SYSCALL_NR(r) = PT_SYSCALL_NR(r->gp);
-	PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);
+	/* ARM x0 is also the first argument, visible at a ptrace entry stop. */
+	if (!IS_ENABLED(CONFIG_UML_ARM64) || UPT_SYSCALL_NR(r) == -1)
+		PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);
 
 	if (syscall_trace_enter(regs))
 		goto out;
@@ -68,6 +70,10 @@ void handle_syscall(struct uml_pt_regs *r)
 				UPT_SYSCALL_ARG3(&regs->regs), UPT_SYSCALL_ARG4(&regs->regs), ret,
 				UPT_IP(&regs->regs), UPT_SP(&regs->regs));
 
+#ifdef CONFIG_UML_ARM64
+	} else if (syscall != -1) {
+		PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);
+#endif
 	}
 
 out:

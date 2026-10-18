@@ -51,8 +51,7 @@ void l4h_uctx_describe(unsigned long badge)
 
 /* ---- registers */
 
-/* Initial register state of a fresh thread: zero GPRs and the x87/SSE
- * init state in XSAVE format. */
+/* Initial register state: zero GPRs, native FP/SIMD defaults. */
 void get_safe_registers(unsigned long *regs, unsigned long *fp_regs)
 {
 	memset(regs, 0, sizeof(unsigned long) * MAX_REG_NR);
@@ -60,8 +59,10 @@ void get_safe_registers(unsigned long *regs, unsigned long *fp_regs)
 		u8 *fp = (u8 *)fp_regs;
 
 		memset(fp, 0, host_fp_size);
+#ifdef CONFIG_UML_X86
 		*(u16 *)(fp + 0) = 0x37f;	/* FCW */
 		*(u32 *)(fp + 24) = 0x1f80;	/* MXCSR */
+#endif
 	}
 }
 
@@ -258,8 +259,7 @@ static void prepare_user(struct task_struct *t)
 	}
 }
 
-/* Map an seL4 user exception to a Linux signal, as the x86 trap handlers
- * would. */
+/* Map an seL4 user exception to the native Linux signal. */
 static void handle_exception(struct uml_pt_regs *regs, struct l4h_uctx *u)
 {
 	struct faultinfo *fi = &current->thread.arch.faultinfo;
@@ -269,6 +269,40 @@ static void handle_exception(struct uml_pt_regs *regs, struct l4h_uctx *u)
 	fi->trap_no = u->exc_number;
 	fi->error_code = u->fault_code;
 	fi->cr2 = 0;
+#ifdef CONFIG_UML_ARM64
+	/* ESR exception classes: BRK, alignment and undefined instruction. */
+	switch (u->exc_number >> 26) {
+	case 0x2c: /* trapped floating-point exception */
+		sig = SIGFPE;
+		code = FPE_FLTUNK;
+		if (u->exc_number & (1UL << 23)) {
+			if (u->exc_number & 1) code = FPE_FLTINV;
+			else if (u->exc_number & 2) code = FPE_FLTDIV;
+			else if (u->exc_number & 4) code = FPE_FLTOVF;
+			else if (u->exc_number & 8) code = FPE_FLTUND;
+			else if (u->exc_number & 16) code = FPE_FLTRES;
+		}
+		break;
+	case 0x3c:
+		sig = SIGTRAP;
+		code = TRAP_BRKPT;
+		break;
+	case 0x22: /* PC alignment */
+	case 0x26: /* SP alignment */
+	case 0x24: /* data abort with alignment FSC */
+		sig = SIGBUS;
+		code = BUS_ADRALN;
+		if ((u->exc_number >> 26) == 0x24)
+			addr = (void __user *)u->fault_addr;
+		else if ((u->exc_number >> 26) == 0x26)
+			addr = (void __user *)UPT_SP(regs);
+		break;
+	default:
+		sig = SIGILL;
+		code = ILL_ILLOPC;
+		break;
+	}
+#else
 	switch (u->exc_number) {
 	case 0:		/* #DE */
 		sig = SIGFPE;
@@ -305,6 +339,7 @@ static void handle_exception(struct uml_pt_regs *regs, struct l4h_uctx *u)
 		addr = NULL;
 		break;
 	}
+#endif
 	if (code == SI_KERNEL)
 		force_sig(sig);
 	else
@@ -370,6 +405,12 @@ void userspace(struct uml_pt_regs *regs)
 	}
 }
 
+#ifdef CONFIG_UML_ARM64
+#define L4H_STACK_RESERVE 16
+#else
+#define L4H_STACK_RESERVE sizeof(void *)
+#endif
+
 /* ---- kernel threads (UML os-Linux/skas/process.c) */
 
 unsigned long get_thread_reg(int reg, jmp_buf *buf)
@@ -389,7 +430,7 @@ unsigned long get_thread_reg(int reg, jmp_buf *buf)
 void new_thread(void *stack, jmp_buf *buf, void (*handler)(void))
 {
 	(*buf)[0].JB_IP = (unsigned long) handler;
-	(*buf)[0].JB_SP = (unsigned long) stack + UM_THREAD_SIZE - sizeof(void *);
+	(*buf)[0].JB_SP = (unsigned long) stack + UM_THREAD_SIZE - L4H_STACK_RESERVE;
 }
 
 #define INIT_JMP_NEW_THREAD 0
@@ -418,7 +459,7 @@ int start_idle_thread(void *stack, jmp_buf *switch_buf)
 	case INIT_JMP_NEW_THREAD:
 		(*switch_buf)[0].JB_IP = (unsigned long) uml_finishsetup;
 		(*switch_buf)[0].JB_SP = (unsigned long) stack +
-			UM_THREAD_SIZE - sizeof(void *);
+			UM_THREAD_SIZE - L4H_STACK_RESERVE;
 		break;
 	case INIT_JMP_CALLBACK:
 		(*cb_proc)(cb_arg);

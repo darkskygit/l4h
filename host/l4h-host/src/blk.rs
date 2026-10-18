@@ -111,6 +111,7 @@ pub struct BlkdConfig {
     pub pci_bdf: u32,
     /// MSI data of MSI-X table entry 0 (the queue interrupt).
     pub msi_data: u32,
+    pub msi_address: u64,
     pub common: PciRegion,
     pub notify: PciRegion,
     pub notify_off_multiplier: u32,

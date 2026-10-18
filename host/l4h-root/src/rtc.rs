@@ -2,15 +2,17 @@
 //! derive their wall clock from it (L4H_HC_GET_TIME) and may correct it
 //! with NTP.
 
+#[cfg(target_arch = "x86_64")]
 use sel4::cap_type;
 
 use crate::mem::Alloc;
 
+#[cfg(target_arch = "x86_64")]
 const CMOS: u16 = 0x70;
 
 /// Nanoseconds since the Unix epoch, read now; 0 if there is no RTC.
 #[cfg(target_arch = "x86_64")]
-pub fn read_ns(alloc: &mut Alloc) -> u64 {
+pub fn read_ns(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, _win: &mut crate::window::Window) -> u64 {
     use sel4::init_thread::slot;
     let s = alloc.slots.alloc();
     let dst = slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
@@ -47,10 +49,12 @@ pub fn read_ns(alloc: &mut Alloc) -> u64 {
     secs * 1_000_000_000
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-pub fn read_ns(_alloc: &mut Alloc) -> u64 {
-    let _ = (CMOS, days_from_civil);
-    0
+/// QEMU virt's PL031: a 32-bit seconds counter at register DR.
+#[cfg(target_arch = "aarch64")]
+pub fn read_ns(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, win: &mut crate::window::Window) -> u64 {
+    let Some(frames) = devmem.frames(&mut alloc.slots, 0x0901_0000, 4096) else { return 0 };
+    win.with_frame_attrs(&crate::component::abs_of(frames[0]), sel4::VmAttributes::EXECUTE_NEVER,
+        |p| unsafe { (p as *const u32).read_volatile() as u64 * 1_000_000_000 })
 }
 
 /// The RTC registers read_ns uses, status register B last, through I/O
@@ -86,6 +90,7 @@ fn sample(port: u64) -> Option<[u8; 8]> {
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
+#[cfg(target_arch = "x86_64")]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);

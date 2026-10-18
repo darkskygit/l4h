@@ -6,17 +6,25 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 initrd=$(realpath "$1")
 cmdline=${2:-console=hvc0}
 tmo=${3:-60}
+source "$root/tools/guest-env.sh"
+if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then
+    source "$root/tools/aarch64-memory.sh"
+    if [ "$(cat "$l4h_memory_stamp" 2>/dev/null || echo 2048)" != "$l4h_memory_mb" ]; then
+        "$root/tools/build-kernel-aarch64.sh"
+        "$root/tools/build-loader-aarch64.sh"
+    fi
+fi
 log=$root/build/qemu.log
 # Never let a failed build leave the previous run's log to be checked.
 rm -f "$log"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
-L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" \
+"$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" \
     L4H_DOM0_INITRD="$initrd" L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-256} \
     L4H_DOM0_VCPUS=${L4H_DOM0_VCPUS:-1} L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} L4H_DOM0_CMDLINE="$cmdline" \
-    "$root/tools/build-host.sh"
-"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+    "$l4h_host_build"
+"$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \
     ${L4H_QEMU_ARGS:-} </dev/null >"$log" 2>&1 &
 qemu=$!
 # The machine never powers off by itself: stop it once every guest has
@@ -31,4 +39,4 @@ while kill -0 "$qemu" 2>/dev/null; do
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true
-sed -n '/dropped to user space/,$p' "$root/build/qemu.log"
+sed -n '/l4h-root:/,$p' "$root/build/qemu.log"

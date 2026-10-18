@@ -14,10 +14,16 @@
 
 unsigned long long l4h_rdtsc(void)
 {
+#ifdef __aarch64__
+	unsigned long ticks;
+	__asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+	return ticks;
+#else
 	uint32_t lo, hi;
 
 	__asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
 	return ((unsigned long long)hi << 32) | lo;
+#endif
 }
 
 void l4h_timer_arm(unsigned long long deadline)

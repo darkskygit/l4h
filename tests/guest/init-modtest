@@ -1,0 +1,7 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+insmod /bin/l4h_modtest.ko || { echo 'MODTEST: FAIL load'; poweroff -f; }
+rmmod l4h_modtest || { echo 'MODTEST: FAIL unload'; poweroff -f; }
+echo 'MODTEST: PASS'
+poweroff -f

@@ -71,4 +71,6 @@ void um_idle_sleep(void);
 
 void kasan_map_memory(void *start, size_t len);
 
+void new_thread_handler(void);
+
 #endif

@@ -18,7 +18,11 @@ static __always_inline struct l4h_vcpu *__l4h_vcpu(void)
 {
 	struct l4h_vcpu *v;
 
+#ifdef CONFIG_UML_ARM64
+	asm volatile("mrs %0, tpidr_el0\n\tldr %0, [%0, #40]" : "=r"(v));
+#else
 	asm volatile("movq %%fs:8, %0" : "=r"(v));
+#endif
 	return v;
 }
 

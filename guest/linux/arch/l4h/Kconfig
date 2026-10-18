@@ -88,6 +88,7 @@ config NR_CPUS
 source "kernel/Kconfig.hz"
 
 source "arch/l4h/x86/Kconfig"
+source "arch/l4h/arm64/Kconfig"
 
 config KERNEL_STACK_ORDER
 	int "Kernel stack size order"

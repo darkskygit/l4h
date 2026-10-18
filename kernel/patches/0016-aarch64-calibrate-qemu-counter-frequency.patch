@@ -1,0 +1,140 @@
+From 2b1fd22f7d154c4f13c2a7b7425c6105171ecd3c Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Sun, 18 Oct 2026 14:17:47 -0700
+Subject: [PATCH] aarch64, qemu: use the architectural counter rate for MCS
+ accounting
+
+QEMU HVF exposes the Apple Silicon counter rate (24 MHz on M4), while the TCG-generated platform description specifies 62.5 MHz. Read CNTFRQ on the boot CPU before creating scheduling contexts and use that rate for budget and consumed-time conversions. Split multiplication and division to avoid overflow at fractional-MHz frequencies and retain safe public conversion bounds.
+---
+ include/arch/arm/arch/64/mode/machine/timer.h | 14 +++++++++----
+ include/arch/arm/arch/machine/timer.h         | 21 ++++++++++++++-----
+ src/drivers/timer/generic_timer.c             | 17 +++++++++++++++
+ 3 files changed, 43 insertions(+), 9 deletions(-)
+
+diff --git a/include/arch/arm/arch/64/mode/machine/timer.h b/include/arch/arm/arch/64/mode/machine/timer.h
+index 5c968675f..297522d7b 100644
+--- a/include/arch/arm/arch/64/mode/machine/timer.h
++++ b/include/arch/arm/arch/64/mode/machine/timer.h
+@@ -16,18 +16,24 @@
+ /* Get the max. ticks_t value that can be expressed in time_t (time in us). This
+  * is the max. value ticksToUs() can be passed without overflowing.
+  */
+-static inline CONST ticks_t getMaxTicksToUs(void)
++static inline PURE ticks_t getMaxTicksToUs(void)
+ {
+-#if USE_KHZ
++#if defined(CONFIG_PLAT_QEMU_ARM_VIRT)
++    return armKSGenericTimerFrequency >= HZ_IN_MHZ ? UINT64_MAX :
++           (UINT64_MAX / HZ_IN_MHZ) * armKSGenericTimerFrequency;
++#elif USE_KHZ
+     return UINT64_MAX / TIMER_CLOCK_KHZ;
+ #else
+     return UINT64_MAX;
+ #endif
+ }
+ 
+-static inline CONST time_t ticksToUs(ticks_t ticks)
++static inline PURE time_t ticksToUs(ticks_t ticks)
+ {
+-#if USE_KHZ
++#if defined(CONFIG_PLAT_QEMU_ARM_VIRT)
++    return (ticks / armKSGenericTimerFrequency) * HZ_IN_MHZ +
++           ((ticks % armKSGenericTimerFrequency) * HZ_IN_MHZ) / armKSGenericTimerFrequency;
++#elif USE_KHZ
+     return (ticks * KHZ_IN_MHZ) / TIMER_CLOCK_KHZ;
+ #else
+     return ticks / TIMER_CLOCK_MHZ;
+diff --git a/include/arch/arm/arch/machine/timer.h b/include/arch/arm/arch/machine/timer.h
+index 553d85291..71fdba998 100644
+--- a/include/arch/arm/arch/machine/timer.h
++++ b/include/arch/arm/arch/machine/timer.h
+@@ -22,6 +22,10 @@
+ #define TIMER_CLOCK_MHZ (TIMER_CLOCK_HZ / HZ_IN_MHZ)
+ 
+ #include <plat/platform_gen.h>
++#if defined(CONFIG_ARCH_AARCH64) && defined(CONFIG_PLAT_QEMU_ARM_VIRT)
++/* HVF can expose the host counter rate instead of QEMU TCG's DT rate. */
++extern word_t armKSGenericTimerFrequency;
++#endif
+ #include <mode/machine/timer.h>
+ 
+ void initTimer(void);
+@@ -29,18 +33,25 @@ void initTimer(void);
+ /* Get the max. time_t value (time in us) that can be expressed in ticks_t. This
+  * is the max. value usToTicks() can be passed without overflowing.
+  */
+-static inline CONST time_t getMaxUsToTicks(void)
++static inline PURE time_t getMaxUsToTicks(void)
+ {
+-#if USE_KHZ
++#if defined(CONFIG_ARCH_AARCH64) && defined(CONFIG_PLAT_QEMU_ARM_VIRT)
++    /* A conservative bound in whole ticks per microsecond. */
++    return UINT64_MAX / ((armKSGenericTimerFrequency + HZ_IN_MHZ - 1) / HZ_IN_MHZ);
++#elif USE_KHZ
+     return UINT64_MAX / TIMER_CLOCK_KHZ;
+ #else
+     return UINT64_MAX / TIMER_CLOCK_MHZ;
+ #endif
+ }
+ 
+-static inline CONST ticks_t usToTicks(time_t us)
++static inline PURE ticks_t usToTicks(time_t us)
+ {
+-#if USE_KHZ
++#if defined(CONFIG_ARCH_AARCH64) && defined(CONFIG_PLAT_QEMU_ARM_VIRT)
++    /* Split before multiplying, including for non-integral MHz rates. */
++    return (us / HZ_IN_MHZ) * armKSGenericTimerFrequency +
++           ((us % HZ_IN_MHZ) * armKSGenericTimerFrequency) / HZ_IN_MHZ;
++#elif USE_KHZ
+     /* reciprocal division overflows too quickly for dividing by KHZ_IN_MHZ.
+      * This operation isn't used frequently or on many platforms, so use manual
+      * division here */
+@@ -50,7 +61,7 @@ static inline CONST ticks_t usToTicks(time_t us)
+ #endif
+ }
+ 
+-static inline CONST ticks_t getTimerPrecision(void)
++static inline PURE ticks_t getTimerPrecision(void)
+ {
+     return usToTicks(TIMER_PRECISION) + TIMER_OVERHEAD_TICKS;
+ }
+diff --git a/src/drivers/timer/generic_timer.c b/src/drivers/timer/generic_timer.c
+index 208950a40..c3d67d08c 100644
+--- a/src/drivers/timer/generic_timer.c
++++ b/src/drivers/timer/generic_timer.c
+@@ -6,8 +6,24 @@
+ 
+ #include <drivers/timer/arm_generic.h>
+ 
++#if defined(CONFIG_ARCH_AARCH64) && defined(CONFIG_PLAT_QEMU_ARM_VIRT) && defined(CONFIG_KERNEL_MCS)
++word_t armKSGenericTimerFrequency = TIMER_CLOCK_HZ;
++#endif
++
+ BOOT_CODE void initGenericTimer(void)
+ {
++#if defined(CONFIG_ARCH_AARCH64) && defined(CONFIG_PLAT_QEMU_ARM_VIRT) && defined(CONFIG_KERNEL_MCS)
++    word_t frequency;
++    SYSTEM_READ_WORD(CNTFRQ, frequency);
++    if (CURRENT_CPU_INDEX() == 0) {
++        if (frequency != 0) {
++            armKSGenericTimerFrequency = frequency;
++        }
++        printf("ARM generic timer: %"SEL4_PRIu_word" Hz\n", armKSGenericTimerFrequency);
++    } else {
++        assert(frequency == 0 || frequency == armKSGenericTimerFrequency);
++    }
++#else
+     if (config_set(CONFIG_DEBUG_BUILD)) {
+         /* check the frequency is correct */
+         word_t gpt_cntfrq = 0;
+@@ -23,6 +39,7 @@ BOOT_CODE void initGenericTimer(void)
+         }
+     }
+ 
++#endif
+ #ifdef CONFIG_KERNEL_MCS
+     /* this sets the irq to UINT64_MAX */
+     ackDeadlineIRQ();
+-- 
+2.47.3
+

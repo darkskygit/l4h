@@ -1,23 +1,24 @@
-//! PCI enumeration through the legacy configuration mechanism (I/O ports
-//! 0xcf8/0xcfc), which every x86 platform l4h targets provides.  Other
-//! architectures (aarch64: ECAM and GIC interrupts) have no PCI support
-//! yet: there, no devices are found.
+//! PCI configuration: x86 I/O ports, or QEMU virt ECAM and GICv2m MSI.
 
 use alloc::vec::Vec;
 
 #[cfg(target_arch = "x86_64")]
 use sel4::cap_type;
-#[cfg(target_arch = "x86_64")]
 use sel4::init_thread::slot;
 
 use crate::mem::Alloc;
 
+#[cfg(target_arch = "x86_64")]
 const CONFIG_ADDRESS: u16 = 0xcf8;
+#[cfg(target_arch = "x86_64")]
 const CONFIG_DATA: u16 = 0xcfc;
 
 pub struct Pci {
     /// IOPort capability for 0xcf8..0xcff (rust-sel4 has no IOPort type).
+    #[cfg(target_arch = "x86_64")]
     port: u64,
+    #[cfg(target_arch = "aarch64")]
+    next_bar: core::cell::Cell<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -61,28 +62,17 @@ pub struct VirtioCap {
     pub notify_off_multiplier: u32,
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-impl Pci {
-    pub fn new(_alloc: &mut Alloc) -> Self {
-        Pci { port: 0 }
-    }
-    pub fn enumerate(&self) -> Vec<Device> {
-        let _ = (self.port, CONFIG_ADDRESS, CONFIG_DATA);
-        Vec::new()
-    }
-    pub fn enable(&self, _d: &Device) {}
-    pub fn enable_memory(&self, _d: &Device) {}
-    pub fn disable(&self, _d: &Device) {}
-    pub fn enable_msix(&self, _d: &Device) {}
-}
-
 /// seL4 user interrupt vectors (CPU vector 0x30 + n, n <= 107 on x86),
 /// split between the users so that they never collide.
 pub const VECTOR_NIC_BASE: u64 = 0;
+#[cfg(target_arch = "x86_64")]
 pub const VECTOR_MONITOR: u64 = 8;
 pub const VECTOR_DISK_BASE: u64 = 16;
 /// Disks beyond this many are left alone.
+#[cfg(target_arch = "x86_64")]
 pub const MAX_DISKS: usize = 64;
+#[cfg(target_arch = "aarch64")]
+pub const MAX_DISKS: usize = 48;
 
 /// A capability for I/O ports [base, base + len), in a new root slot.
 #[cfg(target_arch = "x86_64")]
@@ -111,16 +101,18 @@ pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
         .cap()
         .irq_control_get_msi(d.bus as u64, d.dev as u64, d.func as u64, 0, vector, dst)
         .expect("MSI IRQ handler");
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        let _ = (d, vector, dst);
-        unreachable!("no PCI devices on this architecture");
+        let _ = d;
+        assert!(vector < 64);
+        slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(80 + vector, true, 0, dst)
+            .expect("GICv2m IRQ handler");
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl Pci {
-    pub fn new(alloc: &mut Alloc) -> Self {
+    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem) -> Self {
         let s = alloc.slots.alloc();
         let dst = slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         slot::IO_PORT_CONTROL
@@ -152,6 +144,9 @@ impl Pci {
         });
     }
 
+}
+
+impl Pci {
     pub fn read16(&self, bus: u8, dev: u8, func: u8, off: u8) -> u16 {
         (self.read32(bus, dev, func, off & !3) >> ((off & 2) * 8)) as u16
     }
@@ -248,7 +243,7 @@ impl Pci {
 
     pub fn enumerate(&self) -> Vec<Device> {
         let mut out = Vec::new();
-        for bus in 0..=255u8 {
+        for bus in 0..=if cfg!(target_arch = "aarch64") { 15u8 } else { 255u8 } {
             for dev in 0..32u8 {
                 let id = self.read32(bus, dev, 0, 0);
                 if id & 0xffff == 0xffff {
@@ -263,7 +258,20 @@ impl Pci {
                     let class = self.read32(bus, dev, func, 8);
                     let header = self.read8(bus, dev, func, 0xe) & 0x7f;
                     let (msix, virtio_caps) = self.caps(bus, dev, func);
-                    let bars = if header == 0 { self.probe_bars(bus, dev, func) } else { [Bar::default(); 6] };
+                    #[allow(unused_mut)]
+                    let mut bars = if header == 0 { self.probe_bars(bus, dev, func) } else { [Bar::default(); 6] };
+                    #[cfg(target_arch = "aarch64")]
+                    for (n, b) in bars.iter_mut().enumerate() {
+                        if b.size == 0 || b.is_io { continue; }
+                        let addr = (self.next_bar.get() + b.size - 1) & !(b.size - 1);
+                        assert!(addr + b.size <= 0x3eff_0000, "PCI MMIO aperture exhausted");
+                        let off = 0x10 + 4 * n as u8;
+                        let flags = self.read32(bus, dev, func, off) & 0xf;
+                        self.write32(bus, dev, func, off, addr as u32 | flags);
+                        if flags & 6 == 4 { self.write32(bus, dev, func, off + 4, 0); }
+                        b.addr = addr;
+                        self.next_bar.set(addr + b.size);
+                    }
                     out.push(Device {
                         bus,
                         dev,
@@ -312,5 +320,42 @@ impl Pci {
             let ctrl = self.read16(d.bus, d.dev, d.func, m.cap + 2);
             self.write16(d.bus, d.dev, d.func, m.cap + 2, (ctrl | 0x8000) & !0x4000);
         }
+    }
+}
+
+/// MSI target address, and data for a reserved interrupt slot.
+pub const fn msi_address() -> u64 {
+    #[cfg(target_arch = "x86_64")] { 0xfee0_0000 }
+    #[cfg(target_arch = "aarch64")] { 0x0802_0040 }
+}
+pub const fn msi_data(vector: u64) -> u32 {
+    #[cfg(target_arch = "x86_64")] { 0x30 + vector as u32 }
+    #[cfg(target_arch = "aarch64")] { 80 + vector as u32 }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Pci {
+    // QEMU virt, highmem-ecam=off: 16 MiB ECAM, buses 0..15.
+    const ECAM_VA: usize = 0x6000_0000_0000;
+    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem) -> Self {
+        use sel4::{CapRights, VmAttributes};
+        use crate::mem::ObjCtx;
+        let frames = devmem.frames(&mut alloc.slots, 0x3f00_0000, 1 << 24).expect("PCI ECAM frames");
+        for (n, frame) in frames.into_iter().enumerate() {
+            crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), frame,
+                Self::ECAM_VA + n * 4096, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);
+        }
+        Self { next_bar: core::cell::Cell::new(0x1000_0000) }
+    }
+    fn config(&self, bus: u8, dev: u8, func: u8, off: u8) -> *mut u32 {
+        assert!(bus < 16);
+        (Self::ECAM_VA + ((bus as usize) << 20) + ((dev as usize) << 15)
+            + ((func as usize) << 12) + (off as usize & !3)) as *mut u32
+    }
+    pub fn read32(&self, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+        unsafe { self.config(bus, dev, func, off).read_volatile() }
+    }
+    pub fn write32(&self, bus: u8, dev: u8, func: u8, off: u8, value: u32) {
+        unsafe { self.config(bus, dev, func, off).write_volatile(value); core::arch::asm!("dmb osh", options(nostack)); }
     }
 }

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Boot l4h on QEMU's aarch64 virt machine (TCG: no KVM for arm64 here).
-# The machine starts at EL2 because the kernel loader expects to and drops
-# to EL1; seL4 runs at EL1 and l4h uses no hardware virtualization.
+# Starts directly at EL1 with virtualization disabled. Set
+# L4H_QEMU_VIRTUALIZATION=on to test the loader's EL2-to-EL1 path.
 # Usage: run-qemu-aarch64.sh <l4h-root.elf> [extra qemu args...]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 rootserver=$1; shift
+source "$root/tools/aarch64-memory.sh"
+if [ "$(cat "$l4h_memory_stamp" 2>/dev/null || echo 2048)" != "$l4h_memory_mb" ]; then
+    echo "Rebuild the AArch64 kernel and loader with L4H_MEM=$l4h_memory_mb before booting" >&2
+    exit 1
+fi
 prefix=$root/build/sel4-aarch64
 loader=$root/build/loader-target/aarch64-unknown-none/release/sel4-kernel-loader
 "$root/build/loader-target/release/sel4-kernel-loader-add-payload" \
     --sel4-prefix "$prefix" --loader "$loader" --app "$rootserver" -o "$root/build/l4h-aarch64.img"
-exec qemu-system-aarch64 \
-    -machine virt,virtualization=on,secure=off,gic-version=2 -cpu cortex-a57 \
-    -smp "${L4H_SMP:-4}" -m 2048 \
-    -nographic -serial mon:stdio -no-reboot \
-    -kernel "$root/build/l4h-aarch64.img" "$@"
+exec "$root/tools/run-image-aarch64.sh" "$root/build/l4h-aarch64.img" "$@"

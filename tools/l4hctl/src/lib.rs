@@ -179,6 +179,13 @@ pub fn parse_kernel(b: &[u8]) -> Result<Kernel> {
     if b.len() < 64 || &b[..4] != b"\x7fELF" || b[4] != 2 || b[5] != 1 {
         return err("not a 64-bit little-endian ELF");
     }
+    #[cfg(target_arch = "x86_64")]
+    const MACHINE: u16 = 62;
+    #[cfg(target_arch = "aarch64")]
+    const MACHINE: u16 = 183;
+    if u16::from_le_bytes(rd(b, 18)?) != MACHINE {
+        return err("kernel architecture does not match this guest");
+    }
     let entry = u64::from_le_bytes(rd(b, 24)?);
     let phoff = u64::from_le_bytes(rd(b, 32)?) as usize;
     let phentsize = u16::from_le_bytes(rd(b, 54)?) as usize;

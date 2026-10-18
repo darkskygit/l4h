@@ -4,7 +4,12 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/build/linux-6.18
-out=$root/build/linux-l4h
+arch=${L4H_ARCH:-x86_64}
+case "$arch" in
+    x86_64) out=$root/build/linux-l4h; sel4=$root/build/sel4 ;;
+    aarch64) out=$root/build/linux-l4h-aarch64; sel4=$root/build/sel4-aarch64 ;;
+    *) echo "unsupported L4H_ARCH: $arch" >&2; exit 1 ;;
+esac
 if [ ! -d "$src" ]; then
     echo "missing $src: extract linux-6.18.y there (see DESIGN.md §13)" >&2
     exit 1
@@ -19,9 +24,12 @@ for p in "$root"/guest/linux/patches/*.patch; do
     touch "$stamp"
 done
 mkdir -p "$out"
-mk=(make -C "$src" O="$out" ARCH=l4h
-    L4H_SEL4_INCLUDE="$root/build/sel4/libsel4/include"
+mk=(make -C "$src" O="$out" ARCH=l4h SUBARCH="$arch"
+    L4H_SEL4_INCLUDE="$sel4/libsel4/include"
     L4H_ABI_INCLUDE="$root/include")
+if [ "$arch" = aarch64 ]; then
+    mk+=(CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}")
+fi
 # L4H_LINUX_CC overrides the compiler, e.g. "ccache gcc" in CI.
 if [ -n "${L4H_LINUX_CC:-}" ]; then
     mk+=(CC="$L4H_LINUX_CC")
@@ -29,4 +37,4 @@ fi
 if [ ! -f "$out/.config" ]; then
     "${mk[@]}" defconfig
 fi
-"${mk[@]}" -j"$(nproc)" "${@:-vmlinux}"
+"${mk[@]}" -j"${L4H_JOBS:-$(nproc)}" "${@:-vmlinux}"

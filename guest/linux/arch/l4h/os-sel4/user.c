@@ -16,6 +16,9 @@
 #include "l4h_os.h"
 #include <generated/user_constants.h>
 
+#ifdef __aarch64__
+#include "user-arm64.h"
+#else
 /* gp[] indices of FS_BASE/GS_BASE (struct user_regs_struct order). */
 #define HOST_FS_BASE 21
 #define HOST_GS_BASE 22
@@ -121,6 +124,8 @@ static void gp_to_syscall_msg(const unsigned long *gp)
 	seL4_SetMR(seL4_UnknownSyscall_SP, gp[HOST_SP]);
 	seL4_SetMR(seL4_UnknownSyscall_FLAGS, gp[HOST_EFLAGS]);
 }
+
+#endif
 
 /* uctx->regs_dirty values beyond plain "dirty" */
 #define DIRTY_GP	1
@@ -233,11 +238,14 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	case L4H_UCTX_FAULTED:
 		if (!u->regs_dirty) {
 			info = seL4_ReplyRecv(v->ep, seL4_MessageInfo_new(0, 0, 0, 0), &badge, u->reply);
+
+#ifndef __aarch64__
 		} else if (u->stop == L4H_STOP_SYSCALL && !(u->regs_dirty & DIRTY_SEG)) {
 			gp_to_syscall_msg(gp);
 			info = seL4_ReplyRecv(v->ep,
 					      seL4_MessageInfo_new(0, 0, 0, seL4_UnknownSyscall_Syscall),
 					      &badge, u->reply);
+#endif
 		} else {
 			err = write_regs(u, gp, 0);
 			l4h_BUG_ON(err);
@@ -302,7 +310,11 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	u->state = L4H_UCTX_FAULTED;
 	switch (seL4_MessageInfo_get_label(info)) {
 	case seL4_Fault_UnknownSyscall:
+#ifdef __aarch64__
+		syscall_msg_to_gp(u, gp);
+#else
 		syscall_msg_to_gp(gp);
+#endif
 		u->regs_valid = 1;
 		u->stop = L4H_STOP_SYSCALL;
 		/* The syscall reply cannot carry fs/gs base; the TCB keeps them. */
@@ -311,6 +323,17 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 		u->fault_ip = seL4_GetMR(seL4_VMFault_IP);
 		u->fault_addr = seL4_GetMR(seL4_VMFault_Addr);
 		u->fault_code = seL4_GetMR(seL4_VMFault_FSR);
+#ifdef __aarch64__
+		if ((u->fault_code & 0x3f) == 0x21) {
+			/* Alignment aborts cannot be repaired by mapping the page. */
+			u->exc_number = u->fault_code;
+			u->regs_valid = 0;
+			u->stop = L4H_STOP_EXCEPTION;
+			break;
+		}
+		/* Normalize ESR.WnR to the shared faultinfo write bit. */
+		u->fault_code = (u->fault_code & (1UL << 6)) ? 2 : 0;
+#endif
 		if (seL4_GetMR(seL4_VMFault_PrefetchFault))
 			u->fault_code |= 0x10;	/* instruction fetch */
 		u->regs_valid = 0;
@@ -340,8 +363,12 @@ void l4h_user_sync_seg(struct l4h_uctx *u, unsigned long *gp)
 	    (u->regs_dirty & DIRTY_SEG))
 		return;
 	if (seL4_TCB_ReadRegisters(u->tcb, 0, 0, CTX_WORDS_ALL, &c) == 0) {
+#ifdef __aarch64__
+		gp[HOST_TLS] = c.tpidr_el0;
+#else
 		gp[HOST_FS_BASE] = c.fs_base;
 		gp[HOST_GS_BASE] = c.gs_base;
+#endif
 	}
 }
 

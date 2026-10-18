@@ -129,8 +129,8 @@ impl Nic {
     pub fn new(n: usize, c: &NicConfig) -> Self {
         let mut dma = Dma::new(net::nic_dma_va(n), c.dma_paddr, c.dma_size as usize);
         let msix = Mmio(c.msix_table.va as usize);
-        msix.w32(0, 0xfee0_0000);
-        msix.w32(4, 0);
+        msix.w32(0, c.msi_address as u32);
+        msix.w32(4, (c.msi_address >> 32) as u32);
         msix.w32(8, c.msi_data);
         msix.w32(12, 0);
         let (mut rxq, txq, want, mac, ports, hdr_len) = if c.legacy_io != 0 {

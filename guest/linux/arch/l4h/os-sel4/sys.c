@@ -31,10 +31,17 @@ static const seL4_Word obj_type[L4H_OBJ_NR] = {
 	[L4H_OBJ_CNODE] = seL4_CapTableObject,
 	[L4H_OBJ_SCHED_CONTEXT] = seL4_SchedContextObject,
 	[L4H_OBJ_REPLY] = seL4_ReplyObject,
+#ifdef __aarch64__
+	[L4H_OBJ_FRAME] = seL4_ARM_SmallPageObject,
+	[L4H_OBJ_PT] = seL4_ARM_PageTableObject,
+	[L4H_OBJ_PD] = seL4_ARM_PageTableObject,
+	[L4H_OBJ_PDPT] = seL4_ARM_PageTableObject,
+#else
 	[L4H_OBJ_FRAME] = seL4_X86_4K,
 	[L4H_OBJ_PT] = seL4_X86_PageTableObject,
 	[L4H_OBJ_PD] = seL4_X86_PageDirectoryObject,
 	[L4H_OBJ_PDPT] = seL4_X86_PDPTObject,
+#endif
 };
 
 int l4h_obj_bits(int type, int size_bits)
@@ -115,19 +122,34 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 			     (prot & (L4H_PROT_READ | L4H_PROT_EXEC)) ? seL4_CanRead : seL4_NoRights;
 	/* Readable pages are executable unless marked execute-never (seL4
 	 * patch 0009); there is no execute-only. */
+#ifdef __aarch64__
+	int err = seL4_ARM_Page_Map(frame, vspace, va, r, seL4_ARM_Default_VMAttributes |
+		((prot & L4H_PROT_EXEC) ? 0 : seL4_ARM_ExecuteNever));
+	if (!err && (prot & L4H_PROT_EXEC))
+		err = seL4_ARM_Page_Unify_Instruction(frame, 0, 4096);
+	return err;
+#else
 	seL4_X86_VMAttributes attr = (prot & L4H_PROT_EXEC) ? seL4_X86_Default_VMAttributes :
 				     seL4_X86_ExecuteNever;
 
 	return seL4_X86_Page_Map(frame, vspace, va, r, attr);
+#endif
 }
 
 int l4h_page_unmap(unsigned long frame)
 {
+#ifdef __aarch64__
+	return seL4_ARM_Page_Unmap(frame);
+#else
 	return seL4_X86_Page_Unmap(frame);
+#endif
 }
 
 int l4h_pt_map(int type, unsigned long table, unsigned long vspace, unsigned long va)
 {
+#ifdef __aarch64__
+	return seL4_ARM_PageTable_Map(table, vspace, va, seL4_ARM_Default_VMAttributes);
+#else
 	switch (type) {
 	case L4H_OBJ_PT:
 		return seL4_X86_PageTable_Map(table, vspace, va, seL4_X86_Default_VMAttributes);
@@ -137,6 +159,7 @@ int l4h_pt_map(int type, unsigned long table, unsigned long vspace, unsigned lon
 		return seL4_X86_PDPT_Map(table, vspace, va, seL4_X86_Default_VMAttributes);
 	}
 	return seL4_InvalidArgument;
+#endif
 }
 
 int l4h_tcb_configure_user(unsigned long tcb, unsigned long cspace, unsigned long vspace)
@@ -242,3 +265,11 @@ void __assert_fail(const char *assertion, const char *file, int line, const char
 {
 	panic("libsel4 assertion failed: %s (%s:%d %s)\n", assertion, file, line, function);
 }
+
+#ifdef __aarch64__
+void l4h_flush_icache(unsigned long start, unsigned long end)
+{
+	if (start < end)
+		l4h_BUG_ON(seL4_ARM_VSpace_Unify_Instruction(L4H_CPTR(L4H_SLOT_VSPACE), start, end));
+}
+#endif

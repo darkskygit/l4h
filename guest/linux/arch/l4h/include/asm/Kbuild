@@ -13,8 +13,6 @@ generic-y += irq_work.h
 generic-y += kdebug.h
 generic-y += mcs_spinlock.h
 generic-y += mmiowb.h
-generic-y += module.h
-generic-y += module.lds.h
 generic-y += parport.h
 generic-y += percpu.h
 generic-y += preempt.h
@@ -30,3 +28,11 @@ generic-y += vga.h
 generic-y += video.h
 generic-y += qspinlock.h
 generic-y += qrwlock.h
+
+ifeq ($(SUBARCH),aarch64)
+generic-y += asm-offsets.h bitops.h bitsperlong.h checksum.h div64.h early_ioremap.h ioctl.h kmap_size.h linkage.h local.h local64.h mmzone.h param.h resource.h rqspinlock.h rwonce.h serial.h shmparam.h statfs.h string.h text-patching.h user.h word-at-a-time.h
+endif
+
+ifneq ($(SUBARCH),aarch64)
+generic-y += module.h module.lds.h
+endif

@@ -7,11 +7,20 @@
 #include <linux/cpumask.h>
 
 /* vCPU number from the vCPU's TLS block (struct l4h_tls.cpu, %fs:16). */
+#ifdef CONFIG_UML_ARM64
+#define raw_smp_processor_id() ({ \
+	long __cpu; \
+	asm volatile("mrs %0, tpidr_el0\n\tldr %0, [%0, #48]" : "=r"(__cpu)); \
+	(int)__cpu; \
+})
+#else
 #define raw_smp_processor_id() ({				\
 	long __cpu;						\
 	asm volatile("movq %%fs:16, %0" : "=r"(__cpu));		\
 	(int)__cpu;						\
 })
+
+#endif
 
 #define hard_smp_processor_id()	raw_smp_processor_id()
 

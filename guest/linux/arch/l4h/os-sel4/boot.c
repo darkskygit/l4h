@@ -71,8 +71,14 @@ int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu), void *task)
 	v->start_task = task;
 	v->start_fn = fn;
 	v->start_sp = sp;
+#ifdef __aarch64__
+	regs.pc = (seL4_Word)l4h_secondary_entry;
+	regs.sp = sp;
+	regs.x0 = cpu;
+#else
 	regs.rip = (seL4_Word)l4h_secondary_entry;
 	regs.rsp = sp;
 	regs.rdi = cpu;
+#endif
 	return seL4_TCB_WriteRegisters(v->ktcb, 1, 0, sizeof(regs) / sizeof(seL4_Word), &regs);
 }

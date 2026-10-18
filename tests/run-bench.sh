@@ -3,18 +3,19 @@
 # Usage: run-bench.sh [vcpus]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+source "$root/tools/guest-env.sh"
 out=$root/build/guest
 mkdir -p "$out"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
-objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
-(cd "$root/tools/l4hctl" && cargo +stable build -q --release)
-gcc -O2 -static -o "$out/bench" "$root/tests/guest/bench.c"
+"$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
+"$root/tools/build-l4hctl.sh"
+"$l4h_cc" -O2 -static -o "$out/bench" "$root/tests/guest/bench.c"
 "$root/tools/mkinitramfs.sh" "$out/benchvm.cpio.gz" "$root/tests/guest/init-benchvm" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/benchsrc.cpio.gz" "$root/tests/guest/init-benchsrc" >/dev/null
-cp "$root/build/linux-l4h/vmlinux.stripped" "$out/vmlinux"
+cp "$l4h_linux_out/vmlinux.stripped" "$out/vmlinux"
 "$root/tools/mkinitramfs.sh" "$out/bench.cpio.gz" "$root/tests/guest/init-bench" \
-    "$out/bench" "$root/tools/l4hctl/target/release/l4hctl" "$out/vmlinux" \
+    "$out/bench" "$l4h_ctl" "$out/vmlinux" \
     "$out/benchvm.cpio.gz" "$out/benchsrc.cpio.gz" >/dev/null
 rm -f "$out/bench.img" && truncate -s 1G "$out/bench.img"
 L4H_DOM0_VCPUS=${1:-1} L4H_DOM0_MEM_MB=512 \

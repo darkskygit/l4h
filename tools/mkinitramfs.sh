@@ -5,12 +5,17 @@ set -euo pipefail
 out=$1
 init=${2:-}
 shift 2 || shift $#
-busybox=$(command -v busybox)
+busybox=${L4H_BUSYBOX:-$(command -v busybox)}
+if [ "${L4H_ARCH:-x86_64}" = aarch64 ] && [ -z "${L4H_BUSYBOX:-}" ]; then
+    root=$(cd "$(dirname "$0")/.." && pwd)
+    busybox=$root/build/busybox-aarch64/usr/bin/busybox
+    [ -f "$busybox" ] || { echo "Set L4H_BUSYBOX to a static AArch64 busybox, or run tools/ci-setup.sh aarch64" >&2; exit 1; }
+fi
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 mkdir -p "$dir"/{bin,sbin,etc,proc,sys,dev,tmp,root,mnt,usr/bin,usr/sbin,var/run}
 cp "$busybox" "$dir/bin/busybox"
-for app in $("$busybox" --list); do
+for app in $(busybox --list); do
     [ "$app" = busybox ] || ln -sf busybox "$dir/bin/$app"
 done
 # The kernel runs /sbin/poweroff and /sbin/reboot for host shutdown requests.

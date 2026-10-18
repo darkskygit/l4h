@@ -1,4 +1,5 @@
 #!/bin/sh
+slow=${L4H_TEST_SLOW:-1}
 # dom0 init for tests/run-limits.sh: exhaust the host with guests; the
 # root task must refuse cleanly, and recover after the guests are gone.
 mount -t proc proc /proc
@@ -29,12 +30,12 @@ for id in $ids; do
 done
 l4hctl info | grep memory
 id=$(l4hctl create big --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 256) || fail "no 256 MiB guest on a fragmented host"
-l4hctl console "$id" --until "GUEST: ready" --timeout 60 >/dev/null || fail "guest on a fragmented host"
+l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null || fail "guest on a fragmented host"
 echo "LIMITS: a 256 MiB guest runs on a fragmented host"
 l4hctl destroy "$id"
 for id in $keep; do l4hctl destroy "$id" || fail "destroy $id"; done
 id=$(l4hctl create again --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 64) || fail "create after recovery"
-l4hctl console "$id" --until "GUEST: ready" --timeout 60 >/dev/null || fail "guest after recovery"
+l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null || fail "guest after recovery"
 l4hctl destroy "$id"
 echo "LIMITS: PASS"
 poweroff -f

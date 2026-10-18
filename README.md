@@ -34,7 +34,8 @@ current status of each part.
   (`tools/mkimage.sh`, `tools/gce-image.sh`). On a host with a display
   the UEFI image shows a read-only status dashboard.
 - **aarch64.** seL4, the host components and the ABI test guest run on
-  QEMU `virt` at EL1. The Linux guest is still x86_64-only.
+  QEMU `virt` at EL1. Native AArch64 Linux guests support SMP, signals, TLS,
+  kernel modules, PCI virtio-blk/net and NVMe; virtualization is disabled.
 
 ## Layout
 
@@ -61,13 +62,45 @@ The host needs:
   and the Python modules seL4 needs, in `.venv`;
 - busybox and e2fsprogs;
 - for the UEFI image: GRUB EFI, mtools, sfdisk and OVMF;
-- for aarch64: `gcc-aarch64-linux-gnu` and `qemu-system-arm`.
+- for aarch64: `gcc-aarch64-linux-gnu`, cross libc headers,
+  `qemu-system-arm` and a static AArch64 BusyBox for guest initramfs images.
+  `tools/ci-setup.sh aarch64` prepares these on Debian 13 (run as root).
 
 ```sh
 git submodule update --init
 tools/build-kernel.sh                 # patched seL4 -> build/sel4
 tests/run-selftest.sh 4               # build Linux + host, boot a 4-vCPU guest self-test
 ```
+
+For AArch64, build the kernel and loader once, then select the guest ISA
+with `L4H_ARCH`. The Linux outputs are kept separately in
+`build/linux-l4h-aarch64`; the host uses `build/sel4-aarch64`.
+
+```sh
+tools/build-kernel-aarch64.sh
+tools/build-loader-aarch64.sh
+L4H_ARCH=aarch64 tests/run-selftest.sh 4
+L4H_ARCH=aarch64 tests/run-blktest.sh
+L4H_ARCH=aarch64 tests/run-nettest.sh
+```
+
+The same selection works with `tools/build-linux.sh`, `tools/run-dom0.sh`,
+`tools/mkinitramfs.sh` and the control, memory and scheduler tests.
+`L4H_BUSYBOX` can name another static AArch64 BusyBox. QEMU starts at EL1;
+`L4H_QEMU_VIRTUALIZATION=on` also exercises entry from EL2. UEFI/GCE
+image scripts remain specific to x86_64. `L4H_MEM` accepts MiB, `M` or `G`;
+`run-dom0.sh` rebuilds the seL4 RAM map and loader when its size changes.
+
+An assembled `build/l4h-aarch64.img` also boots directly on Apple Silicon
+macOS with QEMU installed (`brew install qemu`):
+
+```sh
+tools/run-image-aarch64.sh build/l4h-aarch64.img
+```
+
+On macOS the script selects HVF with an emulated GICv2
+(`kernel-irqchip=off`); no intermediate Linux VM is required. Tart's EFI
+machine requires a different platform port.
 
 To run your own dom0 initramfs:
 
@@ -92,6 +125,7 @@ l4hctl console 1 --follow
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
 | `tests/run-futexbench.sh [vcpus] [rounds]` | process-shared futex handoff latency |
 | `tests/run-nodetest.sh /path/to/node [vcpus]` | Node startup/JIT, string internalization, worker threads and concurrent GC |
+| `tests/run-modtest.sh` | external kernel module relocation, load and unload |
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`) | disk pass-through, data integrity |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |
 | `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM |

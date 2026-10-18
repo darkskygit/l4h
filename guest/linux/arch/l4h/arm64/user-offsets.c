@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/kbuild.h>
+void foo(void);
+void foo(void)
+{
+	DEFINE(HOST_IP, 32);
+	DEFINE(HOST_SP, 31);
+	DEFINE(HOST_BP, 29);
+	DEFINE(HOST_AX, 0);
+	DEFINE(HOST_ORIG_AX, 34);
+	DEFINE(HOST_TLS, 35);
+	DEFINE(UM_FRAME_SIZE, 37 * 8);
+	DEFINE(UM_POLLIN, 1);
+	DEFINE(UM_POLLPRI, 2);
+	DEFINE(UM_POLLOUT, 4);
+	DEFINE(UM_PROT_READ, 1);
+	DEFINE(UM_PROT_WRITE, 2);
+	DEFINE(UM_PROT_EXEC, 4);
+}

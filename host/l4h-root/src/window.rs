@@ -42,6 +42,15 @@ impl Window {
         let cap = sel4::init_thread::Slot::<cap_type::Granule>::from_index(self.slot).cap();
         cap.frame_map(slot::VSPACE.cap(), self.va, CapRights::read_write(), attrs).expect("window map");
         let r = f(self.va as *mut u8);
+        // ELF loading writes through this alias. Make those instructions
+        // visible before another VSpace (or core) starts executing them.
+        #[cfg(target_arch = "aarch64")]
+        if attrs.has(VmAttributes::PAGE_CACHEABLE) {
+            let error = sel4::with_ipc_buffer_mut(|ipc| {
+                ipc.inner_mut().seL4_ARM_Page_Unify_Instruction(cap.bits(), 0, 4096)
+            });
+            assert_eq!(error, 0, "window instruction-cache maintenance");
+        }
         cap.frame_unmap().unwrap();
         dst.delete().unwrap();
         r

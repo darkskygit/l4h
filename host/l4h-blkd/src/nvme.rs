@@ -5,11 +5,11 @@
 //! page, every piece but the last ends on one).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::Ordering;
 
 use l4h_rt::host::blk::{self, BlkdConfig};
 use l4h_rt::sel4;
-use l4h_virtio::{Dma, Mmio};
+use l4h_virtio::{dma_fence, Dma, Mmio};
 
 use crate::{DevInfo, Driver, MAX_PIECES, Seg};
 
@@ -79,7 +79,7 @@ impl Sq {
     }
 
     fn ring(&self) {
-        fence(Ordering::SeqCst);
+        dma_fence(Ordering::SeqCst);
         self.doorbell.w32(0, self.tail as u32);
     }
 }
@@ -92,7 +92,7 @@ impl Cq {
         if st & 1 != self.phase {
             return None;
         }
-        fence(Ordering::Acquire);
+        dma_fence(Ordering::Acquire);
         let cid = e.r16(12);
         self.head += 1;
         if self.head == self.depth {
@@ -168,8 +168,8 @@ impl Nvme {
         }
         // MSI-X table entry 0 -> our interrupt, unmasked.
         let msix = Mmio(cfg.msix_table.va as usize);
-        msix.w32(0, 0xfee0_0000);
-        msix.w32(4, 0);
+        msix.w32(0, cfg.msi_address as u32);
+        msix.w32(4, (cfg.msi_address >> 32) as u32);
         msix.w32(8, cfg.msi_data);
         msix.w32(12, 0);
 

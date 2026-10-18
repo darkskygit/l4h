@@ -11,12 +11,14 @@ always-$(KBUILD_BUILTIN) := vmlinux.lds
 
 obj-y = exec.o irq.o mem.o physmem.o process.o ptrace.o reboot.o \
 	signal.o sysrq.o time.o tlb.o trap.o um_arch.o kmsg_dump.o \
-	capflags.o caps.o vspace.o uctx.o skas/
+	caps.o vspace.o uctx.o skas/
 
 obj-$(CONFIG_BLK_DEV_INITRD) += initrd.o
 obj-$(CONFIG_EARLY_PRINTK) += early_printk.o
 obj-$(CONFIG_STACKTRACE) += stacktrace.o
 obj-$(CONFIG_SMP) += smp.o
+
+obj-$(CONFIG_UML_X86) += capflags.o
 
 targets := capflags.c
 

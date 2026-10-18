@@ -119,7 +119,8 @@ pub fn spawn(
         dma.push(frames);
         cfg.nics[n] = net::NicConfig {
             pci_bdf: bdf(d),
-            msi_data: 0x30 + (NIC_MSI_BASE + n as u64) as u32,
+            msi_data: pci::msi_data(NIC_MSI_BASE + n as u64),
+            msi_address: pci::msi_address(),
             common,
             notify,
             notify_off_multiplier: notify_mult,

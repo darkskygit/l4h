@@ -13,9 +13,12 @@ use crate::mem::Alloc;
 /// Badge of the monitor's interrupt on the root task's bound notification.
 pub const MONITOR_BADGE: u64 = 1 << 41;
 
+#[cfg(target_arch = "x86_64")]
 const COM1: u16 = 0x3f8;
+#[cfg(target_arch = "x86_64")]
 const IRQ_COM1: u64 = 4;
 /// seL4 user IRQ vector for COM1.
+#[cfg(target_arch = "x86_64")]
 const VECTOR: u64 = crate::pci::VECTOR_MONITOR;
 
 pub struct Monitor {
@@ -26,7 +29,7 @@ pub struct Monitor {
 
 impl Monitor {
     #[cfg(target_arch = "x86_64")]
-    pub fn new(alloc: &mut Alloc, ntfn: sel4::cap::Notification) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification) -> Option<Self> {
         use sel4::init_thread::slot;
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         let port = alloc.slots.alloc();
@@ -47,10 +50,30 @@ impl Monitor {
         Some(m)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
-    pub fn new(_alloc: &mut Alloc, _ntfn: sel4::cap::Notification) -> Option<Self> {
-        let _ = (COM1, IRQ_COM1, VECTOR);
-        None
+    #[cfg(target_arch = "aarch64")]
+    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification) -> Option<Self> {
+        use sel4::init_thread::slot;
+        use sel4::{CapRights, VmAttributes};
+        use crate::mem::ObjCtx;
+        const UART_VA: usize = 0x6000_0200_0000;
+        let frames = devmem.frames(&mut alloc.slots, 0x0900_0000, 4096)?;
+        crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), frames[0],
+            UART_VA, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);
+        let irq_slot = alloc.slots.alloc();
+        let dst = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap());
+        slot::IRQ_CONTROL.cap().irq_control_get_trigger_core(33, false, 0, &dst).ok()?;
+        let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
+        let badge_slot = alloc.slots.alloc();
+        let badge = sel4::init_thread::Slot::<cap_type::Notification>::from_index(badge_slot).cap();
+        crate::component::abs_of(badge).mint(&crate::component::abs_of(ntfn), CapRights::write_only(), MONITOR_BADGE).ok()?;
+        irq.irq_handler_set_notification(badge).ok()?;
+        unsafe {
+            ((UART_VA + 0x44) as *mut u32).write_volatile(0x7ff); // clear pending IRQs
+            ((UART_VA + 0x38) as *mut u32).write_volatile((1 << 4) | (1 << 6)); // RX, RX timeout
+        }
+        irq.irq_handler_ack().ok()?;
+        sel4::debug_println!("l4h-root: serial monitor on PL011 (type 'help')");
+        Some(Self { port: UART_VA as u64, irq, line: String::new() })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -63,13 +86,16 @@ impl Monitor {
         sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(self.port, (COM1 + off) as u64, v as u64));
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
-    fn inb(&self, _off: u16) -> u8 {
-        0
+    #[cfg(target_arch = "aarch64")]
+    fn inb(&self, off: u16) -> u8 {
+        unsafe {
+            if off == 5 {
+                (((self.port as usize + 0x18) as *const u32).read_volatile() & (1 << 4) == 0) as u8
+            } else {
+                (self.port as *const u32).read_volatile() as u8
+            }
+        }
     }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    fn out(&self, _off: u16, _v: u8) {}
 
     /// The UART interrupted: collect input, run complete lines.
     pub fn interrupt(h: &mut Host) {
@@ -90,6 +116,8 @@ impl Monitor {
                 _ => {}
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { ((m.port + 0x44) as *mut u32).write_volatile(0x7ff); }
         let _ = m.irq.irq_handler_ack();
         h.monitor = Some(m);
     }
