@@ -56,7 +56,7 @@ fn parse_mac(s: &str) -> Result<u64> {
     }
     let mut m = 0u64;
     for p in parts {
-        m = (m << 8) | u64::from_str_radix(p, 16).map_err(|_| Error(format!("bad MAC: {s}")))?;
+        m = (m << 8) | u8::from_str_radix(p, 16).map_err(|_| Error(format!("bad MAC: {s}")))? as u64;
     }
     Ok(m)
 }
@@ -219,17 +219,22 @@ fn parse_num(s: &str) -> Result<u64> {
     s.parse().map_err(|_| Error(format!("bad number: {s}")))
 }
 
+/// A size in MiB, as bytes.
+fn parse_mib(s: &str) -> Result<u64> {
+    parse_num(s)?.checked_mul(1 << 20).ok_or(Error(format!("too large: {s} MiB")))
+}
+
 struct CreateOpts {
     name: String,
-    mem_mb: u64,
+    mem: u64,
     vcpus: u64,
     kernel: String,
     initrd: Option<String>,
     cmdline: String,
     /// (disk, read-only, first sector, sectors)
     disks: Vec<(u64, bool, u64, u64)>,
-    /// seL4 object quota (0: default).
-    quota_mb: u64,
+    /// seL4 object quota in bytes (0: default).
+    quota: u64,
     /// (switch, MAC or 0, flags)
     nics: Vec<(u64, u64, u64)>,
 }
@@ -243,7 +248,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
     let mut name = [0u8; CTL_NAME_MAX];
     let n = o.name.len().min(CTL_NAME_MAX - 1);
     name[..n].copy_from_slice(&o.name.as_bytes()[..n]);
-    let resp = ctl.call(CTL_VM_CREATE, &[o.mem_mb << 20, o.vcpus, k.ram_base, o.quota_mb << 20], &name, &[])?;
+    let resp = ctl.call(CTL_VM_CREATE, &[o.mem, o.vcpus, k.ram_base, o.quota], &name, &[])?;
     let vm = resp.vals[0];
     let r = (|| {
         for &(disk, ro, start, sectors) in &o.disks {
@@ -390,13 +395,13 @@ fn run(args: &[String]) -> Result<i32> {
             let name = args.get(1).ok_or(Error("create: missing NAME".into()))?.clone();
             let mut o = CreateOpts {
                 name,
-                mem_mb: 128,
+                mem: 128 << 20,
                 vcpus: 1,
                 kernel: String::new(),
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
-                quota_mb: 0,
+                quota: 0,
                 nics: Vec::new(),
             };
             let mut it = args[2..].iter();
@@ -405,9 +410,9 @@ fn run(args: &[String]) -> Result<i32> {
                 match a.as_str() {
                     "--kernel" => o.kernel = val()?,
                     "--initrd" => o.initrd = Some(val()?),
-                    "--mem" => o.mem_mb = parse_num(&val()?)?,
+                    "--mem" => o.mem = parse_mib(&val()?)?,
                     "--vcpus" => o.vcpus = parse_num(&val()?)?,
-                    "--quota" => o.quota_mb = parse_num(&val()?)?,
+                    "--quota" => o.quota = parse_mib(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
                         // DISK[,ro][,start=SECTOR][,sectors=N] (or DISK:ro)
@@ -546,7 +551,7 @@ fn run(args: &[String]) -> Result<i32> {
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--follow" | "-f" => follow = true,
-                    "--until" => until = it.next().cloned(),
+                    "--until" => until = Some(it.next().filter(|s| !s.is_empty()).cloned().ok_or(Error("--until: missing pattern".into()))?),
                     "--timeout" => {
                         let s = parse_num(it.next().ok_or(Error("--timeout: missing value".into()))?)?;
                         timeout = Some(Duration::from_secs(s));
@@ -567,6 +572,9 @@ fn run(args: &[String]) -> Result<i32> {
             loop {
                 match rest.first().map(|s| s.as_str()) {
                     Some("--wait") if rest.len() > 1 => {
+                        if rest[1].is_empty() {
+                            return err("--wait: empty pattern");
+                        }
                         wait = Some(rest[1].clone());
                         rest = &rest[2..];
                     }
@@ -597,6 +605,11 @@ fn run(args: &[String]) -> Result<i32> {
                 let r = ctl.call(CTL_CONSOLE_WRITE, &[vm, chunk.len() as u64], chunk, &[])?;
                 off += r.vals[0] as usize;
                 if r.vals[0] == 0 {
+                    // The guest is not reading its console.
+                    if start.elapsed() > timeout {
+                        eprintln!("l4hctl: timed out writing to the console");
+                        return Ok(1);
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
             }
