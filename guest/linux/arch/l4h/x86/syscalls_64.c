@@ -17,27 +17,27 @@
 long arch_prctl(struct task_struct *task, int option,
 		unsigned long __user *arg2)
 {
+	unsigned long *gp = task->thread.regs.regs.gp;
 	long ret = -EINVAL;
 
-	l4h_sync_seg(current);
+	/* task is current, or (PTRACE_ARCH_PRCTL) a tracee stopped by ptrace. */
+	l4h_sync_seg(task);
 	switch (option) {
 	case ARCH_SET_FS:
-		current->thread.regs.regs.gp[FS_BASE / sizeof(unsigned long)] =
-			(unsigned long) arg2;
-		l4h_seg_dirty(current);
+		gp[FS_BASE / sizeof(unsigned long)] = (unsigned long) arg2;
+		l4h_seg_dirty(task);
 		ret = 0;
 		break;
 	case ARCH_SET_GS:
-		current->thread.regs.regs.gp[GS_BASE / sizeof(unsigned long)] =
-			(unsigned long) arg2;
-		l4h_seg_dirty(current);
+		gp[GS_BASE / sizeof(unsigned long)] = (unsigned long) arg2;
+		l4h_seg_dirty(task);
 		ret = 0;
 		break;
 	case ARCH_GET_FS:
-		ret = put_user(current->thread.regs.regs.gp[FS_BASE / sizeof(unsigned long)], arg2);
+		ret = put_user(gp[FS_BASE / sizeof(unsigned long)], arg2);
 		break;
 	case ARCH_GET_GS:
-		ret = put_user(current->thread.regs.regs.gp[GS_BASE / sizeof(unsigned long)], arg2);
+		ret = put_user(gp[GS_BASE / sizeof(unsigned long)], arg2);
 		break;
 	}
 

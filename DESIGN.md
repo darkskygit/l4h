@@ -493,6 +493,9 @@ through the direct map. It fetches FPU and XSAVE state with E2, then rewrites
 the uTCB's registers with `WriteRegisters`. `rt_sigreturn` reverses this.
 
 **ptrace and coredump** use ReadRegisters/WriteRegisters and E2.
+`PTRACE_ARCH_PRCTL` acts on the tracee: its fs/gs base is read back from
+its TCB (user code may have changed it with `wrfsbase`), and a new value
+is kept in its saved registers, marked dirty, until it resumes.
 
 ### 5.5 Calls from the guest to the host
 

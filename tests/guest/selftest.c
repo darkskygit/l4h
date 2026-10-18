@@ -17,11 +17,13 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/personality.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <asm/prctl.h>
 #include <linux/futex.h>
 
 static int failures;
@@ -281,6 +283,90 @@ static void test_fork(void)
 	}
 	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
 	      "exec /bin/true: status %x", status);
+}
+
+/* ---- ptrace */
+#define PT_GS1 0x12345000UL
+#define PT_GS2 0x6789a000UL
+
+static long get_base(int code)
+{
+	unsigned long base = ~0UL;
+
+	syscall(SYS_arch_prctl, code, &base);
+	return base;
+}
+
+static void ptrace_child(void)
+{
+	ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+	/* glibc does not use gs on x86_64: give it a value of our own. */
+	syscall(SYS_arch_prctl, ARCH_SET_GS, PT_GS1);
+	raise(SIGSTOP);
+	if (get_base(ARCH_GET_GS) != PT_GS2)
+		_exit(10);
+	_exit(0);
+}
+
+static int ptrace_stopped(pid_t pid)
+{
+	int status;
+
+	return waitpid(pid, &status, 0) == pid && WIFSTOPPED(status) &&
+	       WSTOPSIG(status) == SIGSTOP;
+}
+
+static int ptrace_reaped;
+
+static void ptrace_tracer(pid_t pid)
+{
+	unsigned long v, fs = get_base(ARCH_GET_FS), fs_new = fs + 0x1000;
+	int status;
+
+	CHECK(ptrace_stopped(pid), "child did not stop");
+
+	/* PTRACE_ARCH_PRCTL acts on the tracee, not on the tracer. */
+	v = 0;
+	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, &v, ARCH_GET_GS) == 0,
+	      "ARCH_PRCTL GET_GS: %s", strerror(errno));
+	CHECK(v == PT_GS1, "ARCH_PRCTL GET_GS read %#lx, tracee has %#lx", v, PT_GS1);
+	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, PT_GS2, ARCH_SET_GS) == 0,
+	      "ARCH_PRCTL SET_GS: %s", strerror(errno));
+	CHECK(get_base(ARCH_GET_GS) == 0, "ARCH_PRCTL SET_GS changed the tracer's gs base");
+	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, &v, ARCH_GET_GS) == 0 && v == PT_GS2,
+	      "ARCH_PRCTL GET_GS after SET_GS: %#lx", v);
+	/* fs base: set the tracee's to another value, then restore it. */
+	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, &v, ARCH_GET_FS) == 0 && v == fs,
+	      "ARCH_PRCTL GET_FS read %#lx, expected %#lx", v, fs);
+	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, fs_new, ARCH_SET_FS) == 0,
+	      "ARCH_PRCTL SET_FS: %s", strerror(errno));
+	CHECK(get_base(ARCH_GET_FS) == fs, "ARCH_PRCTL SET_FS changed the tracer's fs base");
+	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, &v, ARCH_GET_FS) == 0 && v == fs_new,
+	      "ARCH_PRCTL GET_FS after SET_FS: %#lx", v);
+	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, fs, ARCH_SET_FS) == 0,
+	      "ARCH_PRCTL SET_FS (restore): %s", strerror(errno));
+
+	CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "PTRACE_CONT: %s", strerror(errno));
+	CHECK(waitpid(pid, &status, 0) == pid, "waitpid: %s", strerror(errno));
+	ptrace_reaped = 1;
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "child saw the wrong gs base: status %x", status);
+}
+
+static void test_ptrace(void)
+{
+	pid_t pid = fork();
+
+	CHECK(pid >= 0, "fork: %s", strerror(errno));
+	if (pid == 0)
+		ptrace_child();
+	ptrace_reaped = 0;
+	ptrace_tracer(pid);
+	/* On failure the child may still be stopped. */
+	if (!ptrace_reaped) {
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+	}
 }
 
 static void test_many_forks(void)
@@ -681,6 +767,7 @@ static const struct test tests[] = {
 	{ "uaccess_prot", test_uaccess_prot },
 	{ "fork", test_fork },
 	{ "many_forks", test_many_forks },
+	{ "ptrace", test_ptrace },
 	{ "signals_fpu", test_signals_fpu },
 	{ "timers", test_timers },
 	{ "threads", test_threads },

@@ -337,7 +337,9 @@ void l4h_user_sync_seg(struct l4h_uctx *u, unsigned long *gp)
 {
 	seL4_UserContext c;
 
-	if (u->state == L4H_UCTX_NONE || u->state == L4H_UCTX_FRESH)
+	/* gp[] is authoritative until the kernel's own change is written back. */
+	if (u->state == L4H_UCTX_NONE || u->state == L4H_UCTX_FRESH ||
+	    (u->regs_dirty & DIRTY_SEG))
 		return;
 	if (seL4_TCB_ReadRegisters(u->tcb, 0, 0, CTX_WORDS_ALL, &c) == 0) {
 		gp[HOST_FS_BASE] = c.fs_base;
