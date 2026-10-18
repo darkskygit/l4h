@@ -7,7 +7,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 R=$root/build/debian-root
 sudo rm -rf "$R"
 sudo debootstrap --variant=minbase \
-    --include=systemd-sysv,udev,iproute2,procps,kmod,dbus,ifupdown,isc-dhcp-client \
+    --include=systemd-sysv,udev,iproute2,procps,kmod,dbus,ifupdown,isc-dhcp-client,nftables,iputils-ping \
     trixie "$R" http://deb.debian.org/debian
 sudo sh -c "
 echo l4h-debian > $R/etc/hostname

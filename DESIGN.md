@@ -706,6 +706,10 @@ function, such as routing, NAT, DHCP or firewalling, belongs in a VM.
   - MAC learning has 300 s ageing. Unknown unicast, broadcast and multicast
     are flooded within the switch. Locked ports (the default) drop frames
     whose source MAC is not the port's MAC.
+  - `tests/run-router.sh` covers the routing gate. A Debian router VM has
+    one vNIC on the uplink switch and one on an internal switch, and NATs
+    with nftables masquerade. A guest that is only on the internal switch
+    reaches the outside through it.
   - `tests/run-nettest.sh` covers DHCP and ping over the QEMU user-net
     uplink, guest-to-guest pings on internal switches, a guest with two
     vNICs, switch isolation and MAC lock.

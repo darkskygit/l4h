@@ -3,6 +3,7 @@
 # kernel command line variables (passed to init as environment):
 #   IP0, IP1   address/prefix of eth0, eth1 (IP0 may list several, comma-separated)
 #   NEWMAC     MAC to set on eth0 before using it
+#   GW         default gateway
 #   PING PING2 addresses to ping
 mount -t proc proc /proc
 mount -t sysfs sys /sys
@@ -14,6 +15,7 @@ if [ -n "$IP0" ]; then
     ip link set eth0 up
 fi
 if [ -n "$IP1" ]; then ip addr add "$IP1" dev eth1; ip link set eth1 up; fi
+if [ -n "$GW" ]; then ip route add default via "$GW"; fi
 echo "NETVM: ready"
 for t in $PING $PING2; do
     if ping -c 3 -W 2 "$t" >/dev/null 2>&1; then
