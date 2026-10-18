@@ -6,7 +6,8 @@ l4h is a hypervisor for Linux VMs built on the seL4 microkernel. It uses
 and address spaces. l4h therefore runs anywhere seL4 runs, including cloud
 VMs without nested virtualization.
 
-See [DESIGN.md](DESIGN.md) for the design, the decisions behind it and the
+The user manual is in [docs/manual](docs/manual/l4h-manual.tex); render it
+with `make -C docs/manual`. See [DESIGN.md](DESIGN.md) for the design, the decisions behind it and the
 current status of each part.
 
 ## What works
@@ -38,6 +39,7 @@ current status of each part.
 
 ```
 DESIGN.md            design, decisions, status
+docs/manual/         user manual (LaTeX; make -C docs/manual renders the PDF)
 include/l4h/abi.h    guest <-> host ABI (single source of truth)
 kernel/              seL4 submodule, l4h patches (kernel/patches), configs
 guest/linux/         arch/l4h for Linux 6.18 and patches outside arch/
