@@ -26,13 +26,14 @@ apt-get install -y -q --no-install-recommends "${pkgs[@]}"
 # Rust: stable for the dom0 tools and tests, the pinned nightly for the host
 # (host/rust-toolchain.toml).
 if ! command -v rustup >/dev/null; then
-    init=$(mktemp)
+    # rustup-init acts on its file name.
+    init=$(mktemp -d)/rustup-init
     curl -sSfL -o "$init" \
         "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/x86_64-unknown-linux-gnu/rustup-init"
     echo "$RUSTUP_SHA256  $init" | sha256sum -c --quiet
     chmod +x "$init"
     "$init" -y --profile minimal --default-toolchain stable
-    rm -f "$init"
+    rm -rf "$(dirname "$init")"
 fi
 export PATH=$HOME/.cargo/bin:$PATH
 rustup toolchain install stable --profile minimal
