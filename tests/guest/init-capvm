@@ -1,0 +1,26 @@
+#!/bin/sh
+# Init of the guest started by tests/guest/init-captest: under a CPU cap,
+# run the self-test and fork/exec/signal-heavy loops, report every failure.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+n=$(sed -n 's/.*caprounds=\([0-9]*\).*/\1/p' /proc/cmdline)
+echo "CAPVM: ready, ${n:=2} rounds"
+fails=0
+i=0
+while [ "$i" -lt "$n" ]; do
+    i=$((i + 1))
+    /bin/selftest >/tmp/st.log 2>&1 || { fails=$((fails + 1)); cat /tmp/st.log; }
+    # Short-lived processes, as systemd starting up: each blocks in a
+    # syscall on its first run and may find SC_U exhausted.
+    j=0
+    while [ "$j" -lt 100 ]; do
+        r=$(/bin/sh -c 'echo $((6 * 7))') || true
+        [ "$r" = 42 ] || { fails=$((fails + 1)); echo "CAPVM: child $j: '$r'"; }
+        j=$((j + 1))
+    done
+    echo "CAPVM: round $i fails=$fails"
+done
+echo "CAPVM: done fails=$fails"
+while :; do sleep 10; done

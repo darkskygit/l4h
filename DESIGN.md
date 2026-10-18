@@ -645,6 +645,11 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
     thread. The guest therefore waits for the refill, on 100 µs timers,
     when it moves a capped SC_U to another process: not with
     `seL4_Yield`, which charges SC_K all of its remaining budget.
+  - Under a cap, `P_K > P_U` no longer means that a user context runs
+    only once kTCB blocks: when SC_K is out of budget and SC_U is not,
+    the context bound to SC_U runs. The guest therefore writes a
+    preempted context's registers before it binds SC_U to it, never
+    after (`tests/run-captest.sh`).
   - Their SCs hold 16 refills (512-byte objects). With seL4's minimum of
     two, a budget used in many short pieces, as a vCPU that is preempted
     and blocks often uses it, keeps being merged into later refills.

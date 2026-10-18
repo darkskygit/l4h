@@ -213,23 +213,40 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 	int err;
 
 	l4h_BUG_ON(u->fault_ep_vcpu != v->id);
-	bind_sc(v, u);
 	/* gp[] may have been modified whenever it is valid: write it back. */
 	if (u->regs_valid)
 		u->regs_dirty |= DIRTY_GP;
+	/*
+	 * A preempted context is runnable: as soon as it holds SC_U it runs
+	 * whenever this kernel thread does not, and that is not only once we
+	 * block in Recv below.  Under a CPU cap SC_K runs out of budget while
+	 * SC_U still has some, and the context then runs ahead, possibly into
+	 * its next fault, between bind_sc() and Recv.  Writing gp[] after
+	 * binding would then roll its registers back to the state they had
+	 * when it was preempted, and turn a queued fault into one reporting
+	 * those stale registers (resuming 2 bytes into an instruction after
+	 * a "syscall" stop: SIGILL, SIGSEGV, re-executed code).  Write the
+	 * registers while the context has no scheduling context.
+	 */
+	if (u->state == L4H_UCTX_PREEMPTED && u->regs_dirty) {
+		if (u->sc_vcpu >= 0)
+			l4h_user_deschedule(u);
+		err = write_regs(u, gp, 0);
+		l4h_BUG_ON(err);
+	}
+	bind_sc(v, u);
 
 	switch (u->state) {
 	case L4H_UCTX_FRESH:
+		/* Inactive until resumed: it cannot run before this write. */
 		u->regs_dirty |= DIRTY_GP | DIRTY_SEG;
 		err = write_regs(u, gp, 1);
 		l4h_BUG_ON(err);
 		info = seL4_Recv(v->ep, &badge, u->reply);
 		break;
 	case L4H_UCTX_PREEMPTED:
-		if (u->regs_dirty) {
-			err = write_regs(u, gp, 0);
-			l4h_BUG_ON(err);
-		}
+		/* Registers written above.  A fault it raises before we block
+		 * here is queued on the endpoint and received now. */
 		info = seL4_Recv(v->ep, &badge, u->reply);
 		break;
 	case L4H_UCTX_FAULTED:
