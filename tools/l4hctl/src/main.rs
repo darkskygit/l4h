@@ -15,6 +15,7 @@ struct CreateOpts {
     cmdline: String,
     disks: Vec<(u64, bool, u64, u64)>,
     quota: u64,
+    io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
 }
 
@@ -33,6 +34,7 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         cmdline: &o.cmdline,
         disks: o.disks.clone(),
         quota: o.quota,
+        io_pool: o.io_pool,
         nics: o.nics.clone(),
     })?;
     for (&(sw, _, _), mac) in o.nics.iter().zip(macs) {
@@ -85,6 +87,8 @@ const USAGE: &str = "usage: l4hctl <command>
          [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
                                create and start a VM; prints its id
          [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
+         [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
+                               default 4)
   shutdown VM [--reboot]       ask the VM to shut down (or reboot) cleanly
   destroy VM                   stop a VM and free its resources
   sched VM CAP                 cap each vCPU of VM at CAP% of a core (0: none)
@@ -168,6 +172,7 @@ fn run(args: &[String]) -> Result<i32> {
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
                 quota: 0,
+                io_pool: 0,
                 nics: Vec::new(),
             };
             let mut it = args[2..].iter();
@@ -179,6 +184,7 @@ fn run(args: &[String]) -> Result<i32> {
                     "--mem" => o.mem = parse_mib(&val()?)?,
                     "--vcpus" => o.vcpus = parse_num(&val()?)?,
                     "--quota" => o.quota = parse_mib(&val()?)?,
+                    "--io-pool" => o.io_pool = parse_mib(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {
                         // DISK[,ro][,start=SECTOR][,sectors=N] (or DISK:ro)

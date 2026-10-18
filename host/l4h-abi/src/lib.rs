@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 1;
+pub const ABI_VERSION: u64 = 2;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -65,6 +65,7 @@ pub const FPU_SCRATCH_OFFSET: usize = 2048;
 pub const fn dev_area_va(d: usize) -> u64 {
     SPECIAL_BASE + 0x1000_0000 + d as u64 * 0x1_0000
 }
+pub const CTL_DATA_VA: u64 = SPECIAL_BASE + 0x2000_0000;
 pub const SPECIAL_END: u64 = SPECIAL_BASE + 0x4000_0000;
 
 pub const PRIO_KERNEL: u64 = 100;
@@ -103,7 +104,8 @@ pub struct DevDesc {
     pub page_size: u64,
     pub event: u32,
     pub kick_slot: u32,
-    pub reserved: [u64; 2],
+    pub data_va: u64,
+    pub data_size: u64,
 }
 
 #[repr(C)]
@@ -128,7 +130,9 @@ pub struct BootInfo {
     pub nr_vspaces: u64,
     pub nr_devices: u64,
     pub flags: u64,
-    pub reserved: [u64; 18],
+    pub io_pool_gpa: u64,
+    pub io_pool_size: u64,
+    pub reserved: [u64; 16],
     pub untyped: [UntypedDesc; MAX_UNTYPED],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
@@ -194,7 +198,7 @@ pub struct ConsolePage {
 pub const CTL_VERSION: u32 = 1;
 pub const CTL_RESP_OFF: usize = 2048;
 pub const CTL_DATA_MAX: usize = 1984;
-pub const CTL_LOAD_MAX: u64 = 4 << 20;
+pub const CTL_LOAD_MAX: u64 = 1 << 20;
 pub const CTL_NAME_MAX: usize = 32;
 
 #[repr(C)]

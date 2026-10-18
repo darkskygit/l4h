@@ -22,13 +22,15 @@ use crate::elf::Elf;
 use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
 use crate::vmm;
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
-use crate::window::{Window, Windows};
+use crate::window::Window;
 use crate::{AsidPools, HostInfo};
 
 const PAGE: usize = 4096;
 const GIB: usize = 1 << 30;
 /// Devices a guest can have (console, control, virtio).
 pub const MAX_GUEST_DEVICES: usize = 16;
+/// Physically contiguous pieces guest RAM may consist of.
+const MAX_RAM_CHUNKS: usize = 128;
 
 /// Badge layout of the root fault endpoint for guest kernels.
 pub const HYP_BADGE_FAULT: u64 = 1 << 24;
@@ -47,12 +49,26 @@ const ROOT_GUEST_VA: usize = 0x0000_7100_0000_0000;
 fn root_guest_va(id: usize) -> usize {
     ROOT_GUEST_VA + id * 0x10_0000
 }
+/// Where l4h-root maps the control data area of a guest (dom0) for itself.
+const ROOT_CTL_DATA_VA: usize = 0x0000_7180_0000_0000;
+fn root_ctl_data_va(id: usize) -> usize {
+    ROOT_CTL_DATA_VA + id * abi::CTL_LOAD_MAX as usize
+}
+
+/// Default size of a guest's I/O pool, and its bounds (a power of two).
+pub const IO_POOL_DEFAULT: usize = 4 << 20;
+pub const IO_POOL_MIN: usize = 1 << 20;
+pub const IO_POOL_MAX: usize = 256 << 20;
+/// The I/O pool starts at the first GPA above RAM with this alignment.
+const IO_POOL_ALIGN: usize = 2 << 20;
 
 pub struct GuestConfig<'a> {
     pub name: &'a str,
     pub ram: usize,
     pub vcpus: usize,
     pub untyped_quota: usize,
+    /// Bytes of I/O pool (a power of two, IO_POOL_MIN..=IO_POOL_MAX).
+    pub io_pool: usize,
     pub vspaces: usize,
     /// Guest-virtual address of GPA 0 (from the kernel image).
     pub ram_base: usize,
@@ -82,6 +98,29 @@ pub struct RamChunk {
     pub gpa: usize,
     pub paddr: usize,
     pub size: usize,
+}
+
+/// The guest's I/O pool: host-owned, physically contiguous memory above
+/// guest RAM in guest-physical space.  All device I/O goes through it
+/// (the guest bounces with swiotlb); devices and host components never
+/// access guest RAM.  The guest gets mappings of it, not capabilities.
+pub struct IoPool {
+    pub gpa: usize,
+    pub paddr: usize,
+    pub size: usize,
+    /// The frames, slot i = page i (radix `radix`).
+    frames: cap::CNode,
+    radix: usize,
+}
+
+impl IoPool {
+    pub fn frame(&self, i: usize) -> sel4::AbsoluteCPtr {
+        self.frames.absolute_cptr_from_bits_with_depth(i as u64, self.radix)
+    }
+
+    pub fn pages(&self) -> usize {
+        self.size / PAGE
+    }
 }
 
 pub struct Vcpu {
@@ -124,6 +163,10 @@ pub struct Guest {
     pub ram: Vec<RamChunk>,
     /// RAM CNodes and their radix (bits of frame index they resolve).
     pub ram_cnodes: Vec<(cap::CNode, usize)>,
+    pub pool: IoPool,
+    /// dom0: the control device's data area (VM_LOAD source), mapped in
+    /// the root task at root_ctl_data_va(id).
+    ctl_data: bool,
     pub vcpus: Vec<Vcpu>,
     pub state: State,
     pub dom0: bool,
@@ -216,21 +259,25 @@ impl Guest {
         }
     }
 
-    /// Copy `len` bytes from `src` RAM at `src_gpa` to ours at `gpa`.
-    pub fn copy_ram(&self, wins: &mut Windows, gpa: usize, src: &Guest, src_gpa: usize, len: usize) -> bool {
-        if !self.valid_gpa(gpa, len) || !src.valid_gpa(src_gpa, len) {
+    /// Copy `len` bytes at offset `src_off` of the control data area of
+    /// `src` (dom0) to our RAM at `gpa`.  The data area belongs to the
+    /// host: l4h-root never reads a guest's RAM.
+    pub fn load_from_ctl(&self, win: &mut Window, gpa: usize, src: &Guest, src_off: usize, len: usize) -> bool {
+        if !self.valid_gpa(gpa, len) || !src.ctl_data {
             return false;
         }
+        if src_off.checked_add(len).is_none_or(|end| end > abi::CTL_LOAD_MAX as usize) {
+            return false;
+        }
+        // dom0 may change the bytes meanwhile: it only corrupts its image.
+        let from = (root_ctl_data_va(src.id) + src_off) as *const u8;
         let mut off = 0;
         while off < len {
-            let (s, d) = (src_gpa + off, gpa + off);
-            let n = (PAGE - s % PAGE).min(PAGE - d % PAGE).min(len - off);
-            let (sp, dp) = (s & !(PAGE - 1), d & !(PAGE - 1));
-            let (wa, wb) = (&mut wins.a, &mut wins.b);
-            wa.with_frame(&src.ram_frame(sp), |from| {
-                wb.with_frame(&self.ram_frame(dp), |to| unsafe {
-                    ptr::copy_nonoverlapping(from.add(s - sp), to.add(d - dp), n);
-                })
+            let d = gpa + off;
+            let dp = d & !(PAGE - 1);
+            let n = (PAGE - (d - dp)).min(len - off);
+            win.with_frame(&self.ram_frame(dp), |to| unsafe {
+                ptr::copy_nonoverlapping(from.add(off), to.add(d - dp), n);
             });
             off += n;
         }
@@ -263,6 +310,20 @@ impl Guest {
         };
         if let Some(va) = root_va {
             self.map_in_root(alloc, page, va);
+        }
+        if kind == DevKind::Ctl {
+            // The data area for VM_LOAD: host frames that both dom0 and
+            // l4h-root map.
+            for i in 0..abi::CTL_LOAD_MAX as usize / PAGE {
+                let f = self.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+                let copy = alloc.slots.alloc();
+                abs(root_cap::<cap_type::Null>(copy)).copy(&abs(f), CapRights::all()).expect("ctl data copy");
+                let vspace = self.vspace;
+                let va = abi::CTL_DATA_VA as usize + i * PAGE;
+                map_frame(&mut self.ctx(alloc), vspace, root_cap::<cap_type::Granule>(copy), va, CapRights::read_write(), VmAttributes::DEFAULT);
+                self.map_in_root(alloc, f, root_ctl_data_va(self.id) + i * PAGE);
+            }
+            self.ctl_data = true;
         }
         self.devices.push(GuestDev { kind, page });
         Some(d)
@@ -345,12 +406,18 @@ impl Guest {
         }
         bi.nr_vspaces = self.vspaces as u64;
         bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
+        bi.io_pool_gpa = self.pool.gpa as u64;
+        bi.io_pool_size = self.pool.size as u64;
         bi.nr_devices = self.devices.len() as u64;
         for (d, dev) in self.devices.iter().enumerate() {
             let (ty, virtio_id) = match dev.kind {
                 DevKind::Console => (abi::DEV_CONSOLE, 0),
                 DevKind::Ctl => (abi::DEV_CTL, 0),
                 DevKind::Virtio(id) => (abi::DEV_VIRTIO, id),
+            };
+            let (data_va, data_size) = match dev.kind {
+                DevKind::Ctl => (abi::CTL_DATA_VA, abi::CTL_LOAD_MAX),
+                _ => (0, 0),
             };
             bi.devices[d] = abi::DevDesc {
                 ty,
@@ -359,7 +426,8 @@ impl Guest {
                 page_size: PAGE as u64,
                 event: dev_event(d),
                 kick_slot: d as u32,
-                reserved: [0; 2],
+                data_va,
+                data_size,
             };
         }
         let n = cmdline.iter().position(|&c| c == 0).unwrap_or(cmdline.len()).min(abi::CMDLINE_SIZE - 1);
@@ -403,15 +471,16 @@ impl Guest {
     }
 
     /// Destroy the guest and return all its memory and root slots.  The
-    /// caller has detached its devices.  With `pin_ram`, a disk could not
-    /// be stopped and may still write to the guest's RAM: the RAM chunks
-    /// are kept out of use for good.
-    pub fn destroy(mut self, alloc: &mut Alloc, pin_ram: bool) {
+    /// caller has detached its devices.  With `pin_pool`, a disk could not
+    /// be stopped and may still write to the guest's I/O pool, the only
+    /// guest memory a device is given: the pool is kept out of use for
+    /// good.  Guest RAM is never a DMA target, so it is always reused.
+    pub fn destroy(mut self, alloc: &mut Alloc, pin_pool: bool) {
         self.stop();
-        let ram = core::mem::take(&mut self.ram);
-        let pinned = alloc.reclaim_pinning(self.arena, |p| pin_ram && ram.iter().any(|c| c.paddr == p));
+        let pool = self.pool.paddr;
+        let pinned = alloc.reclaim_pinning(self.arena, |p| pin_pool && p == pool);
         if pinned != 0 {
-            sel4::debug_println!("l4h-root: guest {}: {} MiB of RAM kept out of use", self.id, pinned >> 20);
+            sel4::debug_println!("l4h-root: guest {}: {} MiB of I/O pool kept out of use", self.id, pinned >> 20);
         }
         // Capabilities that do not derive from the arena (badged endpoints,
         // copies of global objects) are left in their slots.
@@ -440,9 +509,14 @@ pub fn create(
     if cfg.untyped_quota > abi::MAX_RAM_CNODES * GIB || cfg.ram_base % PAGE != 0 {
         return Err(None);
     }
+    if !cfg.io_pool.is_power_of_two() || cfg.io_pool < IO_POOL_MIN || cfg.io_pool > IO_POOL_MAX {
+        return Err(None);
+    }
     let ram_base = cfg.ram_base;
     let ram = (cfg.ram + PAGE - 1) & !(PAGE - 1);
-    if ram_base == 0 || ram_base.checked_add(ram).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
+    // The I/O pool follows RAM in guest-physical space and in the direct map.
+    let pool_gpa = ram.next_multiple_of(IO_POOL_ALIGN);
+    if ram_base == 0 || ram_base.checked_add(pool_gpa + cfg.io_pool).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
         return Err(None);
     }
 
@@ -452,14 +526,17 @@ pub fn create(
     // factor 2.
     let n_cnodes = ram.div_ceil(GIB);
     let ram_cnode_bytes: usize = (0..n_cnodes).map(|n| ram_cnode_radix(ram, n)).map(|radix| 32usize << radix).sum();
+    let pool_pages = cfg.io_pool / PAGE;
     let overhead = 2 * (ram_cnode_bytes
         + (32 << abi::ROOT_CNODE_BITS) * 3
         + ram / 256
+        + 2 * 32 * pool_pages
+        + cfg.io_pool / 256
         + cfg.vcpus * (64 << 10)
         + cfg.vspaces * PAGE
         + (2 << 20))
-        + vmm::arena_bytes(ram, cfg.vcpus, MAX_GUEST_DEVICES);
-    if alloc.free_bytes() < overhead + ram + cfg.untyped_quota {
+        + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
+    if alloc.free_bytes() < overhead + ram + cfg.io_pool + cfg.untyped_quota {
         return Err(None);
     }
     let mut arena = alloc.arena(overhead).ok_or(None)?;
@@ -484,6 +561,8 @@ pub fn create(
         ram_base,
         ram: Vec::new(),
         ram_cnodes: Vec::new(),
+        pool: IoPool { gpa: pool_gpa, paddr: 0, size: 0, frames: cap::CNode::from_bits(0), radix: 0 },
+        ctl_data: false,
         vcpus: Vec::new(),
         state: State::Created,
         dom0: cfg.dom0,
@@ -529,8 +608,9 @@ pub fn create(
     }
     let mut gpa = 0;
     while gpa < ram {
-        // l4h-vmm and l4h-blkd take at most this many chunks.
-        if g.ram.len() == host::VMM_MAX_RAM_CHUNKS {
+        // A bound on the bookkeeping of a fragmented host (devices and
+        // host components never see guest RAM, so nothing else limits it).
+        if g.ram.len() == MAX_RAM_CHUNKS {
             return Err(Some(g));
         }
         let remaining = ram - gpa;
@@ -569,6 +649,33 @@ pub fn create(
         map_frame(&mut g.ctx(alloc), vspace, frame, ram_base + page, CapRights::read_write(), VmAttributes::DEFAULT);
         // Put it back so the guest finds it at its ABI location.
         g.ram_frame(page).move_(&abs(frame)).expect("move frame back");
+    }
+
+    // ---- I/O pool: one physically contiguous Untyped retyped into frames,
+    // kept in a CNode of the arena and mapped after RAM in the direct map.
+    // The guest gets these mappings only, never a capability to the pool.
+    let pool_bits = cfg.io_pool.trailing_zeros() as usize;
+    let pool_radix = pool_bits - 12;
+    let pool_slot = alloc.slots.alloc();
+    let Some(region) = alloc.split(pool_bits, pool_slot) else {
+        alloc.slots.free(pool_slot);
+        alloc.slots.free(tmp);
+        return Err(Some(g));
+    };
+    let pool_paddr = region.paddr;
+    g.arena.own(pool_slot, pool_paddr, pool_bits);
+    let frames = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: pool_radix });
+    crate::mem::UtPool { regions: ::alloc::vec![region] }
+        .retype(&FRAME_BP, pool_pages, Dest { cnode: abs(frames), offset: 0 })
+        .expect("I/O pool frames");
+    g.pool = IoPool { gpa: pool_gpa, paddr: pool_paddr, size: cfg.io_pool, frames, radix: pool_radix };
+    let keep = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: pool_radix });
+    for i in 0..pool_pages {
+        abs(root_cap::<cap_type::Null>(tmp)).copy(&g.pool.frame(i), CapRights::all()).expect("pool frame copy");
+        let frame = root_cap::<cap_type::Granule>(tmp);
+        let vspace = g.vspace;
+        map_frame(&mut g.ctx(alloc), vspace, frame, ram_base + pool_gpa + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT);
+        keep.absolute_cptr_from_bits_with_depth(i as u64, pool_radix).move_(&abs(frame)).expect("keep pool mapping");
     }
     alloc.slots.free(tmp);
 
@@ -690,9 +797,10 @@ pub fn create(
     }
 
     sel4::debug_println!(
-        "l4h-root: guest {} '{}' created: {} MiB RAM in {} chunk(s), {} vCPU(s), {} MiB untyped",
+        "l4h-root: guest {} '{}' created: {} MiB RAM in {} chunk(s), {} vCPU(s), {} MiB untyped, {} MiB I/O pool",
         id, g.name, ram >> 20, g.ram.len(), cfg.vcpus,
-        g.untyped.iter().map(|b| 1usize << b).sum::<usize>() >> 20
+        g.untyped.iter().map(|b| 1usize << b).sum::<usize>() >> 20,
+        g.pool.size >> 20
     );
     Ok(g)
 }

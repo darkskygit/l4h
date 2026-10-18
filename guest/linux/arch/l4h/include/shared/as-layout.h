@@ -37,6 +37,8 @@ extern struct task_struct *cpu_tasks[];
 extern unsigned long long physmem_size;
 
 extern unsigned long high_physmem;
+/* VA range of the host's I/O pool in the direct map (physmem.c). */
+extern unsigned long l4h_io_pool_start, l4h_io_pool_end;
 extern unsigned long uml_physmem;
 extern unsigned long uml_reserved;
 extern unsigned long end_vm;

@@ -1,8 +1,9 @@
 //! blkd: drives one disk (virtio-blk or NVMe PCI device) for one client (a
 //! guest's l4h-vmm).  Requests carry guest-physical segments, which are
-//! validated against the client's RAM and its LBA window and handed to the
-//! device by physical address: the device reads and writes guest memory
-//! directly.  See DESIGN.md §8.2.
+//! validated against the client's I/O pool and its LBA window and handed to
+//! the device by physical address: the device reads and writes the pool
+//! directly, never guest RAM (the guest bounces through the pool with
+//! swiotlb).  See DESIGN.md §8.2.
 
 #![no_std]
 #![no_main]
@@ -17,8 +18,8 @@ use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
-use l4h_rt::host::blk::{self, BlkdConfig, Channel};
-use l4h_rt::host::{self, RamChunk};
+use l4h_rt::host;
+use l4h_rt::host::blk::{self, BlkdConfig, Channel, Pool};
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
@@ -30,9 +31,9 @@ pub struct Seg {
     pub len: u32,
 }
 
-/// Pieces of one request: each guest segment may split at a RAM chunk
-/// boundary.
-pub const MAX_PIECES: usize = 2 * blk::MAX_SEGS;
+/// Pieces of one request: one per guest segment (the pool is physically
+/// contiguous).
+pub const MAX_PIECES: usize = blk::MAX_SEGS;
 
 pub struct DevInfo {
     /// In 512-byte sectors.
@@ -59,7 +60,8 @@ pub trait Driver {
 
 struct Blkd {
     chan: *mut Channel,
-    ram: Vec<RamChunk>,
+    /// The client's I/O pool, the only memory requests may point to.
+    pool: Pool,
     drv: Box<dyn Driver>,
     lba_start: u64,
     /// Size of the client's window in sectors.
@@ -71,23 +73,15 @@ struct Blkd {
 }
 
 impl Blkd {
-    /// Translate guest-physical segments into physical pieces.
+    /// Translate guest-physical segments into physical pieces.  Every
+    /// segment must lie in the client's I/O pool.
     fn translate(&self, req: &blk::Req, out: &mut Vec<Seg>) -> bool {
         out.clear();
         for s in &req.segs[..req.nr_segs as usize] {
-            let (mut gpa, mut len) = (s.gpa, s.len as u64);
-            while len > 0 {
-                let Some(c) = self.ram.iter().find(|c| gpa >= c.gpa && gpa < c.gpa + c.size) else {
-                    return false;
-                };
-                let n = len.min(c.gpa + c.size - gpa);
-                if out.len() == MAX_PIECES {
-                    return false;
-                }
-                out.push(Seg { pa: c.paddr + (gpa - c.gpa), len: n as u32 });
-                gpa += n;
-                len -= n;
-            }
+            let Some(pa) = self.pool.translate(s.gpa, s.len as u64) else {
+                return false;
+            };
+            out.push(Seg { pa, len: s.len });
         }
         true
     }
@@ -225,7 +219,7 @@ fn main(info: &'static Info) -> ! {
     );
     let mut b = Blkd {
         chan,
-        ram: cfg.ram_chunks[..cfg.nr_ram_chunks as usize].to_vec(),
+        pool: Pool { gpa: cfg.pool_gpa, paddr: cfg.pool_paddr, size: cfg.pool_size },
         drv,
         lba_start,
         sectors,

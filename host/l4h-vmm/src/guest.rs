@@ -1,4 +1,4 @@
-//! Access to the guest: its RAM (mapped at GUEST_RAM_VA) and event pages.
+//! Access to the guest: its I/O pool (mapped at IO_POOL_VA) and event pages.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

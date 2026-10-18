@@ -1,9 +1,10 @@
 //! blkd <-> client (l4h-vmm) block request queue.
 //!
 //! A channel is one shared region: a header, a submission ring and a
-//! completion ring of fixed-size entries.  Data is never copied: requests
-//! carry guest-physical segments, which blkd validates against the
-//! client's RAM chunks (configured by l4h-root) and translates for DMA.
+//! completion ring of fixed-size entries.  Data is never copied here:
+//! requests carry guest-physical segments, which blkd validates against
+//! the client's I/O pool (configured by l4h-root) and translates for DMA.
+//! Guest RAM is never a DMA target.
 
 pub const MAX_SEGS: usize = 16;
 pub const RING_SIZE: usize = 128;
@@ -91,8 +92,6 @@ pub struct PciRegion {
     pub len: u64,
 }
 
-pub const BLKD_MAX_RAM_CHUNKS: usize = crate::VMM_MAX_RAM_CHUNKS;
-
 pub const BLKD_VIRTIO: u32 = 0;
 pub const BLKD_NVME: u32 = 1;
 
@@ -123,9 +122,31 @@ pub struct BlkdConfig {
     pub dma_va: u64,
     pub dma_paddr: u64,
     pub dma_size: u64,
-    /// The client's channel and its guest RAM (GPA -> physical address).
+    /// The client's channel.
     pub chan_va: u64,
-    pub nr_ram_chunks: u32,
-    pub reserved1: u32,
-    pub ram_chunks: [crate::RamChunk; BLKD_MAX_RAM_CHUNKS],
+    /// The client's data region, its I/O pool: guest-physical
+    /// [pool_gpa, pool_gpa + pool_size) is physically contiguous at
+    /// pool_paddr.  Every segment must lie in it.
+    pub pool_gpa: u64,
+    pub pool_paddr: u64,
+    pub pool_size: u64,
+}
+
+/// The data region of a client: segments must lie in its I/O pool, and are
+/// translated with one offset.  Shared with tests/fuzz-virtq.
+#[derive(Clone, Copy, Debug)]
+pub struct Pool {
+    pub gpa: u64,
+    pub paddr: u64,
+    pub size: u64,
+}
+
+impl Pool {
+    /// The physical address of guest-physical [gpa, gpa + len), if it lies
+    /// in the pool (len > 0).
+    pub fn translate(&self, gpa: u64, len: u64) -> Option<u64> {
+        let off = gpa.checked_sub(self.gpa)?;
+        let end = off.checked_add(len)?;
+        (len > 0 && end <= self.size).then(|| self.paddr + off)
+    }
 }

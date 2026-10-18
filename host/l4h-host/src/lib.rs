@@ -19,8 +19,9 @@ pub const SHARED_VA: usize = 0x2000_0000_0000;
 pub const MMIO_VA: usize = 0x3000_0000_0000;
 /// DMA memory (drivers).
 pub const DMA_VA: usize = 0x3800_0000_0000;
-/// Guest RAM (l4h-vmm): GPA g is mapped at GUEST_RAM_VA + g.
-pub const GUEST_RAM_VA: usize = 0x4000_0000_0000;
+/// The guest's I/O pool (l4h-vmm): GPA g in the pool is mapped at
+/// IO_POOL_VA + (g - io_pool_gpa).  l4h-vmm never maps guest RAM.
+pub const IO_POOL_VA: usize = 0x4000_0000_0000;
 
 /// Component CSpace: one CNode of 2^CNODE_BITS slots resolving the whole
 /// CPtr, so a CPtr is simply a slot number.
@@ -77,7 +78,6 @@ pub const VMM_BADGE_HYPERCALL: u64 = 1 << 63;
 
 /// Per-guest l4h-vmm configuration.
 pub const VMM_MAX_DEVICES: usize = 16;
-pub const VMM_MAX_RAM_CHUNKS: usize = 128;
 
 /// Device kinds served by l4h-vmm.
 pub const VDEV_CONSOLE: u32 = 0;
@@ -109,27 +109,21 @@ pub struct VmmDevice {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct RamChunk {
-    pub gpa: u64,
-    pub paddr: u64,
-    pub size: u64,
-}
-
-#[repr(C)]
 pub struct VmmConfig {
     pub guest_id: u32,
     pub nr_vcpus: u32,
-    pub ram_size: u64,
+    /// The guest's I/O pool (guest-physical range), mapped at IO_POOL_VA:
+    /// every address a virtio device uses must lie in it.
+    pub io_pool_gpa: u64,
+    pub io_pool_size: u64,
     pub nr_devices: u32,
-    pub nr_ram_chunks: u32,
+    pub reserved0: u32,
     /// Slot of the badged (L4H_BADGE_EVENT) notification of vCPU v is
     /// VCPU_NTFN_SLOT_BASE + v; its event page is at event_page_va(v).
     pub dom0: u32,
     /// Also copy console output to the host serial port (with a prefix
     /// unless dom0).
     pub serial: u32,
-    pub ram_chunks: [RamChunk; VMM_MAX_RAM_CHUNKS],
     pub devices: [VmmDevice; VMM_MAX_DEVICES],
     /// Wall clock (ns since the Unix epoch, 0 if unknown) at tick count
     /// epoch_ticks.

@@ -210,6 +210,8 @@ bool l4h_kernel_range_ok(unsigned long addr, unsigned long size)
 		return false;
 	if (addr >= uml_physmem && end <= high_physmem)
 		return true;
+	if (addr >= l4h_io_pool_start && end <= l4h_io_pool_end)
+		return true;
 	if (addr >= L4H_SPECIAL_BASE && end <= L4H_SPECIAL_BASE + L4H_BOOTINFO_SIZE)
 		return true;
 	for (addr &= PAGE_MASK; addr < end; addr += PAGE_SIZE) {

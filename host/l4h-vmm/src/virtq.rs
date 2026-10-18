@@ -36,7 +36,7 @@ pub enum ChainError {
 }
 
 impl Queue {
-    /// Activate the queue; addresses must lie in guest RAM and be aligned
+    /// Activate the queue; addresses must lie in the I/O pool and be aligned
     /// as the virtio specification requires.
     pub fn setup(&mut self, mem: &GuestMem, num: u32, num_max: u32, desc: u64, avail: u64, used: u64) -> bool {
         if num == 0 || num > num_max || !num.is_power_of_two() {

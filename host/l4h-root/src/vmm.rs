@@ -1,5 +1,6 @@
-//! Spawning a guest's l4h-vmm and giving it access to the guest: RAM,
-//! event pages, device pages and the vCPU notifications.
+//! Spawning a guest's l4h-vmm and giving it access to the guest: its I/O
+//! pool (not its RAM), event pages, device pages and the vCPU
+//! notifications.
 
 use alloc::vec::Vec;
 
@@ -17,13 +18,13 @@ use crate::{AsidPools, HostInfo};
 static VMM_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-vmm.elf"));
 
 const PAGE: usize = 4096;
-const GIB: usize = 1 << 30;
 
 /// Untyped memory a guest's arena needs for its l4h-vmm.
-pub fn arena_bytes(ram: usize, vcpus: usize, devices: usize) -> usize {
-    // Mapping caps (32 bytes per frame) and page tables for guest RAM,
-    // the VMM image with its heap and stack, and small objects.
-    2 * (ram / 128 + ram / 256) + 8 * (1 << 20) + (vcpus + devices * 16) * 4 * PAGE
+pub fn arena_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
+    // Mapping caps (32 bytes per frame) and page tables for the I/O pool
+    // (the VMM maps nothing else of the guest's memory), the VMM image
+    // with its heap and stack, and small objects.
+    2 * (io_pool / 128 + io_pool / 256) + 8 * (1 << 20) + (vcpus + devices * 16) * 4 * PAGE
 }
 
 /// A device's host-side backend.
@@ -59,16 +60,12 @@ pub fn spawn(
     let mut cfg: alloc::boxed::Box<host::VmmConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
     cfg.guest_id = g.id as u32;
     cfg.nr_vcpus = g.vcpus.len() as u32;
-    cfg.ram_size = g.ram.iter().map(|c| c.size).sum::<usize>() as u64;
+    cfg.io_pool_gpa = g.pool.gpa as u64;
+    cfg.io_pool_size = g.pool.size as u64;
     cfg.dom0 = g.dom0 as u32;
     cfg.serial = 1;
     cfg.epoch_ns = host_info.epoch_ns;
     cfg.epoch_ticks = host_info.epoch_ticks;
-    assert!(g.ram.len() <= host::VMM_MAX_RAM_CHUNKS);
-    cfg.nr_ram_chunks = g.ram.len() as u32;
-    for (i, c) in g.ram.iter().enumerate() {
-        cfg.ram_chunks[i] = host::RamChunk { gpa: c.gpa as u64, paddr: c.paddr as u64, size: c.size as u64 };
-    }
     assert!(backends.len() <= host::VMM_MAX_DEVICES);
     cfg.nr_devices = backends.len() as u32;
     for (i, (d, b)) in backends.iter().enumerate() {
@@ -112,22 +109,16 @@ pub fn spawn(
     };
     let comp = component::create(&args, alloc, &mut g.arena.pool, win, asids, host_info);
 
-    // ---- Guest RAM at GUEST_RAM_VA + gpa.  The mapping capabilities are
-    // kept in CNodes of the guest's arena.
-    let ram: usize = cfg.ram_size as usize;
-    let mut keep = Vec::new();
-    for n in 0..ram.div_ceil(GIB) {
-        let frames = (ram - n * GIB).min(GIB) / PAGE;
-        let radix = (frames.next_power_of_two().trailing_zeros() as usize).max(1);
-        let cn = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: radix });
-        keep.push((cn, radix));
-    }
+    // ---- The I/O pool at IO_POOL_VA, the only guest memory the VMM maps.
+    // The mapping capabilities are kept in a CNode of the guest's arena.
+    let pages = g.pool.pages();
+    let radix = (pages.trailing_zeros() as usize).max(1);
+    let keep = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: radix });
     let attrs = VmAttributes::DEFAULT;
-    for page in (0..ram).step_by(PAGE) {
-        let (cn, radix) = keep[page / GIB];
-        let dst = cn.absolute_cptr_from_bits_with_depth(((page % GIB) / PAGE) as u64, radix);
-        let frame = g.ram_frame(page);
-        comp.map_copy(alloc, &mut g.arena.pool, &frame, host::GUEST_RAM_VA + page, CapRights::read_write(), attrs, dst);
+    for i in 0..pages {
+        let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, radix);
+        let frame = g.pool.frame(i);
+        comp.map_copy(alloc, &mut g.arena.pool, &frame, host::IO_POOL_VA + i * PAGE, CapRights::read_write(), attrs, dst);
     }
 
     // ---- Event pages, notifications and device pages.

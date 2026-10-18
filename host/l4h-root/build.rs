@@ -28,6 +28,7 @@ fn main() {
     fs::write(out.join("dom0-cmdline"), cmdline).unwrap();
     println!("cargo:rerun-if-env-changed=L4H_DOM0_MEM_MB");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_VCPUS");
+    println!("cargo:rerun-if-env-changed=L4H_DOM0_IO_POOL_MB");
     println!("cargo:rerun-if-env-changed=L4H_WATCHDOG_SECS");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_DISKS");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_NICS");

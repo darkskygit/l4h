@@ -74,6 +74,10 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if vcpus == 0 || vcpus > h.info.cores * 4 {
                 return Err(EINVAL);
             }
+            let io_pool = if a[4] != 0 { a[4] as usize } else { crate::guest::IO_POOL_DEFAULT };
+            if !io_pool.is_power_of_two() || !(crate::guest::IO_POOL_MIN..=crate::guest::IO_POOL_MAX).contains(&io_pool) {
+                return Err(EINVAL);
+            }
             let cfg = GuestConfig {
                 name,
                 ram,
@@ -81,6 +85,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 // seL4 objects of the guest kernel: mostly mapping slots
                 // and page tables of its processes.
                 untyped_quota: if a[3] != 0 { a[3] as usize } else { (16 << 20) + ram / 16 },
+                io_pool,
                 vspaces: 64,
                 ram_base: a[2] as usize,
                 dom0: false,
@@ -100,7 +105,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 return Err(EBUSY);
             }
             let d0 = h.guests.get(caller).and_then(|g| g.as_ref()).ok_or(ENOENT)?;
-            if g.copy_ram(&mut h.wins, dst, d0, src, len) { Ok(()) } else { Err(EINVAL) }
+            if g.load_from_ctl(&mut h.wins.a, dst, d0, src, len) { Ok(()) } else { Err(EINVAL) }
         }
         abi::CTL_VM_START => {
             let id = vm_arg(a[0])?;

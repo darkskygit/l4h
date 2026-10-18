@@ -144,11 +144,11 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
     and destroys guests, executes control-API requests, balances vCPUs across
     cores, and runs the serial monitor.
   \item[l4h-vmm] runs once per guest. It serves the guest's hypercalls and
-    virtio devices. It can map only its own guest's memory, so a compromised
-    VMM can harm only that guest.
+    virtio devices. It maps only its own guest's I/O pool (below), never its
+    RAM, so a compromised VMM can harm only that guest.
   \item[l4h-blkd] runs once per attached disk. It drives the disk (virtio-blk
-    or NVMe), checks every request against the guest's memory and its sector
-    window, and lets the device DMA straight into guest memory (zero copy).
+    or NVMe), checks every request against the guest's I/O pool and its
+    sector window, and lets the device DMA straight into the pool.
   \item[l4h-netd] holds every switch and drives the uplink NICs.
 \end{description}
 
@@ -157,6 +157,15 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
 runs, and nothing more. Guest kernels are untrusted, and capabilities confine
 them. The host does not rely on an IOMMU: the trusted drivers validate every
 DMA address, and guests never touch device registers.
+
+\paragraph{The I/O pool.} Each guest has a small I/O pool, 4~MiB by
+default, that belongs to the host and is mapped into the guest after its
+RAM. All device I/O goes through it: the guest kernel copies data between
+its own pages and the pool with Linux's standard restricted-DMA (swiotlb)
+mechanism, and devices, \texttt{l4h-vmm} and the drivers access only the
+pool. The VMM refuses any virtio ring, descriptor or buffer outside it,
+and a guest kernel that does not accept
+\texttt{VIRTIO\_F\_ACCESS\_PLATFORM} gets no devices.
 
 \section{Status and limitations}
 
@@ -497,7 +506,7 @@ nic 0: pci 00:05.0 virtio-net, uplink of switch 0
 
 \begin{lstlisting}
 l4hctl create NAME --kernel FILE [--initrd FILE] [--mem MB] [--vcpus N]
-       [--cmdline STRING] [--quota MB]
+       [--cmdline STRING] [--quota MB] [--io-pool MB]
        [--disk DISK[,ro][,start=SECTOR][,sectors=N]]...
        [--nic SWITCH[,mac=MAC][,nolock]]...
 \end{lstlisting}
@@ -526,6 +535,13 @@ fails, it destroys the half-built VM.
     page tables and mapping slots of its processes. The default is
     16~MiB plus 1/16 of RAM, which suits normal workloads. Raise it for
     guests that map very large amounts of memory in many processes.
+  \item[\texttt{--io-pool MB}] The guest's I/O pool, through which all its
+    disk and network I/O is copied: a power of two from 1 to 256~MiB,
+    default 4~MiB. It is host memory, charged to the guest. A larger pool
+    lets more I/O be in flight (high queue depths, several disks or
+    vNICs); when the pool is full, the guest waits for room. Each disk
+    request uses at most a quarter of the pool, so with 1~MiB a request
+    carries at most 224~KiB.
   \item[\texttt{--disk ...}] Pass a host disk through
     (Chapter~\ref{ch:storage}). Repeat it for more disks; they appear as
     \file{/dev/vda}, \file{/dev/vdb}, \ldots{} in the order given.
@@ -672,9 +688,10 @@ complete the reset (an NVMe controller that stays ready past its timeout,
 up to two minutes, or a virtio-blk device that does not reset within two
 seconds), the serial log shows \texttt{device did not reset}, \cmd{l4hctl
 disks} marks it \texttt{failed}, and attaching it fails with \texttt{I/O
-error}. The destroyed VM's RAM and the driver's DMA memory stay out of use,
-since the device may still write to them, so \cmd{l4hctl info} shows less
-free memory. Reboot the host to recover both.
+error}. The destroyed VM's I/O pool and the driver's DMA memory stay out of
+use, since the device may still write to them, so \cmd{l4hctl info} shows
+less free memory. Reboot the host to recover both. The VM's RAM is reused
+at once: a device is never given guest RAM.
 
 \begin{caveat}
 dom0 decides which guest gets which disk, and can attach any free disk to
@@ -684,7 +701,9 @@ any guest. The host does not check what is on a disk.
 \section{Performance and semantics}
 
 Requests are checked and then sent to the device, which reads and writes
-guest memory directly. Flushes reach the device, so filesystems keep their
+the guest's I/O pool directly; the guest kernel copies the data between the
+pool and its own pages, which costs guest CPU (one \texttt{memcpy} per
+byte). Flushes reach the device, so filesystems keep their
 crash-consistency guarantees. The guest sees the device's logical block
 size, for example 4~KiB on 4Kn NVMe namespaces. Each disk has one queue, and
 discard (TRIM) is not offered.
@@ -801,9 +820,9 @@ router. On GCE, give the router's uplink vNIC the instance's MAC address with
 
 Guest RAM is reserved in full when the VM is created, and returned in full
 when it is destroyed. Besides its RAM, a guest uses its seL4 object quota
-(\texttt{--quota}) and about 30~MiB of host objects, its VMM included. A
-256~MiB guest therefore costs about 317~MiB. \cmd{l4hctl info} shows free
-memory.
+(\texttt{--quota}), its I/O pool (\texttt{--io-pool}, 4~MiB by default)
+and about 30~MiB of host objects, its VMM included. A 256~MiB guest
+therefore costs about 320~MiB. \cmd{l4hctl info} shows free memory.
 
 \texttt{l4h-root} checks every request against the memory and other kernel
 resources it would need, and refuses it with \texttt{out of memory} instead
@@ -1094,10 +1113,12 @@ Op & Name & Arguments & Results \\
 \endhead
 1 & \texttt{HOST\_INFO} & -- & cores, free bytes, total bytes, disks, VMs,
   NICs \\
-2 & \texttt{VM\_CREATE} & RAM bytes, vCPUs, guest RAM base, quota bytes;
-  name in data & VM id \\
+2 & \texttt{VM\_CREATE} & RAM bytes, vCPUs, guest RAM base, quota bytes,
+  I/O pool bytes (0: 4 MiB); name in data & VM id \\
 3 & \texttt{VM\_LOAD} & VM, guest-physical address; bytes in the buffer
-  (at most 4 MiB) & -- \\
+  (at most 1 MiB), which the driver stages in the control device's
+  host-owned data area & -- \\
+
 4 & \texttt{VM\_START} & VM, entry point, end of kernel, initrd address,
   initrd size; command line in data & -- \\
 5 & \texttt{VM\_DESTROY} & VM & -- \\

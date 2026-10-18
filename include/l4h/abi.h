@@ -27,7 +27,7 @@ typedef uint64_t l4h_u64;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 1
+#define L4H_ABI_VERSION 2
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -105,7 +105,8 @@ typedef int64_t l4h_s64;
  *
  * Guest RAM is mapped at bootinfo.ram_base_va: GPA g <-> VA ram_base_va + g.
  * The guest kernel ELF is linked so that its first loadable segment starts
- * at ram_base_va (GPA 0).  Host-provided pages live in the special region.
+ * at ram_base_va (GPA 0).  The I/O pool follows RAM in the same direct map
+ * (bootinfo.io_pool_gpa).  Host-provided pages live in the special region.
  */
 #define L4H_SPECIAL_BASE        0x00007ff000000000ull
 #define L4H_BOOTINFO_VA         L4H_SPECIAL_BASE
@@ -116,6 +117,8 @@ typedef int64_t l4h_s64;
 /* FPU transfers (seL4_TCB_ReadFPU/WriteFPU) use this offset in IPCBUF. */
 #define L4H_FPU_SCRATCH_OFFSET  2048
 #define L4H_DEV_AREA_VA(d)      (L4H_SPECIAL_BASE + 0x10000000ull + (l4h_u64)(d) * 0x10000ull)
+/* Bulk data area of the control device (dom0 only, L4H_CTL_LOAD_MAX). */
+#define L4H_CTL_DATA_VA         (L4H_SPECIAL_BASE + 0x20000000ull)
 /* First VA above the special region that the guest may never use. */
 #define L4H_SPECIAL_END         (L4H_SPECIAL_BASE + 0x40000000ull)
 
@@ -173,7 +176,10 @@ struct l4h_dev_desc {
 	l4h_u64 page_size;      /* bytes mapped at page_va */
 	l4h_u32 event;          /* event bit raised on the target vCPU */
 	l4h_u32 kick_slot;      /* index in L4H_SLOT_DEV_CNODE: notification to kick the backend */
-	l4h_u64 reserved[2];
+	/* L4H_DEV_CTL: a host-owned data area for bulk transfers (VM_LOAD),
+	 * mapped read-write at data_va.  0 for other devices. */
+	l4h_u64 data_va;
+	l4h_u64 data_size;
 };
 
 struct l4h_untyped_desc {
@@ -195,7 +201,14 @@ struct l4h_bootinfo {
 	l4h_u64 nr_vspaces;
 	l4h_u64 nr_devices;
 	l4h_u64 flags;            /* L4H_BOOT_* */
-	l4h_u64 reserved[18];
+	/* The I/O pool: host-owned memory mapped at ram_base_va + io_pool_gpa
+	 * (2 MiB aligned, above RAM).  Every address a virtio device uses
+	 * (rings, descriptor tables, buffers) must lie in it: devices and
+	 * host components never access guest RAM.  The guest uses it through
+	 * the DMA API only (restricted DMA, swiotlb). */
+	l4h_u64 io_pool_gpa;
+	l4h_u64 io_pool_size;
+	l4h_u64 reserved[16];
 	struct l4h_untyped_desc untyped[L4H_MAX_UNTYPED];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
@@ -277,13 +290,14 @@ struct l4h_console_page {
 /* ------------------------------------------------------------------------
  * Control device (L4H_DEV_CTL, dom0 only): a request at offset 0 of the
  * device page and the response at L4H_CTL_RESP_OFF, exchanged with
- * L4H_HC_CTL.  Bulk data (images) is passed by guest-physical address of a
- * physically contiguous dom0 buffer.  See DESIGN.md §9.1.
+ * L4H_HC_CTL.  Bulk data (images) is passed in the device's data area
+ * (l4h_dev_desc.data_va), which belongs to the host: l4h-root never reads
+ * dom0's RAM.  See DESIGN.md §9.1.
  */
 #define L4H_CTL_VERSION         1
 #define L4H_CTL_RESP_OFF        2048
 #define L4H_CTL_DATA_MAX        1984
-#define L4H_CTL_LOAD_MAX        (4u << 20)
+#define L4H_CTL_LOAD_MAX        (1u << 20)
 #define L4H_CTL_NAME_MAX        32
 
 struct l4h_ctl_req {
@@ -303,9 +317,11 @@ enum l4h_ctl_op {
 	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs */
 	L4H_CTL_HOST_INFO = 1,
 	/* args: ram bytes, vcpus, ram_base_va, seL4 object quota bytes (0 =
-	 * default); data: name -> vals[0] = vm */
+	 * default), I/O pool bytes (0 = default, else a power of two from
+	 * 1 MiB to 256 MiB); data: name -> vals[0] = vm */
 	L4H_CTL_VM_CREATE = 2,
-	/* args: vm, dst gpa, src gpa (dom0), len (<= L4H_CTL_LOAD_MAX) */
+	/* args: vm, dst gpa, src offset in the control data area, len
+	 * (<= L4H_CTL_LOAD_MAX) */
 	L4H_CTL_VM_LOAD = 3,
 	/* args: vm, entry, kernel_end gpa, initrd gpa, initrd size; data: cmdline */
 	L4H_CTL_VM_START = 4,

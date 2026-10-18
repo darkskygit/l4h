@@ -86,9 +86,9 @@ components are written in Rust on rust-sel4, with sDDF C drivers.**
 Trust: the seL4 kernel, `l4h-root`, the drivers, blk-mux and vswitch form
 the host TCB. dom0 is trusted for control-plane decisions (§9.1) but cannot
 read other guests' memory. Each `l4h-vmm` is trusted only by its own
-guest: it maps that guest's RAM and nothing else, so a compromised VMM can harm
-only that guest. Guest kernels are untrusted. Capabilities confine them, and
-the hypervisor never validates guest page tables.
+guest: it maps that guest's I/O pool and nothing else (§15), so a compromised
+VMM can harm only that guest. Guest kernels are untrusted. Capabilities
+confine them, and the hypervisor never validates guest page tables.
 
 ---
 
@@ -728,6 +728,9 @@ for each device, with no trapped accesses:
 - Discovery happens through the boot-info device table, not PCI or DT
   probing. Vrings live in guest RAM and are addressed by GPA.
   `VIRTIO_F_ACCESS_PLATFORM` is not negotiated in v1.
+- *Revised (guest-owned memory, §15.1):* vrings and every buffer live in
+  the guest's host-owned I/O pool, and `VIRTIO_F_ACCESS_PLATFORM` is
+  required.
 
 ### 8.2 Block, passthrough (zero-copy)
 
@@ -766,7 +769,8 @@ and no copy.
       PRP lists are sized to the controller's MDTS. A request is split
       into several commands when its pieces cannot share one PRP list.
   - The common part checks every request:
-    - each segment's GPA lies in the client's RAM;
+    - each segment's GPA lies in the client's RAM (*revised, §15.1:* in
+      the client's I/O pool, translated with one offset);
     - the data direction matches the operation;
     - the request is aligned to the logical block size, which is passed to
       the guest as virtio `blk_size`, both within the window and on the
@@ -837,6 +841,9 @@ function, such as routing, NAT, DHCP or firewalling, belongs in a VM.
   as the sDDF client data region. The guest would use a restricted-DMA pool,
   forcing swiotlb for `virtio_net` with `ACCESS_PLATFORM`, so the vswitch
   copies window to window and the VMM copies nothing.
+  *Revised (§15.1):* the restricted-DMA pool exists now, as a host-owned
+  I/O pool outside guest RAM; making netd's port region the pool of a
+  vNIC would remove the VMM's copy.
 - **Revised during implementation (v1).**
   - One component, `netd`, holds every switch and also drives the uplink
     NICs (virtio-net PCI on QEMU). Uplinks are ports of a switch like any
@@ -972,10 +979,12 @@ versioned structs defined in `l4h-abi`.
   per call.
 - `/dev/l4hctl` takes one ioctl that carries a request, its response and,
   for `VM_LOAD`, a user buffer. The driver stages the buffer in physically
-  contiguous memory and passes its GPA.
+  contiguous memory and passes its GPA. *Revised (§15.1):* it stages it in
+  the control device's data area, 1 MiB of host-owned frames mapped into
+  dom0, and passes an offset: `l4h-root` never reads a guest's RAM.
 - `l4hctl` parses the guest kernel ELF in dom0 userspace and loads it with
   raw `VM_LOAD(vm, gpa, bytes)` writes. `l4h-root` copies page by page from
-  dom0's frames to the new guest's frames and never parses guest images.
+  the data area to the new guest's frames and never parses guest images.
   The lifecycle is `vm_create` → `blk_attach`* → `vm_load`* → `vm_start`
   (writes the boot info and spawns the guest's `l4h-vmm`) → `vm_destroy`.
 - `vm_shutdown` (`l4hctl shutdown [--reboot]`) is the ACPI-power-button
@@ -1177,7 +1186,8 @@ Rules that keep the port cheap:
 | context switch | ~1–2 µs | ~2–3 µs | Two `SetSchedParams` and a reply. No FPU copying. |
 | `clock_gettime` | vDSO | vDSO (rdtsc) | No trap. |
 | fork+exec | baseline | 1.5–3× | Lazy refault. |
-| disk I/O | | near native | Zero-copy; the main overhead is two queue hops. |
+| disk I/O | | near native | Zero-copy; the main overhead is two queue hops. *Revised (§15.1):* one copy, by the guest kernel, through its I/O pool. |
+
 | network | | ~2 copies per direction | Needs the I/O-window optimization to compete. |
 
 **Distribution check.** `tests/run-debian.sh` boots Debian 13 with
@@ -1310,3 +1320,75 @@ Still open, but not blocking M0–M3:
   This is the current assumption.
 - The API wire format beyond v1 fixed structs, if external orchestration
   needs a richer schema. That would be added in dom0 userspace.
+
+---
+
+## 15. Guest-owned memory
+
+Implemented from the design "guest-owned memory (2 MiB Untyped RAM,
+host-owned I/O pool)", revision 2, in its three phases. Goal: a guest's
+paging structures and other kernel objects come from its own RAM, so that
+its host overhead is a small fixed amount instead of growing with its RAM.
+The precondition is that no device and no host component ever touches
+memory the guest can retype.
+
+### 15.1 Host-owned I/O pool and restricted DMA (phase 1)
+
+- **The pool.** At create time `l4h-root` allocates the guest's I/O pool as
+  one physically contiguous Untyped of `io_pool` bytes (default 4 MiB; a
+  power of two from 1 to 256 MiB; `l4hctl create --io-pool`, dom0 with
+  `L4H_DOM0_IO_POOL_MB`). It retypes it into frames and maps them into the
+  guest kernel's VSpace at `ram_base_va + io_pool_gpa`, where
+  `io_pool_gpa` is RAM rounded up to 2 MiB (boot info `io_pool_gpa`,
+  `io_pool_size`), and into the guest's `l4h-vmm`. The guest gets these
+  mappings only, no capability to the pool at all (stronger than the
+  design, which gave it frame-cap copies: it never needs them).
+- **Guest kernel.** `arch/l4h` no longer selects `NO_DMA`: it has
+  dma-direct (device addresses are GPAs) with `SWIOTLB` and
+  `DMA_RESTRICTED_POOL`. The pool is added to memblock and reserved, so it
+  has struct pages but never enters the page allocator.
+  `guest/linux/patches/0002` adds `swiotlb_dev_init_pool(dev, base, size)`
+  and lets `DMA_RESTRICTED_POOL` be built without OF. The pool gets one
+  swiotlb area per possible CPU (as far as 128-slot segments allow), and a
+  full pool does not warn: it is normal back-pressure.
+  - The transport registers one platform device, `virtio-l4h`, binds it to
+    the pool and makes it the parent (DMA device) of every virtio device.
+    Vrings are coherent allocations from the pool; buffers bounce.
+  - It requires `VIRTIO_F_ACCESS_PLATFORM`, and fails a queue the host
+    refuses.
+- **VMM.** `GuestMem` is a window on the pool only (`IO_POOL_VA`); it
+  checks every guest address against `[io_pool_gpa, +io_pool_size)` with
+  overflow-safe arithmetic. A driver that does not accept
+  `ACCESS_PLATFORM` fails `FEATURES_OK`; a queue outside the pool is
+  refused, and `DRIVER_OK` then fails (status `DEVICE_NEEDS_RESET`) until
+  the device is reset. Chains with any buffer or indirect table outside
+  the pool are returned unused.
+- **Request size.** A block request bounces entirely through the pool, and
+  one that cannot fit even in an empty pool would be requeued forever. The
+  VMM therefore offers `VIRTIO_BLK_F_SIZE_MAX` with `size_max` such that
+  `seg_max * size_max` is at most a quarter of the pool (72 KiB segments,
+  about 1 MiB per request, with 4 MiB; 16 KiB with 1 MiB).
+- **blk-mux.** blkd's client data region is the pool: every segment must
+  lie in it and is translated with one offset (`host::blk::Pool`). The
+  RAM chunk tables of blkd and the VMM are gone.
+- **Hypercalls and other host access.** The device register pages and the
+  console ring were already host pages. The only hypercall that passed a
+  guest buffer by GPA was the control API's `VM_LOAD`: its source is now
+  an offset in the control device's data area, 1 MiB of host frames mapped
+  into dom0 (`l4h_dev_desc.data_va`), so `l4h-root` never reads guest RAM.
+  `L4H_CTL_LOAD_MAX` is 1 MiB. ABI version 2.
+- **Disk detach (F1).** Destroy still suspends blkd and resets the device
+  (`blkd::detach`, `reset`) before any memory is reused. Only the pool and
+  blkd's DMA memory can be device targets now, so a device that does not
+  confirm the reset pins those (`Guest::destroy(pin_pool)`), not the
+  guest's RAM.
+- **Tests.** `tests/testguest` plays a hostile driver against a virtio-blk
+  disk: no `ACCESS_PLATFORM`, rings in RAM or across the pool's end,
+  header, data or status in RAM, a buffer past the pool's end; a read
+  through the pool still works. `tests/fuzz-virtq` places the pool at
+  random GPAs (including 0 and the top of the address space), aims
+  descriptors and rings inside, at the edges of and outside it, checks
+  queue setup both ways, checks blkd's pool check, and checks that no
+  chain outside the pool reaches blkd. `run-blktest.sh` adds 8 parallel
+  direct writers and readers (more than the pool holds); it also passes
+  with `L4H_DOM0_IO_POOL_MB=1`.

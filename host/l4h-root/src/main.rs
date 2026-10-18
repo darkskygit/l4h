@@ -68,6 +68,8 @@ const fn parse_usize(s: Option<&str>, default: usize) -> usize {
 }
 const DOM0_MEM_MB: usize = parse_usize(option_env!("L4H_DOM0_MEM_MB"), 256);
 const DOM0_VCPUS: usize = parse_usize(option_env!("L4H_DOM0_VCPUS"), 1);
+/* dom0's I/O pool (a power of two, 1-256 MiB). */
+const DOM0_IO_POOL_MB: usize = parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), guest::IO_POOL_DEFAULT >> 20);
 /* Disks passed to dom0 at boot (the first n); the rest are free for the
  * control API. */
 const DOM0_DISKS: usize = parse_usize(option_env!("L4H_DOM0_DISKS"), 64);
@@ -216,7 +218,7 @@ impl Host {
     }
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
-        let bytes = cfg.ram.checked_add(cfg.untyped_quota)?;
+        let bytes = cfg.ram.checked_add(cfg.untyped_quota)?.checked_add(cfg.io_pool)?;
         if !self.can_afford(bytes, cfg.vspaces + 4) {
             return None;
         }
@@ -458,6 +460,7 @@ pub fn boot_dom0(h: &mut Host) {
         ram: DOM0_MEM_MB << 20,
         vcpus: DOM0_VCPUS,
         untyped_quota: 64 << 20,
+        io_pool: DOM0_IO_POOL_MB << 20,
         vspaces: 64,
         ram_base,
         dom0: true,

@@ -4,8 +4,9 @@
  *
  * ioctl(L4HCTL_IOC_CALL) passes a struct l4h_ctl_req to l4h-root and
  * returns the struct l4h_ctl_resp.  For L4H_CTL_VM_LOAD, the bytes to load
- * come from a user buffer: they are staged in a physically contiguous
- * kernel buffer whose guest-physical address replaces args[2].
+ * come from a user buffer: they are staged in the device's data area, a
+ * host-owned region (l4h-root never reads guest RAM), and args[2] becomes
+ * their offset there (0).
  */
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -29,6 +30,7 @@ struct l4hctl_call {
 
 static void *ctl_page;
 static void *stage;
+static unsigned long stage_size;
 static DEFINE_MUTEX(ctl_lock);
 
 static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
@@ -50,12 +52,12 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		goto out;
 	}
 	if (req->op == L4H_CTL_VM_LOAD) {
-		if (call.len > L4H_CTL_LOAD_MAX ||
+		if (call.len > stage_size ||
 		    copy_from_user(stage, u64_to_user_ptr(call.buf), call.len)) {
 			ret = -EFAULT;
 			goto out;
 		}
-		req->args[2] = __pa(stage);
+		req->args[2] = 0;
 		req->args[3] = call.len;
 	}
 	memset(resp, 0, sizeof(*resp));
@@ -84,14 +86,18 @@ static int __init l4hctl_init(void)
 	const struct l4h_bootinfo *bi = l4h_bootinfo;
 	unsigned int i;
 
-	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++)
-		if (bi->devices[i].type == L4H_DEV_CTL)
+	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++) {
+		if (bi->devices[i].type == L4H_DEV_CTL) {
 			ctl_page = (void *)bi->devices[i].page_va;
+			stage = (void *)bi->devices[i].data_va;
+			stage_size = min_t(unsigned long, bi->devices[i].data_size, L4H_CTL_LOAD_MAX);
+		}
+	}
 	if (!ctl_page)
 		return 0;
-	stage = (void *)__get_free_pages(GFP_KERNEL, get_order(L4H_CTL_LOAD_MAX));
-	if (!stage)
-		return -ENOMEM;
+	if (!stage || !stage_size)
+		return -ENODEV;
+
 	pr_info("l4hctl: control device present\n");
 	return misc_register(&l4hctl_dev);
 }

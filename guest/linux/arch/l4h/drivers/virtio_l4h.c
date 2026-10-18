@@ -6,6 +6,12 @@
  * page (struct l4h_virtio_regs, read directly), a kick notification and an
  * event line.  Register writes with side effects are committed with the
  * L4H_HC_DEV_WRITE hypercall to l4h-vmm.  No access traps.
+ *
+ * Devices never see guest RAM: every device is a child of one platform
+ * device bound to the host's I/O pool (a restricted DMA pool, swiotlb), so
+ * its rings come from the pool and its buffers bounce through it.  The
+ * transport requires VIRTIO_F_ACCESS_PLATFORM, which makes virtio use the
+ * DMA API, and l4h-vmm refuses drivers without it.
  */
 
 #include <linux/init.h>
@@ -13,6 +19,8 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/dma-mapping.h>
+#include <linux/swiotlb.h>
 #include <linux/slab.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
@@ -31,6 +39,9 @@ struct virtio_l4h_device {
 };
 
 #define to_vl4h(_vdev) container_of(_vdev, struct virtio_l4h_device, vdev)
+
+/* The DMA device of every virtio-l4h device, bound to the I/O pool. */
+static struct platform_device *vl4h_dma;
 
 static unsigned long vl4h_op(struct virtio_l4h_device *d, unsigned long op, unsigned long a,
 			     unsigned long b)
@@ -54,6 +65,11 @@ static int vl4h_finalize_features(struct virtio_device *vdev)
 	vring_transport_features(vdev);
 	if (!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
 		dev_err(&vdev->dev, "virtio-l4h devices must offer VIRTIO_F_VERSION_1\n");
+		return -EINVAL;
+	}
+	/* Device addresses must be I/O pool addresses: the DMA API. */
+	if (!__virtio_test_bit(vdev, VIRTIO_F_ACCESS_PLATFORM)) {
+		dev_err(&vdev->dev, "virtio-l4h devices must offer VIRTIO_F_ACCESS_PLATFORM\n");
 		return -EINVAL;
 	}
 	WRITE_ONCE(d->regs->driver_features, vdev->features);
@@ -198,7 +214,13 @@ static struct virtqueue *vl4h_setup_vq(struct virtio_device *vdev, unsigned int 
 	WRITE_ONCE(q->driver, virtqueue_get_avail_addr(vq));
 	WRITE_ONCE(q->device, virtqueue_get_used_addr(vq));
 	WRITE_ONCE(q->ready, 1);
-	vl4h_op(d, L4H_VIRTIO_OP_QUEUE, index, 0);
+	if (vl4h_op(d, L4H_VIRTIO_OP_QUEUE, index, 0)) {
+		/* The rings are not in the I/O pool, or the size is wrong. */
+		dev_err(&vdev->dev, "queue %u refused by the host\n", index);
+		WRITE_ONCE(q->ready, 0);
+		vring_del_virtqueue(vq);
+		return ERR_PTR(-EINVAL);
+	}
 	return vq;
 }
 
@@ -268,11 +290,37 @@ static void vl4h_release_dev(struct device *dev)
 	kfree(to_vl4h(vdev));
 }
 
+/* The parent of all virtio-l4h devices: their DMA goes through the pool. */
+static int __init vl4h_dma_init(const struct l4h_bootinfo *bi)
+{
+	int err;
+
+	if (!bi->io_pool_size) {
+		pr_err("virtio-l4h: no I/O pool: no devices\n");
+		return -ENODEV;
+	}
+	vl4h_dma = platform_device_register_simple("virtio-l4h", PLATFORM_DEVID_NONE, NULL, 0);
+	if (IS_ERR(vl4h_dma))
+		return PTR_ERR(vl4h_dma);
+	err = dma_coerce_mask_and_coherent(&vl4h_dma->dev, DMA_BIT_MASK(64));
+	if (!err)
+		err = swiotlb_dev_init_pool(&vl4h_dma->dev, bi->io_pool_gpa, bi->io_pool_size);
+	if (err) {
+		pr_err("virtio-l4h: cannot use the I/O pool at %#llx: %d\n",
+		       (unsigned long long)bi->io_pool_gpa, err);
+		platform_device_unregister(vl4h_dma);
+		vl4h_dma = NULL;
+	}
+	return err;
+}
+
 static int __init virtio_l4h_init(void)
 {
 	const struct l4h_bootinfo *bi = l4h_bootinfo;
 	unsigned int i;
 
+	if (vl4h_dma_init(bi))
+		return 0;
 	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++) {
 		const struct l4h_dev_desc *desc = &bi->devices[i];
 		struct virtio_l4h_device *d;
@@ -302,6 +350,8 @@ static int __init virtio_l4h_init(void)
 		d->vdev.id.vendor = READ_ONCE(d->regs->vendor_id);
 		d->vdev.config = &virtio_l4h_config_ops;
 		d->vdev.dev.release = vl4h_release_dev;
+		d->vdev.dev.parent = &vl4h_dma->dev;
+
 		err = register_virtio_device(&d->vdev);
 		if (err) {
 			pr_err("virtio-l4h: device %u: register failed: %d\n", i, err);

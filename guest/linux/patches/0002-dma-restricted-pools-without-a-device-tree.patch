@@ -1,0 +1,210 @@
+dma: restricted DMA pools without a device tree
+
+A restricted DMA pool confines a device's DMA to one memory range: its
+streaming mappings bounce through the pool and its coherent allocations
+come from it.  In 6.18 a pool can only be described by a device-tree
+"restricted-dma-pool" reserved-memory node, so DMA_RESTRICTED_POOL
+depends on OF and OF_RESERVED_MEM.
+
+The l4h guest (ARCH=l4h) has no device tree.  Its host gives it an I/O
+pool, the only guest-physical memory devices and host components may
+access, and every virtio device must be confined to it.  Add
+swiotlb_dev_init_pool(dev, base, size), which does for a physical range
+what rmem_swiotlb_device_init() does for a reserved_mem (devices bound to
+the same range share one io_tlb_mem; the pool gets per-CPU areas), and
+let DMA_RESTRICTED_POOL be selected without OF.  Such a pool is small
+and shared by every device, so running full is normal back-pressure (the
+block layer requeues, networking drops or refills later): it does not
+warn.  The device-tree path is unchanged.
+
+--- a/include/linux/swiotlb.h
++++ b/include/linux/swiotlb.h
+@@ -111,8 +111,11 @@
+ 	struct dentry *debugfs;
+ 	bool force_bounce;
+ 	bool for_alloc;
++	/* A full pool is normal back-pressure, not worth a warning. */
++	bool quiet;
+ #ifdef CONFIG_SWIOTLB_DYNAMIC
+ 	bool can_grow;
++
+ 	u64 phys_limit;
+ 	spinlock_t lock;
+ 	struct list_head pools;
+@@ -284,12 +287,19 @@
+ #ifdef CONFIG_DMA_RESTRICTED_POOL
+ struct page *swiotlb_alloc(struct device *dev, size_t size);
+ bool swiotlb_free(struct device *dev, struct page *page, size_t size);
++int swiotlb_dev_init_pool(struct device *dev, phys_addr_t base, size_t size);
+ 
+ static inline bool is_swiotlb_for_alloc(struct device *dev)
+ {
+ 	return dev->dma_io_tlb_mem->for_alloc;
+ }
+ #else
++static inline int swiotlb_dev_init_pool(struct device *dev, phys_addr_t base,
++					size_t size)
++{
++	return -ENODEV;
++}
++
+ static inline struct page *swiotlb_alloc(struct device *dev, size_t size)
+ {
+ 	return NULL;
+--- a/kernel/dma/Kconfig
++++ b/kernel/dma/Kconfig
+@@ -113,17 +113,22 @@
+ 
+ config DMA_RESTRICTED_POOL
+ 	bool "DMA Restricted Pool"
+-	depends on OF && OF_RESERVED_MEM && SWIOTLB
++	depends on SWIOTLB
+ 	help
+ 	  This enables support for restricted DMA pools which provide a level of
+ 	  DMA memory protection on systems with limited hardware protection
+ 	  capabilities, such as those lacking an IOMMU.
+ 
++	  Pools are described by the device tree ("restricted-dma-pool"
++	  reserved memory, with OF_RESERVED_MEM) or created by platform code
++	  with swiotlb_dev_init_pool().
++
+ 	  For more information see
+ 	  <Documentation/devicetree/bindings/reserved-memory/reserved-memory.txt>
+ 	  and <kernel/dma/swiotlb.c>.
+ 	  If unsure, say "n".
+ 
++
+ #
+ # Should be selected if we can mmap non-coherent mappings to userspace.
+ # The only thing that is really required is a way to set an uncached bit
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@ -1425,7 +1425,7 @@
+ 	size = ALIGN(mapping_size + offset, alloc_align_mask + 1);
+ 	index = swiotlb_find_slots(dev, orig_addr, size, alloc_align_mask, &pool);
+ 	if (index == -1) {
+-		if (!(attrs & DMA_ATTR_NO_WARN))
++		if (!(attrs & DMA_ATTR_NO_WARN) && !mem->quiet)
+ 			dev_warn_ratelimited(dev,
+ 	"swiotlb buffer is full (sz: %zd bytes), total %lu (slots), used %lu (slots)\n",
+ 				 size, mem->nslabs, mem_used(mem));
+@@ -1812,6 +1812,112 @@
+ 	return true;
+ }
+ 
++/*
++ * Restricted pools without a device tree: platform code passes a physical
++ * range.  Devices bound to the same range share one pool.
++ */
++struct swiotlb_range_pool {
++	struct list_head list;
++	phys_addr_t base;
++	size_t size;
++	struct io_tlb_mem *mem;
++};
++
++static LIST_HEAD(swiotlb_range_pools);
++static DEFINE_MUTEX(swiotlb_range_lock);
++
++/**
++ * swiotlb_dev_init_pool() - bind a device to a restricted DMA pool
++ * @dev:	device whose DMA must stay within the pool
++ * @base:	physical address of the pool, in the linear mapping
++ * @size:	bytes; a multiple of IO_TLB_SEGSIZE << IO_TLB_SHIFT
++ *
++ * Does for a physical range what a "restricted-dma-pool" reserved-memory
++ * node does for the devices that refer to it: all streaming DMA of @dev
++ * bounces through the pool (force_bounce) and its coherent allocations
++ * come from it (for_alloc), so nothing @dev is given lies outside it.  The
++ * pool is split into per-CPU areas.  The memory must not be used for
++ * anything else, and must have struct pages (memblock-reserved RAM).
++ *
++ * Return: 0, or a negative errno.
++ */
++int swiotlb_dev_init_pool(struct device *dev, phys_addr_t base, size_t size)
++{
++	unsigned long nslabs = size >> IO_TLB_SHIFT;
++	struct swiotlb_range_pool *rp;
++	struct io_tlb_pool *pool;
++	struct io_tlb_mem *mem;
++	unsigned int nareas;
++	char name[40];
++	int err = 0;
++
++	if (!size || size % (IO_TLB_SEGSIZE << IO_TLB_SHIFT) ||
++	    !PAGE_ALIGNED(base) || !pfn_valid(PHYS_PFN(base)) ||
++	    PageHighMem(pfn_to_page(PHYS_PFN(base))))
++		return -EINVAL;
++
++	mutex_lock(&swiotlb_range_lock);
++	list_for_each_entry(rp, &swiotlb_range_pools, list) {
++		if (rp->base == base && rp->size == size) {
++			dev->dma_io_tlb_mem = rp->mem;
++			goto out;
++		}
++		if (base < rp->base + rp->size && rp->base < base + size) {
++			err = -EBUSY;
++			goto out;
++		}
++	}
++
++	err = -ENOMEM;
++	rp = kzalloc(sizeof(*rp), GFP_KERNEL);
++	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
++	if (!rp || !mem)
++		goto fail;
++	pool = &mem->defpool;
++	nareas = rounddown_pow_of_two(limit_nareas(roundup_pow_of_two(num_possible_cpus()), nslabs));
++	pool->slots = kcalloc(nslabs, sizeof(*pool->slots), GFP_KERNEL);
++	pool->areas = kcalloc(nareas, sizeof(*pool->areas), GFP_KERNEL);
++	if (!pool->slots || !pool->areas)
++		goto fail;
++
++	set_memory_decrypted((unsigned long)phys_to_virt(base), size >> PAGE_SHIFT);
++	swiotlb_init_io_tlb_pool(pool, base, phys_to_virt(base), nslabs, false, nareas);
++	mem->force_bounce = true;
++	mem->for_alloc = true;
++	/* Callers wait for room: the block layer requeues, networking drops
++	 * or refills later. */
++	mem->quiet = true;
++#ifdef CONFIG_SWIOTLB_DYNAMIC
++	spin_lock_init(&mem->lock);
++	INIT_LIST_HEAD_RCU(&mem->pools);
++#endif
++	add_mem_pool(mem, pool);
++	snprintf
++(name, sizeof(name), "swiotlb-%pa", &base);
++	swiotlb_create_debugfs_files(mem, name);
++
++	rp->base = base;
++	rp->size = size;
++	rp->mem = mem;
++	list_add(&rp->list, &swiotlb_range_pools);
++	dev->dma_io_tlb_mem = mem;
++	pr_info("restricted DMA pool at %pa, %zu MiB, %u areas\n", &base, size >> 20, nareas);
++	err = 0;
++	goto out;
++fail:
++	if (mem) {
++		kfree(mem->defpool.slots);
++		kfree(mem->defpool.areas);
++	}
++	kfree(mem);
++	kfree(rp);
++out:
++	mutex_unlock(&swiotlb_range_lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(swiotlb_dev_init_pool);
++
++#ifdef CONFIG_OF_RESERVED_MEM
+ static int rmem_swiotlb_device_init(struct reserved_mem *rmem,
+ 				    struct device *dev)
+ {
+@@ -1904,4 +2010,6 @@
+ }
+ 
+ RESERVEDMEM_OF_DECLARE(dma, "restricted-dma-pool", rmem_swiotlb_setup);
++#endif /* CONFIG_OF_RESERVED_MEM */
+ #endif /* CONFIG_DMA_RESTRICTED_POOL */
++

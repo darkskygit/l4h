@@ -10,10 +10,15 @@ use crate::guest::{GuestMem, Vcpus};
 use crate::virtq::Queue;
 
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// Device addresses are subject to platform rules: here, they must lie in
+/// the guest's I/O pool.  Required, so that a driver that would put rings
+/// or buffers in guest RAM gets no device at all.
+pub const VIRTIO_F_ACCESS_PLATFORM: u64 = 1 << 33;
 pub const VIRTIO_RING_F_INDIRECT_DESC: u64 = 1 << 28;
 
 const STATUS_FEATURES_OK: u32 = 8;
 const STATUS_DRIVER_OK: u32 = 4;
+const STATUS_NEEDS_RESET: u32 = 64;
 const STATUS_FAILED: u32 = 128;
 
 /// What a device type implements on top of the common model.
@@ -44,6 +49,11 @@ pub struct Device<B: Backend> {
     pub event: u32,
     queues: [Queue; abi::VIRTIO_MAX_QUEUES],
     features: u64,
+    /// The driver's features were accepted (FEATURES_OK).
+    features_ok: bool,
+    /// A queue was refused (an address outside the I/O pool, a bad size):
+    /// DRIVER_OK fails until the device is reset.
+    queue_error: bool,
     pub backend: B,
 }
 
@@ -53,7 +63,9 @@ impl<B: Backend> Device<B> {
             regs: page_va as *mut abi::VirtioRegs,
             event,
             queues: Default::default(),
-            features: backend.features() | VIRTIO_F_VERSION_1,
+            features: backend.features() | VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM,
+            features_ok: false,
+            queue_error: false,
             backend,
         };
         unsafe {
@@ -101,6 +113,8 @@ impl<B: Backend> Device<B> {
             self.isr().store(0, Ordering::SeqCst);
             self.kick_word().store(0, Ordering::SeqCst);
         }
+        self.features_ok = false;
+        self.queue_error = false;
         self.set_status(0);
     }
 
@@ -120,16 +134,27 @@ impl<B: Backend> Device<B> {
     pub fn op(&mut self, mem: &GuestMem, vcpus: &Vcpus, op: u64, a: u64, _b: u64) -> u64 {
         match op {
             abi::VIRTIO_OP_STATUS => {
-                let s = self.status();
+                let mut s = self.status();
                 if s == 0 {
                     self.reset();
-                } else if s & STATUS_FEATURES_OK != 0 {
+                    return 0;
+                }
+                if s & STATUS_FEATURES_OK != 0 && !self.features_ok {
                     let drv = unsafe { addr_of!((*self.regs).driver_features).read_volatile() };
-                    if drv & !self.features != 0 || drv & VIRTIO_F_VERSION_1 == 0 {
-                        self.set_status(s & !STATUS_FEATURES_OK);
+                    let required = VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM;
+                    if drv & !self.features != 0 || drv & required != required {
+                        s &= !STATUS_FEATURES_OK;
+                        self.set_status(s);
                     } else {
+                        self.features_ok = true;
                         self.backend.features_accepted(drv);
                     }
+                }
+                if s & STATUS_DRIVER_OK != 0 && (!self.features_ok || self.queue_error) {
+                    // A queue outside the I/O pool, or features never
+                    // accepted: the device stays unusable until reset.
+                    self.set_status((s & !STATUS_DRIVER_OK) | STATUS_NEEDS_RESET);
+                    return u64::MAX;
                 }
                 if s & STATUS_DRIVER_OK != 0 && s & STATUS_FAILED == 0 {
                     // Buffers may have been queued before DRIVER_OK.
@@ -155,6 +180,7 @@ impl<B: Backend> Device<B> {
                 }
                 if !self.queues[q].setup(mem, regs.num, self.backend.queue_max(q), regs.desc, regs.driver, regs.device) {
                     unsafe { addr_of_mut!((*self.regs).queues[q].ready).write_volatile(0) };
+                    self.queue_error = true;
                     return u64::MAX;
                 }
                 0

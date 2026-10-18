@@ -244,7 +244,8 @@ void __init l4h_linux_main(void)
 	physmem_size = bi->ram_size;
 	uml_reserved = uml_physmem + bi->kernel_end_gpa;
 	high_physmem = uml_physmem + physmem_size;
-	end_iomem = high_physmem;
+	/* The direct map ends after the I/O pool, which follows RAM. */
+	end_iomem = max(high_physmem, uml_physmem + bi->io_pool_gpa + bi->io_pool_size);
 
 	task_size = L4H_TASK_SIZE;
 	start_vm = VMALLOC_START;

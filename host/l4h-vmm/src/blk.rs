@@ -1,5 +1,6 @@
 //! virtio-blk device backed by a blkd channel.  Data buffers are passed
-//! to blkd by guest-physical address; nothing is copied here.
+//! to blkd by guest-physical address (they lie in the guest's I/O pool);
+//! nothing is copied here.
 
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
@@ -13,6 +14,7 @@ use crate::guest::GuestMem;
 use crate::virtq::{Buf, Queue};
 
 const VIRTIO_ID_BLOCK: u32 = 2;
+const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
 const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
@@ -23,6 +25,20 @@ const VIRTIO_BLK_S_IOERR: u8 = 1;
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 const QUEUE_SIZE: u32 = blk::RING_SIZE as u32;
+/// Segments of a request, leaving room for data sharing the header and
+/// status buffers.
+const SEG_MAX: u32 = blk::MAX_SEGS as u32 - 2;
+/// The largest segment the guest's DMA layer maps at once (swiotlb).
+const SEG_SIZE_LIMIT: u32 = 256 << 10;
+
+/// Largest segment for a guest whose I/O pool has `pool` bytes.  Every
+/// request bounces through the pool, so one must never need more than a
+/// part of it: a request that cannot fit even in an empty pool would be
+/// retried forever.  seg_max * size_max is at most a quarter of the pool.
+pub fn size_max(pool: u64) -> u32 {
+    let per_seg = (pool / 4 / SEG_MAX as u64).min(SEG_SIZE_LIMIT as u64) as u32;
+    (per_seg & !4095).max(4096)
+}
 
 #[derive(Clone, Copy)]
 struct Inflight {
@@ -37,6 +53,8 @@ pub struct Blk {
     read_only: bool,
     /// Logical block size of the disk: the guest aligns requests to it.
     block_size: u32,
+    /// Largest data segment (see size_max).
+    size_max: u32,
     /// Requests submitted to blkd, by chain head: at most one per head.
     inflight: [Option<Inflight>; QUEUE_SIZE as usize],
     /// Requests of this generation blkd has not completed yet.
@@ -49,8 +67,9 @@ pub struct Blk {
 }
 
 impl Blk {
-    /// The channel must be ready.
-    pub fn new(chan_va: usize, kick: sel4::cap::Notification) -> Self {
+    /// The channel must be ready.  `pool` is the size of the guest's I/O
+    /// pool.
+    pub fn new(chan_va: usize, kick: sel4::cap::Notification, pool: u64) -> Self {
         let chan = chan_va as *mut Channel;
         let (capacity, read_only, block_size) = unsafe {
             fence(Ordering::Acquire);
@@ -66,6 +85,7 @@ impl Blk {
             capacity,
             read_only,
             block_size,
+            size_max: size_max(pool).max(block_size),
             inflight: [None; QUEUE_SIZE as usize],
             outstanding: 0,
             generation: 0,
@@ -224,7 +244,7 @@ impl Backend for Blk {
     }
 
     fn features(&self) -> u64 {
-        let mut f = VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH | VIRTIO_RING_F_INDIRECT_DESC;
+        let mut f = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE | VIRTIO_BLK_F_FLUSH | VIRTIO_RING_F_INDIRECT_DESC;
         if self.read_only {
             f |= VIRTIO_BLK_F_RO;
         }
@@ -241,8 +261,9 @@ impl Backend for Blk {
 
     fn init_config(&self, config: &mut [u8]) {
         config[0..8].copy_from_slice(&self.capacity.to_le_bytes());
-        // seg_max: leave room for data sharing the header/status buffers.
-        config[12..16].copy_from_slice(&(blk::MAX_SEGS as u32 - 2).to_le_bytes());
+        config[8..12].copy_from_slice(&self.size_max.to_le_bytes());
+        config[12..16].copy_from_slice(&SEG_MAX.to_le_bytes());
+
         config[20..24].copy_from_slice(&self.block_size.to_le_bytes());
     }
 

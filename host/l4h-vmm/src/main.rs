@@ -102,7 +102,7 @@ fn wall_clock_ns(cfg: &VmmConfig, hz: u64) -> u64 {
 fn main(info: &'static Info) -> ! {
     let cfg: &VmmConfig = unsafe { info.config() };
     let tsc_hz = info.header().tsc_hz;
-    let mem = GuestMem { base: host::GUEST_RAM_VA, size: cfg.ram_size };
+    let mem = GuestMem { base: host::IO_POOL_VA, gpa: cfg.io_pool_gpa, size: cfg.io_pool_size };
     let vcpus = Vcpus { n: cfg.nr_vcpus as usize };
 
     // Block backends announce themselves ready (capacity known) on the
@@ -132,6 +132,7 @@ fn main(info: &'static Info) -> ! {
                 blk::Blk::new(
                     d.chan_va as usize,
                     cap::<cap_type::Notification>(d.chan_kick_slot),
+                    cfg.io_pool_size,
                 ),
             )),
             host::VDEV_NET => Dev::Net(Device::new(

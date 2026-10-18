@@ -9,7 +9,7 @@ use std::os::fd::AsRawFd;
 
 pub const CTL_VERSION: u32 = 1;
 pub const CTL_DATA_MAX: usize = 1984;
-pub const CTL_LOAD_MAX: usize = 4 << 20;
+pub const CTL_LOAD_MAX: usize = 1 << 20;
 pub const CTL_NAME_MAX: usize = 32;
 
 pub const CTL_HOST_INFO: u32 = 1;
@@ -241,6 +241,8 @@ pub struct VmSpec<'a> {
     pub disks: Vec<(u64, bool, u64, u64)>,
     /// seL4 object quota in bytes (0: default).
     pub quota: u64,
+    /// I/O pool in bytes (0: default, 4 MiB; a power of two, 1-256 MiB).
+    pub io_pool: u64,
     /// (switch, MAC or 0, NIC_* flags)
     pub nics: Vec<(u64, u64, u64)>,
 }
@@ -288,7 +290,7 @@ impl Ctl {
         let mut name = [0u8; CTL_NAME_MAX];
         let n = o.name.len().min(CTL_NAME_MAX - 1);
         name[..n].copy_from_slice(&o.name.as_bytes()[..n]);
-        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, k.ram_base, o.quota], &name, &[])?;
+        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, k.ram_base, o.quota, o.io_pool], &name, &[])?;
         let vm = resp.vals[0];
         let r = (|| {
             for &(disk, ro, start, sectors) in &o.disks {

@@ -164,11 +164,11 @@ pub fn attach(
     cfg.dma_paddr = dma_paddr as u64;
     cfg.dma_size = 1 << DMA_BITS;
     cfg.chan_va = host::blkd_chan_va() as u64;
-    assert!(client.ram.len() <= blk::BLKD_MAX_RAM_CHUNKS);
-    cfg.nr_ram_chunks = client.ram.len() as u32;
-    for (i, c) in client.ram.iter().enumerate() {
-        cfg.ram_chunks[i] = host::RamChunk { gpa: c.gpa as u64, paddr: c.paddr as u64, size: c.size as u64 };
-    }
+    // The client's data region is its I/O pool: guest RAM is never given
+    // to a device.
+    cfg.pool_gpa = client.pool.gpa as u64;
+    cfg.pool_paddr = client.pool.paddr as u64;
+    cfg.pool_size = client.pool.size as u64;
     let cfg_bytes = unsafe {
         core::slice::from_raw_parts(&*cfg as *const blk::BlkdConfig as *const u8, core::mem::size_of::<blk::BlkdConfig>())
     };
@@ -241,9 +241,10 @@ pub fn attach(
 /// mastering and MSI-X turned off.  Clearing bus mastering alone is not
 /// enough: a device may finish a command it already started, and it keeps
 /// its queues to resume on the next enable.  Returns false if the device
-/// did not confirm the reset: it may still write to the client's memory,
-/// which the caller must then not reuse.  The driver's DMA memory is kept
-/// out of use in that case, and the disk is never enabled again.
+/// did not confirm the reset: it may still write to the client's I/O pool
+/// (the only client memory a device is given), which the caller must then
+/// not reuse.  The driver's DMA memory is kept out of use in that case,
+/// and the disk is never enabled again.
 pub fn detach(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
     let b = disk.driver.take();
     if let Some(b) = &b {

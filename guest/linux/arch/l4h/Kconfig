@@ -24,7 +24,10 @@ config UML
 	select HAVE_DEBUG_KMEMLEAK
 	select HAVE_DEBUG_BUGVERBOSE
 	select HAVE_PAGE_SIZE_4KB
-	select NO_DMA
+	# Device I/O goes through the host's I/O pool: dma-direct (device
+	# addresses are guest-physical) with a restricted swiotlb pool.
+	select SWIOTLB
+	select DMA_RESTRICTED_POOL
 	select GENERIC_IRQ_SHOW
 	select GENERIC_CPU_DEVICES
 	select TRACE_IRQFLAGS_SUPPORT
@@ -111,6 +114,8 @@ config L4H_VIRTIO
 	select VIRTIO
 	help
 	  Paravirtual transport for virtio devices provided by l4h-vmm.
+	  Devices are confined to the host's I/O pool (restricted DMA) and
+	  require VIRTIO_F_ACCESS_PLATFORM.
 
 config L4H_CTL
 	bool "l4h control channel (dom0)"
