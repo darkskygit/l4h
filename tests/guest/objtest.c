@@ -162,9 +162,12 @@ static void test_pressure(unsigned long span, const char *label)
 	read_stats(&s1);
 	printf("OBJTEST: %s: %d processes x %lu page tables\n", label, NPROC, span / (2 * MIB));
 	show("under page-table pressure:");
-	/* 4 KiB per page table: the objects must be there. */
-	CHECK(s1.used_kb >= s0.used_kb + need_kb / 2 && s1.objects_kb >= s1.used_kb,
-	      "L4hObjectsUsed grew only from %lu to %lu kB", s0.used_kb, s1.used_kb);
+	/* 4 KiB per page table, all live at once: the objects must be there.
+	 * Not checked against s0: page tables of an earlier round's
+	 * processes may still be freed while this round builds its own. */
+	CHECK(s1.used_kb >= need_kb && s1.objects_kb >= s1.used_kb,
+	      "L4hObjectsUsed is %lu kB (%lu before), at least %lu expected",
+	      s1.used_kb, s0.used_kb, need_kb);
 	CHECK(s1.to_objects > 0, "no frame block became an object block");
 	stop_pressure(fd, NPROC, pids);
 	/* Back to what boot had, plus the free blocks kept and some
