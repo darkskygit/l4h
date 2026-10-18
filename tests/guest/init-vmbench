@@ -1,0 +1,66 @@
+#!/bin/sh
+# dom0 init for tests/run-vmbench.sh: host memory used per guest beyond its
+# RAM, and guest create / boot / shutdown / destroy latency.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "VMBENCH: FAIL: $*"; poweroff -f; }
+N=$(sed -n 's/.*VMB_N=\([0-9]*\).*/\1/p' /proc/cmdline)
+free_mib() { l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p'; }
+create() { l4hctl create "$1" --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem "$2" --vcpus "$3" \
+    --cmdline "console=hvc0 quiet" || fail "create $1"; }
+ready() { l4hctl console "$1" --until "GUEST: ready" --timeout 120 >/dev/null || fail "guest $1 did not boot"; }
+# min / median / max of the numbers in a file
+stats() { sort -n "$1" | awk '{ v[NR] = $1 } END { printf "min %d  median %d  max %d ms (n=%d)", v[1], v[int((NR + 1) / 2)], v[NR], NR }'; }
+l4hctl info
+base=$(free_mib)
+echo "VMBENCH: start, $base MiB free"
+
+# ---- memory: host memory a booted guest takes beyond its RAM
+for spec in 64:1 128:1 256:1 512:1 128:2 128:4; do
+    mem=${spec%:*}; vcpus=${spec#*:}
+    id=$(create m$mem-$vcpus "$mem" "$vcpus")
+    ready "$id"
+    used=$((base - $(free_mib)))
+    echo "VMBENCH: mem ${mem} MiB, $vcpus vCPU: host uses $used MiB, overhead $((used - mem)) MiB"
+    l4hctl destroy "$id" || fail "destroy $id"
+    [ "$(free_mib)" -ge $((base - 1)) ] || fail "memory not reclaimed after $mem MiB guest"
+done
+B=4
+ids=""
+for i in $(seq 1 "$B"); do ids="$ids $(create batch$i 128 1)"; done
+for id in $ids; do ready "$id"; done
+used=$((base - $(free_mib)))
+echo "VMBENCH: $B guests of 128 MiB: host uses $used MiB, overhead $(( (used - 128 * B) / B )) MiB per guest"
+for id in $ids; do l4hctl destroy "$id" || fail "destroy $id"; done
+
+# ---- latency, 128 MiB / 1 vCPU guests
+: > /tmp/create; : > /tmp/boot; : > /tmp/shutdown; : > /tmp/destroy; : > /tmp/kill
+for i in $(seq 1 "$N"); do
+    t0=$(mstime); id=$(create lat$i 128 1); t1=$(mstime)
+    ready "$id"; t2=$(mstime)
+    l4hctl shutdown "$id" || fail "shutdown $id"
+    until l4hctl list | grep -q "lat$i .* stopped"; do :; done; t3=$(mstime)
+    l4hctl destroy "$id" || fail "destroy $id"; t4=$(mstime)
+    echo $((t1 - t0)) >> /tmp/create; echo $((t2 - t0)) >> /tmp/boot
+    echo $((t3 - t2)) >> /tmp/shutdown; echo $((t4 - t3)) >> /tmp/destroy
+    # destroy of a running guest
+    id=$(create kill$i 128 1); ready "$id"
+    t0=$(mstime); l4hctl destroy "$id" || fail "destroy $id"; echo $(( $(mstime) - t0 )) >> /tmp/kill
+done
+echo "VMBENCH: create (call returns):       $(stats /tmp/create)"
+echo "VMBENCH: create to guest init ready:  $(stats /tmp/boot)"
+echo "VMBENCH: shutdown request to stopped: $(stats /tmp/shutdown)"
+echo "VMBENCH: destroy, stopped guest:      $(stats /tmp/destroy)"
+echo "VMBENCH: destroy, running guest:      $(stats /tmp/kill)"
+for mem in 256 512; do
+    : > /tmp/c
+    for i in 1 2 3; do
+        t0=$(mstime); id=$(create big$i "$mem" 1); echo $(( $(mstime) - t0 )) >> /tmp/c
+        l4hctl destroy "$id" || fail "destroy $id"
+    done
+    echo "VMBENCH: create, $mem MiB guest:      $(stats /tmp/c)"
+done
+echo "VMBENCH: done"
+poweroff -f
