@@ -1,0 +1,16 @@
+#!/bin/sh
+# Boot check run by tests/run-debian.sh inside Debian (installed by tests/mkdebian.sh).
+# Boot check for tests/run-debian.sh.
+echo "DEBIAN: up, kernel $(uname -r), $(nproc) vCPU(s)"
+state=$(systemctl is-system-running --wait)
+echo "DEBIAN: system $state"
+systemctl --failed --no-legend --plain | sed 's/^/DEBIAN: failed: /'
+ip -br addr | sed 's/^/DEBIAN: /'
+getent hosts deb.debian.org >/dev/null && echo 'DEBIAN: dns ok'
+t0=$(date +%s)
+apt-get update -q >/tmp/apt.log 2>&1 && echo "DEBIAN: apt-get update ok ($(( $(date +%s) - t0 ))s)"
+t0=$(date +%s)
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q iputils-ping >>/tmp/apt.log 2>&1 && echo "DEBIAN: apt-get install ok ($(( $(date +%s) - t0 ))s)" || tail -5 /tmp/apt.log | sed 's/^/DEBIAN: apt: /'
+ping -c 2 -W 3 10.0.2.2 >/dev/null && echo 'DEBIAN: network ok'
+echo 'DEBIAN: done'
+systemctl poweroff

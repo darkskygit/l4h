@@ -983,6 +983,14 @@ Rules that keep the port cheap:
 | disk I/O | | near native | Zero-copy; the main overhead is two queue hops. |
 | network | | ~2 copies per direction | Needs the I/O-window optimization to compete. |
 
+**Distribution check.** `tests/run-debian.sh` boots Debian 13 with
+systemd as dom0 from a passed-through virtio-blk disk, on 2 vCPUs:
+- systemd reaches "running" with no failed units;
+- DHCP and DNS work over the user-mode uplink;
+- `apt-get update` and `apt-get install` succeed;
+- `ping` works.
+The image comes from `tests/mkdebian.sh`.
+
 **Measured (v1, `tests/run-bench.sh`).** The test machine is unusual: the
 dev box is itself a Hyper-V VM, so QEMU/KVM runs *nested*. Every VM exit
 of seL4 (timer MSR writes, IPIs, EOIs, HLT wakeups) costs tens of

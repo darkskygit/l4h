@@ -1,0 +1,10 @@
+[Unit]
+Description=l4h boot check
+After=multi-user.target network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/l4h-test
+StandardOutput=journal+console
+[Install]
+WantedBy=multi-user.target

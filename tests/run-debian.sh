@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Boot Debian (systemd) as dom0 from a passed-through virtio-blk disk, with
+# networking through the QEMU user-mode uplink.  The image comes from
+# tests/mkdebian.sh (build/debian.img).
+# Usage: run-debian.sh [vcpus]
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+img=$root/build/debian.img
+[ -f "$img" ] || { echo "no $img: run tests/mkdebian.sh" >&2; exit 1; }
+"$root/tools/build-linux.sh" vmlinux 2>&1 | grep -E "error|undefined" && exit 1 || true
+objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
+L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" L4H_DOM0_INITRD= \
+    L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-1024} L4H_DOM0_VCPUS=${1:-2} \
+    L4H_DOM0_CMDLINE="console=hvc0 root=/dev/vda rw" "$root/tools/build-host.sh"
+log=$root/build/qemu-debian.log
+cp --sparse=always "$img" "$root/build/debian-run.img"
+"$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
+    -drive file="$root/build/debian-run.img",if=none,id=d0,format=raw,cache=none \
+    -device virtio-blk-pci,drive=d0,disable-legacy=on \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
+    </dev/null >"$log" 2>&1 &
+qemu=$!
+end=$((SECONDS + ${DEBIAN_TIMEOUT:-300}))
+while kill -0 "$qemu" 2>/dev/null; do
+    grep -aq "l4h-root: all guests stopped\|Kernel panic" "$log" && { sleep 1; kill "$qemu"; break; }
+    [ "$SECONDS" -lt "$end" ] || { kill "$qemu"; break; }
+    sleep 1
+done
+wait "$qemu" 2>/dev/null || true
+grep -a "DEBIAN:\|Kernel panic\|Failed to start\|l4h-root: guest" "$log" || true
+grep -aq "DEBIAN: system running" "$log"

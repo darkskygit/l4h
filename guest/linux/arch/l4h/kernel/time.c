@@ -117,6 +117,8 @@ void l4h_timer_setup_cpu(void)
 /* Steal time, from the event pages (see asm/paravirt.h). */
 struct static_key paravirt_steal_enabled;
 struct static_key paravirt_steal_rq_enabled;
+/* x86's qspinlock checks this under CONFIG_PARAVIRT: native spinlocks. */
+DEFINE_STATIC_KEY_FALSE(virt_spin_lock_key);
 #endif
 
 void __init time_init(void)
