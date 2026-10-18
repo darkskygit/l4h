@@ -1,0 +1,89 @@
+From f4144d11d56a0cf490fed3d1e9cd2b87c887ef53 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sat, 17 Oct 2026 22:58:58 -0700
+Subject: [PATCH 8/8] api: restrict debug syscalls to threads with a minimum
+ MCP
+
+Debug and benchmark system calls need no capability, and several of them
+(SysDebugHalt, error paths of SysDebugNameThread and SysDebugSendIPI) halt
+the whole system with the kernel lock held. A system that runs untrusted
+code with debug facilities enabled therefore lets that code stop the
+machine with one instruction.
+
+Add KernelDebugSyscallMinMCP: threads whose maximum controlled priority is
+below it get an unknown-syscall fault for these system calls, as for any
+undefined one. The default, 0, keeps the current behaviour. Since a thread
+cannot raise its MCP beyond the MCP of the TCB authorising the change,
+untrusted code confined to a lower MCP band cannot regain access.
+---
+ config.cmake          | 11 +++++++++++
+ include/api/syscall.h |  7 +++++++
+ src/api/syscall.c     |  5 +++++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/config.cmake b/config.cmake
+index 750ab9b19..ac5d49823 100644
+--- a/config.cmake
++++ b/config.cmake
+@@ -103,6 +103,17 @@ config_string(
+   DEFAULT 12
+   UNQUOTE)
+ 
++config_string(
++  KernelDebugSyscallMinMCP DEBUG_SYSCALL_MIN_MCP
++  "Debug and benchmark system calls (seL4_DebugPutChar, seL4_DebugHalt, ...) are \
++    available only to threads whose maximum controlled priority is at least this \
++    value; other threads get an unknown-syscall fault, as for any undefined system \
++    call. Debug system calls need no capability, and some halt the whole system, so \
++    a system running untrusted code at user level with debug facilities enabled \
++    should give that code a lower MCP than this value. 0 allows every thread."
++  DEFAULT 0
++  UNQUOTE)
++
+ config_string(KernelTimerTickMS TIMER_TICK_MS "Timer tick period in milliseconds" DEFAULT 2 UNQUOTE
+               DEPENDS "NOT KernelIsMCS" UNDEF_DISABLED)
+ config_string(KernelTimeSlice TIME_SLICE "Number of timer ticks until a thread is preempted."
+diff --git a/include/api/syscall.h b/include/api/syscall.h
+index ab818621b..e0e922296 100644
+--- a/include/api/syscall.h
++++ b/include/api/syscall.h
+@@ -33,6 +33,13 @@ exception_t handleSyscall(syscall_t syscall);
+ 
+ /* True if every syscall from the thread must be delivered as a fault. */
+ #define threadTrapsSyscalls(_t) (!!((_t)->tcbFlags & seL4_TCBFlag_trapSyscalls))
++
++/* True if the thread may use debug and benchmark system calls. */
++#if CONFIG_DEBUG_SYSCALL_MIN_MCP > 0
++#define threadMayDebug(_t) ((_t)->tcbMCP >= CONFIG_DEBUG_SYSCALL_MIN_MCP)
++#else
++#define threadMayDebug(_t) true
++#endif
+ exception_t handleInterruptEntry(void);
+ exception_t handleUnknownSyscall(word_t w);
+ exception_t handleUserLevelFault(word_t w_a, word_t w_b);
+diff --git a/src/api/syscall.c b/src/api/syscall.c
+index 82014adaf..3f56510fb 100644
+--- a/src/api/syscall.c
++++ b/src/api/syscall.c
+@@ -113,6 +113,10 @@ exception_t handleUnknownSyscall(word_t w)
+         return EXCEPTION_NONE;
+     }
+ 
++    if (unlikely(!threadMayDebug(NODE_STATE(ksCurThread)))) {
++        goto unknown_syscall;
++    }
++
+ #ifdef CONFIG_PRINTING
+     if (w == SysDebugPutChar) {
+         kernel_putchar(getRegister(NODE_STATE(ksCurThread), capRegister));
+@@ -261,6 +265,7 @@ exception_t handleUnknownSyscall(word_t w)
+     } /* end switch(w) */
+ #endif /* CONFIG_ENABLE_BENCHMARKS */
+ 
++unknown_syscall:
+     MCS_DO_IF_BUDGET({
+ #ifdef CONFIG_SET_TLS_BASE_SELF
+         if (w == SysSetTLSBase)
+-- 
+2.47.3
+

@@ -2,7 +2,7 @@
 set(KernelPlatform "pc99" CACHE STRING "")
 set(KernelSel4Arch "x86_64" CACHE STRING "")
 set(KernelIsMCS ON CACHE BOOL "")
-set(KernelMaxNumNodes "16" CACHE STRING "")
+set(KernelMaxNumNodes "64" CACHE STRING "")
 set(KernelFastpath ON CACHE BOOL "")
 set(KernelVerificationBuild OFF CACHE BOOL "")
 set(KernelOptimisation "-O2" CACHE STRING "")
@@ -24,6 +24,11 @@ set(KernelRetypeFanOutLimit "16384" CACHE STRING "")
 set(KernelMultiboot2Header ON CACHE BOOL "")
 set(KernelHugePage ON CACHE BOOL "")
 set(KernelTimerTickMS "2" CACHE STRING "")
-# Debug-friendly defaults; tools/build.sh flips these for release builds.
+# Debug builds by default; L4H_RELEASE=1 tools/build-kernel.sh turns
+# KernelDebugBuild (assertions, debug syscalls) off.  Printing stays on: the
+# host components log to the serial port through the kernel.
 set(KernelDebugBuild ON CACHE BOOL "")
 set(KernelPrinting ON CACHE BOOL "")
+# Debug syscalls (some halt the machine) only for host components: guest
+# threads have an MCP of at most L4H_PRIO_KERNEL (100).
+set(KernelDebugSyscallMinMCP "101" CACHE STRING "")

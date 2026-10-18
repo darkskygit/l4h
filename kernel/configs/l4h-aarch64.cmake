@@ -18,4 +18,6 @@ set(KernelMaxNumBootinfoUntypedCaps "230" CACHE STRING "")
 set(KernelRetypeFanOutLimit "16384" CACHE STRING "")
 set(KernelTimerTickMS "2" CACHE STRING "")
 set(KernelDebugBuild ON CACHE BOOL "")
+# Debug syscalls only for host components (see l4h-x86_64.cmake).
+set(KernelDebugSyscallMinMCP "101" CACHE STRING "")
 set(KernelPrinting ON CACHE BOOL "")

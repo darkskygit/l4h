@@ -5,6 +5,8 @@
  *   - a user thread with seL4_TCBFlag_trapSyscalls in a pool VSpace,
  *     whose Linux-style syscalls and page faults arrive as fault IPC,
  *   - seL4_TCB_ReadFPU of the user thread's xmm0,
+ *   - seL4 debug syscalls refused to guest threads (an unknown syscall),
+ *   - seL4_X86_ExecuteNever mappings,
  *   - seL4_TCB_SetTimer delivering a timer badge.
  * It prints "TESTGUEST: PASS" or "TESTGUEST: FAIL ..." and powers off.
  */
@@ -198,7 +200,7 @@ static void map_user_page(seL4_CPtr vspace, seL4_CPtr frame, seL4_Word va, seL4_
 }
 #endif
 
-extern char user_prog[];
+extern char user_prog[], user_debug[];
 
 void tg_main(const struct l4h_bootinfo *bootinfo)
 {
@@ -320,6 +322,45 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 	CHECK(seL4_GetMR(MR_ARG0) == 777, "exit code=", seL4_GetMR(MR_ARG0));
 	puts("testguest: syscall return value reached user mode\n");
 	seL4_TCB_Suspend(utcb);
+
+	/* 5: without the trap flag, seL4_DebugHalt (which would stop the whole
+	 * host) is an unknown syscall for a guest thread: its MCP is too low. */
+	fl = seL4_TCB_SetFlags(utcb, seL4_TCBFlag_trapSyscalls, 0);
+	CHECK(fl.error == 0 && fl.flags == 0, "clearflags=", fl.flags);
+#ifdef __aarch64__
+	regs.pc = (seL4_Word)user_debug;
+#else
+	regs.rip = (seL4_Word)user_debug;
+#endif
+	err = seL4_TCB_WriteRegisters(utcb, 1, 0, sizeof(regs) / sizeof(seL4_Word), &regs);
+	CHECK(err == 0, "write regs err=", err);
+	info = seL4_Recv(ep, &badge, reply);
+	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "debug label=",
+	      seL4_MessageInfo_get_label(info));
+	CHECK(seL4_GetMR(seL4_UnknownSyscall_Syscall) == (seL4_Word)-14, "debug sysno=",
+	      seL4_GetMR(seL4_UnknownSyscall_Syscall));
+	puts("testguest: debug syscalls refused to guest threads\n");
+	seL4_TCB_Suspend(utcb);
+
+#ifndef __aarch64__
+	/* 6: seL4_X86_ExecuteNever (patch 0009): the program page, remapped
+	 * execute-never, faults on instruction fetch. */
+	err = seL4_X86_Page_Map(prog_frame, vspace, (seL4_Word)user_prog, seL4_CanRead,
+				seL4_X86_ExecuteNever);
+	CHECK(err == 0, "remap xn err=", err);
+	regs.rip = (seL4_Word)user_prog;
+	err = seL4_TCB_WriteRegisters(utcb, 1, 0, sizeof(regs) / sizeof(seL4_Word), &regs);
+	CHECK(err == 0, "write regs err=", err);
+	info = seL4_Recv(ep, &badge, reply);
+	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_VMFault, "xn label=",
+	      seL4_MessageInfo_get_label(info));
+	CHECK(seL4_GetMR(seL4_VMFault_Addr) == (seL4_Word)user_prog, "xn addr=",
+	      seL4_GetMR(seL4_VMFault_Addr));
+	CHECK(seL4_GetMR(seL4_VMFault_PrefetchFault) == 1, "xn prefetch=",
+	      seL4_GetMR(seL4_VMFault_PrefetchFault));
+	puts("testguest: execute-never mappings fault on instruction fetch\n");
+	seL4_TCB_Suspend(utcb);
+#endif
 
 	/* E3: deadline timer 10 ms from now signals the bound notification. */
 	uint64_t t0 = rdtsc();

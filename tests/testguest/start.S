@@ -45,6 +45,14 @@ user_prog:
 	movq	$60, %rax
 	syscall
 2:	jmp	2b
+
+/* seL4_DebugHalt from a thread without the trap flag: must fault (patch
+ * 0008), not halt the host. */
+	.globl user_debug
+user_debug:
+	movq	$-14, %rdx
+	syscall
+4:	jmp	4b
 	.balign 4096
 
 	.section .bss

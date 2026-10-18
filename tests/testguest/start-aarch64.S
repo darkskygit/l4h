@@ -47,6 +47,14 @@ user_prog:
 	mov	x8, #93
 	svc	#0
 2:	b	2b
+
+/* seL4_DebugHalt from a thread without the trap flag: must fault (patch
+ * 0008), not halt the host. */
+	.globl user_debug
+user_debug:
+	mov	x7, #-14
+	svc	#0
+4:	b	4b
 	.balign 4096
 
 	.section .bss
