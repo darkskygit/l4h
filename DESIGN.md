@@ -994,6 +994,13 @@ systemd as dom0 from a passed-through virtio-blk disk, on 2 vCPUs:
 - `apt-get update` and `apt-get install` succeed;
 - `ping` works.
 The image comes from `tests/mkdebian.sh`.
+`tests/run-workload.sh` covers the M2 and M3 gates on that image, with 4
+vCPUs:
+- fio random writes with crc32c verification, direct I/O, libaio,
+  queue depth 16: 13.4k IOPS, all verified;
+- busybox built with `make -j4` in 124 s, and the result runs;
+- a clean `e2fsck -f` of the disk on the host;
+- a checksum intact after a second boot.
 
 **Measured (v1, `tests/run-bench.sh`).** The test machine is unusual: the
 dev box is itself a Hyper-V VM, so QEMU/KVM runs *nested*. Every VM exit

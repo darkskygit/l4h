@@ -7,7 +7,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 R=$root/build/debian-root
 sudo rm -rf "$R"
 sudo debootstrap --variant=minbase \
-    --include=systemd-sysv,udev,iproute2,procps,kmod,dbus,ifupdown,isc-dhcp-client,nftables,iputils-ping \
+    --include=systemd-sysv,udev,iproute2,procps,kmod,dbus,ifupdown,isc-dhcp-client,nftables,iputils-ping,build-essential,fio,bzip2,wget \
     trixie "$R" http://deb.debian.org/debian
 sudo sh -c "
 echo l4h-debian > $R/etc/hostname
@@ -20,7 +20,11 @@ install -m 755 $root/tests/guest/debian-l4h-test $R/usr/local/sbin/l4h-test
 install -m 644 $root/tests/guest/debian-l4h-test.service $R/etc/systemd/system/l4h-test.service
 ln -sf /etc/systemd/system/l4h-test.service $R/etc/systemd/system/multi-user.target.wants/l4h-test.service
 "
+# Source for the build workload (tests/run-workload.sh).
+bb=$root/build/busybox-1.36.1.tar.bz2
+[ -f "$bb" ] || wget -q -O "$bb" https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+sudo cp "$bb" "$R/root/busybox.tar.bz2"
 sudo rm -f "$root/build/debian.img"
-sudo mkfs.ext4 -q -F -d "$R" "$root/build/debian.img" 2G
+sudo mkfs.ext4 -q -F -d "$R" "$root/build/debian.img" 4G
 sudo chown "$(id -u)" "$root/build/debian.img"
 echo "$root/build/debian.img"

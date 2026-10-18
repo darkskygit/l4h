@@ -3,6 +3,9 @@
 # networking through the QEMU user-mode uplink.  The image comes from
 # tests/mkdebian.sh (build/debian.img).
 # Usage: run-debian.sh [vcpus]
+# DEBIAN_ROLE adds l4h.role=<role> to the kernel command line;
+# DEBIAN_KEEP=1 boots the image left by the previous run instead of a fresh
+# copy.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 img=$root/build/debian.img
@@ -11,9 +14,9 @@ img=$root/build/debian.img
 objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
 L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" L4H_DOM0_INITRD= \
     L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-1024} L4H_DOM0_VCPUS=${1:-2} \
-    L4H_DOM0_CMDLINE="console=hvc0 root=/dev/vda rw" "$root/tools/build-host.sh"
+    L4H_DOM0_CMDLINE="console=hvc0 root=/dev/vda rw${DEBIAN_ROLE:+ l4h.role=$DEBIAN_ROLE}" "$root/tools/build-host.sh"
 log=$root/build/qemu-debian.log
-cp --sparse=always "$img" "$root/build/debian-run.img"
+[ "${DEBIAN_KEEP:-0}" = 1 ] || cp --sparse=always "$img" "$root/build/debian-run.img"
 "$root/tools/run-qemu.sh" "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
     -drive file="$root/build/debian-run.img",if=none,id=d0,format=raw,cache=none \
     -device virtio-blk-pci,drive=d0,disable-legacy=on \
@@ -27,5 +30,9 @@ while kill -0 "$qemu" 2>/dev/null; do
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true
-grep -a "DEBIAN:\|Kernel panic\|Failed to start\|l4h-root: guest" "$log" || true
-grep -aq "DEBIAN: system running" "$log"
+grep -a "DEBIAN:\|WORKLOAD:\|Kernel panic\|Failed to start\|l4h-root: guest" "$log" || true
+if [ -n "${DEBIAN_ROLE:-}" ]; then
+    grep -aq "WORKLOAD: done" "$log"
+else
+    grep -aq "DEBIAN: system running" "$log"
+fi

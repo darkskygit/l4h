@@ -3,6 +3,39 @@
 # Boot check for tests/run-debian.sh.
 # With l4h.role=router on the kernel command line, act as the NAT router of
 # tests/run-router.sh instead: eth0 = uplink (DHCP), eth1 = 192.168.77.1/24.
+# With l4h.role=workload: disk integrity (fio verify), a parallel build,
+# and a checksum that the next boot (l4h.role=verify) checks.
+if grep -q "l4h.role=workload" /proc/cmdline; then
+    systemctl is-system-running --wait >/dev/null
+    echo "WORKLOAD: start, $(nproc) vCPU(s)"
+    fio --name=verify --filename=/var/tmp/fio.dat --size=256M --rw=randwrite --bs=4k \
+        --ioengine=libaio --iodepth=16 --direct=1 --verify=crc32c --verify_fatal=1 \
+        --output=/tmp/fio.log >/dev/null 2>&1 \
+        && echo "WORKLOAD: fio verify ok, $(grep -o 'IOPS=[^,]*' /tmp/fio.log | head -1)" \
+        || { echo "WORKLOAD: fio failed"; tail -5 /tmp/fio.log; }
+    rm -f /var/tmp/fio.dat
+    cd /root && tar xjf /root/busybox.tar.bz2 && cd busybox-* && make -s defconfig >/dev/null 2>&1
+    sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+    t0=$(date +%s)
+    if make -s -j"$(nproc)" >/tmp/build.log 2>&1; then
+        echo "WORKLOAD: busybox build ok in $(( $(date +%s) - t0 ))s"
+        sha256sum busybox > /root/busybox.sha256
+        ./busybox echo "WORKLOAD: built busybox runs"
+    else
+        echo "WORKLOAD: build failed"; tail -10 /tmp/build.log
+    fi
+    sync
+    echo "WORKLOAD: done"
+    systemctl poweroff
+    exit 0
+fi
+if grep -q "l4h.role=verify" /proc/cmdline; then
+    systemctl is-system-running --wait >/dev/null
+    cd /root/busybox-* && sha256sum -c /root/busybox.sha256 >/dev/null && echo "WORKLOAD: data intact after reboot"
+    echo "WORKLOAD: done"
+    systemctl poweroff
+    exit 0
+fi
 if grep -q "l4h.role=router" /proc/cmdline; then
     systemctl is-system-running --wait >/dev/null
     sysctl -q -w net.ipv4.ip_forward=1
