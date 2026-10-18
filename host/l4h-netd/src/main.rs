@@ -46,6 +46,9 @@ struct GuestPort {
     switch: u32,
     mac: [u8; 6],
     lock: bool,
+    /// An isolated port exchanges frames only with ports that are not
+    /// isolated (other guests' normal ports and the uplink).
+    isolated: bool,
     client: sel4::cap::Notification,
     /// The client must be told about new RX frames or freed TX slots.
     signal: bool,
@@ -205,14 +208,25 @@ impl Netd {
         } else {
             None
         };
+        let from_isolated = self.is_isolated(from);
         match known {
             Some(to) if to == from => {}
+            Some(to) if from_isolated && self.is_isolated(to) => {}
             Some(to) if self.switch_of(to) == Some(switch) => self.deliver(to, frame, hdr),
             _ => {
                 for to in self.members(switch, from) {
-                    self.deliver(to, frame, hdr);
+                    if !(from_isolated && self.is_isolated(to)) {
+                        self.deliver(to, frame, hdr);
+                    }
                 }
             }
+        }
+    }
+
+    fn is_isolated(&self, p: PortId) -> bool {
+        match p {
+            PortId::Guest(i) => self.ports[i].as_ref().is_some_and(|p| p.isolated),
+            PortId::Uplink(_) => false,
         }
     }
 
@@ -350,6 +364,7 @@ fn main(info: &'static Info) -> ! {
                         switch: mr(1) as u32,
                         mac,
                         lock: mr(3) & net::NETD_PORT_MAC_LOCK != 0,
+                        isolated: mr(3) & net::NETD_PORT_ISOLATED != 0,
                         client: cap::<cap_type::Notification>(net::NETD_SLOT_CLIENT_BASE + i as u64),
                         signal: false,
                         rx_frames: 0,

@@ -724,7 +724,7 @@ addresses are still delivered, by flooding.
 
 \section{vNICs}
 
-\texttt{--nic SWITCH[,mac=MAC][,nolock]} adds a vNIC to a new VM.
+\texttt{--nic SWITCH[,mac=MAC][,nolock][,isolated]} adds a vNIC to a new VM.
 
 \begin{description}[style=nextline]
   \item[\texttt{mac=MAC}] The MAC address, as
@@ -735,6 +735,11 @@ addresses are still delivered, by flooding.
     frames with its own source MAC, so guests cannot impersonate each other.
     Turn it off for guests that bridge other machines, such as a Linux
     bridge or containers with their own MACs.
+  \item[\texttt{isolated}] Make the vNIC an isolated port. Isolated ports
+    exchange no frames with each other, including broadcasts; they reach
+    only the switch's normal ports and its uplink. Put many untrusted
+    guests on one switch with a router VM on a normal port, and they can
+    reach the router but not each other.
 \end{description}
 
 Each vNIC appears as a virtio-net device with a 1500-byte MTU. Checksum

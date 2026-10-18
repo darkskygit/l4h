@@ -212,7 +212,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if id == caller {
                 return Err(EINVAL);
             }
-            resp.vals[0] = h.create_nic(id, a[1] as u32, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0)?;
+            resp.vals[0] = h.create_nic(id, a[1] as u32, a[2], a[3] & abi::NIC_NO_MAC_LOCK == 0, a[3] & abi::NIC_ISOLATED != 0)?;
             Ok(())
         }
         abi::CTL_NIC_INFO => {

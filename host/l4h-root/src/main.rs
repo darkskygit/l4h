@@ -73,6 +73,9 @@ const DOM0_VCPUS: usize = parse_usize(option_env!("L4H_DOM0_VCPUS"), 1);
 const DOM0_DISKS: usize = parse_usize(option_env!("L4H_DOM0_DISKS"), 64);
 /* vNICs of dom0 on switch 0, which has the first NIC as its uplink. */
 const DOM0_NICS: usize = parse_usize(option_env!("L4H_DOM0_NICS"), 1);
+/* Internal switches 1..=n, created at first boot, each with one more vNIC
+ * of dom0 (a normal port, for routing between it and isolated guests). */
+const DOM0_INTERNAL_SWITCHES: usize = parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0);
 /* Seconds between watchdog dumps of guest vCPU state; 0 disables. */
 const WATCHDOG_SECS: usize = parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0);
 const TIMER_BADGE: u64 = 1 << 40;
@@ -312,7 +315,7 @@ impl Host {
 
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
     /// Returns the MAC.
-    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool) -> Result<u64, i64> {
+    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, i64> {
         if !self.can_afford(8 << 20, 0) {
             return Err(ctl::ENOMEM);
         }
@@ -326,7 +329,7 @@ impl Host {
             if mac >> 40 & 1 != 0 {
                 return Err(ctl::EINVAL);
             }
-            let (p, backend) = h.netd.add_port(g, d, switch, mac, lock, &mut h.alloc)?;
+            let (p, backend) = h.netd.add_port(g, d, switch, mac, lock, isolated, &mut h.alloc)?;
             g.backends.push((d, backend));
             g.ports.push(p);
             Ok(mac)
@@ -479,7 +482,13 @@ pub fn boot_dom0(h: &mut Host) {
     let uplink = h.netd.nics.iter().position(|n| n.switch == Some(sw));
     for i in 0..DOM0_NICS {
         let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };
-        h.create_nic(id, sw, mac, true).expect("dom0 NIC");
+        h.create_nic(id, sw, mac, true, false).expect("dom0 NIC");
+    }
+    while (h.netd.switches as usize) < 1 + DOM0_INTERNAL_SWITCHES {
+        h.netd.create_switch();
+    }
+    for i in 1..=DOM0_INTERNAL_SWITCHES {
+        h.create_nic(id, i as u32, 0, true, false).expect("dom0 internal NIC");
     }
     h.with_guest(id, |h, g| {
         assert!(

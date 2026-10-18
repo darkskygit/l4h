@@ -82,6 +82,7 @@ pub const NETD_SLOT_CLIENT_BASE: u64 = 64;
 /// MR0 = port, MR1 = switch, MR2 = MAC (low 48 bits), MR3 = flags.
 pub const NETD_ADD_PORT: u64 = 1;
 pub const NETD_PORT_MAC_LOCK: u64 = 1 << 0;
+pub const NETD_PORT_ISOLATED: u64 = 1 << 1;
 /// MR0 = port.  netd no longer touches the port's memory when this returns.
 pub const NETD_REMOVE_PORT: u64 = 2;
 /// MR0 = NIC, MR1 = switch.

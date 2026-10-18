@@ -41,9 +41,16 @@ grep -q "ping 192.168.1.1 failed" /tmp/d || fail "MAC lock"
 # E does the same on an unlocked port: forwarded.
 run e "" --nic "$sw1,nolock" --cmdline "console=hvc0 IP0=192.168.1.5/24 NEWMAC=02:00:00:00:00:98 PING=192.168.1.1"
 grep -q "ping 192.168.1.1 ok" /tmp/e || fail "unlocked port"
+# F and G are isolated ports: both reach A (a normal port), not each other.
+run f "" --nic "$sw1,isolated" --cmdline "console=hvc0 IP0=192.168.1.6/24 PING=192.168.1.1"
+grep -q "ping 192.168.1.1 ok" /tmp/f || fail "isolated port -> normal port"
+run g "" --nic "$sw1,isolated" --cmdline "console=hvc0 IP0=192.168.1.7/24 PING=192.168.1.1 PING2=192.168.1.6"
+grep -q "ping 192.168.1.1 ok" /tmp/g || fail "isolated port -> normal port"
+grep -q "ping 192.168.1.6 failed" /tmp/g || fail "isolated ports reach each other"
+echo "NETTEST: isolated ports ok"
 l4hctl switch "$sw1"
 l4hctl switch "$sw2"
 l4hctl list
-for v in $vm_a $vm_b $vm_c $vm_d $vm_e; do l4hctl destroy "$v" || fail "destroy $v"; done
+for v in $vm_a $vm_b $vm_c $vm_d $vm_e $vm_f $vm_g; do l4hctl destroy "$v" || fail "destroy $v"; done
 echo "NETTEST: PASS"
 poweroff -f

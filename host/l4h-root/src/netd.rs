@@ -223,6 +223,7 @@ impl Netd {
         switch: u32,
         mac: u64,
         lock: bool,
+        isolated: bool,
         alloc: &mut Alloc,
     ) -> Result<(usize, vmm::Backend), i64> {
         if switch >= self.switches {
@@ -257,7 +258,7 @@ impl Netd {
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
         abs_of(kick).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), 1 << p).expect("port kick");
-        let flags = if lock { net::NETD_PORT_MAC_LOCK } else { 0 };
+        let flags = if lock { net::NETD_PORT_MAC_LOCK } else { 0 } | if isolated { net::NETD_PORT_ISOLATED } else { 0 };
         call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]);
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
         let mac_bytes = mac.to_be_bytes();

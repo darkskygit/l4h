@@ -234,6 +234,7 @@ pub const CTL_VM_INFO: u32 = 17;
 pub const CTL_VM_STATS: u32 = 18;
 pub const CTL_VM_SHUTDOWN: u32 = 19;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
+pub const NIC_ISOLATED: u64 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
