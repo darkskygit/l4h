@@ -7,6 +7,31 @@ mount -t devtmpfs dev /dev
 # busybox poweroff/reboot signal init (l4hctl shutdown).
 trap 'echo "GUEST: shutting down"; poweroff -f' USR2 TERM
 echo "GUEST: ready, $(nproc) cpus"
+# Roles for the destroy-under-I/O test in init-ctltest.
+case " $(cat /proc/cmdline) " in
+*" l4htest=dmaload "*)
+    # Keep the disk (a pattern, throttled by QEMU) busy with direct reads
+    # into this guest's memory until the guest is destroyed.
+    for i in $(seq 0 15); do
+        dd if=/dev/vda of=/dev/null bs=1M iflag=direct skip=$((i * 2)) 2>/dev/null &
+    done
+    sleep 2
+    echo "GUEST: dma busy"
+    while :; do sleep 10; done ;;
+*" l4htest=dmacheck "*)
+    # Fill most of RAM with zeros and watch for disk data appearing in it:
+    # DMA of the destroyed dmaload guest landing in reused memory.
+    mkdir -p /tmp/z && mount -t tmpfs -o size=100m tmp /tmp/z
+    dd if=/dev/zero of=/tmp/z/fill bs=1M count=80 2>/dev/null
+    echo "GUEST: dma check start"
+    for i in $(seq 1 10); do
+        sleep 2
+        n=$(tr -d '\000' < /tmp/z/fill | wc -c)
+        [ "$n" = 0 ] || break
+    done
+    echo "GUEST: stale bytes $n"
+    while :; do sleep 10; done ;;
+esac
 if [ -b /dev/vda ]; then
     echo "GUEST: vda size $(cat /sys/block/vda/size) ro $(cat /sys/block/vda/ro)"
     mount -t ext4 /dev/vda /mnt || echo "GUEST: mount failed"

@@ -27,7 +27,7 @@ for i in 1 2; do
     id=$(l4hctl create disk$i --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create disk$i"
     l4hctl console "$id" --until "GUEST: disk ok" --timeout 60 > /tmp/out || fail "disk vm $i"
     grep -q "GUEST: disk count $((i - 1))" /tmp/out || { cat /tmp/out; fail "disk count"; }
-    l4hctl disks | grep -q "owner vm $id" || fail "disk owner"
+    l4hctl disks > /tmp/disks && grep -q "owner vm $id" /tmp/disks || fail "disk owner"
     l4hctl destroy "$id" || fail "destroy disk$i"
 done
 # Clean shutdown on request.
@@ -60,6 +60,22 @@ for w in start=8193 start=8192,sectors=16383; do
 done
 l4hctl list | grep -q badwin && fail "refused VM left behind"
 echo "CTLTEST: unaligned windows refused"
+# Destroying a guest with disk I/O in flight (disk 1 virtio-blk, disk 2
+# NVMe; both hold a pattern and QEMU throttles their reads): the disk
+# must be quiesced before the guest's memory is reused, and work again
+# when attached to the next guest.
+for d in 1 2 1 2; do
+    id=$(l4hctl create dmaload --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --disk $d \
+        --cmdline "console=hvc0 l4htest=dmaload") || fail "create dmaload $d"
+    l4hctl console "$id" --until "GUEST: dma busy" --timeout 60 >/dev/null || fail "dmaload $d"
+    l4hctl destroy "$id" || fail "destroy dmaload $d"
+    id=$(l4hctl create dmacheck --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
+        --cmdline "console=hvc0 l4htest=dmacheck") || fail "create dmacheck"
+    l4hctl console "$id" --until "GUEST: stale bytes" --timeout 90 > /tmp/out || fail "dmacheck"
+    grep -q "GUEST: stale bytes 0" /tmp/out || { cat /tmp/out; fail "disk $d DMA into reused memory"; }
+    l4hctl destroy "$id" || fail "destroy dmacheck"
+    echo "CTLTEST: disk $d destroyed under I/O, no stale DMA"
+done
 l4hctl disks
 echo "CTLTEST: PASS"
 poweroff -f
