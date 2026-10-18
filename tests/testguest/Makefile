@@ -6,7 +6,7 @@ CFLAGS := -O2 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mno-red-
 	  -mno-sse -mno-mmx -mno-avx -mcmodel=large -nostdinc -isystem $(shell $(CC) -print-file-name=include) \
 	  -I$(SEL4) -I$(ROOT)/include -Wall -Wno-builtin-declaration-mismatch
 
-$(OUT)/testguest.elf: main.c start.S linker.ld
+$(OUT)/testguest.elf: main.c start.S linker.ld $(ROOT)/include/l4h/abi.h
 	mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -c main.c -o $(OUT)/main.o
 	$(CC) $(CFLAGS) -c start.S -o $(OUT)/start.o

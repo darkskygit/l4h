@@ -7,7 +7,9 @@
  *   - seL4_TCB_ReadFPU of the user thread's xmm0,
  *   - seL4 debug syscalls refused to guest threads (an unknown syscall),
  *   - seL4_X86_ExecuteNever mappings,
- *   - seL4_TCB_SetTimer delivering a timer badge.
+ *   - seL4_TCB_SetTimer delivering a timer badge,
+ *   - the I/O pool: a virtio-blk driver that ignores ACCESS_PLATFORM or
+ *     puts rings or buffers outside the pool is refused.
  * It prints "TESTGUEST: PASS" or "TESTGUEST: FAIL ..." and powers off.
  */
 #include <stdint.h>
@@ -202,6 +204,284 @@ static void map_user_page(seL4_CPtr vspace, seL4_CPtr frame, seL4_Word va, seL4_
 
 extern char user_prog[], user_debug[];
 
+/* ---- seL4 semantics of Untyped copies (DESIGN.md §15.2)
+ *
+ * l4h-root keeps the original Untyped of each 2 MiB block of guest RAM and
+ * gives the guest a copy.  Check, on a 2 MiB Untyped `orig` with a copy
+ * `copy` (playing l4h-root's and the guest's caps):
+ *   - while the copy exists, the original cannot be retyped;
+ *   - objects retyped from the copy can be revoked through the copy;
+ *   - a retype from a copy without children starts again at its base and
+ *     the memory is zeroed (reset), whatever it held before;
+ *   - a copy with children cannot be copied again;
+ *   - revoking the original deletes the copy and everything retyped from it.
+ */
+#define UT_TEST_VA	(L4H_SPECIAL_BASE + 0x30000000ull)
+#ifdef __aarch64__
+#define UT_FRAME	seL4_ARM_SmallPageObject
+#define ut_unmap	seL4_ARM_Page_Unmap
+#else
+#define UT_FRAME	seL4_X86_4K
+#define ut_unmap	seL4_X86_Page_Unmap
+#endif
+
+static void ut_map(seL4_CPtr frame, seL4_Word va)
+{
+	map_user_page(L4H_CPTR(L4H_SLOT_VSPACE), frame, va, seL4_ReadWrite);
+}
+
+static void untyped_copy_test(seL4_CPtr quota)
+{
+	seL4_Word orig_slot = next_slot++, copy_slot = next_slot++;
+	seL4_CPtr orig = L4H_CPTR(orig_slot), copy = L4H_CPTR(copy_slot);
+	int err;
+
+	err = seL4_Untyped_Retype(quota, seL4_UntypedObject, 21, L4H_CNODE_CPTR, 0, 0, orig_slot, 1);
+	CHECK(err == 0, "2 MiB untyped err=", err);
+	err = seL4_CNode_Copy(L4H_CNODE_CPTR, copy_slot, L4H_ROOT_DEPTH, L4H_CNODE_CPTR, orig_slot,
+			      L4H_ROOT_DEPTH, seL4_AllRights);
+	CHECK(err == 0, "untyped copy err=", err);
+
+	/* Frames from the copy, the last one mapped and written. */
+	seL4_Word f0 = next_slot;
+	next_slot += 512;
+	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 512);
+	CHECK(err == 0, "frames from the copy err=", err);
+	volatile uint64_t *p = (volatile uint64_t *)UT_TEST_VA;
+	ut_map(L4H_CPTR(f0 + 511), UT_TEST_VA);
+	p[0] = 0x1234567890abcdefull;
+	CHECK(p[0] == 0x1234567890abcdefull, "frame write", p[0]);
+
+	/* The original is full while the copy exists: it cannot be retyped. */
+	err = seL4_Untyped_Retype(orig, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, next_slot, 1);
+	CHECK(err == seL4_NotEnoughMemory, "retype of the original with a copy err=", err);
+	/* A copy that has children cannot be copied again. */
+	err = seL4_CNode_Copy(L4H_CNODE_CPTR, next_slot, L4H_ROOT_DEPTH, L4H_CNODE_CPTR, copy_slot,
+			      L4H_ROOT_DEPTH, seL4_AllRights);
+	CHECK(err != 0, "copy of a copy with children", 0);
+
+	/* Revoking the copy deletes its frames and their mappings. */
+	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, copy_slot, L4H_ROOT_DEPTH);
+	CHECK(err == 0, "revoke copy err=", err);
+	err = ut_unmap(L4H_CPTR(f0 + 511));
+	CHECK(err == seL4_InvalidCapability, "frame after revoke err=", err);
+
+	/* The copy has no children: the next retype resets it.  A CNode
+	 * that fills the whole block fits again, so the free index went back
+	 * to 0; then frames again, which must read as zero. */
+	seL4_Word cn = next_slot++;
+	err = seL4_Untyped_Retype(copy, seL4_CapTableObject, 21 - seL4_SlotBits, L4H_CNODE_CPTR, 0, 0, cn, 1);
+	CHECK(err == 0, "2 MiB CNode from the reset copy err=", err);
+	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, copy_slot, L4H_ROOT_DEPTH);
+	CHECK(err == 0, "revoke copy (CNode) err=", err);
+	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 512);
+	CHECK(err == 0, "frames again err=", err);
+	ut_map(L4H_CPTR(f0 + 511), UT_TEST_VA);
+	CHECK(p[0] == 0, "reset memory not zeroed: ", p[0]);
+
+	/* Revoking the original (teardown by l4h-root) deletes the copy and
+	 * everything retyped from it. */
+	err = seL4_CNode_Revoke(L4H_CNODE_CPTR, orig_slot, L4H_ROOT_DEPTH);
+	CHECK(err == 0, "revoke original err=", err);
+	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, next_slot, 1);
+	CHECK(err == seL4_InvalidCapability, "copy after revoke of the original err=", err);
+	err = ut_unmap(L4H_CPTR(f0 + 511));
+	CHECK(err == seL4_InvalidCapability, "frame after revoke of the original err=", err);
+	/* And the original is usable again. */
+	err = seL4_Untyped_Retype(orig, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, 1);
+	CHECK(err == 0, "original after revoke err=", err);
+	puts("testguest: Untyped copies: retype/revoke through a copy, reset, teardown by the original: ok\n");
+}
+
+/* ---- the I/O pool, from a hostile driver's point of view
+ *
+ * Devices may only use the host's I/O pool: l4h-vmm refuses a driver that
+ * does not accept VIRTIO_F_ACCESS_PLATFORM, rings outside the pool and
+ * requests with any buffer outside it.  Played against the first
+ * virtio-blk device (sector 0 holds "l4h-pool-test" from the host).
+ */
+#define VIRTIO_ID_BLOCK		2
+#define VIRTIO_F_VERSION_1	(1ull << 32)
+#define VIRTIO_F_ACCESS_PLATFORM (1ull << 33)
+#define ST_ACK			1
+#define ST_DRIVER		2
+#define ST_DRIVER_OK		4
+#define ST_FEATURES_OK		8
+#define ST_NEEDS_RESET		64
+#define VQ_NEXT			1
+#define VQ_WRITE		2
+#define QN			8
+
+static int blk_dev = -1;
+
+static void *gpa_va(uint64_t gpa)
+{
+	return (void *)(bi->ram_base_va + gpa);
+}
+
+static volatile struct l4h_virtio_regs *blk_regs(void)
+{
+	return (volatile struct l4h_virtio_regs *)bi->devices[blk_dev].page_va;
+}
+
+static uint64_t dev_write(uint64_t op, uint64_t a)
+{
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	seL4_SetMR(0, blk_dev);
+	seL4_SetMR(1, op);
+	seL4_SetMR(2, a);
+	seL4_SetMR(3, 0);
+	seL4_Call(L4H_CPTR(L4H_SLOT_HYP_EP), seL4_MessageInfo_new(L4H_HC_DEV_WRITE, 0, 0, 4));
+	return seL4_GetMR(0);
+}
+
+static uint64_t set_status(uint32_t s)
+{
+	blk_regs()->status = s;
+	return dev_write(L4H_VIRTIO_OP_STATUS, 0);
+}
+
+/* Reset, negotiate `features`; returns the status the device left. */
+static uint32_t negotiate(uint64_t features)
+{
+	volatile struct l4h_virtio_regs *r = blk_regs();
+
+	set_status(0);
+	CHECK(r->status == 0, "reset status=", r->status);
+	set_status(ST_ACK | ST_DRIVER);
+	r->driver_features = features;
+	dev_write(L4H_VIRTIO_OP_FEATURES, 0);
+	set_status(ST_ACK | ST_DRIVER | ST_FEATURES_OK);
+	return r->status;
+}
+
+/* Queue 0 with its rings at `ring_gpa`: returns the hypercall result. */
+static uint64_t setup_queue(uint64_t ring_gpa)
+{
+	volatile struct l4h_virtq_regs *q = &blk_regs()->queues[0];
+
+	/* Clear the rings where they are mapped (RAM, or all in the pool). */
+	if (ring_gpa + 0x400 <= bi->io_pool_gpa + bi->io_pool_size)
+		for (uint64_t *p = gpa_va(ring_gpa); p < (uint64_t *)gpa_va(ring_gpa + 0x400); p++)
+			*p = 0;
+	q->num = QN;
+	q->desc = ring_gpa;
+	q->driver = ring_gpa + 0x100;
+	q->device = ring_gpa + 0x200;
+	q->ready = 1;
+	return dev_write(L4H_VIRTIO_OP_QUEUE, 0);
+}
+
+struct vdesc {
+	uint64_t addr;
+	uint32_t len;
+	uint16_t flags, next;
+};
+
+/* Read sector 0 with the header, data and status at the given GPAs (the
+ * rings are in the pool at `ring_gpa`).  Returns the used length, or -1 if
+ * the device did not return the chain. */
+static int64_t blk_read(uint64_t ring_gpa, uint64_t hdr, uint64_t data, uint64_t status)
+{
+	static uint16_t avail_idx;
+	struct vdesc *d = gpa_va(ring_gpa);
+	volatile uint16_t *avail = gpa_va(ring_gpa + 0x100);
+	volatile uint16_t *used_idx = gpa_va(ring_gpa + 0x200 + 2);
+	volatile uint32_t *used = gpa_va(ring_gpa + 0x200 + 4);
+	uint16_t before = *used_idx;
+
+	if (hdr >= bi->io_pool_gpa) {
+		uint32_t *h = gpa_va(hdr);
+		h[0] = 0;	/* VIRTIO_BLK_T_IN */
+		h[1] = 0;
+		h[2] = h[3] = 0;	/* sector 0 */
+	}
+	d[0] = (struct vdesc){ hdr, 16, VQ_NEXT, 1 };
+	d[1] = (struct vdesc){ data, 512, VQ_NEXT | VQ_WRITE, 2 };
+	d[2] = (struct vdesc){ status, 1, VQ_WRITE, 0 };
+	avail[2 + avail_idx % QN] = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	avail[1] = ++avail_idx;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	__atomic_fetch_or(&blk_regs()->kick, 1ull, __ATOMIC_SEQ_CST);
+	seL4_Signal(L4H_CPTR2(L4H_SLOT_DEV_CNODE, bi->devices[blk_dev].kick_slot));
+	uint64_t end = rdtsc() + bi->tsc_hz;
+	while (*used_idx == before) {
+		if (rdtsc() > end)
+			return -1;
+		seL4_Yield();
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	return used[2 * (before % QN) + 1];
+}
+
+static void io_pool_test(void)
+{
+	uint64_t pool = bi->io_pool_gpa, size = bi->io_pool_size;
+
+	CHECK(size >= (1 << 20) && pool >= bi->ram_size && pool % 4096 == 0, "pool=", pool);
+	puthex("testguest: I/O pool at ", pool);
+	for (int i = 0; i < (int)bi->nr_devices; i++)
+		if (bi->devices[i].type == L4H_DEV_VIRTIO && bi->devices[i].virtio_id == VIRTIO_ID_BLOCK)
+			blk_dev = i;
+	if (blk_dev < 0) {
+		puts("testguest: no virtio-blk device, I/O pool test skipped\n");
+		return;
+	}
+	volatile struct l4h_virtio_regs *r = blk_regs();
+	CHECK(r->device_features & VIRTIO_F_ACCESS_PLATFORM, "features=", r->device_features);
+
+	/* A driver without ACCESS_PLATFORM is refused. */
+	uint32_t s = negotiate(VIRTIO_F_VERSION_1);
+	CHECK(!(s & ST_FEATURES_OK), "FEATURES_OK without ACCESS_PLATFORM, status=", s);
+
+	/* Rings in guest RAM are refused, and so is DRIVER_OK after that. */
+	uint64_t ram_ring = (bi->kernel_end_gpa + 0xfff) & ~0xfffull;
+	s = negotiate(VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM);
+	CHECK(s & ST_FEATURES_OK, "FEATURES_OK refused, status=", s);
+	CHECK(setup_queue(ram_ring) != 0, "queue in RAM accepted, gpa=", ram_ring);
+	CHECK(r->queues[0].ready == 0, "queue in RAM ready=", r->queues[0].ready);
+	CHECK(setup_queue(pool + size - 0x100) != 0, "queue across the pool end accepted", 0);
+	CHECK(set_status(ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK) != 0, "DRIVER_OK accepted", 0);
+	CHECK(!(r->status & ST_DRIVER_OK) && (r->status & ST_NEEDS_RESET), "status=", r->status);
+
+	/* Rings in the pool work. */
+	s = negotiate(VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM);
+	CHECK(s & ST_FEATURES_OK, "FEATURES_OK refused, status=", s);
+	CHECK(setup_queue(pool) == 0, "queue in the pool refused", pool);
+	CHECK(set_status(ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK) == 0, "DRIVER_OK refused", 0);
+
+	volatile uint8_t *data = gpa_va(pool + 0x1000);
+	volatile uint8_t *st = gpa_va(pool + 0x600);
+	volatile uint8_t *ram = gpa_va(ram_ring);
+	/* A read into the pool. */
+	*st = 0xff;
+	int64_t n = blk_read(pool, pool + 0x400, pool + 0x1000, pool + 0x600);
+	CHECK(n == 513 && *st == 0, "pool read: used=", n);
+	CHECK(data[0] == 'l' && data[1] == '4' && data[2] == 'h', "pool read data=", data[0]);
+	/* A read into guest RAM is refused: nothing is written there, and the
+	 * status byte is untouched. */
+	for (int i = 0; i < 1024; i++)
+		ram[i] = 0x5a;
+	*st = 0xff;
+	n = blk_read(pool, pool + 0x400, ram_ring, pool + 0x600);
+	CHECK(n == 0 && *st == 0xff && ram[0] == 0x5a && ram[511] == 0x5a, "RAM read: used=", n);
+	/* So are a header in RAM, a status byte in RAM, and a buffer that runs
+	 * past the end of the pool. */
+	n = blk_read(pool, ram_ring, pool + 0x1000, pool + 0x600);
+	CHECK(n == 0 && *st == 0xff, "header in RAM: used=", n);
+	n = blk_read(pool, pool + 0x400, pool + 0x1000, ram_ring + 600);
+	CHECK(n == 0 && ram[600] == 0x5a, "status in RAM: used=", n);
+	n = blk_read(pool, pool + 0x400, pool + size - 256, pool + 0x600);
+	CHECK(n == 0 && *st == 0xff, "buffer past the pool: used=", n);
+	/* The device still works. */
+	data[0] = 0;
+	n = blk_read(pool, pool + 0x400, pool + 0x1000, pool + 0x600);
+	CHECK(n == 513 && *st == 0 && data[0] == 'l', "pool read again: used=", n);
+	set_status(0);
+	puts("testguest: I/O pool: ACCESS_PLATFORM required, rings and buffers outside the pool refused\n");
+}
+
 void tg_main(const struct l4h_bootinfo *bootinfo)
 {
 	bi = bootinfo;
@@ -372,6 +652,9 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 	CHECK(badge & L4H_BADGE_TIMER, "timer badge=", badge);
 	CHECK(t1 >= deadline - bi->tsc_hz / 10000, "timer early by=", deadline - t1);
 	puthex("testguest: E3 timer fired, latency ticks=", t1 - deadline);
+
+	io_pool_test();
+	untyped_copy_test(L4H_CPTR(L4H_SLOT_UNTYPED_BASE));
 
 	puts("TESTGUEST: PASS\n");
 	power(L4H_POWER_OFF);

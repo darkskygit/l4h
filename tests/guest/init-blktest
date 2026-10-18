@@ -20,6 +20,26 @@ umount /mnt || fail "umount"
 echo 3 > /proc/sys/vm/drop_caches
 mount -t ext4 /dev/vda /mnt || fail "remount"
 cmp /tmp/pat /mnt/pat || fail "readback mismatch"
+# I/O pool pressure: 8 parallel direct writers, then readers, need more
+# bounce buffers than the I/O pool holds.  The block layer waits for room,
+# and every byte must arrive intact.
+echo "BLKTEST: $(cat /sys/block/vda/queue/max_segment_size)-byte segments, $(cat /sys/block/vda/queue/max_segments) per request"
+dd if=/dev/urandom of=/tmp/pat4 bs=1M count=4 2>/dev/null
+for i in 1 2 3 4 5 6 7 8; do
+    dd if=/tmp/pat4 of=/mnt/p$i bs=1M oflag=direct 2>/dev/null &
+done
+wait
+sync
+echo 3 > /proc/sys/vm/drop_caches
+for i in 1 2 3 4 5 6 7 8; do
+    dd if=/mnt/p$i of=/tmp/r$i bs=1M iflag=direct 2>/dev/null &
+done
+wait
+for i in 1 2 3 4 5 6 7 8; do
+    cmp /tmp/pat4 /tmp/r$i || fail "parallel direct I/O mismatch ($i)"
+    rm -f /mnt/p$i /tmp/r$i
+done
+echo "BLKTEST: parallel direct I/O through the I/O pool: ok"
 umount /mnt
 echo "BLKTEST: PASS"
 poweroff -f

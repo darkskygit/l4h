@@ -1,11 +1,15 @@
 //! Feed l4h-vmm's virtqueue code (host/l4h-vmm/src/virtq.rs and mem.rs,
 //! compiled here unchanged) with random guest memory: queue setup, avail
-//! rings and descriptor tables are all garbage.  It must never touch memory
-//! outside guest RAM, panic or loop forever.  Also feeds netd's offload
-//! code (host/l4h-netd/src/offload.rs) random virtio-net headers and checks
-//! its TCP segmentation, and checks that a virtio-blk reset waits for
-//! every request blkd has (host/l4h-vmm/src/blk.rs), whatever the guest
-//! puts in the avail ring.
+//! rings and descriptor tables are all garbage, and addresses point
+//! inside, at the edges of, just outside and far outside the guest's I/O
+//! pool (which is all the VMM maps).  It must never touch memory outside
+//! the pool, accept a buffer outside it, panic or loop forever.  Also
+//! checks blk-mux's pool check (host/l4h-host/src/blk.rs, Pool), feeds
+//! netd's offload code (host/l4h-netd/src/offload.rs) random virtio-net
+//! headers and checks its TCP segmentation, and checks that a virtio-blk
+//! reset waits for every request blkd has (host/l4h-vmm/src/blk.rs),
+//! whatever the guest puts in the avail ring, and that no request with a
+//! buffer outside the pool reaches blkd.
 
 #![allow(dead_code)]
 
@@ -29,14 +33,6 @@ mod offload;
 // l4h-vmm's virtio-blk backend (blk.rs), unchanged, over mocks of what it
 // uses from l4h_rt and the device model; blkcheck.rs plays blkd.
 extern crate self as l4h_rt;
-
-pub const VMM_MAX_RAM_CHUNKS: usize = 128;
-#[derive(Clone, Copy, Default)]
-pub struct RamChunk {
-    pub gpa: u64,
-    pub paddr: u64,
-    pub size: u64,
-}
 
 #[path = "../../../host/l4h-host/src/blk.rs"]
 pub mod host_blk;
@@ -97,52 +93,193 @@ impl Rng {
     }
 }
 
+/// Is guest-physical [a, a + n) inside the pool [gpa, gpa + size)?  An
+/// independent check of GuestMem::valid and Pool::translate.
+fn inside(gpa: u64, size: u64, a: u64, n: u64) -> bool {
+    a >= gpa && (a - gpa) as u128 + n as u128 <= size as u128
+}
+
+/// Where a fuzzed pool sits: above some RAM, at guest-physical 0, or at the
+/// very top of the address space (so that address arithmetic overflows).
+fn pool_gpa(rng: &mut Rng, size: u64) -> u64 {
+    match rng.below(8) {
+        0 => 0,
+        1 => 0u64.wrapping_sub(size),
+        _ => (1 + rng.below(1 << 14)) << 21,
+    }
+}
+
+/// An address a hostile guest might use: mostly in the pool, often at or
+/// just past its edges, sometimes anywhere (guest RAM, garbage).
+fn guest_addr(rng: &mut Rng, gpa: u64, size: u64) -> u64 {
+    match rng.below(8) {
+        0 => rng.next(),
+        1 => gpa.wrapping_sub(1 + rng.below(64)),
+        2 => gpa.wrapping_add(size).wrapping_sub(rng.below(64)),
+        _ => gpa.wrapping_add(rng.below(size)),
+    }
+}
+
 fn main() {
     let iterations: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
     let size = 64 * 1024u64;
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut chains = 0u64;
+    let (mut chains, mut refused) = (0u64, 0u64);
     let mut bufs = Vec::new();
     for _ in 0..iterations {
-        let mut ram: Vec<u64> = (0..size / 8).map(|_| rng.next()).collect();
-        let mem = GuestMem { base: ram.as_mut_ptr() as usize, size };
+        let mut pool: Vec<u64> = (0..size / 8).map(|_| rng.next()).collect();
+        let gpa = pool_gpa(&mut rng, size);
+        let mem = GuestMem { base: pool.as_mut_ptr() as usize, gpa, size };
         // Mostly plausible queue layouts, sometimes wild ones.
         let num = 1u32 << rng.below(9);
-        let pick = |rng: &mut Rng| if rng.below(4) == 0 { rng.next() } else { rng.below(size) };
         // Mostly aligned as required, sometimes not (setup must refuse).
         let align = |rng: &mut Rng, v: u64, a: u64| if rng.below(8) == 0 { v } else { v & !(a - 1) };
-        let (desc, avail, used) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
+        let (desc, avail, used) = (guest_addr(&mut rng, gpa, size), guest_addr(&mut rng, gpa, size), guest_addr(&mut rng, gpa, size));
         let (desc, avail, used) = (align(&mut rng, desc, 16), align(&mut rng, avail, 2), align(&mut rng, used, 4));
+        let n = num as u64;
+        let rings_inside = inside(gpa, size, desc, 16 * n) && inside(gpa, size, avail, 6 + 2 * n) && inside(gpa, size, used, 6 + 8 * n);
+        let aligned = desc % 16 == 0 && avail % 2 == 0 && used % 4 == 0;
         let mut q = virtq::Queue::default();
-        if !q.setup(&mem, num, 256, desc, avail, used) {
+        let ok = q.setup(&mem, num, 256, desc, avail, used);
+        assert_eq!(ok, rings_inside && aligned && num <= 256, "queue setup: rings {desc:#x} {avail:#x} {used:#x}, pool {gpa:#x}");
+        if !ok {
             continue;
         }
         // Make chains mostly local so that they are followed for a while.
-        for i in 0..num as u64 {
-            if rng.below(2) == 0 {
+        for i in 0..n {
+            if rng.below(8) != 0 {
                 let d = desc + 16 * i;
-                mem.write::<u16>(d + 12, (rng.below(8)) as u16);
-                mem.write::<u16>(d + 14, rng.below(num as u64 + 2) as u16);
+                let indirect = if rng.below(8) == 0 { virtq::VIRTQ_DESC_F_INDIRECT } else { 0 };
+                mem.write::<u16>(d + 12, rng.below(4) as u16 | indirect);
+                mem.write::<u16>(d + 14, rng.below(n + 2) as u16);
                 mem.write::<u32>(d + 8, rng.below(4096) as u32);
-                mem.write::<u64>(d, rng.below(size));
+                let a = if rng.below(2) == 0 { gpa + rng.below(size) } else { guest_addr(&mut rng, gpa, size) };
+                mem.write::<u64>(d, a);
             }
         }
-        for _ in 0..rng.below(2 * num as u64) {
+        // Mostly valid chain heads in the avail ring.
+        for i in 0..n {
+            if rng.below(8) != 0 {
+                mem.write::<u16>(avail + 4 + 2 * i, rng.below(n) as u16);
+            }
+        }
+        for _ in 0..rng.below(2 * n) {
             let Some(head) = q.pop(&mem) else { break };
-            let _ = q.chain(&mem, head, &mut bufs);
+            if q.chain(&mem, head, &mut bufs).is_err() {
+                refused += 1;
+            }
             for b in &bufs {
-                assert!(mem.valid(b.gpa, b.len as u64), "chain buffer outside guest RAM");
+                assert!(inside(gpa, size, b.gpa, b.len as u64), "chain buffer outside the I/O pool");
             }
             chains += 1;
             q.push(&mem, head, rng.below(1 << 16) as u32);
             let _ = q.wants_interrupt(&mem);
         }
     }
-    println!("fuzz-virtq: {iterations} queues, {chains} chains parsed, no violations");
+    println!("fuzz-virtq: {iterations} queues, {chains} chains parsed ({refused} refused), no violations");
+    let edges = edge_check(&mut rng, iterations / 20);
+    println!("fuzz-virtq: pool edges: {edges} chains at the edges of the I/O pool checked");
+    let segs = pool_check(&mut rng, iterations * 4);
+    println!("fuzz-virtq: blk-mux pool check: {} segments, {segs} accepted", iterations * 4);
     let segs = offload_check(&mut rng, iterations / 4);
     println!("fuzz-virtq: offload: {} frames, {segs} segments checked", iterations / 4);
-    let reqs = blkcheck::drain_check(&mut rng, iterations / 20);
-    println!("fuzz-virtq: blk: {} resets, {reqs} requests drained", iterations / 20);
+    let (reqs, bad) = blkcheck::drain_check(&mut rng, iterations / 20);
+    println!("fuzz-virtq: blk: {} resets, {reqs} requests drained, {bad} chains outside the pool refused", iterations / 20);
+}
+
+/// Chains whose buffers or indirect tables end exactly at the end of the
+/// pool are accepted; one byte further, or one byte below its start, they
+/// are refused.
+fn edge_check(rng: &mut Rng, n: u64) -> u64 {
+    use virtq::{VIRTQ_DESC_F_INDIRECT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    let size = 16 * 1024u64;
+    let mut bufs = Vec::new();
+    let mut checked = 0;
+    for _ in 0..n {
+        let mut pool = vec![0u64; size as usize / 8];
+        let gpa = pool_gpa(rng, size);
+        let mem = GuestMem { base: pool.as_mut_ptr() as usize, gpa, size };
+        let mut q = virtq::Queue::default();
+        // Rings in the middle of the pool, away from the buffers at its
+        // edges, 8 entries.
+        let (desc, avail, used) = (gpa + 0x2000, gpa + 0x2100, gpa + 0x2200);
+        assert!(q.setup(&mem, 8, 8, desc, avail, used));
+        let end = gpa.wrapping_add(size);
+        let len = 1 + rng.below(512);
+        // Buffer kinds: (address, length, valid).
+        let cases = [
+            (end.wrapping_sub(len), len, true),
+            (end.wrapping_sub(len).wrapping_add(1), len, false),
+            (gpa, len, true),
+            (gpa.wrapping_sub(1), len, false),
+            (end, 1, false),
+            (gpa.wrapping_add(0x1000), u32::MAX as u64, false),
+        ];
+        for (k, &(addr, blen, valid)) in cases.iter().enumerate() {
+            let expect = if rng.below(2) == 0 {
+                // Descriptor 0 points at a one-entry indirect table that
+                // ends at addr + blen: valid only if the table is inside.
+                let table = (addr.wrapping_add(blen) & !15).wrapping_sub(16);
+                let table_ok = inside(gpa, size, table, 16);
+                mem.write::<u64>(desc, table);
+                mem.write::<u32>(desc + 8, 16);
+                mem.write::<u16>(desc + 12, VIRTQ_DESC_F_INDIRECT);
+                if table_ok {
+                    mem.write::<u64>(table, gpa + 0x2300);
+                    mem.write::<u32>(table + 8, 64);
+                    mem.write::<u16>(table + 12, VIRTQ_DESC_F_WRITE);
+                }
+                table_ok
+            } else {
+                // A header in the pool, then the buffer under test.
+                mem.write::<u64>(desc, gpa + 0x2300);
+                mem.write::<u32>(desc + 8, 16);
+                mem.write::<u16>(desc + 12, VIRTQ_DESC_F_NEXT);
+                mem.write::<u16>(desc + 14, 1);
+                mem.write::<u64>(desc + 16, addr);
+                mem.write::<u32>(desc + 24, blen.min(u32::MAX as u64) as u32);
+                mem.write::<u16>(desc + 28, VIRTQ_DESC_F_WRITE);
+                valid
+            };
+            mem.write::<u16>(avail + 4 + 2 * (k as u64 % 8), 0);
+            mem.write::<u16>(avail + 2, k as u16 + 1);
+            let head = q.pop(&mem).unwrap();
+            assert_eq!(q.chain(&mem, head, &mut bufs).is_ok(), expect, "buffer {addr:#x}+{blen:#x}, pool {gpa:#x}");
+            for b in &bufs {
+                assert!(inside(gpa, size, b.gpa, b.len as u64));
+            }
+            q.push(&mem, head, 0);
+            checked += 1;
+        }
+    }
+    checked
+}
+
+/// blk-mux (blkd) accepts a segment only inside the client's pool and
+/// translates it with one offset.
+fn pool_check(rng: &mut Rng, n: u64) -> u64 {
+    let mut accepted = 0;
+    for _ in 0..n {
+        let size = (1u64 << (20 + rng.below(9))).min(256 << 20);
+        let gpa = pool_gpa(rng, size);
+        let pool = host::blk::Pool { gpa, paddr: rng.below(1 << 40) << 12, size };
+        let a = guest_addr(rng, gpa, size);
+        let len = match rng.below(4) {
+            0 => rng.next() as u32 as u64,
+            1 => 0,
+            _ => rng.below(1 << 17),
+        };
+        let want = len > 0 && inside(gpa, size, a, len);
+        match pool.translate(a, len) {
+            Some(pa) => {
+                assert!(want, "blk-mux accepted {a:#x}+{len:#x} outside the pool at {gpa:#x}");
+                assert_eq!(pa, pool.paddr + (a - gpa));
+                accepted += 1;
+            }
+            None => assert!(!want, "blk-mux refused {a:#x}+{len:#x} inside the pool at {gpa:#x}"),
+        }
+    }
+    accepted
 }
 
 fn csum(data: &[u8]) -> u32 {
