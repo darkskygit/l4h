@@ -94,8 +94,17 @@ void l4h_idle_wait(void)
 	/* A signal sent between the check above and the wait leaves the
 	 * notification active, so the wait returns immediately: no lost
 	 * wakeups. */
+	unsigned long long t0 = l4h_rdtsc();
 	seL4_Wait(v->ntfn, &badge);
+	/* Published for the host's steal-time estimate (only we write it). */
+	__atomic_store_n(&v->evt->idle_ticks, v->evt->idle_ticks + (l4h_rdtsc() - t0), __ATOMIC_RELAXED);
 	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+}
+
+/* Steal time of vCPU `cpu` in ns, as published by the host. */
+unsigned long long l4h_steal_ns(int cpu)
+{
+	return __atomic_load_n(&l4h_vcpus[cpu].evt->steal_ns, __ATOMIC_RELAXED);
 }
 
 void l4h_send_ipi(int cpu, unsigned long reasons)

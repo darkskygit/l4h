@@ -198,6 +198,7 @@ void l4h_deliver_events(int timer, unsigned long ipi, unsigned long *events);
 /* ---- console, power, hypercalls */
 void l4h_console_write(const char *s, unsigned int n);
 void __attribute__((noreturn)) l4h_power(int how);
+unsigned long long l4h_steal_ns(int cpu);
 unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, int n_out);
 
 /* ---- SMP */

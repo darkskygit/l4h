@@ -84,7 +84,9 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
     let mut active = alloc::vec![0u64; cores];
     // (guest, vcpu, core, consumed, movable)
     let mut sample = Vec::new();
+    let tsc_mhz = (h.info.tsc_hz / 1_000_000).max(1);
     for g in h.guests.iter_mut().flatten() {
+        let event_pages: Vec<*mut l4h_abi::EventPage> = (0..g.vcpus.len()).map(|v| g.event_page(v)).collect();
         for (v, vcpu) in g.vcpus.iter_mut().enumerate() {
             let c = consumed(vcpu.sc_k) + consumed(vcpu.sc_u);
             if g.state != State::Running {
@@ -92,6 +94,20 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
             }
             vcpu.cooldown = vcpu.cooldown.saturating_sub(1);
             vcpu.usage = (c * 1000 / elapsed_us) as u32;
+            // Steal: time the vCPU existed minus what it ran minus what it
+            // spent idle (reported by the guest).
+            if vcpu.wall_ticks != 0 || c != 0 {
+                vcpu.wall_ticks += elapsed_us * tsc_mhz;
+                vcpu.run_ticks += c * tsc_mhz;
+                let idle = unsafe { core::ptr::addr_of!((*event_pages[v]).idle_ticks).read_volatile() };
+                let steal = vcpu.wall_ticks.saturating_sub(vcpu.run_ticks).saturating_sub(idle);
+                let ns = steal * 1000 / tsc_mhz;
+                if ns > vcpu.steal_ns {
+                    vcpu.steal_ns = ns;
+                    let page = event_pages[v];
+                    unsafe { core::ptr::addr_of_mut!((*page).steal_ns).write_volatile(ns) };
+                }
+            }
             load[vcpu.core] += c;
             if c * 100 >= elapsed_us * ACTIVE_PCT {
                 active[vcpu.core] += 1;

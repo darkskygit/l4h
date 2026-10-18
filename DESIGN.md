@@ -525,8 +525,19 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   - The interval is measured, not assumed: root work such as building a
     guest can delay a period.
 - **CPU caps** (`vm_set_sched`, `l4hctl sched`) set the budget of both SCs
-  to a percentage of the 5 ms period. Weights and steal-time reporting
-  are not implemented yet. `l4hctl top` shows each VM's CPU use over the
+  to a percentage of the 5 ms period. Weights are not implemented.
+  - seL4 refuses to bind an SC whose budget is exhausted to a blocked
+    thread. The guest therefore yields until the refill when it moves a
+    capped SC_U to another process.
+- **Steal time.**
+  - The guest accumulates its idle time in the event page (`idle_ticks`).
+  - Each balancer period, `l4h-root` computes, per vCPU,
+    `steal = wall − consumed − idle`, counting from the vCPU's first run.
+    It publishes the result monotonically as `steal_ns`.
+  - The guest returns it as Linux's paravirt steal clock
+    (`CONFIG_PARAVIRT_TIME_ACCOUNTING`), so it shows as `st` in /proc/stat
+    and top. A guest capped at 25% sees about 75% steal
+    (`tests/run-m6test.sh`). `l4hctl top` shows each VM's CPU use over the
   last period.
 - **Memory.** Free memory is a set of untouched power-of-two Untyped
   blocks, managed buddy-style without coalescing. An allocation splits

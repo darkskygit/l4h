@@ -170,8 +170,12 @@ static void bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u)
 		__atomic_compare_exchange_n(&o->sc_owner, &(struct l4h_uctx *){ u }, 0, 0,
 					    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 	}
-	err = seL4_TCB_SetSchedParams(u->tcb, v->ktcb, L4H_PRIO_USER, L4H_PRIO_USER, v->sc_u,
-				      u->fault_ep);
+	/* seL4 refuses to bind a scheduling context without budget available
+	 * (capped vCPUs exhaust SC_U) to a blocked thread, which u is: yield
+	 * until the budget is refilled, within one period. */
+	while ((err = seL4_TCB_SetSchedParams(u->tcb, v->ktcb, L4H_PRIO_USER, L4H_PRIO_USER,
+					      v->sc_u, u->fault_ep)) == seL4_IllegalOperation)
+		seL4_Yield();
 	l4h_BUG_ON(err);
 	u->sc_vcpu = v->id;
 	v->sc_owner = u;

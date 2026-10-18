@@ -123,3 +123,13 @@ endmenu
 
 config ARCH_SUSPEND_POSSIBLE
 	def_bool n
+
+config PARAVIRT
+	def_bool y
+	help
+	  Steal time reported by the l4h host.
+
+config PARAVIRT_TIME_ACCOUNTING
+	bool "Paravirtual steal time accounting"
+	default y
+	select PARAVIRT

@@ -8,6 +8,8 @@
  * TCB deadline timer (l4h extension E3), which signals the vCPU.
  */
 
+#include <linux/jump_label.h>
+#include <asm/paravirt.h>
 #include <linux/clockchips.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -111,6 +113,12 @@ void l4h_timer_setup_cpu(void)
 	clockevents_config_and_register(evt, l4h_tsc_hz, l4h_tsc_hz / 500000, ~0ul >> 1);
 }
 
+#ifdef CONFIG_PARAVIRT
+/* Steal time, from the event pages (see asm/paravirt.h). */
+struct static_key paravirt_steal_enabled;
+struct static_key paravirt_steal_rq_enabled;
+#endif
+
 void __init time_init(void)
 {
 	u64 hz = l4h_tsc_hz;
@@ -122,6 +130,11 @@ void __init time_init(void)
 	clocksource_register_hz(&l4h_tsc_clocksource, hz);
 	sched_clock_register(l4h_sched_clock, 64, NSEC_PER_SEC);
 	l4h_timer_setup_cpu();
+#ifdef CONFIG_PARAVIRT
+	static_key_slow_inc(&paravirt_steal_enabled);
+	if (IS_ENABLED(CONFIG_PARAVIRT_TIME_ACCOUNTING))
+		static_key_slow_inc(&paravirt_steal_rq_enabled);
+#endif
 	pr_info("l4h: TSC %llu.%03llu MHz, deadline timer clockevent\n",
 		hz / 1000000, (hz / 1000) % 1000);
 }

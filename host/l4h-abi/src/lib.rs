@@ -81,7 +81,8 @@ pub const NR_EVENTS: usize = 512;
 pub struct EventPage {
     pub pending: [u64; NR_EVENTS / 64],
     pub steal_ns: u64,
-    pub reserved: [u64; 503],
+    pub idle_ticks: u64,
+    pub reserved: [u64; 502],
 }
 
 pub const BOOTINFO_MAGIC: u64 = 0x3154_4f4f_4248_344c;

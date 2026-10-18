@@ -95,6 +95,11 @@ pub struct Vcpu {
     pub cooldown: u32,
     /// CPU used in the last balancer period, in permille of a core.
     pub usage: u32,
+    /// Steal-time bookkeeping (counter ticks): time since the vCPU first
+    /// ran, CPU it consumed; steal published so far (ns).
+    pub wall_ticks: u64,
+    pub run_ticks: u64,
+    pub steal_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +280,11 @@ impl Guest {
 
     pub fn console_page(&self) -> *mut abi::ConsolePage {
         (root_guest_va(self.id) + PAGE) as *mut abi::ConsolePage
+    }
+
+    /// Event page of vCPU `v`, as mapped in the root task.
+    pub fn event_page(&self, v: usize) -> *mut abi::EventPage {
+        (root_guest_va(self.id) + 0x2_0000 + v * PAGE) as *mut abi::EventPage
     }
 
     pub fn console_ring(&self) -> *const host::ConsoleRing {
@@ -612,7 +622,13 @@ pub fn create(
         g.give_badged(base + abi::VCPU_IPI, ntfn, CapRights::write_only(), abi::BADGE_IPI);
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0 });
+        g.vcpus.push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+    }
+
+    // ---- Event pages in the root task too (steal time).
+    for v in 0..g.vcpus.len() {
+        let ev = g.vcpus[v].event;
+        g.map_in_root(alloc, ev, root_guest_va(id) + 0x2_0000 + v * PAGE);
     }
 
     // ---- Boot info frames (written at boot).

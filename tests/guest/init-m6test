@@ -24,8 +24,13 @@ before=$(cpu hog)
 echo "M6TEST: uncapped: ${before}%"
 [ "$before" -ge 80 ] || fail "busy guest uses only ${before}%"
 l4hctl sched "$id" 25 || fail "sched"
+steal() { l4hctl send "$id" --wait "DENSVM: stat" stat >/dev/null; l4hctl console "$id" | grep "DENSVM: stat" | tail -1 | awk '{ print $11 }'; }
+s0=$(steal)
 sleep 2
 after=$(cpu hog)
+s1=$(steal)
+echo "M6TEST: guest steal ticks while capped: $((s1 - s0)) in 2 s"
+[ $((s1 - s0)) -ge 80 ] || fail "steal time not reported ($s0 -> $s1)"
 echo "M6TEST: capped at 25%: ${after}%"
 [ "$after" -ge 15 ] && [ "$after" -le 35 ] || fail "cap not applied (${after}%)"
 l4hctl sched "$id" 0

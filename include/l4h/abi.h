@@ -143,8 +143,12 @@ typedef int64_t l4h_s64;
 #define L4H_NR_EVENTS           512
 struct l4h_event_page {
 	l4h_u64 pending[L4H_NR_EVENTS / 64];
-	l4h_u64 steal_ns;      /* written by the host balancer */
-	l4h_u64 reserved[503];
+	l4h_u64 steal_ns;      /* written by the host: time the vCPU was runnable
+	                        * but not running, cumulative, monotonic */
+	l4h_u64 idle_ticks;    /* written by the guest: time the vCPU blocked
+	                        * idle, in time-counter ticks, cumulative (the
+	                        * host derives steal_ns from it) */
+	l4h_u64 reserved[502];
 };
 
 /* ------------------------------------------------------------------------
