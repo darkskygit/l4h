@@ -1,0 +1,128 @@
+//! A minimal monitor on the serial console (COM1, the GCE serial port),
+//! for when dom0 is not usable (DESIGN.md §9.1): list, destroy,
+//! restart-dom0.  The kernel keeps printing to the same port; we only take
+//! its receive side.
+
+use alloc::string::String;
+
+use sel4::cap_type;
+
+use crate::Host;
+use crate::mem::Alloc;
+
+/// Badge of the monitor's interrupt on the root task's bound notification.
+pub const MONITOR_BADGE: u64 = 1 << 41;
+
+const COM1: u16 = 0x3f8;
+const IRQ_COM1: u64 = 4;
+/// seL4 user IRQ vector for COM1 (MSIs use the low ones).
+const VECTOR: u64 = 40;
+
+pub struct Monitor {
+    port: u64,
+    irq: sel4::cap::IrqHandler,
+    line: String,
+}
+
+impl Monitor {
+    #[cfg(target_arch = "x86_64")]
+    pub fn new(alloc: &mut Alloc, ntfn: sel4::cap::Notification) -> Option<Self> {
+        use sel4::init_thread::slot;
+        let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
+        let port = alloc.slots.alloc();
+        slot::IO_PORT_CONTROL.cap().ioport_control_issue(COM1 as u64, COM1 as u64 + 7, &abs(port)).ok()?;
+        let irq_slot = alloc.slots.alloc();
+        slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, IRQ_COM1, 0, 0, VECTOR, &abs(irq_slot)).ok()?;
+        let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
+        let badged = alloc.slots.alloc();
+        abs(badged)
+            .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), MONITOR_BADGE)
+            .ok()?;
+        irq.irq_handler_set_notification(sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap()).ok()?;
+        let m = Monitor { port: port as u64, irq, line: String::new() };
+        // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
+        m.out(1, 0x01);
+        m.out(4, m.inb(4) | 0x08);
+        sel4::debug_println!("l4h-root: serial monitor on COM1 (type 'help')");
+        Some(m)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn new(_alloc: &mut Alloc, _ntfn: sel4::cap::Notification) -> Option<Self> {
+        let _ = (COM1, IRQ_COM1, VECTOR);
+        None
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn inb(&self, off: u16) -> u8 {
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_In8(self.port, COM1 + off).result as u8)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn out(&self, off: u16, v: u8) {
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(self.port, (COM1 + off) as u64, v as u64));
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn inb(&self, _off: u16) -> u8 {
+        0
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn out(&self, _off: u16, _v: u8) {}
+
+    /// The UART interrupted: collect input, run complete lines.
+    pub fn interrupt(h: &mut Host) {
+        let Some(mut m) = h.monitor.take() else { return };
+        while m.inb(5) & 1 != 0 {
+            let c = m.inb(0);
+            match c {
+                b'\r' | b'\n' => {
+                    let line = core::mem::take(&mut m.line);
+                    if !line.trim().is_empty() {
+                        run(h, line.trim());
+                    }
+                }
+                0x08 | 0x7f => {
+                    m.line.pop();
+                }
+                c if (0x20..0x7f).contains(&c) && m.line.len() < 80 => m.line.push(c as char),
+                _ => {}
+            }
+        }
+        let _ = m.irq.irq_handler_ack();
+        h.monitor = Some(m);
+    }
+}
+
+fn run(h: &mut Host, line: &str) {
+    let mut words = line.split_whitespace();
+    let cmd = words.next().unwrap_or("");
+    match cmd {
+        "help" => sel4::debug_println!("monitor: help | list | info | destroy <vm> | restart-dom0"),
+        "list" => {
+            for g in h.guests.iter().flatten() {
+                sel4::debug_println!(
+                    "monitor: vm {} '{}': {:?}, {} vCPU(s), {} MiB{}",
+                    g.id, g.name, g.state, g.vcpus.len(), g.ram_size() >> 20,
+                    if g.dom0 { ", dom0" } else { "" }
+                );
+            }
+        }
+        "info" => sel4::debug_println!(
+            "monitor: {} cores, {} MiB free of {} MiB, {} disk(s), {} NIC(s)",
+            h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.disks.len(), h.netd.nics.len()
+        ),
+        "destroy" => match words.next().and_then(|w| w.parse::<usize>().ok()) {
+            Some(id) if h.guest(id).is_some_and(|g| !g.dom0) => {
+                let _ = h.destroy_guest(id);
+            }
+            _ => sel4::debug_println!("monitor: destroy <vm> (not dom0; use restart-dom0)"),
+        },
+        "restart-dom0" => match h.guests.iter().flatten().find(|g| g.dom0).map(|g| g.id) {
+            Some(id) => crate::restart_dom0(h, id),
+            None => crate::boot_dom0(h),
+        },
+        _ => sel4::debug_println!("monitor: unknown command '{}' (try 'help')", cmd),
+    }
+}

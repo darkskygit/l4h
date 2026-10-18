@@ -14,6 +14,7 @@ mod devmem;
 mod elf;
 mod guest;
 mod mem;
+mod monitor;
 mod netd;
 mod pci;
 mod sched;
@@ -172,6 +173,7 @@ pub struct Host {
     pub netd: netd::Netd,
     pub guests: Vec<Option<Guest>>,
     pub total_bytes: usize,
+    pub monitor: Option<monitor::Monitor>,
 }
 
 impl Host {
@@ -370,7 +372,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         netd,
         guests: Vec::new(),
         total_bytes,
+        monitor: None,
     };
+    h.monitor = monitor::Monitor::new(&mut h.alloc, wd_ntfn);
 
     if DOM0_KERNEL.is_empty() {
         sel4::debug_println!("l4h-root: no dom0 kernel embedded, nothing to do");
@@ -380,7 +384,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     serve(&mut h, reply)
 }
 
-fn boot_dom0(h: &mut Host) {
+pub fn boot_dom0(h: &mut Host) {
     let ram_base = elf::Elf::parse(DOM0_KERNEL).expect("dom0 kernel").bounds().0 as usize;
     let cfg = GuestConfig {
         name: "dom0",
@@ -417,7 +421,7 @@ fn boot_dom0(h: &mut Host) {
 
 /// dom0 rebooted or crashed: replace it.  Other guests keep running; the
 /// new dom0 finds them with the control API.
-fn restart_dom0(h: &mut Host, id: usize) {
+pub fn restart_dom0(h: &mut Host, id: usize) {
     sel4::debug_println!("l4h-root: restarting dom0");
     let _ = h.destroy_guest(id);
     boot_dom0(h);
@@ -468,7 +472,13 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let resp = if badge & TIMER_BADGE != 0 {
+        let notified = badge & (TIMER_BADGE | monitor::MONITOR_BADGE) != 0;
+        if badge & monitor::MONITOR_BADGE != 0 {
+            monitor::Monitor::interrupt(h);
+        }
+        let resp = if badge & monitor::MONITOR_BADGE != 0 && badge & TIMER_BADGE == 0 {
+            None
+        } else if badge & TIMER_BADGE != 0 {
             let now = rdtsc();
             sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
             last_balance = now;
@@ -503,7 +513,7 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             None => {
                 // A reply object left unanswered (a faulted or stopped
                 // thread) stays bound to its caller: use a fresh one.
-                if badge & TIMER_BADGE == 0 {
+                if !notified {
                     reply = h.alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
                 }
                 (info, badge) = hyp_ep.recv(reply);
