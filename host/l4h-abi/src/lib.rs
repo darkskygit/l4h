@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 2;
+pub const ABI_VERSION: u64 = 3;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -24,8 +24,6 @@ pub const ROOT_DEPTH: usize = ROOT_GUARD_BITS + ROOT_CNODE_BITS;
 pub const SLOT_VSPACE: usize = 2;
 pub const SLOT_HYP_EP: usize = 3;
 
-pub const SLOT_UNTYPED_BASE: usize = 16;
-pub const MAX_UNTYPED: usize = 48;
 
 pub const SLOT_VCPU_BASE: usize = 64;
 pub const VCPU_STRIDE: usize = 8;
@@ -41,9 +39,13 @@ pub const VCPU_IPI: usize = 5;
 pub const VCPU_IPCBUF: usize = 6;
 pub const VCPU_EVENT: usize = 7;
 
-pub const SLOT_RAM_CNODE_BASE: usize = 576;
-pub const MAX_RAM_CNODES: usize = 64;
-pub const RAM_CNODE_FRAMES: usize = 1 << L2_INDEX_BITS;
+pub const BLOCK_SHIFT: usize = 21;
+pub const BLOCK_SIZE: usize = 1 << BLOCK_SHIFT;
+pub const RAM_L2_BITS: usize = 9;
+pub const SLOT_RAM_L1_BASE: usize = 576;
+pub const MAX_RAM_L1: usize = 64;
+pub const MAX_BLOCKS: usize = MAX_RAM_L1 << RAM_L2_BITS;
+pub const SLOT_BLOCKS: usize = 642;
 
 pub const SLOT_VSPACE_POOL: usize = 640;
 pub const SLOT_DEV_CNODE: usize = 641;
@@ -108,11 +110,6 @@ pub struct DevDesc {
     pub data_size: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct UntypedDesc {
-    pub size_bits: u64,
-}
 
 #[repr(C)]
 pub struct BootInfo {
@@ -126,14 +123,14 @@ pub struct BootInfo {
     pub initrd_size: u64,
     pub nr_vcpus: u64,
     pub tsc_hz: u64,
-    pub nr_untyped: u64,
+    pub nr_blocks: u64,
     pub nr_vspaces: u64,
     pub nr_devices: u64,
     pub flags: u64,
     pub io_pool_gpa: u64,
     pub io_pool_size: u64,
-    pub reserved: [u64; 16],
-    pub untyped: [UntypedDesc; MAX_UNTYPED],
+    pub boot_blocks: u64,
+    pub reserved: [u64; 15],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
 }
@@ -283,7 +280,8 @@ const _: () = assert!(core::mem::size_of::<EventPage>() == 4096);
 const _: () = assert!(core::mem::size_of::<DevDesc>() == 48);
 const _: () = assert!(
     core::mem::size_of::<BootInfo>()
-        == 32 * 8 + MAX_UNTYPED * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE
+        == 32 * 8 + MAX_DEVICES * 48 + CMDLINE_SIZE
+
 );
 const _: () = assert!(core::mem::size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() == 88 + 16 * 40);

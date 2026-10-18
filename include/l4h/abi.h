@@ -27,7 +27,7 @@ typedef uint64_t l4h_u64;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 2
+#define L4H_ABI_VERSION 3
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -66,8 +66,6 @@ typedef int64_t l4h_s64;
 #define L4H_SLOT_HYP_EP         3   /* Call: hypercalls served by l4h-vmm */
 #define L4H_SLOT_ASID_POOL      4   /* reserved */
 
-#define L4H_SLOT_UNTYPED_BASE   16  /* Untyped quota, bootinfo.nr_untyped caps */
-#define L4H_MAX_UNTYPED         48
 
 /* Per-vCPU objects: root slots L4H_SLOT_VCPU(v) + L4H_VCPU_* */
 #define L4H_SLOT_VCPU_BASE      64
@@ -82,14 +80,32 @@ typedef int64_t l4h_s64;
 #define L4H_VCPU_IPCBUF         6   /* frame: kTCB IPC buffer (+FPU scratch) */
 #define L4H_VCPU_EVENT          7   /* frame: event page */
 
-/* Guest RAM: root slot L4H_SLOT_RAM_CNODE(n) is a radix-18 CNode holding
- * the 4 KiB frame caps for GPA [n GiB, n+1 GiB). */
-#define L4H_SLOT_RAM_CNODE_BASE 576
-#define L4H_MAX_RAM_CNODES      64
-#define L4H_RAM_CNODE_FRAMES    (1u << L4H_L2_INDEX_BITS)
+/* Guest RAM is a list of 2 MiB blocks; block b covers GPA
+ * [b * L4H_BLOCK_SIZE, (b + 1) * L4H_BLOCK_SIZE).  See DESIGN.md §15.2.
+ *
+ * Boot blocks, [0, bootinfo.boot_blocks), hold the kernel image and initrd:
+ * the host retyped them into frames and mapped them in the direct map, and
+ * the guest has no Untyped for them.  For every other block, slot b of the
+ * block CNode (root slot L4H_SLOT_BLOCKS) holds a copy of its 2 MiB Untyped:
+ * the guest retypes it into frames or into seL4 objects, as it likes.
+ *
+ * Frames are named through two levels of RAM CNodes.  Root slot
+ * L4H_SLOT_RAM_L1_BASE + n is a level-1 CNode (radix 9, no guard) for GPA
+ * [n GiB, n+1 GiB); its slot j holds the level-2 CNode (radix 9) of block
+ * 512 n + j, whose slot k holds the frame of the block's page k.  The host
+ * fills the level-1 slots of boot blocks; the guest retypes level-2 CNodes
+ * into the others. */
+#define L4H_BLOCK_SHIFT         21
+#define L4H_BLOCK_SIZE          (1ull << L4H_BLOCK_SHIFT)
+#define L4H_RAM_L2_BITS         9   /* frames of a block: 2^9 */
+#define L4H_SLOT_RAM_L1_BASE    576
+#define L4H_MAX_RAM_L1          64
+#define L4H_MAX_BLOCKS          (L4H_MAX_RAM_L1 << L4H_RAM_L2_BITS)
 #define L4H_FRAME_CPTR(gpa)                                             \
-	L4H_CPTR2(L4H_SLOT_RAM_CNODE_BASE + ((gpa) >> 30),                  \
-		  ((gpa) >> 12) & (L4H_RAM_CNODE_FRAMES - 1))
+	L4H_CPTR2(L4H_SLOT_RAM_L1_BASE + ((gpa) >> 30),                     \
+		  ((gpa) >> 12) & ((1u << L4H_L2_INDEX_BITS) - 1))
+#define L4H_SLOT_BLOCKS         642
+#define L4H_BLOCK_CPTR(b)       L4H_CPTR2(L4H_SLOT_BLOCKS, b)
 
 /* A CNode with bootinfo.nr_vspaces pre-assigned (ASID-bearing) VSpace
  * roots that the guest uses for its processes. */
@@ -182,9 +198,6 @@ struct l4h_dev_desc {
 	l4h_u64 data_size;
 };
 
-struct l4h_untyped_desc {
-	l4h_u64 size_bits;
-};
 
 struct l4h_bootinfo {
 	l4h_u64 magic;
@@ -197,7 +210,7 @@ struct l4h_bootinfo {
 	l4h_u64 initrd_size;
 	l4h_u64 nr_vcpus;
 	l4h_u64 tsc_hz;
-	l4h_u64 nr_untyped;
+	l4h_u64 nr_blocks;        /* RAM blocks: ram_size / L4H_BLOCK_SIZE */
 	l4h_u64 nr_vspaces;
 	l4h_u64 nr_devices;
 	l4h_u64 flags;            /* L4H_BOOT_* */
@@ -208,8 +221,8 @@ struct l4h_bootinfo {
 	 * the DMA API only (restricted DMA, swiotlb). */
 	l4h_u64 io_pool_gpa;
 	l4h_u64 io_pool_size;
-	l4h_u64 reserved[16];
-	struct l4h_untyped_desc untyped[L4H_MAX_UNTYPED];
+	l4h_u64 boot_blocks;      /* blocks [0, boot_blocks) are host frames */
+	l4h_u64 reserved[15];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
 };
@@ -316,9 +329,11 @@ struct l4h_ctl_resp {
 enum l4h_ctl_op {
 	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs */
 	L4H_CTL_HOST_INFO = 1,
-	/* args: ram bytes, vcpus, ram_base_va, seL4 object quota bytes (0 =
-	 * default), I/O pool bytes (0 = default, else a power of two from
+	/* args: ram bytes (rounded up to 2 MiB), vcpus, ram_base_va, -
+	 * (ignored: there is no object quota any more, objects come from
+	 * guest RAM), I/O pool bytes (0 = default, else a power of two from
 	 * 1 MiB to 256 MiB); data: name -> vals[0] = vm */
+
 	L4H_CTL_VM_CREATE = 2,
 	/* args: vm, dst gpa, src offset in the control data area, len
 	 * (<= L4H_CTL_LOAD_MAX) */

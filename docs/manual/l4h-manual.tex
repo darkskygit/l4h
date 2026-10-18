@@ -506,7 +506,7 @@ nic 0: pci 00:05.0 virtio-net, uplink of switch 0
 
 \begin{lstlisting}
 l4hctl create NAME --kernel FILE [--initrd FILE] [--mem MB] [--vcpus N]
-       [--cmdline STRING] [--quota MB] [--io-pool MB]
+       [--cmdline STRING] [--io-pool MB]
        [--disk DISK[,ro][,start=SECTOR][,sectors=N]]...
        [--nic SWITCH[,mac=MAC][,nolock]]...
 \end{lstlisting}
@@ -524,17 +524,16 @@ fails, it destroys the half-built VM.
     the guest's memory.
   \item[\texttt{--initrd FILE}] An initramfs, loaded 1 MiB above the
     kernel.
-  \item[\texttt{--mem MB}] RAM, default 128 MiB. The minimum is 8 MiB; the
-    maximum is 64 GiB.
+  \item[\texttt{--mem MB}] RAM, default 128 MiB, rounded up to whole 2~MiB
+    blocks. The minimum is 8 MiB; the maximum is 64 GiB. The guest kernel
+    also makes its page tables and other seL4 objects out of this RAM
+    (Section~\ref{sec:memory}).
   \item[\texttt{--vcpus N}] vCPUs, default 1, at most four times the host's
     cores.
   \item[\texttt{--cmdline STRING}] The kernel command line, default
     \texttt{console=hvc0}. If you replace it, keep \texttt{console=hvc0} so
     that the console works.
-  \item[\texttt{--quota MB}] Memory for the guest kernel's seL4 objects:
-    page tables and mapping slots of its processes. The default is
-    16~MiB plus 1/16 of RAM, which suits normal workloads. Raise it for
-    guests that map very large amounts of memory in many processes.
+
   \item[\texttt{--io-pool MB}] The guest's I/O pool, through which all its
     disk and network I/O is copied: a power of two from 1 to 256~MiB,
     default 4~MiB. It is host memory, charged to the guest. A larger pool
@@ -817,12 +816,22 @@ router. On GCE, give the router's uplink vNIC the instance's MAC address with
 \label{ch:cpu}
 
 \section{Memory accounting}
+\label{sec:memory}
 
 Guest RAM is reserved in full when the VM is created, and returned in full
-when it is destroyed. Besides its RAM, a guest uses its seL4 object quota
-(\texttt{--quota}), its I/O pool (\texttt{--io-pool}, 4~MiB by default)
-and about 30~MiB of host objects, its VMM included. A 256~MiB guest
-therefore costs about 320~MiB. \cmd{l4hctl info} shows free memory.
+when it is destroyed. It comes in 2~MiB blocks from anywhere in the host's
+memory, so a fragmented host can still run large guests. Besides its RAM,
+a guest uses its I/O pool (\texttt{--io-pool}, 4~MiB by default) and about
+6~MiB of host objects (its VMM, CNodes, vCPUs and boot info): 10~MiB in
+all with the default pool, whatever the size of its RAM. A 256~MiB guest
+therefore costs 266~MiB. \cmd{l4hctl info} shows free memory.
+
+The guest kernel makes the seL4 objects it needs, such as its processes'
+page tables, capability slots and threads, out of its own RAM: a guest
+with many processes has less free memory, as on native Linux, but never
+costs the host more. In the guest, \file{/proc/meminfo} shows them as
+\texttt{L4hObjects}.
+
 
 \texttt{l4h-root} checks every request against the memory and other kernel
 resources it would need, and refuses it with \texttt{out of memory} instead
@@ -1080,7 +1089,7 @@ Host cores & 64 \\
 Host disks & 64 \\
 Guests per host, including dom0 & about 61 (64 ids) \\
 vCPUs per guest & $4\times$ host cores, at most 64 \\
-RAM per guest (in at most 128 contiguous chunks) & 8 MiB to 64 GiB \\
+RAM per guest (2 MiB blocks, from anywhere) & 8 MiB to 64 GiB \\
 Devices per guest (console, disks, vNICs) & 16 \\
 Host NICs & 4 \\
 Switch ports, all switches together & 48 \\
@@ -1113,8 +1122,10 @@ Op & Name & Arguments & Results \\
 \endhead
 1 & \texttt{HOST\_INFO} & -- & cores, free bytes, total bytes, disks, VMs,
   NICs \\
-2 & \texttt{VM\_CREATE} & RAM bytes, vCPUs, guest RAM base, quota bytes,
-  I/O pool bytes (0: 4 MiB); name in data & VM id \\
+2 & \texttt{VM\_CREATE} & RAM bytes, vCPUs, guest RAM base, -- (ignored;
+  formerly an object quota), I/O pool bytes (0: 4 MiB); name in data & VM
+  id \\
+
 3 & \texttt{VM\_LOAD} & VM, guest-physical address; bytes in the buffer
   (at most 1 MiB), which the driver stages in the control device's
   host-owned data area & -- \\

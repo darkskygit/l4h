@@ -2,9 +2,16 @@
 //! boot info, following `include/l4h/abi.h`.
 //!
 //! A guest is created empty (`create`), gets devices attached and its
-//! image loaded (`write_ram`, `copy_ram`), and is then booted
+//! image loaded (`write_ram`, `load_ram`), and is then booted
 //! (`write_boot_info`, `start`).  All its objects come from its arena, so
 //! `destroy` reclaims everything by revoking the arena.
+//!
+//! Guest RAM is a list of 2 MiB blocks, each its own Untyped from any free
+//! 2 MiB of host memory (DESIGN.md §15.2).  l4h-root keeps the original
+//! Untyped of every block; the guest gets a copy of those it may retype
+//! (all but the boot blocks, which l4h-root fills with frames for the
+//! image).  Revoking the originals at destroy deletes whatever the guest
+//! made of them.
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -19,18 +26,21 @@ use l4h_host as host;
 
 use crate::component::Component;
 use crate::elf::Elf;
-use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
+use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot, UtPool, UtRegion};
 use crate::vmm;
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
 
 const PAGE: usize = 4096;
-const GIB: usize = 1 << 30;
+/// A block of guest RAM, and its frames.
+pub const BLOCK: usize = abi::BLOCK_SIZE;
+const BLOCK_FRAMES: usize = BLOCK / PAGE;
+/// Blocks of host frames after the image: the guest kernel's memory until
+/// it has mapped the rest of its RAM.
+pub const BOOT_SLACK: usize = 1;
 /// Devices a guest can have (console, control, virtio).
 pub const MAX_GUEST_DEVICES: usize = 16;
-/// Physically contiguous pieces guest RAM may consist of.
-const MAX_RAM_CHUNKS: usize = 128;
 
 /// Badge layout of the root fault endpoint for guest kernels.
 pub const HYP_BADGE_FAULT: u64 = 1 << 24;
@@ -64,9 +74,9 @@ const IO_POOL_ALIGN: usize = 2 << 20;
 
 pub struct GuestConfig<'a> {
     pub name: &'a str,
+    /// Bytes of RAM, rounded up to whole blocks.
     pub ram: usize,
     pub vcpus: usize,
-    pub untyped_quota: usize,
     /// Bytes of I/O pool (a power of two, IO_POOL_MIN..=IO_POOL_MAX).
     pub io_pool: usize,
     pub vspaces: usize,
@@ -92,12 +102,14 @@ pub fn dev_event(d: usize) -> u32 {
     16 + d as u32
 }
 
-/// A physically contiguous range of guest RAM.
-#[derive(Clone, Copy, Debug)]
-pub struct RamChunk {
-    pub gpa: usize,
+/// A 2 MiB block of guest RAM.
+pub struct Block {
+    /// Root slot of the original Untyped.
+    ut: Slot,
     pub paddr: usize,
-    pub size: usize,
+    /// A block l4h-root filled with frames (a boot block): its level-2 RAM
+    /// CNode.
+    frames: Option<cap::CNode>,
 }
 
 /// The guest's I/O pool: host-owned, physically contiguous memory above
@@ -160,9 +172,13 @@ pub struct Guest {
     pub cnode: cap::CNode,
     pub vspace: cap::VSpace,
     pub ram_base: usize,
-    pub ram: Vec<RamChunk>,
-    /// RAM CNodes and their radix (bits of frame index they resolve).
-    pub ram_cnodes: Vec<(cap::CNode, usize)>,
+    pub blocks: Vec<Block>,
+    /// Level-1 RAM CNodes, one per GiB of guest-physical space.
+    ram_l1: Vec<cap::CNode>,
+    /// The guest's copies of the blocks' Untypeds.
+    block_cn: (cap::CNode, usize),
+    /// Blocks [0, boot_blocks) are host frames; set at boot.
+    pub boot_blocks: usize,
     pub pool: IoPool,
     /// dom0: the control device's data area (VM_LOAD source), mapped in
     /// the root task at root_ctl_data_va(id).
@@ -170,7 +186,6 @@ pub struct Guest {
     pub vcpus: Vec<Vcpu>,
     pub state: State,
     pub dom0: bool,
-    untyped: Vec<usize>,
     vspaces: usize,
     bootinfo: Vec<cap::Granule>,
     entry: u64,
@@ -202,19 +217,14 @@ pub(crate) fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
 }
 
-/// Radix of the RAM CNode covering GiB `n` of a guest with `ram` bytes.
-fn ram_cnode_radix(ram: usize, n: usize) -> usize {
-    let frames = (ram - n * GIB).min(GIB) / PAGE;
-    (frames.next_power_of_two().trailing_zeros() as usize).max(1)
-}
 
 impl Guest {
     pub fn ctx<'a>(&'a mut self, alloc: &'a mut Alloc) -> ObjCtx<'a> {
-        ObjCtx { slots: &mut alloc.slots, pool: &mut self.arena.pool }
+        ObjCtx::arena(alloc, &mut self.arena)
     }
 
     pub fn ram_size(&self) -> usize {
-        self.ram.iter().map(|c| c.size).sum()
+        self.blocks.len() * BLOCK
     }
 
     /// Destination for a capability in the guest's root CNode.
@@ -234,43 +244,75 @@ impl Guest {
             .unwrap_or_else(|e| panic!("guest slot {} mint failed: {:?}", idx, e));
     }
 
-    /// The frame capability backing guest-physical address `gpa`.
+    /// The frame capability backing guest-physical address `gpa`, which
+    /// must be in a block l4h-root filled with frames.
     pub fn ram_frame(&self, gpa: usize) -> sel4::AbsoluteCPtr {
-        let (cn, radix) = self.ram_cnodes[gpa / GIB];
-        cn.absolute_cptr_from_bits_with_depth(((gpa / PAGE) % abi::RAM_CNODE_FRAMES) as u64, radix)
+        let cn = self.blocks[gpa / BLOCK].frames.expect("guest RAM block without host frames");
+        cn.absolute_cptr_from_bits_with_depth(((gpa % BLOCK) / PAGE) as u64, abi::RAM_L2_BITS)
     }
 
     pub fn valid_gpa(&self, gpa: usize, len: usize) -> bool {
         gpa.checked_add(len).is_some_and(|end| end <= self.ram_size())
     }
 
-    /// Copy `data` into guest RAM at `gpa`.
-    pub fn write_ram(&self, win: &mut Window, gpa: usize, data: &[u8]) {
-        assert!(self.valid_gpa(gpa, data.len()));
-        let mut off = 0;
-        while off < data.len() {
-            let page = (gpa + off) & !(PAGE - 1);
-            let in_page = (gpa + off) - page;
-            let n = (PAGE - in_page).min(data.len() - off);
-            win.with_frame(&self.ram_frame(page), |p| unsafe {
-                ptr::copy_nonoverlapping(data[off..].as_ptr(), p.add(in_page), n);
-            });
-            off += n;
+    /// Fill block `b` with frames: a level-2 RAM CNode (which the guest
+    /// finds in its level-1 CNode) holding 512 frames retyped from the
+    /// block's Untyped, mapped in the direct map.  The block becomes a
+    /// boot block: the guest gets no Untyped for it.
+    fn block_frames(&mut self, alloc: &mut Alloc, b: usize) {
+        if self.blocks[b].frames.is_some() {
+            return;
         }
+        let l2 = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
+        self.ram_l1[b >> abi::RAM_L2_BITS]
+            .absolute_cptr_from_bits_with_depth((b & ((1 << abi::RAM_L2_BITS) - 1)) as u64, abi::RAM_L2_BITS)
+            .copy(&abs(l2), CapRights::all())
+            .expect("level-2 RAM CNode");
+        let Block { ut, paddr, .. } = self.blocks[b];
+        let region = UtRegion::fresh(root_cap::<cap_type::Untyped>(ut), paddr, abi::BLOCK_SHIFT);
+        UtPool { regions: ::alloc::vec![region] }
+            .retype(&FRAME_BP, BLOCK_FRAMES, Dest { cnode: abs(l2), offset: 0 })
+            .expect("RAM frames");
+        self.blocks[b].frames = Some(l2);
+        // The direct map uses the original frame caps; the guest maps
+        // copies elsewhere.
+        let tmp = alloc.slots.alloc();
+        for i in 0..BLOCK_FRAMES {
+            let gpa = b * BLOCK + i * PAGE;
+            abs(root_cap::<cap_type::Null>(tmp)).move_(&self.ram_frame(gpa)).expect("move frame");
+            let frame = root_cap::<cap_type::Granule>(tmp);
+            let (vspace, va) = (self.vspace, self.ram_base + gpa);
+            map_frame(&mut self.ctx(alloc), vspace, frame, va, CapRights::read_write(), VmAttributes::DEFAULT);
+            self.ram_frame(gpa).move_(&abs(frame)).expect("move frame back");
+        }
+        alloc.slots.free(tmp);
     }
 
-    /// Copy `len` bytes at offset `src_off` of the control data area of
-    /// `src` (dom0) to our RAM at `gpa`.  The data area belongs to the
-    /// host: l4h-root never reads a guest's RAM.
-    pub fn load_from_ctl(&self, win: &mut Window, gpa: usize, src: &Guest, src_off: usize, len: usize) -> bool {
-        if !self.valid_gpa(gpa, len) || !src.ctl_data {
+    /// Make guest RAM [gpa, gpa + len) host frames, to load an image into
+    /// it before the guest runs.
+    fn prepare_ram(&mut self, alloc: &mut Alloc, gpa: usize, len: usize) -> bool {
+        if !self.valid_gpa(gpa, len) || self.state != State::Created || self.boot_blocks != 0 {
             return false;
         }
-        if src_off.checked_add(len).is_none_or(|end| end > abi::CTL_LOAD_MAX as usize) {
+        if len != 0 {
+            for b in gpa / BLOCK..=(gpa + len - 1) / BLOCK {
+                self.block_frames(alloc, b);
+            }
+        }
+        true
+    }
+
+    /// Copy `data` into guest RAM at `gpa` (before boot).
+    pub fn write_ram(&mut self, alloc: &mut Alloc, win: &mut Window, gpa: usize, data: &[u8]) -> bool {
+        self.load_ram(alloc, win, gpa, data.as_ptr(), data.len())
+    }
+
+    /// Copy `len` bytes from `from` (memory of the root task) into guest
+    /// RAM at `gpa` (before boot).
+    pub fn load_ram(&mut self, alloc: &mut Alloc, win: &mut Window, gpa: usize, from: *const u8, len: usize) -> bool {
+        if !self.prepare_ram(alloc, gpa, len) {
             return false;
         }
-        // dom0 may change the bytes meanwhile: it only corrupts its image.
-        let from = (root_ctl_data_va(src.id) + src_off) as *const u8;
         let mut off = 0;
         while off < len {
             let d = gpa + off;
@@ -284,6 +326,12 @@ impl Guest {
         true
     }
 
+    /// dom0's control data area (VM_LOAD source) as mapped in the root
+    /// task.  It belongs to the host: l4h-root never reads a guest's RAM.
+    pub fn ctl_data(&self) -> Option<*const u8> {
+        self.ctl_data.then(|| root_ctl_data_va(self.id) as *const u8)
+    }
+
     /// Add a device: a shared page mapped in the guest at its device area
     /// and a kick capability (badged notification of l4h-vmm).
     pub fn add_device(&mut self, alloc: &mut Alloc, kind: DevKind) -> Option<usize> {
@@ -291,11 +339,11 @@ impl Guest {
         if d >= MAX_GUEST_DEVICES || self.state != State::Created {
             return None;
         }
-        let page = self.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+        let page = self.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let (vspace, ntfn) = (self.vspace, self.vmm_ntfn);
         let mut ctx = self.ctx(alloc);
         // The guest maps a copy; the original is kept for l4h-vmm.
-        let copy = ctx.slots.alloc();
+        let copy = ctx.alloc.slots.alloc();
         abs(root_cap::<cap_type::Null>(copy)).copy(&abs(page), CapRights::all()).expect("device page copy");
         map_frame(&mut ctx, vspace, root_cap::<cap_type::Granule>(copy), abi::dev_area_va(d) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
         self.dev_cn
@@ -315,7 +363,7 @@ impl Guest {
             // The data area for VM_LOAD: host frames that both dom0 and
             // l4h-root map.
             for i in 0..abi::CTL_LOAD_MAX as usize / PAGE {
-                let f = self.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+                let f = self.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
                 let copy = alloc.slots.alloc();
                 abs(root_cap::<cap_type::Null>(copy)).copy(&abs(f), CapRights::all()).expect("ctl data copy");
                 let vspace = self.vspace;
@@ -334,9 +382,8 @@ impl Guest {
     fn map_in_root(&mut self, alloc: &mut Alloc, frame: cap::Granule, va: usize) {
         let copy = alloc.slots.alloc();
         abs(root_cap::<cap_type::Null>(copy)).copy(&abs(frame), CapRights::all()).expect("root map copy");
-        let Alloc { slots, pool, .. } = alloc;
-        slots.global(|slots| {
-            map_frame(&mut ObjCtx { slots, pool }, slot::VSPACE.cap(), root_cap::<cap_type::Granule>(copy), va, CapRights::read_write(), VmAttributes::DEFAULT);
+        alloc.global(|alloc| {
+            map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), root_cap::<cap_type::Granule>(copy), va, CapRights::read_write(), VmAttributes::DEFAULT);
         });
     }
 
@@ -372,9 +419,12 @@ impl Guest {
         (root_guest_va(self.id) + 0x1_0000) as *const host::ConsoleRing
     }
 
-    /// Write the boot info.  Validates the boot parameters.
+    /// Write the boot info and give the guest its RAM: the boot blocks
+    /// (image, initrd and BOOT_SLACK more) as host frames, the others as
+    /// Untyped copies.  Validates the boot parameters.
     pub fn write_boot_info(
         &mut self,
+        alloc: &mut Alloc,
         win: &mut Window,
         host_info: &HostInfo,
         entry: u64,
@@ -387,6 +437,32 @@ impl Guest {
         if kernel_end > ram || kernel_end % PAGE != 0 || entry_gpa >= kernel_end || !self.valid_gpa(initrd.0, initrd.1) {
             return false;
         }
+        if self.boot_blocks != 0 {
+            return false;
+        }
+        // Boot blocks: a prefix of RAM up to the image (and anything else
+        // loaded), plus slack.  The guest needs at least one block of its
+        // own for seL4 objects.
+        let image_end = kernel_end.max(initrd.0 + initrd.1);
+        let loaded = self.blocks.iter().rposition(|b| b.frames.is_some()).map_or(0, |b| b + 1);
+        let boot = image_end.div_ceil(BLOCK).max(loaded) + BOOT_SLACK;
+        if boot >= self.blocks.len() {
+            return false;
+        }
+        for b in 0..boot {
+            self.block_frames(alloc, b);
+        }
+        let (block_cn, radix) = self.block_cn;
+        for b in boot..self.blocks.len() {
+            // A block without children: its copy is a sibling Untyped
+            // that the guest can retype and revoke, and revoking the
+            // original still deletes everything made from either.
+            block_cn
+                .absolute_cptr_from_bits_with_depth(b as u64, radix)
+                .copy(&abs(root_cap::<cap_type::Untyped>(self.blocks[b].ut)), CapRights::all())
+                .expect("block Untyped copy");
+        }
+        self.boot_blocks = boot;
         let mut bi: alloc::boxed::Box<abi::BootInfo> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
         bi.magic = abi::BOOTINFO_MAGIC;
         bi.abi_version = abi::ABI_VERSION;
@@ -400,11 +476,10 @@ impl Guest {
         }
         bi.nr_vcpus = self.vcpus.len() as u64;
         bi.tsc_hz = host_info.tsc_hz;
-        bi.nr_untyped = self.untyped.len() as u64;
-        for (i, b) in self.untyped.iter().enumerate() {
-            bi.untyped[i].size_bits = *b as u64;
-        }
+        bi.nr_blocks = self.blocks.len() as u64;
+        bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces as u64;
+
         bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
         bi.io_pool_gpa = self.pool.gpa as u64;
         bi.io_pool_size = self.pool.size as u64;
@@ -503,51 +578,56 @@ pub fn create(
     host_info: &HostInfo,
 ) -> Result<Guest, Option<Guest>> {
     // Every value comes from the control API: check before computing.
-    if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < (8 << 20) || cfg.ram > abi::MAX_RAM_CNODES * GIB {
+    if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < (8 << 20) || cfg.ram > abi::MAX_BLOCKS * BLOCK {
         return Err(None);
     }
-    if cfg.untyped_quota > abi::MAX_RAM_CNODES * GIB || cfg.ram_base % PAGE != 0 {
+    if cfg.ram_base % PAGE != 0 {
         return Err(None);
     }
     if !cfg.io_pool.is_power_of_two() || cfg.io_pool < IO_POOL_MIN || cfg.io_pool > IO_POOL_MAX {
         return Err(None);
     }
     let ram_base = cfg.ram_base;
-    let ram = (cfg.ram + PAGE - 1) & !(PAGE - 1);
+    let ram = cfg.ram.next_multiple_of(BLOCK);
+    let nr_blocks = ram / BLOCK;
     // The I/O pool follows RAM in guest-physical space and in the direct map.
     let pool_gpa = ram.next_multiple_of(IO_POOL_ALIGN);
     if ram_base == 0 || ram_base.checked_add(pool_gpa + cfg.io_pool).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
         return Err(None);
     }
 
-    // Host-side objects for this guest: CNodes, paging structures for the
-    // direct map, vCPU objects, VSpace pool, boot info, its l4h-vmm.
-    // Power-of-two splitting and alignment can waste up to half, hence the
-    // factor 2.
-    let n_cnodes = ram.div_ceil(GIB);
-    let ram_cnode_bytes: usize = (0..n_cnodes).map(|n| ram_cnode_radix(ram, n)).map(|radix| 32usize << radix).sum();
+    // Host-side objects for this guest (its arena grows if this is too
+    // little): CNodes, the RAM CNodes of the boot blocks and the paging
+    // structures mapping them, vCPU objects, the VSpace pool, the I/O
+    // pool's frame and mapping CNodes, boot info, its l4h-vmm.  Guest
+    // RAM other than the boot blocks costs the host nothing but the
+    // block's own memory and a slot: the guest makes its own RAM CNodes,
+    // page tables and objects from it.
+    let n_l1 = nr_blocks.div_ceil(1 << abi::RAM_L2_BITS);
+    let block_radix = (nr_blocks.next_power_of_two().trailing_zeros() as usize).max(1);
     let pool_pages = cfg.io_pool / PAGE;
-    let overhead = 2 * (ram_cnode_bytes
-        + (32 << abi::ROOT_CNODE_BITS) * 3
-        + ram / 256
+    let estimate = (32 << abi::ROOT_CNODE_BITS) * 4
+        + n_l1 * (32 << abi::RAM_L2_BITS)
+        + (32 << block_radix)
+        + 16 * ((32 << abi::RAM_L2_BITS) + PAGE)
         + 2 * 32 * pool_pages
-        + cfg.io_pool / 256
-        + cfg.vcpus * (64 << 10)
+        + (cfg.io_pool / 512 + 2 * PAGE)
+        + cfg.vcpus * (16 << 10)
         + cfg.vspaces * PAGE
-        + (2 << 20))
+        + abi::BOOTINFO_SIZE as usize
+        + if cfg.dom0 { abi::CTL_LOAD_MAX as usize } else { 0 }
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
-    if alloc.free_bytes() < overhead + ram + cfg.io_pool + cfg.untyped_quota {
+    if alloc.free_bytes() < estimate + ram + cfg.io_pool {
         return Err(None);
     }
-    let mut arena = alloc.arena(overhead).ok_or(None)?;
+    let mut arena = alloc.arena(estimate).ok_or(None)?;
 
     // Guest root CNode.
     let cnode_slot = alloc.slots.alloc();
     arena
-        .pool
-        .retype(&ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS }, 1, Dest::root(cnode_slot))
+        .retype(alloc, &ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS }, 1, Dest::root(cnode_slot))
         .expect("guest CNode");
-    let vspace_slot = arena.object(&mut alloc.slots, PML4_BP);
+    let vspace_slot = arena.object(alloc, PML4_BP);
     let vspace = root_cap::<cap_type::VSpace>(vspace_slot);
     asids.assign(alloc, vspace);
 
@@ -559,14 +639,15 @@ pub fn create(
         cnode: root_cap::<cap_type::CNode>(cnode_slot),
         vspace,
         ram_base,
-        ram: Vec::new(),
-        ram_cnodes: Vec::new(),
+        blocks: Vec::new(),
+        ram_l1: Vec::new(),
+        block_cn: (cap::CNode::from_bits(0), 0),
+        boot_blocks: 0,
         pool: IoPool { gpa: pool_gpa, paddr: 0, size: 0, frames: cap::CNode::from_bits(0), radix: 0 },
         ctl_data: false,
         vcpus: Vec::new(),
         state: State::Created,
         dom0: cfg.dom0,
-        untyped: Vec::new(),
         vspaces: cfg.vspaces,
         bootinfo: Vec::new(),
         entry: 0,
@@ -585,71 +666,39 @@ pub fn create(
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();
     let guard6 = CNodeCapData::new(0, abi::L2_INDEX_BITS - abi::ROOT_CNODE_BITS).into_word();
-    let meta = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+    let meta = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
     meta.absolute_cptr_from_bits_with_depth(0, abi::ROOT_CNODE_BITS)
         .mint(&abs(g.cnode), CapRights::all(), guard34)
         .expect("meta CNode");
     g.give_badged(abi::SLOT_META, meta, CapRights::all(), guard6);
     g.give(abi::SLOT_VSPACE, g.vspace, CapRights::all());
 
-    // ---- RAM: physically contiguous chunks retyped into 4 KiB frames that
-    // live in CNodes, one per GiB of guest-physical space.
-    for n in 0..n_cnodes {
-        let radix = ram_cnode_radix(ram, n);
-        let s = alloc.slots.alloc();
-        g.arena
-            .pool
-            .retype(&ObjectBlueprint::CNode { size_bits: radix }, 1, Dest::root(s))
-            .expect("RAM CNode");
-        let cn = root_cap::<cap_type::CNode>(s);
-        let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - radix).into_word();
-        g.give_badged(abi::SLOT_RAM_CNODE_BASE + n, cn, CapRights::all(), guard);
-        g.ram_cnodes.push((cn, radix));
+    // ---- RAM: 2 MiB blocks, each an Untyped from any free 2 MiB of host
+    // memory (physically contiguous within the block only).  Nothing is
+    // retyped yet: the image is loaded into blocks that become host
+    // frames (boot blocks), and the guest gets the others as Untypeds.
+    // Level-1 RAM CNodes (one per GiB, resolving 9 bits) for the guest's
+    // level-2 RAM CNodes, and the block CNode for the Untyped copies.
+    let guard0 = CNodeCapData::new(0, 0).into_word();
+    for n in 0..n_l1 {
+        let cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
+        g.give_badged(abi::SLOT_RAM_L1_BASE + n, cn, CapRights::all(), guard0);
+        g.ram_l1.push(cn);
     }
-    let mut gpa = 0;
-    while gpa < ram {
-        // A bound on the bookkeeping of a fragmented host (devices and
-        // host components never see guest RAM, so nothing else limits it).
-        if g.ram.len() == MAX_RAM_CHUNKS {
+    let block_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: block_radix });
+    let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix).into_word();
+    g.give_badged(abi::SLOT_BLOCKS, block_cn, CapRights::all(), guard);
+    g.block_cn = (block_cn, block_radix);
+    for _ in 0..nr_blocks {
+        let ut = alloc.slots.alloc();
+        let Some(region) = alloc.split(abi::BLOCK_SHIFT, ut) else {
+            alloc.slots.free(ut);
             return Err(Some(g));
-        }
-        let remaining = ram - gpa;
-        // Largest power-of-two chunk that fits, never crossing a GiB.
-        let mut bits = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
-        bits = bits.min(30);
-        let chunk_slot = alloc.slots.alloc();
-        let region = loop {
-            if let Some(r) = alloc.split(bits, chunk_slot) {
-                break r;
-            }
-            if bits <= 21 {
-                return Err(Some(g));
-            }
-            bits -= 1;
         };
-        let size = 1usize << bits;
-        let frames = size / PAGE;
-        let (cn, _) = g.ram_cnodes[gpa / GIB];
-        let dest = Dest { cnode: abs(cn), offset: (gpa / PAGE) % abi::RAM_CNODE_FRAMES };
-        let paddr = region.paddr;
-        let mut pool = crate::mem::UtPool { regions: ::alloc::vec![region] };
-        pool.retype(&FRAME_BP, frames, dest).expect("RAM frames");
-        g.arena.own(chunk_slot, paddr, bits);
-        g.ram.push(RamChunk { gpa, paddr, size });
-        gpa += size;
+        g.arena.own(ut, region.paddr, abi::BLOCK_SHIFT);
+        g.blocks.push(Block { ut, paddr: region.paddr, frames: None });
     }
-
-    // ---- Direct map of all guest RAM in the guest-kernel VSpace.  The
-    // original frame caps are used; the guest maps copies elsewhere.
     let tmp = alloc.slots.alloc();
-    for page in (0..ram).step_by(PAGE) {
-        abs(root_cap::<cap_type::Null>(tmp)).move_(&g.ram_frame(page)).expect("move frame");
-        let frame = root_cap::<cap_type::Granule>(tmp);
-        let vspace = g.vspace;
-        map_frame(&mut g.ctx(alloc), vspace, frame, ram_base + page, CapRights::read_write(), VmAttributes::DEFAULT);
-        // Put it back so the guest finds it at its ABI location.
-        g.ram_frame(page).move_(&abs(frame)).expect("move frame back");
-    }
 
     // ---- I/O pool: one physically contiguous Untyped retyped into frames,
     // kept in a CNode of the arena and mapped after RAM in the direct map.
@@ -664,12 +713,12 @@ pub fn create(
     };
     let pool_paddr = region.paddr;
     g.arena.own(pool_slot, pool_paddr, pool_bits);
-    let frames = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: pool_radix });
+    let frames = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });
     crate::mem::UtPool { regions: ::alloc::vec![region] }
         .retype(&FRAME_BP, pool_pages, Dest { cnode: abs(frames), offset: 0 })
         .expect("I/O pool frames");
     g.pool = IoPool { gpa: pool_gpa, paddr: pool_paddr, size: cfg.io_pool, frames, radix: pool_radix };
-    let keep = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: pool_radix });
+    let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });
     for i in 0..pool_pages {
         abs(root_cap::<cap_type::Null>(tmp)).copy(&g.pool.frame(i), CapRights::all()).expect("pool frame copy");
         let frame = root_cap::<cap_type::Granule>(tmp);
@@ -679,26 +728,11 @@ pub fn create(
     }
     alloc.slots.free(tmp);
 
-    // ---- Untyped quota for the guest's own kernel objects.
-    let mut remaining = cfg.untyped_quota;
-    while remaining >= PAGE && g.untyped.len() < abi::MAX_UNTYPED {
-        let bits = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
-        let bits = bits.min(28);
-        let s = alloc.slots.alloc();
-        let Some(r) = alloc.split(bits, s) else {
-            alloc.slots.free(s);
-            break;
-        };
-        g.arena.own(s, r.paddr, bits);
-        g.give(abi::SLOT_UNTYPED_BASE + g.untyped.len(), root_cap::<cap_type::Untyped>(s), CapRights::all());
-        g.untyped.push(bits);
-        remaining -= 1 << bits;
-    }
 
     // ---- VSpace pool for guest processes and device CNode.
-    let pool_cn = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+    let pool_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
     for i in 0..cfg.vspaces {
-        let vs = g.arena.object_cap::<cap_type::VSpace>(&mut alloc.slots, PML4_BP);
+        let vs = g.arena.object_cap::<cap_type::VSpace>(alloc, PML4_BP);
         asids.assign(alloc, vs);
         pool_cn
             .absolute_cptr_from_bits_with_depth(i as u64, abi::ROOT_CNODE_BITS)
@@ -706,12 +740,12 @@ pub fn create(
             .expect("vspace pool copy");
     }
     g.give_badged(abi::SLOT_VSPACE_POOL, pool_cn, CapRights::all(), guard6);
-    g.dev_cn = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
+    g.dev_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::ROOT_CNODE_BITS });
     g.give_badged(abi::SLOT_DEV_CNODE, g.dev_cn, CapRights::all(), guard6);
 
     // ---- Hypercall endpoint (served by l4h-vmm).
-    g.vmm_ep = g.arena.object_cap::<cap_type::Endpoint>(&mut alloc.slots, ObjectBlueprint::Endpoint);
-    g.vmm_ntfn = g.arena.object_cap::<cap_type::Notification>(&mut alloc.slots, ObjectBlueprint::Notification);
+    g.vmm_ep = g.arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
+    g.vmm_ntfn = g.arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     g.give_badged(
         abi::SLOT_HYP_EP,
         g.vmm_ep,
@@ -722,7 +756,7 @@ pub fn create(
     // ---- vCPUs.
     for v in 0..cfg.vcpus {
         let core = (host_info.next_core() + v) % host_info.cores;
-        let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut g.arena.pool };
+        let mut ctx = ObjCtx::arena(alloc, &mut g.arena);
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
         let ntfn = ctx.cap::<cap_type::Notification>(ObjectBlueprint::Notification);
@@ -778,7 +812,7 @@ pub fn create(
 
     // ---- Boot info frames (written at boot).
     for p in 0..(abi::BOOTINFO_SIZE as usize / PAGE) {
-        let frame = g.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+        let frame = g.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let vspace = g.vspace;
         map_frame(&mut g.ctx(alloc), vspace, frame, abi::BOOTINFO_VA as usize + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
         g.bootinfo.push(frame);
@@ -787,7 +821,7 @@ pub fn create(
     // ---- Console (input page, output ring) and, for dom0, control.
     g.add_device(alloc, DevKind::Console).unwrap();
     for i in 0..host::CONSOLE_RING_PAGES {
-        let f = g.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP);
+        let f = g.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let va = root_guest_va(id) + 0x1_0000 + i * PAGE;
         g.map_in_root(alloc, f, va);
         g.console_ring.push(f);
@@ -797,17 +831,15 @@ pub fn create(
     }
 
     sel4::debug_println!(
-        "l4h-root: guest {} '{}' created: {} MiB RAM in {} chunk(s), {} vCPU(s), {} MiB untyped, {} MiB I/O pool",
-        id, g.name, ram >> 20, g.ram.len(), cfg.vcpus,
-        g.untyped.iter().map(|b| 1usize << b).sum::<usize>() >> 20,
-        g.pool.size >> 20
+        "l4h-root: guest {} '{}' created: {} MiB RAM in {} blocks, {} vCPU(s), {} MiB I/O pool, {} KiB host objects",
+        id, g.name, ram >> 20, nr_blocks, cfg.vcpus, g.pool.size >> 20, g.arena.bytes() >> 10
     );
     Ok(g)
 }
 
 /// Load an ELF kernel and initrd embedded in the root task (dom0) and write
 /// the boot info.  Returns false if the image does not fit.
-pub fn load_embedded(g: &mut Guest, win: &mut Window, host_info: &HostInfo, kernel: &[u8], initrd: &[u8], cmdline: &str) -> bool {
+pub fn load_embedded(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &HostInfo, kernel: &[u8], initrd: &[u8], cmdline: &str) -> bool {
     let Ok(elf) = Elf::parse(kernel) else { return false };
     let (lo, hi) = elf.bounds();
     if (lo as usize) & !(PAGE - 1) != g.ram_base {
@@ -819,10 +851,13 @@ pub fn load_embedded(g: &mut Guest, win: &mut Window, host_info: &HostInfo, kern
         return false;
     }
     for seg in elf.segments() {
-        g.write_ram(win, seg.vaddr as usize - g.ram_base, seg.data);
+        if !g.write_ram(alloc, win, seg.vaddr as usize - g.ram_base, seg.data) {
+            return false;
+        }
     }
-    if !initrd.is_empty() {
-        g.write_ram(win, initrd_gpa, initrd);
+    if !initrd.is_empty() && !g.write_ram(alloc, win, initrd_gpa, initrd) {
+        return false;
     }
-    g.write_boot_info(win, host_info, elf.entry, kernel_end, (initrd_gpa, initrd.len()), cmdline.as_bytes())
+    g.write_boot_info(alloc, win, host_info, elf.entry, kernel_end, (initrd_gpa, initrd.len()), cmdline.as_bytes())
+
 }

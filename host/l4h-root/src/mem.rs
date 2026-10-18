@@ -114,6 +114,16 @@ impl Slots {
     }
 }
 
+impl Alloc {
+    /// `Slots::global` for code that needs the whole allocator.
+    pub fn global<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let t = self.slots.track.take();
+        let r = f(self);
+        self.slots.track = t;
+        r
+    }
+}
+
 /// One Untyped capability and our view of its watermark.
 pub struct UtRegion {
     pub cap: cap::Untyped,
@@ -239,17 +249,22 @@ impl UtPool {
 
 /// Global allocation state of the root task.
 ///
-/// Free memory is kept as untouched power-of-two Untyped *blocks* (buddy
-/// style, without coalescing): a request takes the smallest block that
-/// fits and splits it in halves as needed, so large aligned allocations
-/// (guest RAM) never waste memory on alignment.  Memory reclaimed from
-/// guests returns as blocks.  Small global objects come from `pool`, which
-/// is refilled with blocks.
+/// Free memory is kept as untouched power-of-two Untyped *blocks*, buddy
+/// style: a request takes the smallest block that fits and splits it in
+/// halves as needed, so large aligned allocations never waste memory on
+/// alignment.  Memory reclaimed from guests returns as blocks, and a block
+/// whose buddy is free too merges with it again: the Untyped of every
+/// split block is kept (with the halves as its children), and deleting
+/// both halves makes it whole.  Guest RAM comes in 2 MiB blocks, so
+/// without merging the free memory would end up in 2 MiB pieces.  Small
+/// global objects come from `pool`, which is refilled with blocks.
 pub struct Alloc {
     pub slots: Slots,
     /// Small objects of the root task itself.
     pub pool: UtPool,
     blocks: Vec<UtRegion>,
+    /// Split blocks, (paddr, size bits) -> slot of their Untyped.
+    parents: BTreeMap<(usize, usize), Slot>,
 }
 
 const SMALL_POOL_BITS: usize = 24;
@@ -260,7 +275,7 @@ fn untyped_at(s: Slot) -> cap::Untyped {
 
 impl Alloc {
     pub fn new(slots: Slots, bootinfo: &sel4::BootInfo) -> Self {
-        let mut a = Alloc { slots, pool: UtPool::empty(), blocks: UtPool::from_bootinfo(bootinfo).regions };
+        let mut a = Alloc { slots, pool: UtPool::empty(), blocks: UtPool::from_bootinfo(bootinfo).regions, parents: BTreeMap::new() };
         a.refill();
         a
     }
@@ -288,6 +303,9 @@ impl Alloc {
 
     /// An untouched Untyped of exactly 2^bits bytes, in root slot `slot`.
     pub fn split(&mut self, bits: usize, slot: Slot) -> Option<UtRegion> {
+        if !self.blocks.iter().any(|b| b.size_bits >= bits) {
+            self.merge_up_to(bits);
+        }
         let (i, _) = self
             .blocks
             .iter()
@@ -301,11 +319,9 @@ impl Alloc {
             b.cap
                 .untyped_retype(&ObjectBlueprint::Untyped { size_bits: half }, &root_cnode_dest(), s.start, 2)
                 .expect("split block");
-            // The parent capability is not needed any more: the halves
-            // stay valid, and its memory is never retyped again.
-            let parent = b.cap.bits() as Slot;
-            slot::CNODE.cap().absolute_cptr(b.cap).delete().expect("delete split parent");
-            self.slots.global(|sl| sl.free(parent));
+            // The parent is kept, to merge the halves again when both
+            // are free.
+            self.parents.insert((b.paddr, b.size_bits), b.cap.bits() as Slot);
             self.blocks.push(UtRegion::fresh(untyped_at(s.start + 1), b.paddr + (1 << half), half));
             b = UtRegion::fresh(untyped_at(s.start), b.paddr, half);
         }
@@ -352,10 +368,60 @@ impl Alloc {
             }
             let s = self.slots.global(|s| s.alloc());
             slot::CNODE.cap().absolute_cptr(untyped_at(s)).move_(&slot::CNODE.cap().absolute_cptr(cap)).expect("move block");
-            self.blocks.push(UtRegion::fresh(untyped_at(s), paddr, bits));
+            self.free_block(UtRegion::fresh(untyped_at(s), paddr, bits));
         }
         pinned
     }
+
+    /// Return an untouched block.  It is merged with its buddy only when a
+    /// larger block is needed: the next retype of a merged parent makes
+    /// seL4 clear all the memory its children used, which for a large
+    /// parent costs far more than the request that split it.
+    fn free_block(&mut self, r: UtRegion) {
+        self.blocks.push(r);
+    }
+
+    /// Merge free buddies, smallest first, into blocks of up to 2^bits
+    /// bytes, so that a request for 2^bits can be met.
+    fn merge_up_to(&mut self, bits: usize) {
+        loop {
+            let mut merged = false;
+            let mut i = 0;
+            while i < self.blocks.len() {
+                let (paddr, b) = (self.blocks[i].paddr, self.blocks[i].size_bits);
+                let parent = (paddr & !(1 << b), b + 1);
+                let buddy = paddr ^ (1 << b);
+                let pslot = self.parents.get(&parent).copied();
+                let j = self.blocks.iter().position(|x| x.paddr == buddy && x.size_bits == b);
+                let (Some(pslot), Some(j), true) = (pslot, j, b < bits) else {
+                    i += 1;
+                    continue;
+                };
+                // Neither half has children: deleting both leaves the
+                // parent without children, so its next retype starts
+                // afresh (and clears what the halves used).
+                let (x, y) = (self.blocks.swap_remove(i.max(j)), self.blocks.swap_remove(i.min(j)));
+                for half in [x.cap, y.cap] {
+                    let s = half.bits() as Slot;
+                    slot::CNODE.cap().absolute_cptr(half).delete().expect("delete merged half");
+                    self.slots.global(|sl| sl.free(s));
+                }
+                self.parents.remove(&parent);
+                self.blocks.push(UtRegion::fresh(untyped_at(pslot), parent.0, parent.1));
+                merged = true;
+            }
+            if !merged || self.blocks.iter().any(|b| b.size_bits >= bits) {
+                return;
+            }
+        }
+    }
+
+
+    /// Free blocks: (count, bytes of the largest), for diagnostics.
+    pub fn block_stats(&self) -> (usize, usize) {
+        (self.blocks.len(), self.largest_block_bits().map_or(0, |b| 1 << b))
+    }
+
 
     /// Undo a partly built arena: reclaim its memory and free its slots.
     fn release(&mut self, arena: Arena) {
@@ -398,12 +464,19 @@ impl Alloc {
     }
 }
 
-/// Untyped memory dedicated to one guest.
+/// An arena grows by at least this much (2^bits bytes) when it runs out.
+const ARENA_GROW_BITS: usize = 20;
+
+/// Untyped memory dedicated to one guest (or host component).
+///
+/// An arena starts with the memory its owner is expected to need and
+/// grows from the free blocks, a block at a time, if that was too little:
+/// host overhead is accounted as it is used, without a safety factor.
 pub struct Arena {
     pub pool: UtPool,
     /// Untyped capabilities owned by the guest (slot, paddr, size bits):
-    /// the arena's own regions and others (RAM chunks, quota).  Revoking
-    /// these destroys every object created from them.
+    /// the arena's own regions and others (RAM blocks, the I/O pool).
+    /// Revoking these destroys every object created from them.
     pub owned: Vec<(Slot, usize, usize)>,
 }
 
@@ -412,40 +485,66 @@ impl Arena {
         self.owned.push((slot, paddr, bits));
     }
 
-    pub fn object(&mut self, slots: &mut Slots, bp: ObjectBlueprint) -> Slot {
-        let s = slots.alloc();
-        self.pool
-            .retype(&bp, 1, Dest::root(s))
-            .unwrap_or_else(|| panic!("guest arena exhausted allocating {:?}", bp.ty()));
+    /// Retype `count` objects of `bp` into `dest`, growing the arena if it
+    /// has no room.  None if the host is out of memory.
+    pub fn retype(&mut self, alloc: &mut Alloc, bp: &ObjectBlueprint, count: usize, dest: Dest) -> Option<usize> {
+        if let Some(p) = self.pool.retype(bp, count, dest) {
+            return Some(p);
+        }
+        let need = count << bp.physical_size_bits();
+        let bits = (need.next_power_of_two().trailing_zeros() as usize).max(ARENA_GROW_BITS);
+        let slot = alloc.slots.alloc();
+        let Some(region) = alloc.split(bits, slot) else {
+            alloc.slots.free(slot);
+            return None;
+        };
+        self.owned.push((slot, region.paddr, bits));
+        self.pool.regions.push(region);
+        self.pool.regions.sort_by_key(|r| r.size_bits);
+        self.pool.retype(bp, count, dest)
+    }
+
+    /// Bytes this arena holds (its own regions, not RAM or pool).
+    pub fn bytes(&self) -> usize {
+        self.pool.regions.iter().map(|r| r.size()).sum()
+    }
+
+    pub fn object(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> Slot {
+        let s = alloc.slots.alloc();
+        self.retype(alloc, &bp, 1, Dest::root(s))
+            .unwrap_or_else(|| panic!("out of host memory allocating {:?}", bp.ty()));
         s
     }
 
-    pub fn object_cap<T: sel4::CapType>(&mut self, slots: &mut Slots, bp: ObjectBlueprint) -> sel4::Cap<T> {
-        let s = self.object(slots, bp);
+    pub fn object_cap<T: sel4::CapType>(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> sel4::Cap<T> {
+        let s = self.object(alloc, bp);
         sel4::init_thread::Slot::<T>::from_index(s).cap()
     }
 }
 
-/// Something objects can be allocated from: the global pool or an arena,
-/// together with the root slot allocator.
+/// Something objects can be allocated from: an arena (which grows from the
+/// allocator), or the root task's global pool.
 pub struct ObjCtx<'a> {
-    pub slots: &'a mut Slots,
-    pub pool: &'a mut UtPool,
+    pub alloc: &'a mut Alloc,
+    pub arena: Option<&'a mut Arena>,
 }
 
-impl ObjCtx<'_> {
-    pub fn object(&mut self, bp: ObjectBlueprint) -> Slot {
-        let s = self.slots.alloc();
-        self.pool
-            .retype(&bp, 1, Dest::root(s))
-            .unwrap_or_else(|| {
-                for r in &self.pool.regions {
-                    sel4::debug_println!("  region paddr={:#x} bits={} used={:#x}", r.paddr, r.size_bits, r.used);
-                }
-                panic!("out of memory allocating {:?} ({} bits)", bp.ty(), bp.physical_size_bits())
-            });
-        s
+impl<'a> ObjCtx<'a> {
+    pub fn arena(alloc: &'a mut Alloc, arena: &'a mut Arena) -> Self {
+        ObjCtx { alloc, arena: Some(arena) }
     }
+
+    pub fn global(alloc: &'a mut Alloc) -> Self {
+        ObjCtx { alloc, arena: None }
+    }
+
+    pub fn object(&mut self, bp: ObjectBlueprint) -> Slot {
+        match &mut self.arena {
+            Some(a) => a.object(self.alloc, bp),
+            None => self.alloc.object(bp),
+        }
+    }
+
 
     pub fn cap<T: sel4::CapType>(&mut self, bp: ObjectBlueprint) -> sel4::Cap<T> {
         let s = self.object(bp);

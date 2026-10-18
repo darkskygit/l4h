@@ -140,7 +140,7 @@ pub fn attach(
     // ---- Channel to the client's l4h-vmm, in the client's arena.
     let chan_pages = core::mem::size_of::<blk::Channel>().div_ceil(PAGE);
     let chan: Vec<cap::Granule> = (0..chan_pages)
-        .map(|_| client.arena.object_cap::<cap_type::Granule>(&mut alloc.slots, FRAME_BP))
+        .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP))
         .collect();
 
     let mut cfg: alloc::boxed::Box<blk::BlkdConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
@@ -185,10 +185,10 @@ pub fn attach(
         ntfn: None,
         service_ep: None,
     };
-    let comp = component::create(&args, alloc, &mut arena.pool, win, asids, host_info);
+    let comp = component::create(&args, alloc, &mut arena, win, asids, host_info);
 
     // Mapping caps are kept in a CNode of the arena.
-    let keep = arena.object_cap::<cap_type::CNode>(&mut alloc.slots, sel4::ObjectBlueprint::CNode { size_bits: 10 });
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
         let s = keep.absolute_cptr_from_bits_with_depth(keep_next, 10);
@@ -197,13 +197,13 @@ pub fn attach(
     };
 
     // ---- Device BARs (uncached).
-    map_bars(&comp, alloc, &mut arena.pool, devmem, d, &mut disk.bars, &bar_list, bar_va, &mut keep_slot);
+    map_bars(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, &bar_list, bar_va, &mut keep_slot);
     for i in 0..n_dma {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
-        comp.map_copy(alloc, &mut arena.pool, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
+        comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
     for (i, f) in chan.iter().enumerate() {
-        comp.map_copy(alloc, &mut arena.pool, &abs_of(*f), host::blkd_chan_va() + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
+        comp.map_copy(alloc, &mut arena, &abs_of(*f), host::blkd_chan_va() + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
 
     // ---- Interrupt, notifications.
@@ -385,7 +385,7 @@ pub fn virtio_bars(d: &pci::Device) -> Vec<u8> {
 pub fn map_bars(
     comp: &Component,
     alloc: &mut Alloc,
-    pool: &mut UtPool,
+    arena: &mut Arena,
     devmem: &mut DevMem,
     d: &pci::Device,
     cache: &mut Vec<(u8, Vec<cap::Granule>)>,
@@ -401,7 +401,7 @@ pub fn map_bars(
         for (i, f) in frames.iter().enumerate() {
             comp.map_copy(
                 alloc,
-                pool,
+                arena,
                 &abs_of(*f),
                 bar_va(b) + i * PAGE,
                 CapRights::read_write(),

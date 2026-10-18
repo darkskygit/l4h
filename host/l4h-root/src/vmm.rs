@@ -19,12 +19,14 @@ static VMM_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-vmm.elf"))
 
 const PAGE: usize = 4096;
 
-/// Untyped memory a guest's arena needs for its l4h-vmm.
+/// Untyped memory a guest's arena is expected to need for its l4h-vmm (the
+/// arena grows if it needs more).
 pub fn arena_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
     // Mapping caps (32 bytes per frame) and page tables for the I/O pool
     // (the VMM maps nothing else of the guest's memory), the VMM image
-    // with its heap and stack, and small objects.
-    2 * (io_pool / 128 + io_pool / 256) + 8 * (1 << 20) + (vcpus + devices * 16) * 4 * PAGE
+    // with its 1 MiB heap and 512 KiB stack, its CNode, and the mappings
+    // of event pages, device pages and backend channels.
+    io_pool / 128 + io_pool / 512 + (5 << 19) + (32 << host::CNODE_BITS) + (vcpus + devices * 16) * 2 * PAGE
 }
 
 /// A device's host-side backend.
@@ -107,22 +109,22 @@ pub fn spawn(
         ntfn: Some(g.vmm_ntfn),
         service_ep: Some(g.vmm_ep),
     };
-    let comp = component::create(&args, alloc, &mut g.arena.pool, win, asids, host_info);
+    let comp = component::create(&args, alloc, &mut g.arena, win, asids, host_info);
 
     // ---- The I/O pool at IO_POOL_VA, the only guest memory the VMM maps.
     // The mapping capabilities are kept in a CNode of the guest's arena.
     let pages = g.pool.pages();
     let radix = (pages.trailing_zeros() as usize).max(1);
-    let keep = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: radix });
+    let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
     let attrs = VmAttributes::DEFAULT;
     for i in 0..pages {
         let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, radix);
         let frame = g.pool.frame(i);
-        comp.map_copy(alloc, &mut g.arena.pool, &frame, host::IO_POOL_VA + i * PAGE, CapRights::read_write(), attrs, dst);
+        comp.map_copy(alloc, &mut g.arena, &frame, host::IO_POOL_VA + i * PAGE, CapRights::read_write(), attrs, dst);
     }
 
     // ---- Event pages, notifications and device pages.
-    let small = g.arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: 12 });
+    let small = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: 12 });
     let mut small_next = 0u64;
     let mut keep_slot = || {
         let s = small.absolute_cptr_from_bits_with_depth(small_next, 12);
@@ -131,23 +133,23 @@ pub fn spawn(
     };
     for (v, vcpu) in g.vcpus.iter().enumerate() {
         let ev = crate::component::abs_of(vcpu.event);
-        comp.map_copy(alloc, &mut g.arena.pool, &ev, host::vmm_event_page_va(v), CapRights::read_write(), attrs, keep_slot());
+        comp.map_copy(alloc, &mut g.arena, &ev, host::vmm_event_page_va(v), CapRights::read_write(), attrs, keep_slot());
         comp.give_badged(host::VCPU_NTFN_SLOT_BASE + v as u64, vcpu.ntfn, CapRights::write_only(), abi::BADGE_EVENT);
     }
     for (d, dev) in g.devices.iter().enumerate() {
         let p = crate::component::abs_of(dev.page);
-        comp.map_copy(alloc, &mut g.arena.pool, &p, host::vmm_device_page_va(d), CapRights::read_write(), attrs, keep_slot());
+        comp.map_copy(alloc, &mut g.arena, &p, host::vmm_device_page_va(d), CapRights::read_write(), attrs, keep_slot());
     }
     for (i, f) in g.console_ring.iter().enumerate() {
         let p = crate::component::abs_of(*f);
-        comp.map_copy(alloc, &mut g.arena.pool, &p, host::VMM_CONSOLE_RING_VA + i * PAGE, CapRights::read_write(), attrs, keep_slot());
+        comp.map_copy(alloc, &mut g.arena, &p, host::VMM_CONSOLE_RING_VA + i * PAGE, CapRights::read_write(), attrs, keep_slot());
     }
     for &(d, ref b) in backends.iter() {
         match b {
             Backend::Blk { chan, kick } => {
                 for (i, f) in chan.iter().enumerate() {
                     let fc = crate::component::abs_of(*f);
-                    comp.map_copy(alloc, &mut g.arena.pool, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, keep_slot());
+                    comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, keep_slot());
                 }
                 comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
             }
@@ -155,7 +157,7 @@ pub fn spawn(
                 for (i, f) in chan.iter().enumerate() {
                     let fc = crate::component::abs_of(*f);
                     let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, 10);
-                    comp.map_copy(alloc, &mut g.arena.pool, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
+                    comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
                 }
                 comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
             }

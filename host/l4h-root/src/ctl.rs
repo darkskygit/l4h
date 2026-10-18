@@ -78,13 +78,12 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if !io_pool.is_power_of_two() || !(crate::guest::IO_POOL_MIN..=crate::guest::IO_POOL_MAX).contains(&io_pool) {
                 return Err(EINVAL);
             }
+            // a[3] was the seL4 object quota: the guest's objects come
+            // from its own RAM now, so it is ignored.
             let cfg = GuestConfig {
                 name,
                 ram,
                 vcpus,
-                // seL4 objects of the guest kernel: mostly mapping slots
-                // and page tables of its processes.
-                untyped_quota: if a[3] != 0 { a[3] as usize } else { (16 << 20) + ram / 16 },
                 io_pool,
                 vspaces: 64,
                 ram_base: a[2] as usize,
@@ -100,12 +99,22 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if id == caller || len as u64 > abi::CTL_LOAD_MAX {
                 return Err(EINVAL);
             }
-            let g = h.guests.get(id).and_then(|g| g.as_ref()).ok_or(ENOENT)?;
-            if g.state != State::Created || g.vmm.is_some() {
-                return Err(EBUSY);
+            // The source is dom0's control data area, which belongs to
+            // the host: l4h-root never reads a guest's RAM.
+            let from = h.guest(caller).and_then(|d0| d0.ctl_data()).ok_or(EINVAL)?;
+            if src.checked_add(len).is_none_or(|end| end > abi::CTL_LOAD_MAX as usize) {
+                return Err(EINVAL);
             }
-            let d0 = h.guests.get(caller).and_then(|g| g.as_ref()).ok_or(ENOENT)?;
-            if g.load_from_ctl(&mut h.wins.a, dst, d0, src, len) { Ok(()) } else { Err(EINVAL) }
+            h.with_guest(id, |h, g| {
+                if g.state != State::Created || g.vmm.is_some() {
+                    return Err(EBUSY);
+                }
+                // dom0 may change the bytes meanwhile: it only corrupts the
+                // image it loads.
+                let from = unsafe { from.add(src) };
+                if g.load_ram(&mut h.alloc, &mut h.wins.a, dst, from, len) { Ok(()) } else { Err(EINVAL) }
+            })
+            .ok_or(ENOENT)?
         }
         abi::CTL_VM_START => {
             let id = vm_arg(a[0])?;
@@ -117,7 +126,8 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 .with_guest(id, |h, g| {
                     g.state == State::Created
                         && g.vmm.is_none()
-                        && g.write_boot_info(&mut h.wins.a, &h.info, a[1], a[2] as usize, (a[3] as usize, a[4] as usize), cmdline)
+                        && g.write_boot_info(&mut h.alloc, &mut h.wins.a, &h.info, a[1], a[2] as usize, (a[3] as usize, a[4] as usize), cmdline)
+
                 })
                 .ok_or(ENOENT)?;
             if !ok {

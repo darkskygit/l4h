@@ -14,7 +14,6 @@ struct CreateOpts {
     initrd: Option<String>,
     cmdline: String,
     disks: Vec<(u64, bool, u64, u64)>,
-    quota: u64,
     io_pool: u64,
     nics: Vec<(u64, u64, u64)>,
 }
@@ -33,7 +32,6 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         initrd: &initrd,
         cmdline: &o.cmdline,
         disks: o.disks.clone(),
-        quota: o.quota,
         io_pool: o.io_pool,
         nics: o.nics.clone(),
     })?;
@@ -171,7 +169,6 @@ fn run(args: &[String]) -> Result<i32> {
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
-                quota: 0,
                 io_pool: 0,
                 nics: Vec::new(),
             };
@@ -183,7 +180,6 @@ fn run(args: &[String]) -> Result<i32> {
                     "--initrd" => o.initrd = Some(val()?),
                     "--mem" => o.mem = parse_mib(&val()?)?,
                     "--vcpus" => o.vcpus = parse_num(&val()?)?,
-                    "--quota" => o.quota = parse_mib(&val()?)?,
                     "--io-pool" => o.io_pool = parse_mib(&val()?)?,
                     "--cmdline" => o.cmdline = val()?,
                     "--disk" => {

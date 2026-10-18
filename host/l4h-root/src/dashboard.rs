@@ -89,14 +89,13 @@ impl Dashboard {
             size *= 2;
         }
         let base = addr & !(size - 1);
-        let Alloc { slots, pool, .. } = alloc;
-        let frames = slots.global(|slots| devmem.frames(slots, base, size))?;
+        let frames = alloc.slots.global(|slots| devmem.frames(slots, base, size))?;
         let first = (addr - base) / 4096;
         let pages = (addr - base + len).div_ceil(4096) - first;
         let wc = VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining);
-        slots.global(|slots| {
+        alloc.global(|alloc| {
             for (i, f) in frames[first..first + pages].iter().enumerate() {
-                map_frame(&mut ObjCtx { slots, pool }, sel4::init_thread::slot::VSPACE.cap(), *f, FB_VA + i * 4096, CapRights::read_write(), wc);
+                map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), *f, FB_VA + i * 4096, CapRights::read_write(), wc);
             }
         });
         let fb = (FB_VA + (addr & 4095)) as *mut u8;

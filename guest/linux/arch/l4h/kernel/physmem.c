@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Guest-physical memory of the l4h guest.  All of it is mapped by the host
- * at uml_physmem (GPA 0), so there is nothing to map here: we only tell
- * memblock about it.
+ * Guest-physical memory of the l4h guest, mapped at uml_physmem (GPA 0).
+ * The host has mapped the boot blocks (kernel, initrd, a little slack) and
+ * the I/O pool; here memblock learns about those.  l4h_caps_init() maps
+ * the rest of RAM itself and adds it (DESIGN.md §15.2).
  *
  * The host's I/O pool follows RAM (bootinfo.io_pool_gpa).  It is in the
  * direct map and has struct pages (swiotlb hands out its pages for
@@ -41,12 +42,16 @@ void __init setup_physmem(unsigned long start, unsigned long reserve_end,
 {
 	const struct l4h_bootinfo *bi = l4h_bootinfo;
 	unsigned long reserve = reserve_end - start;
+	unsigned long boot = bi->boot_blocks * L4H_BLOCK_SIZE;
 	unsigned long end = len;
 
-	if (len <= reserve)
-		panic("l4h: kernel image (%lu bytes) larger than RAM (%lu)\n", reserve, len);
+	if (boot <= reserve || boot > len)
+		panic("l4h: kernel image (%lu bytes) does not fit its boot blocks (%lu)\n", reserve, boot);
+	if (bi->initrd_size && bi->initrd_gpa + bi->initrd_size > boot)
+		panic("l4h: initrd outside the boot blocks\n");
 
-	memblock_add(0, len);
+	memblock_add(0, boot);
+
 	memblock_reserve(0, reserve);
 	if (bi->initrd_size)
 		memblock_reserve(bi->initrd_gpa, PAGE_ALIGN(bi->initrd_size));

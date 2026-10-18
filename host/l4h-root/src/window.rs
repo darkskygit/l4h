@@ -22,7 +22,7 @@ impl Window {
         // Pre-create the paging structures for the window so that mapping
         // never has to allocate.
         let probe = alloc.object_cap::<cap_type::Granule>(crate::vspace::FRAME_BP);
-        let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut alloc.pool };
+        let mut ctx = ObjCtx::global(alloc);
         map_frame(&mut ctx, slot::VSPACE.cap(), probe, va, CapRights::read_write(), VmAttributes::DEFAULT);
         probe.frame_unmap().unwrap();
         Self { slot, va }

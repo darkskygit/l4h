@@ -146,12 +146,12 @@ pub fn spawn(
         ntfn: None,
         service_ep: None,
     };
-    let comp = component::create(&args, alloc, &mut arena.pool, win, asids, info);
+    let comp = component::create(&args, alloc, &mut arena, win, asids, info);
 
     // Mapping caps of every NIC page: DMA buffers and BARs.
     const KEEP_BITS: usize = 13;
     const _: () = assert!(net::MAX_NICS * ((1 << NIC_DMA_BITS) / PAGE + 1024) <= 1 << KEEP_BITS);
-    let keep = arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
         assert!(keep_next < 1 << KEEP_BITS, "netd: too many NIC pages");
@@ -162,10 +162,10 @@ pub fn spawn(
     let mut nic_list = Vec::new();
     for (n, d) in nics.into_iter().enumerate() {
         let mut bars = Vec::new();
-        map_bars(&comp, alloc, &mut arena.pool, devmem, &d, &mut bars, &crate::blkd::virtio_bars(&d), |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bars(&comp, alloc, &mut arena, devmem, &d, &mut bars, &crate::blkd::virtio_bars(&d), |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
-            comp.map_copy(alloc, &mut arena.pool, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
+            comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
         }
         if is_legacy(&d) {
             let (base, len) = (d.bars[0].addr as u16, d.bars[0].size as u16);
@@ -247,7 +247,7 @@ impl Netd {
         for (i, f) in chan.iter().enumerate() {
             let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
             // Paging structures for the port come from netd's own pool.
-            self.comp.map_copy(alloc, &mut self.arena.pool, &abs_of(*f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst);
+            self.comp.map_copy(alloc, &mut self.arena, &abs_of(*f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst);
         }
         self.comp.give_badged(
             net::NETD_SLOT_CLIENT_BASE + p as u64,

@@ -422,6 +422,11 @@ none.
 
   Running out of quota is a guest-local OOM. Tearing down a guest is a single
   revoke of its Untyped.
+
+  *Revised (guest-owned memory, §15):* guest RAM is 2 MiB blocks from
+  anywhere, which the guest receives as Untypeds (all but the boot blocks)
+  and retypes itself, into frames or into its kernel objects. There is no
+  quota and no chunk table any more; devices see only the I/O pool.
 - Huge pages are not in v1. A later version can back hugetlb/THP regions with
   2 MiB frame caps from dedicated chunks.
 
@@ -672,6 +677,11 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   - its seL4 object quota, by default 16 MiB plus RAM/16, used for its
     processes' mapping slots and page tables;
   - about 30 MiB of host objects, including its `l4h-vmm`.
+
+  *Revised (§15):* free halves merge again (lazily), there is no quota,
+  and a guest costs its RAM plus about 10 MiB whatever its size: a 256 MiB
+  guest costs 266 MiB.
+
 - **Limits.** `l4h-root` checks a request's memory, ASIDs and root CNode
   slots before starting it, and refuses with ENOMEM instead of exhausting
   itself.
@@ -1006,7 +1016,8 @@ versioned structs defined in `l4h-abi`.
   (`tests/run-ctltest.sh`).
 - **Disk detach.** A disk is detached only when its guest is destroyed.
   The device may hold commands that address the guest's RAM and blkd's
-  DMA memory (queues, PRP lists, request headers), so `l4h-root`:
+  DMA memory (queues, PRP lists, request headers), so `l4h-root`
+  (*revised, §15.1:* the guest's I/O pool, not its RAM):
   1. suspends blkd, so that nothing more is submitted;
   2. resets the device itself, through a mapping of its registers: NVMe
      clears CC.EN and waits up to CAP.TO for CSTS.RDY to clear, which
@@ -1024,7 +1035,8 @@ versioned structs defined in `l4h-abi`.
   device does not confirm the reset, it is marked failed and never enabled
   again (`blk_attach` returns EIO, `l4hctl disks` says so). The guest's RAM
   chunks and blkd's DMA memory are then kept out of the free pool for
-  good; their objects are still destroyed. Disks are also reset at boot,
+  good; their objects are still destroyed (*revised, §15.1:* the guest's
+  I/O pool and blkd's DMA memory). Disks are also reset at boot,
   with bus mastering off, before anything enables them, since firmware
   may leave a controller running. There is no IOMMU (§8.2), so nothing
   else confines a device.
@@ -1392,3 +1404,105 @@ memory the guest can retype.
   chain outside the pool reaches blkd. `run-blktest.sh` adds 8 parallel
   direct writers and readers (more than the pool holds); it also passes
   with `L4H_DOM0_IO_POOL_MB=1`.
+
+### 15.2 Guest RAM as 2 MiB Untypeds (phase 2)
+
+- **seL4 semantics, settled first** (`tests/testguest`, `untyped_copy_test`
+  and `ram_blocks_test`, seL4 16.0.0). An Untyped can be copied only while
+  it has no children; the copy is a revocable MDB child of the original, and
+  copying sets the original's free index to "full", so the two can never
+  hand out the same memory. The guest retypes and revokes through its copy;
+  a retype from a copy without children starts at its base and the memory
+  is zeroed (reset); a copy with children cannot be copied again; revoking
+  the original deletes the copy and everything retyped from it. So the
+  design's first scheme works as intended: l4h-root keeps the original of
+  every block and gives the guest a copy. The fallback (only cap to a
+  2 MiB Untyped under a parent) was not needed.
+- **Blocks.** Guest RAM is `ram / 2 MiB` blocks (RAM is rounded up to
+  2 MiB), each a 2 MiB Untyped split from any free memory: guest RAM is no
+  longer physically contiguous at all, and the chunk table and
+  `VMM_MAX_RAM_CHUNKS` are gone. The originals stay in the guest's arena
+  (`Arena::owned`), so destroy revokes them as before. Each block costs the
+  host one root CNode slot.
+- **Boot blocks.** `l4h-root` turns a block into host frames (a level-2 RAM
+  CNode, 512 frames, mapped in the direct map) when an image is loaded into
+  it (`VM_LOAD`, or dom0's embedded image). At `VM_START` the boot blocks
+  are the prefix of RAM up to the end of the kernel, the initrd and
+  anything loaded, plus `BOOT_SLACK` (one) block for the guest kernel's
+  memory until it has mapped the rest; at least one block must be left for
+  the guest. Deviation: the design counted two slack blocks as boot blocks
+  *and* as the guest's first object pool, which cannot both hold (the
+  guest has no Untyped for a boot block); here the slack block is frames
+  for early `memblock` allocations, and object blocks come from the
+  Untyped blocks.
+- **Capabilities (ABI version 3).** Root slot `L4H_SLOT_BLOCKS` is the block
+  CNode: slot `b` holds the Untyped copy of every non-boot block. Frames
+  are named through two levels: root slot `L4H_SLOT_RAM_L1_BASE + n` is a
+  level-1 CNode (radix 9) for GiB `n`, whose slot `j` holds the level-2
+  CNode (radix 9) of block `512 n + j`; `L4H_FRAME_CPTR(gpa)` keeps its old
+  value. l4h-root installs the level-2 CNodes of boot blocks (it keeps its
+  own capability to them, to load images); the guest retypes its own
+  into the others. Boot info: `nr_blocks`, `boot_blocks`; the Untyped
+  quota (`L4H_SLOT_UNTYPED_BASE`, `bootinfo.untyped[]`) is gone, and
+  `VM_CREATE`'s quota argument is ignored (`l4hctl --quota` removed).
+- **Guest early boot** (`kernel/caps.c`, `l4h_caps_init`): memblock knows
+  only the boot blocks. The guest marks some non-boot blocks as object
+  blocks, creates its first capability CNode and the user CSpace from
+  them, then for every other block retypes its level-2 RAM CNode (into its
+  level-1 slot) and 512 frames, and maps them at `ram_base_va + GPA`
+  (read-write, execute-never), adding page tables from object blocks. Each
+  block is added to memblock once mapped; object blocks are added and
+  reserved, so they have struct pages.
+- **Objects.** `l4h_obj_alloc` takes objects from Untyped *chunks* of 16,
+  64 or 128 KiB (by object size, as the old quota allocator did) that it
+  carves out of object blocks, one open block per class. seL4 reuses an
+  Untyped's memory only when all its children are gone; with whole 2 MiB
+  blocks as the unit, a few long-lived objects (TCBs, a process's page
+  tables) pinned each block, freed page tables were never reused, and
+  `smp_mm_stress` exhausted 32 MiB of objects and slowed down sevenfold.
+  A chunk resets as soon as its own objects are gone; a block is free
+  when all its chunks are, and then forgets them. Slot CNodes (128 KiB)
+  come straight from a block, since a chunk needs a slot. In this phase
+  the object blocks are fixed at boot, 4 MiB plus RAM/32 out of the
+  guest's own RAM (the old default quota, 16 MiB plus RAM/16, left a
+  128 MiB guest too little RAM for ctltest's 80 MiB tmpfs); §15.3 makes
+  them dynamic. `/proc/meminfo` shows `L4hObjects` (RAM in
+  object blocks) and `L4hObjectsUsed` (in chunks with live objects).
+  Deviation: the design's per-vCPU open blocks are per class only. All
+  allocations take one lock anyway, and per-vCPU blocks would multiply the
+  partly used blocks by the number of vCPUs.
+- **Host accounting.** The ×2 safety factor is gone: an arena starts with
+  an estimate of what its owner needs and grows from the free blocks
+  (1 MiB at a time) when it runs out (`Arena::retype`). The VMM's estimate
+  went from 8 MiB to what it maps (image, 1 MiB heap, 512 KiB stack).
+- **Buddy merging.** With RAM coming back in 2 MiB blocks, the host's free
+  memory would end up in 2 MiB pieces, and an I/O pool (4 MiB) could no
+  longer be found. `Alloc` now keeps the Untyped of every block it
+  splits, and merges two free halves again by deleting them. It merges
+  lazily, only when no free block is large enough (`merge_up_to`): the
+  next retype of a merged parent makes seL4 clear everything its children
+  used, and merging eagerly up to GiB blocks made every guest create clear
+  a GiB of memory (create took 470 ms instead of 150).
+- aarch64: the host side (l4h-root) is ISA-independent and builds the same
+  blocks; the aarch64 test guest uses them. The Linux guest, and so the
+  guest's side of phases 2 and 3, is x86_64 only, like the rest of the
+  Linux port.
+- **Measured** (`tests/run-vmbench.sh`, nested QEMU/KVM, debug builds;
+  host memory beyond a booted guest's RAM, and median latencies):
+
+  | | main | phase 1 | phase 2 |
+  |---|---|---|---|
+  | overhead, 64 MiB guest | 41 MiB | 43 MiB | 10 MiB |
+  | overhead, 128 MiB | 48 MiB | 49 MiB | 10 MiB |
+  | overhead, 256 MiB | 62 MiB | 60 MiB | 10 MiB |
+  | overhead, 512 MiB | 90 MiB | 82 MiB | 10 MiB |
+  | create (call returns), 128 MiB | 389 ms | 316 ms | 128 ms |
+  | create to init ready, 128 MiB | 446 ms | 344 ms | 258 ms |
+  | create, 512 MiB | 1266 ms | 931 ms | 143 ms |
+  | destroy, stopped guest | 345 ms | 39 ms | 119 ms |
+
+  The overhead is the 4 MiB I/O pool plus about 6 MiB of host objects,
+  whatever the RAM. Creating a guest no longer retypes its RAM: that
+  moved into the guest's boot (create-to-ready minus create, about 130 ms
+  for 128 MiB, was 57 ms). Phase 1 made create and destroy faster because
+  the VMM no longer maps guest RAM.

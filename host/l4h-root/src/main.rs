@@ -218,7 +218,7 @@ impl Host {
     }
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
-        let bytes = cfg.ram.checked_add(cfg.untyped_quota)?.checked_add(cfg.io_pool)?;
+        let bytes = cfg.ram.checked_add(cfg.io_pool)?;
         if !self.can_afford(bytes, cfg.vspaces + 4) {
             return None;
         }
@@ -459,7 +459,6 @@ pub fn boot_dom0(h: &mut Host) {
         name: "dom0",
         ram: DOM0_MEM_MB << 20,
         vcpus: DOM0_VCPUS,
-        untyped_quota: 64 << 20,
         io_pool: DOM0_IO_POOL_MB << 20,
         vspaces: 64,
         ram_base,
@@ -495,7 +494,7 @@ pub fn boot_dom0(h: &mut Host) {
     }
     h.with_guest(id, |h, g| {
         assert!(
-            guest::load_embedded(g, &mut h.wins.a, &h.info, DOM0_KERNEL, DOM0_INITRD, DOM0_CMDLINE.trim()),
+            guest::load_embedded(g, &mut h.alloc, &mut h.wins.a, &h.info, DOM0_KERNEL, DOM0_INITRD, DOM0_CMDLINE.trim()),
             "dom0 image does not fit"
         );
     });

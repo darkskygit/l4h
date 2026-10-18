@@ -10,7 +10,7 @@ use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type
 use l4h_host as host;
 
 use crate::elf::Elf;
-use crate::mem::{Alloc, ObjCtx, Slot, UtPool};
+use crate::mem::{Alloc, Arena, ObjCtx, Slot};
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
@@ -71,7 +71,7 @@ impl Component {
     pub fn map_copy(
         &self,
         alloc: &mut Alloc,
-        pool: &mut UtPool,
+        arena: &mut Arena,
         frame: &sel4::AbsoluteCPtr,
         va: usize,
         rights: CapRights,
@@ -81,7 +81,7 @@ impl Component {
         let s = alloc.slots.alloc();
         abs(root_cap::<cap_type::Null>(s)).copy(frame, CapRights::all()).expect("copy frame");
         let f = root_cap::<cap_type::Granule>(s);
-        map_frame(&mut ObjCtx { slots: &mut alloc.slots, pool }, self.vspace, f, va, rights, attrs);
+        map_frame(&mut ObjCtx::arena(alloc, arena), self.vspace, f, va, rights, attrs);
         keep.move_(&abs(f)).expect("keep mapping cap");
         alloc.slots.free(s);
     }
@@ -102,17 +102,18 @@ pub struct SpawnArgs<'a> {
     pub service_ep: Option<cap::Endpoint>,
 }
 
-/// Create a component, without starting it.  Objects come from `pool`.
+/// Create a component, without starting it.  Objects come from `arena`.
 pub fn create(
     args: &SpawnArgs,
     alloc: &mut Alloc,
-    pool: &mut UtPool,
+    arena: &mut Arena,
     win: &mut Window,
     asids: &mut AsidPools,
     host_info: &HostInfo,
 ) -> Component {
     let elf = Elf::parse(args.elf).expect("component ELF");
-    let mut ctx = ObjCtx { slots: &mut alloc.slots, pool };
+    let mut ctx = ObjCtx::arena(alloc, arena);
+
 
     let vspace = ctx.cap::<cap_type::VSpace>(PML4_BP);
     let cnode = ctx.cap::<cap_type::CNode>(ObjectBlueprint::CNode { size_bits: host::CNODE_BITS });
@@ -144,7 +145,7 @@ pub fn create(
         let end = (seg.vaddr + seg.memsz) as usize;
         for page in (start..end).step_by(PAGE) {
             let frame = *pages.entry(page).or_insert_with(|| {
-                let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut *pool };
+                let mut ctx = ObjCtx::arena(alloc, &mut *arena);
                 let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
                 let rights = if writable[&page] { CapRights::read_write() } else { CapRights::read_only() };
                 map_frame(&mut ctx, vspace, f, page, rights, VmAttributes::DEFAULT);
@@ -183,7 +184,7 @@ pub fn create(
     assert!(host::CONFIG_OFFSET + args.config.len() <= host::INFO_SIZE, "component config too large");
     info[host::CONFIG_OFFSET..host::CONFIG_OFFSET + args.config.len()].copy_from_slice(args.config);
     for (i, chunk) in info.chunks(PAGE).enumerate() {
-        let mut ctx = ObjCtx { slots: &mut alloc.slots, pool: &mut *pool };
+        let mut ctx = ObjCtx::arena(alloc, &mut *arena);
         let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
         map_frame(&mut ctx, vspace, f, host::INFO_VA + i * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
         win.with_frame(&abs(f), |p| unsafe {
@@ -191,7 +192,7 @@ pub fn create(
         });
     }
     map_frame(
-        &mut ObjCtx { slots: &mut alloc.slots, pool: &mut *pool },
+        &mut ObjCtx::arena(alloc, &mut *arena),
         vspace,
         ipcbuf,
         host::IPCBUF_VA,
