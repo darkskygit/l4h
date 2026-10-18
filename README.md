@@ -90,6 +90,7 @@ l4hctl console 1 --follow
 |------|----------------|
 | `tests/run-testguest.sh`, `tests/run-testguest-aarch64.sh` | guest ABI and seL4 extensions (freestanding guest) |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
+| `tests/run-futexbench.sh [vcpus] [rounds]` | process-shared futex handoff latency |
 | `tests/run-nodetest.sh /path/to/node [vcpus]` | Node startup/JIT, string internalization, worker threads and concurrent GC |
 | `tests/run-blktest.sh` (`BLKTEST_DEV=nvme`) | disk pass-through, data integrity |
 | `tests/run-ctltest.sh` | VM lifecycle, console, clean shutdown, disk re-attach, windows, reclaim |

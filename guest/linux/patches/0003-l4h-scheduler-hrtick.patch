@@ -1,0 +1,6 @@
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -66 +66,2 @@
+-SCHED_FEAT(HRTICK, false)
++/* L4H has a high-resolution clockevent; honor CFS slices below the tick. */
++SCHED_FEAT(HRTICK, IS_ENABLED(CONFIG_L4H))
