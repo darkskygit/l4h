@@ -6,7 +6,7 @@
 //! starting at the current watermark).  Guest RAM relies on this to obtain
 //! physically contiguous chunks.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -18,36 +18,47 @@ pub type Slot = usize;
 
 /// Allocator for slots in the root task's own CNode.
 ///
+/// Free slots are kept as coalesced ranges, so that ranges freed by
+/// destroyed guests (vNIC ports, disk DMA buffers) can be allocated again
+/// as ranges.
+///
 /// While tracking is on, every slot allocated (and not freed again) is
 /// recorded, so that the slots holding a guest's capabilities can be
 /// cleaned up and reused when the guest is destroyed.
 pub struct Slots {
-    free: Range<usize>,
-    recycled: Vec<usize>,
+    /// Free ranges: start -> end (exclusive).
+    free: BTreeMap<Slot, Slot>,
+    count: usize,
     track: Option<BTreeSet<Slot>>,
 }
 
 impl Slots {
     pub fn new(range: Range<usize>) -> Self {
-        Self { free: range, recycled: Vec::new(), track: None }
+        let count = range.len();
+        let mut free = BTreeMap::new();
+        if count > 0 {
+            free.insert(range.start, range.end);
+        }
+        Self { free, count, track: None }
     }
 
     pub fn alloc(&mut self) -> Slot {
-        let s = match self.recycled.pop() {
-            Some(s) => s,
-            None => self.free.next().expect("root CNode full"),
-        };
-        if let Some(t) = &mut self.track {
-            t.insert(s);
-        }
-        s
+        self.alloc_range(1).start
     }
 
-    /// Allocate `n` consecutive slots.
+    /// Allocate `n` consecutive slots (the lowest range that fits).
     pub fn alloc_range(&mut self, n: usize) -> Range<Slot> {
-        let start = self.free.start;
-        assert!(start + n <= self.free.end, "root CNode full");
-        self.free.start += n;
+        let (start, end) = self
+            .free
+            .iter()
+            .find(|&(s, e)| e - s >= n)
+            .map(|(&s, &e)| (s, e))
+            .expect("root CNode full");
+        self.free.remove(&start);
+        if end - start > n {
+            self.free.insert(start + n, end);
+        }
+        self.count -= n;
         if let Some(t) = &mut self.track {
             t.extend(start..start + n);
         }
@@ -58,12 +69,29 @@ impl Slots {
         if let Some(t) = &mut self.track {
             t.remove(&s);
         }
-        self.recycled.push(s);
+        let (mut start, mut end) = (s, s + 1);
+        if let Some((&ps, &pe)) = self.free.range(..=s).next_back() {
+            assert!(pe <= s, "slot {} freed twice", s);
+            if pe == s {
+                self.free.remove(&ps);
+                start = ps;
+            }
+        }
+        if let Some(ne) = self.free.remove(&end) {
+            end = ne;
+        }
+        self.free.insert(start, end);
+        self.count += 1;
     }
 
     /// Slots that can still be allocated.
     pub fn available(&self) -> usize {
-        self.free.len() + self.recycled.len()
+        self.count
+    }
+
+    /// The longest range `alloc_range` can return.
+    pub fn largest_range(&self) -> usize {
+        self.free.iter().map(|(s, e)| e - s).max().unwrap_or(0)
     }
 
     /// Start recording allocations into `set`.
@@ -273,7 +301,11 @@ impl Alloc {
             b.cap
                 .untyped_retype(&ObjectBlueprint::Untyped { size_bits: half }, &root_cnode_dest(), s.start, 2)
                 .expect("split block");
-            // The parent keeps its slot: it stays the halves' parent.
+            // The parent capability is not needed any more: the halves
+            // stay valid, and its memory is never retyped again.
+            let parent = b.cap.bits() as Slot;
+            slot::CNODE.cap().absolute_cptr(b.cap).delete().expect("delete split parent");
+            self.slots.global(|sl| sl.free(parent));
             self.blocks.push(UtRegion::fresh(untyped_at(s.start + 1), b.paddr + (1 << half), half));
             b = UtRegion::fresh(untyped_at(s.start), b.paddr, half);
         }
@@ -311,12 +343,24 @@ impl Alloc {
         }
     }
 
+    /// Undo a partly built arena: reclaim its memory and free its slots.
+    fn release(&mut self, arena: Arena) {
+        let slots: Vec<Slot> = arena.owned.iter().map(|o| o.0).collect();
+        self.reclaim(arena);
+        for s in slots {
+            self.slots.free(s);
+        }
+    }
+
     /// Carve a per-guest arena of at least `bytes` out of the free blocks.
     pub fn arena(&mut self, bytes: usize) -> Option<Arena> {
         let mut arena = Arena { pool: UtPool::empty(), owned: Vec::new() };
         let mut remaining = bytes;
         while remaining > 0 {
-            let max_bits = self.largest_block_bits()?;
+            let Some(max_bits) = self.largest_block_bits() else {
+                self.release(arena);
+                return None;
+            };
             // Binary decomposition: the largest power of two not above
             // what is left, and a rounded-up tail below 1 MiB.
             let want_bits = if remaining <= 1 << 20 {
@@ -326,7 +370,11 @@ impl Alloc {
             };
             let bits = want_bits.min(max_bits);
             let slot = self.slots.alloc();
-            let region = self.split(bits, slot)?;
+            let Some(region) = self.split(bits, slot) else {
+                self.slots.free(slot);
+                self.release(arena);
+                return None;
+            };
             arena.owned.push((slot, region.paddr, bits));
             remaining = remaining.saturating_sub(1 << bits);
             arena.pool.regions.push(region);

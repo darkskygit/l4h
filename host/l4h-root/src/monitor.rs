@@ -15,8 +15,8 @@ pub const MONITOR_BADGE: u64 = 1 << 41;
 
 const COM1: u16 = 0x3f8;
 const IRQ_COM1: u64 = 4;
-/// seL4 user IRQ vector for COM1 (MSIs use the low ones).
-const VECTOR: u64 = 40;
+/// seL4 user IRQ vector for COM1.
+const VECTOR: u64 = crate::pci::VECTOR_MONITOR;
 
 pub struct Monitor {
     port: u64,

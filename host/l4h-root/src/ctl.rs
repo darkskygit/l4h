@@ -186,7 +186,9 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             unsafe {
                 let mut head = addr_of!((*p).in_head).read_volatile();
                 let tail = addr_of!((*p).in_tail).read_volatile();
-                let room = abi::CONSOLE_IN_SIZE - head.wrapping_sub(tail) as usize;
+                // Both indices are in the guest's page: the guest may have
+                // written anything there.
+                let room = abi::CONSOLE_IN_SIZE.saturating_sub(head.wrapping_sub(tail) as usize);
                 let n = len.min(room);
                 for &c in &req.data[..n] {
                     addr_of_mut!((*p).input[head as usize % abi::CONSOLE_IN_SIZE]).write_volatile(c);

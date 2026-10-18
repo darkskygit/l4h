@@ -338,8 +338,8 @@ enum l4h_ctl_op {
 	L4H_CTL_NIC_INFO = 15,
 	/* args: vm, CPU cap per vCPU in percent of a core (0 = none) */
 	L4H_CTL_VM_SET_SCHED = 16,
-	/* args: vm -> vals[0..] = core of each vCPU (up to 6), vals[5] = number
-	 * of vCPUs if more */
+	/* args: vm -> vals[v] = host core of vCPU v, for v < min(6, vCPUs) (the
+	 * vCPU count is in L4H_CTL_VM_LIST) */
 	L4H_CTL_VM_INFO = 17,
 	/* args: vm, L4H_POWER_OFF or L4H_POWER_REBOOT: ask the guest to shut
 	 * down or reboot cleanly */

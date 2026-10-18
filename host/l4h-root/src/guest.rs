@@ -148,11 +148,11 @@ pub struct Guest {
     pub asids: usize,
 }
 
-fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
+pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
     slot::CNODE.cap().absolute_cptr(c)
 }
 
-fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
+pub(crate) fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
 }
 
@@ -415,21 +415,26 @@ impl Guest {
 
 /// Create a guest with no image.  Root slots allocated here and in later
 /// operations on the guest must be tracked into `Guest::slots` by the
-/// caller (see `Alloc::slots`).
+/// caller (see `Alloc::slots`).  On failure, returns the partly built
+/// guest, if there is one, for the caller to destroy.
 pub fn create(
     id: usize,
     cfg: &GuestConfig,
     alloc: &mut Alloc,
     asids: &mut AsidPools,
     host_info: &HostInfo,
-) -> Option<Guest> {
-    let ram_base = cfg.ram_base & !(PAGE - 1);
-    let ram = (cfg.ram + PAGE - 1) & !(PAGE - 1);
-    if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || ram < (8 << 20) || ram > abi::MAX_RAM_CNODES * GIB {
-        return None;
+) -> Result<Guest, Option<Guest>> {
+    // Every value comes from the control API: check before computing.
+    if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < (8 << 20) || cfg.ram > abi::MAX_RAM_CNODES * GIB {
+        return Err(None);
     }
-    if ram_base == 0 || (ram_base + ram) as u64 > abi::SPECIAL_BASE {
-        return None;
+    if cfg.untyped_quota > abi::MAX_RAM_CNODES * GIB || cfg.ram_base % PAGE != 0 {
+        return Err(None);
+    }
+    let ram_base = cfg.ram_base;
+    let ram = (cfg.ram + PAGE - 1) & !(PAGE - 1);
+    if ram_base == 0 || ram_base.checked_add(ram).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
+        return Err(None);
     }
 
     // Host-side objects for this guest: CNodes, paging structures for the
@@ -446,9 +451,9 @@ pub fn create(
         + (2 << 20))
         + vmm::arena_bytes(ram, cfg.vcpus, MAX_GUEST_DEVICES);
     if alloc.free_bytes() < overhead + ram + cfg.untyped_quota {
-        return None;
+        return Err(None);
     }
-    let mut arena = alloc.arena(overhead)?;
+    let mut arena = alloc.arena(overhead).ok_or(None)?;
 
     // Guest root CNode.
     let cnode_slot = alloc.slots.alloc();
@@ -515,6 +520,10 @@ pub fn create(
     }
     let mut gpa = 0;
     while gpa < ram {
+        // l4h-vmm and l4h-blkd take at most this many chunks.
+        if g.ram.len() == host::VMM_MAX_RAM_CHUNKS {
+            return Err(Some(g));
+        }
         let remaining = ram - gpa;
         // Largest power-of-two chunk that fits, never crossing a GiB.
         let mut bits = (usize::BITS - 1 - remaining.leading_zeros()) as usize;
@@ -524,7 +533,9 @@ pub fn create(
             if let Some(r) = alloc.split(bits, chunk_slot) {
                 break r;
             }
-            assert!(bits > 21, "out of memory for guest RAM");
+            if bits <= 21 {
+                return Err(Some(g));
+            }
             bits -= 1;
         };
         let size = 1usize << bits;
@@ -674,7 +685,7 @@ pub fn create(
         id, g.name, ram >> 20, g.ram.len(), cfg.vcpus,
         g.untyped.iter().map(|b| 1usize << b).sum::<usize>() >> 20
     );
-    Some(g)
+    Ok(g)
 }
 
 /// Load an ELF kernel and initrd embedded in the root task (dom0) and write

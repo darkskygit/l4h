@@ -17,6 +17,7 @@ mod mem;
 mod monitor;
 mod netd;
 mod pci;
+mod rtc;
 mod sched;
 mod vmm;
 mod vspace;
@@ -41,6 +42,8 @@ pub const MAX_GUESTS: usize = 64;
 /// Memory and root CNode slots kept back from guest requests.
 const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 32768;
+/// Longest free slot range kept for vNIC ports and disk DMA buffers.
+const RESERVE_RANGE: usize = 4096;
 
 static DOM0_KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-kernel"));
 static DOM0_INITRD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-initrd"));
@@ -79,6 +82,10 @@ pub struct HostInfo {
     pub hyp_ep: cap::Endpoint,
     sched_control_base: usize,
     pub timeslice_us: u64,
+    /// Wall clock at boot (ns since the epoch, 0 if unknown) and the tick
+    /// count when it was read.
+    pub epoch_ns: u64,
+    pub epoch_ticks: u64,
     /// Round-robin placement of new guests.
     placement: core::cell::Cell<usize>,
 }
@@ -196,13 +203,15 @@ impl Host {
     /// Resources a guest operation may need, checked before starting it so
     /// that requests fail cleanly instead of exhausting the root task.
     fn can_afford(&self, bytes: usize, asids: usize) -> bool {
-        self.alloc.free_bytes() >= bytes + RESERVE_BYTES
+        bytes.checked_add(RESERVE_BYTES).is_some_and(|b| self.alloc.free_bytes() >= b)
             && self.asids.available() >= asids
             && self.alloc.slots.available() >= RESERVE_SLOTS
+            && self.alloc.slots.largest_range() >= RESERVE_RANGE
     }
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
-        if !self.can_afford(cfg.ram + cfg.untyped_quota, cfg.vspaces + 4) {
+        let bytes = cfg.ram.checked_add(cfg.untyped_quota)?;
+        if !self.can_afford(bytes, cfg.vspaces + 4) {
             return None;
         }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
@@ -213,11 +222,32 @@ impl Host {
         let asids = self.asids.in_use;
         let g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info);
         let slots = self.alloc.slots.untrack();
-        let mut g = g?;
-        g.slots = slots;
-        g.asids = self.asids.in_use - asids;
-        self.guests[id] = Some(g);
-        Some(id)
+        match g {
+            Ok(mut g) => {
+                g.slots = slots;
+                g.asids = self.asids.in_use - asids;
+                self.guests[id] = Some(g);
+                Some(id)
+            }
+            Err(partial) => {
+                // Give back whatever was built.
+                self.asids.in_use = asids;
+                match partial {
+                    Some(mut g) => {
+                        g.slots = slots;
+                        g.destroy(&mut self.alloc);
+                    }
+                    None => {
+                        for s in slots {
+                            let _ = guest::abs(guest::root_cap::<cap_type::Null>(s)).delete();
+                            self.alloc.slots.free(s);
+                        }
+                    }
+                }
+                sel4::debug_println!("l4h-root: cannot create guest '{}': out of memory", cfg.name);
+                None
+            }
+        }
     }
 
     /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
@@ -332,6 +362,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
         timeslice_us: 5000,
+        epoch_ns: rtc::read_ns(&mut alloc),
+        epoch_ticks: rdtsc(),
         placement: core::cell::Cell::new(0),
     };
     let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
@@ -347,9 +379,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
         );
         if blkd::is_disk(&d) {
+            if disks.len() == pci::MAX_DISKS {
+                sel4::debug_println!("l4h-root: more than {} disks, ignoring this one", pci::MAX_DISKS);
+                continue;
+            }
             // Stop whatever the firmware left running.
             pci.disable(&d);
-            let v = disks.len() as u64;
+            let v = pci::VECTOR_DISK_BASE + disks.len() as u64;
             disks.push(Disk::new(d, v));
         } else if netd::is_virtio_net(&d) {
             pci.disable(&d);

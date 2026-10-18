@@ -121,10 +121,11 @@ impl Blkd {
         }
         let bytes: u64 = segs.iter().map(|s| s.len as u64).sum();
         let bs = self.block_size as u64;
-        if bytes == 0 || bytes % bs != 0 || (req.sector * 512) % bs != 0 {
+        // The sector comes from the client: check its range first.
+        if req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
             return Err(blk::STATUS_IOERR);
         }
-        if req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
+        if bytes == 0 || bytes % bs != 0 || (req.sector * 512) % bs != 0 {
             return Err(blk::STATUS_IOERR);
         }
         if !self.translate(req, pieces) {

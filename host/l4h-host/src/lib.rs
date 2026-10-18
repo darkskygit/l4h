@@ -77,7 +77,7 @@ pub const VMM_BADGE_HYPERCALL: u64 = 1 << 63;
 
 /// Per-guest l4h-vmm configuration.
 pub const VMM_MAX_DEVICES: usize = 16;
-pub const VMM_MAX_RAM_CHUNKS: usize = 16;
+pub const VMM_MAX_RAM_CHUNKS: usize = 128;
 
 /// Device kinds served by l4h-vmm.
 pub const VDEV_CONSOLE: u32 = 0;
@@ -131,6 +131,10 @@ pub struct VmmConfig {
     pub serial: u32,
     pub ram_chunks: [RamChunk; VMM_MAX_RAM_CHUNKS],
     pub devices: [VmmDevice; VMM_MAX_DEVICES],
+    /// Wall clock (ns since the Unix epoch, 0 if unknown) at tick count
+    /// epoch_ticks.
+    pub epoch_ns: u64,
+    pub epoch_ticks: u64,
 }
 
 pub const VCPU_NTFN_SLOT_BASE: u64 = 64;

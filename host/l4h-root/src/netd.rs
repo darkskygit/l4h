@@ -26,8 +26,8 @@ const NIC_DMA_BITS: usize = 22;
 /// Port memory: the channel plus the CNode keeping netd's mappings of it.
 const PORT_BITS: usize = 22;
 const PORT_KEEP_BITS: usize = 10;
-/// MSI vectors of NICs start here (disks use the ones below).
-const NIC_MSI_BASE: u64 = 16;
+/// MSI vectors of NICs start here.
+const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
 
 pub fn is_virtio_net(d: &pci::Device) -> bool {
@@ -126,10 +126,14 @@ pub fn spawn(
     };
     let comp = component::create(&args, alloc, &mut arena.pool, win, asids, info);
 
-    let keep = arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: 12 });
+    // Mapping caps of every NIC page: DMA buffers and BARs.
+    const KEEP_BITS: usize = 13;
+    const _: () = assert!(net::MAX_NICS * ((1 << NIC_DMA_BITS) / PAGE + 1024) <= 1 << KEEP_BITS);
+    let keep = arena.object_cap::<cap_type::CNode>(&mut alloc.slots, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
-        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, 12);
+        assert!(keep_next < 1 << KEEP_BITS, "netd: too many NIC pages");
+        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, KEEP_BITS);
         keep_next += 1;
         s
     };

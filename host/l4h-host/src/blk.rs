@@ -91,7 +91,7 @@ pub struct PciRegion {
     pub len: u64,
 }
 
-pub const BLKD_MAX_RAM_CHUNKS: usize = 16;
+pub const BLKD_MAX_RAM_CHUNKS: usize = crate::VMM_MAX_RAM_CHUNKS;
 
 pub const BLKD_VIRTIO: u32 = 0;
 pub const BLKD_NVME: u32 = 1;

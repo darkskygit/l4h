@@ -76,6 +76,14 @@ impl Pci {
 }
 
 /// An IRQ handler for MSI vector `vector` of `d`, into `dst`.
+/// seL4 user interrupt vectors (CPU vector 0x30 + n, n <= 107 on x86),
+/// split between the users so that they never collide.
+pub const VECTOR_NIC_BASE: u64 = 0;
+pub const VECTOR_MONITOR: u64 = 8;
+pub const VECTOR_DISK_BASE: u64 = 16;
+/// Disks beyond this many are left alone.
+pub const MAX_DISKS: usize = 64;
+
 pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
     #[cfg(target_arch = "x86_64")]
     sel4::init_thread::slot::IRQ_CONTROL

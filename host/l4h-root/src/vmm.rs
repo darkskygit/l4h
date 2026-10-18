@@ -62,6 +62,8 @@ pub fn spawn(
     cfg.ram_size = g.ram.iter().map(|c| c.size).sum::<usize>() as u64;
     cfg.dom0 = g.dom0 as u32;
     cfg.serial = 1;
+    cfg.epoch_ns = host_info.epoch_ns;
+    cfg.epoch_ticks = host_info.epoch_ticks;
     assert!(g.ram.len() <= host::VMM_MAX_RAM_CHUNKS);
     cfg.nr_ram_chunks = g.ram.len() as u32;
     for (i, c) in g.ram.iter().enumerate() {
