@@ -857,6 +857,26 @@ versioned structs defined in `l4h-abi`.
 3. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
    adding one NIC driver.
 
+**Status (v1).**
+
+- **Image.** `tools/mkimage.sh` builds a GPT disk image. Its EFI system
+  partition holds:
+  - a standalone GRUB EFI binary;
+  - the seL4 kernel, loaded with `multiboot2` and
+    `console_port=0x3f8 debug_port=0x3f8`, because UEFI firmware need not
+    fill in the BIOS data area that seL4 otherwise reads the port from;
+  - `l4h-root`, which carries dom0's images, as `module2`.
+- **Local test.** `tests/run-uefitest.sh` boots that image the way GCE
+  would, under OVMF on a q35 machine: NVMe boot disk, virtio-net NIC, KVM
+  without VMX. dom0 sees the boot disk as host disk 0 and gets DHCP
+  through the virtio-net uplink.
+- **Deployment.** `tools/gce-image.sh` packages the image as
+  `disk.raw.tar.gz` and prints the `gcloud` import and instance commands
+  (N2, `nic-type=VIRTIO_NET`, `UEFI_COMPATIBLE`).
+- **Not yet tried on GCE itself.** gVNIC, which C3 and later need, is not
+  implemented: QEMU cannot emulate it, so the driver could not be tested
+  here.
+
 ---
 
 ## 11. Portability to aarch64
