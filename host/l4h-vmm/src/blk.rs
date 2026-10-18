@@ -37,8 +37,10 @@ pub struct Blk {
     read_only: bool,
     /// Logical block size of the disk: the guest aligns requests to it.
     block_size: u32,
-    /// Requests submitted to blkd, by chain head.
+    /// Requests submitted to blkd, by chain head: at most one per head.
     inflight: [Option<Inflight>; QUEUE_SIZE as usize],
+    /// Requests of this generation blkd has not completed yet.
+    outstanding: usize,
     /// Bumped on reset, so completions of earlier requests are dropped.
     generation: u32,
     /// A chain popped from the queue that did not fit in the channel.
@@ -65,6 +67,7 @@ impl Blk {
             read_only,
             block_size,
             inflight: [None; QUEUE_SIZE as usize],
+            outstanding: 0,
             generation: 0,
             stalled: None,
             bufs: Vec::new(),
@@ -85,8 +88,27 @@ impl Blk {
         q.push(mem, head, written);
     }
 
+    /// The response `id` of this generation arrived: the request it
+    /// identifies, if it was in flight.
+    fn retire(&mut self, id: u64) -> Option<(u16, Inflight)> {
+        if (id >> 32) as u32 != self.generation {
+            return None;
+        }
+        let h = id as u16;
+        let inf = self.inflight.get_mut(h as usize).and_then(|i| i.take())?;
+        self.outstanding -= 1;
+        Some((h, inf))
+    }
+
     /// Handle one chain.  Returns false if it must wait for channel space.
     fn submit(&mut self, mem: &GuestMem, q: &mut Queue, head: u16) -> bool {
+        // The driver offered a chain blkd still owns.  Requests are known
+        // by their head, so drop this one: the head returns to the driver
+        // once, when the first request completes.  A correct driver never
+        // does this.
+        if self.inflight.get(head as usize).is_some_and(|i| i.is_some()) {
+            return true;
+        }
         let mut bufs = core::mem::take(&mut self.bufs);
         let ok = q.chain(mem, head, &mut bufs).is_ok();
         let r = self.submit_bufs(mem, q, head, ok, &bufs);
@@ -185,6 +207,7 @@ impl Blk {
         req.id = ((self.generation as u64) << 32) | head as u64;
         let written = u32::try_from(written).unwrap_or(u32::MAX);
         self.inflight[head as usize] = Some(Inflight { status_gpa, written });
+        self.outstanding += 1;
         unsafe {
             let h = addr_of!((*self.chan).sq.head).read_volatile();
             addr_of_mut!((*self.chan).reqs[h as usize % blk::RING_SIZE]).write_volatile(req);
@@ -265,13 +288,12 @@ impl Backend for Blk {
                 fence(Ordering::Acquire);
                 let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
                 addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                if (resp.id >> 32) as u32 != self.generation || !queue.ready {
-                    continue;
-                }
-                let h = resp.id as u16;
-                let Some(inf) = self.inflight.get_mut(h as usize).and_then(|i| i.take()) else {
+                let Some((h, inf)) = self.retire(resp.id) else {
                     continue;
                 };
+                if !queue.ready {
+                    continue;
+                }
                 let status = match resp.status {
                     blk::STATUS_OK => VIRTIO_BLK_S_OK,
                     blk::STATUS_UNSUPP => VIRTIO_BLK_S_UNSUPP,
@@ -287,7 +309,7 @@ impl Backend for Blk {
 
     fn drain(&mut self) {
         self.stalled = None;
-        while self.inflight.iter().any(|i| i.is_some()) {
+        while self.outstanding != 0 {
             unsafe {
                 let tail = addr_of!((*self.chan).cq.tail).read_volatile();
                 if tail == addr_of!((*self.chan).cq.head).read_volatile() {
@@ -299,11 +321,7 @@ impl Backend for Blk {
                 fence(Ordering::Acquire);
                 let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
                 addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
-                if (resp.id >> 32) as u32 == self.generation {
-                    if let Some(i) = self.inflight.get_mut(resp.id as u16 as usize) {
-                        *i = None;
-                    }
-                }
+                self.retire(resp.id);
             }
         }
         // Requests completed from now on belong to the next generation.
@@ -313,6 +331,7 @@ impl Backend for Blk {
     fn reset(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.inflight = [None; QUEUE_SIZE as usize];
+        self.outstanding = 0;
         self.stalled = None;
     }
 }

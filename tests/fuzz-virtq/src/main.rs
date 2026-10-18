@@ -3,7 +3,9 @@
 //! rings and descriptor tables are all garbage.  It must never touch memory
 //! outside guest RAM, panic or loop forever.  Also feeds netd's offload
 //! code (host/l4h-netd/src/offload.rs) random virtio-net headers and checks
-//! its TCP segmentation.
+//! its TCP segmentation, and checks that a virtio-blk reset waits for
+//! every request blkd has (host/l4h-vmm/src/blk.rs), whatever the guest
+//! puts in the avail ring.
 
 #![allow(dead_code)]
 
@@ -23,6 +25,61 @@ mod virtq;
 
 #[path = "../../../host/l4h-netd/src/offload.rs"]
 mod offload;
+
+// l4h-vmm's virtio-blk backend (blk.rs), unchanged, over mocks of what it
+// uses from l4h_rt and the device model; blkcheck.rs plays blkd.
+extern crate self as l4h_rt;
+
+pub const VMM_MAX_RAM_CHUNKS: usize = 128;
+#[derive(Clone, Copy, Default)]
+pub struct RamChunk {
+    pub gpa: u64,
+    pub paddr: u64,
+    pub size: u64,
+}
+
+#[path = "../../../host/l4h-host/src/blk.rs"]
+pub mod host_blk;
+pub mod host {
+    pub use crate::host_blk as blk;
+}
+
+pub mod sel4 {
+    /// blk.rs yields while it waits for blkd: blkd runs then.
+    pub fn r#yield() {
+        crate::blkcheck::blkd_run();
+    }
+    pub mod cap {
+        pub struct Notification;
+        impl Notification {
+            pub fn signal(&self) {}
+        }
+    }
+}
+
+/// The part of host/l4h-vmm/src/dev.rs that blk.rs uses.
+mod dev {
+    use crate::guest::GuestMem;
+    use crate::virtq::Queue;
+    pub const VIRTIO_RING_F_INDIRECT_DESC: u64 = 1 << 28;
+    pub trait Backend {
+        fn device_id(&self) -> u32;
+        fn features(&self) -> u64;
+        fn num_queues(&self) -> usize;
+        fn queue_max(&self, q: usize) -> u32;
+        fn init_config(&self, config: &mut [u8]);
+        fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool;
+        fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool;
+        fn drain(&mut self) {}
+        fn reset(&mut self);
+        fn features_accepted(&mut self, _features: u64) {}
+    }
+}
+
+#[path = "../../../host/l4h-vmm/src/blk.rs"]
+mod blk;
+
+mod blkcheck;
 
 use guest::GuestMem;
 
@@ -84,6 +141,8 @@ fn main() {
     println!("fuzz-virtq: {iterations} queues, {chains} chains parsed, no violations");
     let segs = offload_check(&mut rng, iterations / 4);
     println!("fuzz-virtq: offload: {} frames, {segs} segments checked", iterations / 4);
+    let reqs = blkcheck::drain_check(&mut rng, iterations / 20);
+    println!("fuzz-virtq: blk: {} resets, {reqs} requests drained", iterations / 20);
 }
 
 fn csum(data: &[u8]) -> u32 {

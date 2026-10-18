@@ -699,14 +699,20 @@ and no copy.
     - each segment's GPA lies in the client's RAM;
     - the data direction matches the operation;
     - the request is aligned to the logical block size, which is passed to
-      the guest as virtio `blk_size`;
+      the guest as virtio `blk_size`, both within the window and on the
+      disk;
     - it stays within the LBA window (`start`/`sectors`).
-    Writes are refused on read-only attachments.
+    Writes are refused on read-only attachments. Windows must start and
+    end on 4 KiB, the largest block size blkd supports (`l4h-root`
+    refuses others with EINVAL): the NVMe driver addresses whole blocks,
+    so a window starting inside one would reach the sectors before it.
   - There is still a single queue: no `VIRTIO_BLK_F_MQ`, discard or write
     zeroes yet.
   - A device or queue reset waits until blkd has completed every request
     of the old queue (the device may still DMA into its buffers) before
-    the hypercall returns.
+    the hypercall returns. The VMM counts the requests it gave blkd, and
+    ignores a chain whose head is already in flight: a guest listing a
+    head twice cannot make the reset return early.
   - Tested with QEMU NVMe at 512-byte and 4 KiB LBAs
     (`BLKTEST_DEV=nvme tests/run-blktest.sh`), and with a read-only window
     in `tests/run-ctltest.sh`.
