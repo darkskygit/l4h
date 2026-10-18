@@ -207,6 +207,31 @@ We need no IOMMU, since no device is passed into a guest.
   (user memory corruption) or replayed an invalidation on a reused VSpace
   root (triple fault). The flag is now checked first. This is an upstream
   bug.
+- **0012, stale timer interrupts (x86, MCS).** The local APIC latches a
+  timer interrupt that fires while the kernel runs with interrupts off,
+  for example while a core waits for the kernel lock. It is delivered on
+  the way back to user level, after the kernel has armed the next
+  deadline, and seL4 handled it as a new timer event, which means another
+  wait for the lock.
+  - When vCPUs of the machine running seL4 are descheduled, or a core
+    holds the lock for long, a lock wait can outlast the 5 ms timeslice
+    that the previous entry armed. The next timer interrupt is then
+    latched during the wait, and so on.
+  - Every core then loops through the lock on stale interrupts and user
+    threads never run again, even after the host load has gone. In CI
+    (4 vCPUs on a 4-vCPU runner) this stopped the whole machine during
+    the 4-vCPU self-test. Locally 4 vCPUs on 2 host CPUs hit it on every
+    run.
+  - A timer interrupt that finds the timer still armed (the TSC-deadline
+    MSR is cleared when it fires) is now acknowledged and dropped before
+    the lock is taken. `ksArmedDeadline` from 0006 is checked first, so
+    interrupts that are due skip the MSR read. This is an upstream bug.
+    On aarch64 the timer interrupt is level-triggered, so setting a new
+    deadline withdraws it.
+  - seL4 still needs its vCPUs to run together: the kernel lock is a FIFO
+    (CLH) lock, and remote calls wait for every target core. With 4 vCPUs
+    on 2 host CPUs and no pause-loop exiting (nested virtualisation),
+    guests make progress but very slowly.
 
 
 - **0004, x86_64 user RSP across syscalls.** seL4's fast `syscall` entry

@@ -1,0 +1,116 @@
+From b457849bf6cd930beff56916845f16296ea138e5 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sun, 18 Oct 2026 02:18:52 -0700
+Subject: [PATCH] x86, mcs: drop stale timer interrupts before taking the
+ kernel lock
+
+The local APIC latches a timer interrupt that fires while the kernel
+runs with interrupts disabled, for example while a core waits for the
+kernel lock, and delivers it when the kernel returns to user level. By
+then the kernel has handled everything that was due and armed the
+timer for the next event, but it took the latched interrupt as a new
+timer event: one more kernel entry, and one more wait for the lock.
+
+When the lock is contended, as on vCPUs that the hypervisor
+deschedules, that wait can outlast the timeslice armed by the previous
+entry. The next timer interrupt is then latched during the wait, and
+so on: every core loops through the lock on stale timer interrupts and
+user threads never run again, even after the contention has gone. With
+4 vCPUs on 2-3 host CPUs, or briefly sharing 4 host CPUs with other
+load, the whole machine stopped this way; counters showed every timer
+entry arriving within ~100 cycles of the previous kernel exit, while
+the TSC-deadline MSR still held the deadline armed ~5 ms ahead.
+
+The timer disarms itself when it fires (the TSC-deadline MSR reads 0,
+the one-shot count reaches 0). A timer interrupt that finds it still
+armed was raised for a deadline since replaced: acknowledge it and
+return to user level without taking the lock. The armed deadline
+(ksArmedDeadline) is compared with the time first, so interrupts that
+are due do not pay for the MSR read, which traps when virtualised.
+---
+ include/arch/x86/arch/machine/timer.h | 12 +++++++++
+ src/arch/x86/c_traps.c                | 38 +++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/include/arch/x86/arch/machine/timer.h b/include/arch/x86/arch/machine/timer.h
+index 5771277..3367f7d 100644
+--- a/include/arch/x86/arch/machine/timer.h
++++ b/include/arch/x86/arch/machine/timer.h
+@@ -71,6 +71,18 @@ static inline void setDeadline(ticks_t deadline)
+         apic_write_reg(APIC_TIMER_COUNT, MAX(1, div64(deadline, x86KSapicRatio)));
+     }
+ }
++
++/* Whether the timer is still armed, i.e. has not fired since the deadline
++ * was last set. The timer disarms itself when it fires: the TSC-deadline
++ * MSR then reads 0, and the one-shot count has reached 0. Reading either
++ * exits to the hypervisor when the kernel runs virtualised. */
++static inline bool_t timerArmed(void)
++{
++    if (likely(x86KSapicRatio == 0)) {
++        return x86_rdmsr(IA32_TSC_DEADLINE_MSR) != 0;
++    }
++    return apic_read_reg(APIC_TIMER_CURRENT) != 0;
++}
+ #else
+ static inline void resetTimer(void)
+ {
+diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
+index a2e04c9..21949d1 100644
+--- a/src/arch/x86/c_traps.c
++++ b/src/arch/x86/c_traps.c
+@@ -26,6 +26,32 @@ void VISIBLE c_nested_interrupt(int irq)
+     ARCH_NODE_STATE(x86KSPendingInterrupt) = irq;
+ }
+ 
++#ifdef CONFIG_KERNEL_MCS
++/* Whether a timer interrupt is stale: raised for a deadline that has since
++ * been replaced by a later one, which is still armed.
++ *
++ * The local APIC latches a timer interrupt that fires while the kernel runs
++ * with interrupts disabled, for instance while this core waits for the
++ * kernel lock, and delivers it as soon as the kernel returns to user level,
++ * by which time the kernel has handled everything that was due and armed
++ * the timer for the next event. Handling the stale interrupt as a timer
++ * event is not only wasted work: under SMP it costs another wait for the
++ * kernel lock. When the lock is contended, as when the cores are vCPUs that
++ * the hypervisor deschedules, that wait can outlast the timeslice that the
++ * previous entry armed, so the next timer interrupt is latched during it,
++ * and so on: every core then loops through the lock on stale timer
++ * interrupts, never running user code, even after the contention is gone. */
++static inline bool_t timerIRQIsStale(void)
++{
++    ticks_t armed = NODE_STATE(ksArmedDeadline);
++
++    /* The deadline is per core and only written by this core. Comparing
++     * it with the time first avoids reading the timer state, which traps
++     * when virtualised, for interrupts that are due. */
++    return armed != 0 && getCurrentTime() < armed && timerArmed();
++}
++#endif
++
+ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
+ {
+     /* need to run this first as the NODE_LOCK code might end up as a function call
+@@ -35,6 +61,18 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
+         x86_enable_ibrs();
+     }
+ 
++#ifdef CONFIG_KERNEL_MCS
++    /* Drop a stale timer interrupt without taking the kernel lock: the
++     * timer will raise the interrupt again at the deadline it is armed
++     * with. */
++    if (irq == int_timer && timerIRQIsStale()) {
++        c_entry_hook();
++        apic_ack_active_interrupt();
++        restore_user_context();
++        UNREACHABLE();
++    }
++#endif
++
+     /* Only grab the lock if we are not handling 'int_remote_call_ipi' interrupt
+      * also flag this lock as IRQ lock if handling the irq interrupts. */
+     NODE_LOCK_IF(irq != int_remote_call_ipi,
+-- 
+2.47.3
+
