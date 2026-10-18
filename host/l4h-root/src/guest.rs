@@ -95,6 +95,9 @@ pub struct Vcpu {
     pub cooldown: u32,
     /// CPU used in the last balancer period, in permille of a core.
     pub usage: u32,
+    /// Under a CPU cap: SC_K's part of the vCPU's budget, in permille
+    /// (sched::budgets).
+    pub k_share: u32,
     /// Steal-time bookkeeping (counter ticks): time since the vCPU first
     /// ran, CPU it consumed; steal published so far (ns).
     pub wall_ticks: u64,
@@ -610,7 +613,7 @@ pub fn create(
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
         let ntfn = ctx.cap::<cap_type::Notification>(ObjectBlueprint::Notification);
-        let sc_bits = sel4::sys::seL4_MinSchedContextBits as usize;
+        let sc_bits = crate::sched::SC_BITS;
         let sc_k = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext { size_bits: sc_bits });
         let sc_u = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext { size_bits: sc_bits });
         let ipcbuf = ctx.cap::<cap_type::Granule>(FRAME_BP);
@@ -651,7 +654,7 @@ pub fn create(
         g.give_badged(base + abi::VCPU_IPI, ntfn, CapRights::write_only(), abi::BADGE_IPI);
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+        g.vcpus.push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
     }
 
     // ---- Event pages in the root task too (steal time).

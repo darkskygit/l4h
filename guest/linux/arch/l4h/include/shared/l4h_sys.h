@@ -184,6 +184,7 @@ void l4h_timer_arm(unsigned long long tsc_deadline);
 int l4h_collect_events(int *timer, unsigned long *ipi, unsigned long *events);
 /* Block this vCPU until something happens. */
 void l4h_idle_wait(void);
+void l4h_wait_briefly(void);
 /* Cheap check for undelivered events on this vCPU. */
 int l4h_events_pending(void);
 /* Deliver pending events (calls l4h_deliver_events). */

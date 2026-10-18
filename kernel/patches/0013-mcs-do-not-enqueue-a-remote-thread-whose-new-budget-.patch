@@ -1,0 +1,45 @@
+From 186ae251d9f278b64d2091afcdd962aec69d6d27 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sun, 18 Oct 2026 01:42:58 -0700
+Subject: [PATCH 13/13] mcs: do not enqueue a remote thread whose new budget is not
+ ready
+
+SchedControl_ConfigureFlags on a scheduling context whose thread is
+runnable on another core calls schedContext_resume(), which postpones
+the thread to the release queue when its (updated) refills are not
+ready yet, and then enqueued it in the remote core's ready queue
+anyway. Debug kernels fail the isSchedulable() assertion in
+tcbSchedEnqueue(); release kernels put the thread in both queues.
+
+This happens whenever a budget-limited SC is reconfigured on its own
+core from another core while its budget is used up, for example when a
+CPU cap is changed or a capped vCPU's budget is redistributed.
+
+Enqueue only a schedulable thread, as possibleSwitchTo() does locally.
+A postponed one still needs remoteQueueUpdate(): the remote core may be
+idle and must reprogram its timer for the release.
+---
+ src/object/schedcontrol.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/object/schedcontrol.c b/src/object/schedcontrol.c
+index c3ee1498e..a99cba828 100644
+--- a/src/object/schedcontrol.c
++++ b/src/object/schedcontrol.c
+@@ -63,8 +63,12 @@ static exception_t invokeSchedControl_ConfigureFlags(sched_context_t *target, wo
+             if (isRunnable(thread) && thread != NODE_STATE(ksCurThread)) {
+                 possibleSwitchTo(thread);
+             }
+-        } else if (isRunnable(thread)) {
++        } else if (isSchedulable(thread)) {
+             SCHED_ENQUEUE(thread);
++        } else if (isRunnable(thread)) {
++            /* schedContext_resume() put it in the release queue: the core
++             * must still reprogram its timer for the release. */
++            SMP_COND_STATEMENT(remoteQueueUpdate(thread));
+         }
+         if (thread == NODE_STATE(ksCurThread)) {
+             rescheduleRequired();
+-- 
+2.47.3
+

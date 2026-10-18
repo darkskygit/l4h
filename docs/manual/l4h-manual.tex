@@ -824,6 +824,12 @@ several vCPUs. CAP\% 0 means no cap.
 the cap. A capped VM never uses more than its vCPU count times its cap, even
 when cores are idle. Caps can be changed while a VM runs.
 
+A vCPU's guest kernel and user code share its budget: the host shifts it,
+every 100\,ms, towards whichever of them runs out, so a VM that is busy in
+user space gets nearly its whole cap. The cap holds over each 5\,ms period,
+or a longer one for caps below 8\% (40\,ms at 1\%), since the kernel and
+user parts each need a minimum budget of 200\,$\mu$s.
+
 \paragraph{Steal time.} Guests see the time they were ready to run but
 waiting for a core as \emph{steal}, in the \texttt{st} column of
 \cmd{top} and \cmd{vmstat}, as on any cloud VM. A VM capped at 25\% that tries

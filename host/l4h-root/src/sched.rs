@@ -29,29 +29,73 @@ pub fn consumed(sc: sel4::cap::SchedContext) -> u64 {
     r.consumed
 }
 
-/// Budget of a vCPU's scheduling contexts for a CPU cap in percent
-/// (0 = uncapped).
-pub fn budget_us(timeslice_us: u64, cap_pct: u32) -> u64 {
-    if cap_pct == 0 || cap_pct >= 100 {
-        timeslice_us
-    } else {
-        (timeslice_us * cap_pct as u64 / 100).max(MIN_BUDGET_US)
-    }
-}
-
 /// seL4's minimum budget is a few times the kernel WCET; stay well above.
 const MIN_BUDGET_US: u64 = 200;
+/// Size of a vCPU's scheduling contexts: room for 1 + EXTRA_REFILLS
+/// refills (the smallest holds only seL4's minimum of 2).  With few
+/// refills, a budget used in many short pieces, as a vCPU that is
+/// preempted and blocks often uses it, is merged into later refills and
+/// lost to the vCPU.
+pub const SC_BITS: usize = 9;
+const EXTRA_REFILLS: u64 = 14;
+/// SC_K's initial part of a capped vCPU's budget (permille).
+pub const K_SHARE_INIT: u32 = 500;
+
+/// Scheduling parameters of a vCPU, in µs: (period, SC_K budget, SC_U
+/// budget).  Uncapped (`cap_pct` 0 or 100), both SCs may use the whole
+/// period.  Under a cap the two SCs share one budget, `cap_pct` of the
+/// period, so that the vCPU as a whole never exceeds its cap; SC_K gets
+/// `k_share` permille of it.  Each SC needs at least MIN_BUDGET_US, so a
+/// small cap stretches the period instead (1% runs 400 µs every 40 ms).
+pub fn budgets(timeslice_us: u64, cap_pct: u32, k_share: u32) -> (u64, u64, u64) {
+    if cap_pct == 0 || cap_pct >= 100 {
+        return (timeslice_us, timeslice_us, timeslice_us);
+    }
+    let cap = cap_pct as u64;
+    let period = timeslice_us.max((2 * MIN_BUDGET_US * 100).div_ceil(cap));
+    let total = period * cap / 100;
+    let k = (total * k_share as u64 / 1000).clamp(MIN_BUDGET_US, total - MIN_BUDGET_US);
+    (period, k, total - k)
+}
+
+/// A capped vCPU used `ck` and `cu` µs of SC_K and SC_U over `elapsed_us`:
+/// the new SC_K share, if its budget should move.  An SC that used (nearly)
+/// all of its budget gets what the other one leaves, with headroom; when
+/// both did, they move towards an even split.
+fn adapt_share(timeslice_us: u64, cap_pct: u32, k_share: u32, ck: u64, cu: u64, elapsed_us: u64) -> Option<u32> {
+    // More than the elapsed time: consumption from an earlier period
+    // reported late (the root task ran late), not a measure of this one.
+    if cap_pct == 0 || cap_pct >= 100 || ck + cu > elapsed_us {
+        return None;
+    }
+    let (period, bk, bu) = budgets(timeslice_us, cap_pct, k_share);
+    let total = bk + bu;
+    // Use per period.
+    let (uk, uu) = (ck * period / elapsed_us, cu * period / elapsed_us);
+    let (full_k, full_u) = (uk * 10 >= bk * 9, uu * 10 >= bu * 9);
+    let new_k = match (full_k, full_u) {
+        (true, false) => total.saturating_sub((uu + uu / 4).max(MIN_BUDGET_US)),
+        (false, true) => (uk + uk / 4).max(MIN_BUDGET_US),
+        (true, true) => (bk + total / 2) / 2,
+        (false, false) => return None,
+    }
+    .clamp(MIN_BUDGET_US, total - MIN_BUDGET_US);
+    // Reconfigure only for a real change.
+    if new_k.abs_diff(bk) * 16 < total {
+        return None;
+    }
+    Some((new_k * 1000).div_ceil(total) as u32)
+}
 
 /// (Re)configure vCPU `v` of guest `g` on `core` with the guest's cap.
 pub fn configure(h: &Host, gid: usize, v: usize, core: usize) -> bool {
     let Some(g) = h.guest(gid) else { return false };
     let vcpu = &g.vcpus[v];
-    let period = h.info.timeslice_us;
-    let budget = budget_us(period, g.cpu_cap_pct);
+    let (period, budget_k, budget_u) = budgets(h.info.timeslice_us, g.cpu_cap_pct, vcpu.k_share);
     let sc = h.info.sched_control(core);
     let r = sc
-        .sched_control_configure_flags(vcpu.sc_k, budget, period, 0, 0, 0)
-        .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, budget, period, 0, 0, 0));
+        .sched_control_configure_flags(vcpu.sc_k, budget_k, period, EXTRA_REFILLS, 0, 0)
+        .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, budget_u, period, EXTRA_REFILLS, 0, 0));
     if let Err(e) = r {
         sel4::debug_println!("l4h-root: configure guest {} vCPU {} on core {}: {:?}", gid, v, core, e);
     }
@@ -77,20 +121,28 @@ pub fn set_cap(h: &mut Host, gid: usize, cap_pct: u32) -> bool {
 /// of one if the target core is lightly loaded).
 pub fn balance(h: &mut Host, elapsed_us: u64) {
     let cores = h.info.cores;
-    if cores < 2 || elapsed_us == 0 {
+    if elapsed_us == 0 {
         return;
     }
     let mut load = alloc::vec![0u64; cores];
     let mut active = alloc::vec![0u64; cores];
     // (guest, vcpu, core, consumed, movable)
     let mut sample = Vec::new();
+    // Capped vCPUs whose budget split changed: (guest, vcpu, core).
+    let mut resplit = Vec::new();
     let tsc_mhz = (h.info.tsc_hz / 1_000_000).max(1);
+    let timeslice_us = h.info.timeslice_us;
     for g in h.guests.iter_mut().flatten() {
         let event_pages: Vec<*mut l4h_abi::EventPage> = (0..g.vcpus.len()).map(|v| g.event_page(v)).collect();
         for (v, vcpu) in g.vcpus.iter_mut().enumerate() {
-            let c = consumed(vcpu.sc_k) + consumed(vcpu.sc_u);
+            let (ck, cu) = (consumed(vcpu.sc_k), consumed(vcpu.sc_u));
+            let c = ck + cu;
             if g.state != State::Running {
                 continue;
+            }
+            if let Some(share) = adapt_share(timeslice_us, g.cpu_cap_pct, vcpu.k_share, ck, cu, elapsed_us) {
+                vcpu.k_share = share;
+                resplit.push((g.id, v, vcpu.core));
             }
             vcpu.cooldown = vcpu.cooldown.saturating_sub(1);
             vcpu.usage = (c * 1000 / elapsed_us) as u32;
@@ -114,6 +166,12 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
             }
             sample.push((g.id, v, vcpu.core, c, vcpu.cooldown == 0));
         }
+    }
+    for &(gid, v, core) in &resplit {
+        configure(h, gid, v, core);
+    }
+    if cores < 2 {
+        return;
     }
     // Busy: at least half of a fair share among the core's active vCPUs
     // (a starved vCPU on a crowded core still counts).

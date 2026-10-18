@@ -101,6 +101,25 @@ void l4h_idle_wait(void)
 	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
 }
 
+/*
+ * Block for about 100 us, or until an event arrives, without consuming
+ * CPU.  The kernel's own timer deadline is kept: it ends the wait too.
+ */
+void l4h_wait_briefly(void)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	unsigned long long saved = v->timer_deadline;
+	unsigned long long dl = l4h_rdtsc() + l4h_tsc_hz / 10000;
+	seL4_Word badge = 0;
+
+	if (saved && saved < dl)
+		dl = saved;
+	seL4_TCB_SetTimer(v->ktcb, dl, L4H_BADGE_TIMER);
+	seL4_Wait(v->ntfn, &badge);
+	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
+	seL4_TCB_SetTimer(v->ktcb, saved, L4H_BADGE_TIMER);
+}
+
 /* Steal time of vCPU `cpu` in ns, as published by the host. */
 unsigned long long l4h_steal_ns(int cpu)
 {

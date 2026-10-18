@@ -232,6 +232,15 @@ We need no IOMMU, since no device is passed into a guest.
     (CLH) lock, and remote calls wait for every target core. With 4 vCPUs
     on 2 host CPUs and no pause-loop exiting (nested virtualisation),
     guests make progress but very slowly.
+- **0013, MCS reconfiguration of a remote thread.**
+  `SchedControl_ConfigureFlags` on an SC whose runnable thread is on
+  another core postponed the thread to the release queue when its new
+  refill was not ready, then enqueued it in that core's ready queue too:
+  a failed assertion in debug kernels, corrupt queues otherwise. l4h-root
+  does this whenever it changes the budget of a capped vCPU that used it
+  up. Only a schedulable thread is enqueued now; for a postponed one the
+  remote core is still told to reprogram its timer. This is an upstream
+  bug.
 
 
 - **0004, x86_64 user RSP across syscalls.** seL4's fast `syscall` entry
@@ -543,7 +552,8 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   Every band has MCS budgets, so no component can starve the bands below it.
 - **Per-vCPU budgets.**
   - `SC_K` and `SC_U` each get period T (default 5 ms) and a budget derived
-    from the guest's CPU *weight* and *cap*, as configured.
+    from the guest's CPU *weight* and *cap*, as configured. Under a cap
+    they split one budget (see the revision below).
   - Sums across a core may exceed 100%, which is overcommit. Inside the guest
     band, threads with budget left are scheduled round-robin.
   - Caps are hard: a guest never exceeds its configured vCPU count times its
@@ -584,11 +594,30 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
     put for 1 s.
   - The interval is measured, not assumed: root work such as building a
     guest can delay a period.
-- **CPU caps** (`vm_set_sched`, `l4hctl sched`) set the budget of both SCs
-  to a percentage of the 5 ms period. Weights are not implemented.
+- **CPU caps** (`vm_set_sched`, `l4hctl sched`) give a vCPU one budget,
+  a percentage of the 5 ms period, split between its SC_K and SC_U, so
+  that the vCPU as a whole stays within the cap. Weights are not
+  implemented.
+  - Each SC needs at least 200 µs, well above seL4's minimum budget, so
+    caps below 8% get a longer period: 1% is 400 µs every 40 ms.
+  - The split adapts. Each balancer period, an SC that used at least 90%
+    of its part gets what the other one used plus a quarter (at least
+    200 µs); when both used theirs, the split moves halfway towards even.
+    A user-bound vCPU capped at 25% therefore ends up with 1050 µs for
+    SC_U and 200 µs for SC_K, and a syscall-bound one the reverse.
+  - seL4 keeps the sliding-window limit of a reconfigured SC whose
+    thread is runnable; an SC that is idle or unbound starts afresh with
+    its new budget. Since the split changes at most once per balancer
+    period, that is at most one period's budget (5% of the cap) extra.
+    Samples covering more CPU time than elapsed (consumption reported
+    late when the root task ran late) do not move the split.
   - seL4 refuses to bind an SC whose budget is exhausted to a blocked
-    thread. The guest therefore yields until the refill when it moves a
-    capped SC_U to another process.
+    thread. The guest therefore waits for the refill, on 100 µs timers,
+    when it moves a capped SC_U to another process: not with
+    `seL4_Yield`, which charges SC_K all of its remaining budget.
+  - Their SCs hold 16 refills (512-byte objects). With seL4's minimum of
+    two, a budget used in many short pieces, as a vCPU that is preempted
+    and blocks often uses it, keeps being merged into later refills.
 - **Steal time.**
   - The guest accumulates its idle time in the event page (`idle_ticks`).
   - Each balancer period, `l4h-root` computes, per vCPU,
