@@ -71,6 +71,7 @@ impl Pci {
         Vec::new()
     }
     pub fn enable(&self, _d: &Device) {}
+    pub fn enable_memory(&self, _d: &Device) {}
     pub fn disable(&self, _d: &Device) {}
     pub fn enable_msix(&self, _d: &Device) {}
 }
