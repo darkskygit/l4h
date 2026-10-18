@@ -635,11 +635,27 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   implemented.
   - Each SC needs at least 200 µs, well above seL4's minimum budget, so
     caps below 8% get a longer period: 1% is 400 µs every 40 ms.
-  - The split adapts. Each balancer period, an SC that used at least 90%
-    of its part gets what the other one used plus a quarter (at least
-    200 µs); when both used theirs, the split moves halfway towards even.
-    A user-bound vCPU capped at 25% therefore ends up with 1050 µs for
-    SC_U and 200 µs for SC_K, and a syscall-bound one the reverse.
+  - The split adapts. When, in a balancer period, either SC used at
+    least 90% of its part, the budget is split in proportion to what each
+    used (each keeps at least 200 µs). A user-bound vCPU capped at 25%
+    therefore ends up with most of the budget in SC_U, and a syscall-bound
+    one the reverse.
+    - *Revised:* the first rule gave a saturated SC "what the other used
+      plus a quarter". A vCPU alternates between its kernel and user
+      threads, so when one SC runs out the other stalls too, and its use
+      understates its demand. The split flipped every period (2300/200 µs,
+      then about 400/2100 µs). A fork/exec-heavy guest capped at 50% used
+      about 20% of its budget: 200 fork+exec took 16 s instead of about
+      1 s. The usage ratio survives that throttling.
+    - **Remaining cost.** Splitting one budget between two strictly
+      alternating SCs still loses capacity, because whichever SC runs out
+      first in a period stalls the vCPU while the other's budget goes
+      unused. In `tests/run-capperf.sh` (release seL4, nested KVM, noisy),
+      200 fork+exec at a 50% cap took 3.9 s with the proportional split.
+      With both SCs given the whole budget, an experiment that breaks the
+      cap, they took 1.8 s, against 0.4–0.7 s uncapped. So the split still
+      costs about 2×, and something else, not yet found, costs about 2×
+      more.
   - seL4 keeps the sliding-window limit of a reconfigured SC whose
     thread is runnable; an SC that is idle or unbound starts afresh with
     its new budget. Since the split changes at most once per balancer

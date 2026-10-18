@@ -59,27 +59,31 @@ pub fn budgets(timeslice_us: u64, cap_pct: u32, k_share: u32) -> (u64, u64, u64)
 }
 
 /// A capped vCPU used `ck` and `cu` µs of SC_K and SC_U over `elapsed_us`:
-/// the new SC_K share, if its budget should move.  An SC that used (nearly)
-/// all of its budget gets what the other one leaves, with headroom; when
-/// both did, they move towards an even split.
+/// the new SC_K share, if its budget should move.
+///
+/// Once either SC used (nearly) all of its budget, the budget is split in
+/// proportion to what each used.  The other SC's use is not a measure of
+/// its demand: a vCPU alternates between its kernel and user threads
+/// (each syscall or fault runs the one, then the other), so when one SC
+/// runs out the other stalls too.  Giving the saturated SC "what the other
+/// used plus headroom" therefore starved the other one, which saturated in
+/// the next period: the split flipped every period, and a syscall-heavy
+/// guest capped at 50% used about 10% of a core.  The ratio of the two
+/// uses survives that throttling, so it is what the split follows.
 fn adapt_share(timeslice_us: u64, cap_pct: u32, k_share: u32, ck: u64, cu: u64, elapsed_us: u64) -> Option<u32> {
     // More than the elapsed time: consumption from an earlier period
     // reported late (the root task ran late), not a measure of this one.
-    if cap_pct == 0 || cap_pct >= 100 || ck + cu > elapsed_us {
+    if cap_pct == 0 || cap_pct >= 100 || ck + cu > elapsed_us || ck + cu == 0 {
         return None;
     }
     let (period, bk, bu) = budgets(timeslice_us, cap_pct, k_share);
     let total = bk + bu;
     // Use per period.
     let (uk, uu) = (ck * period / elapsed_us, cu * period / elapsed_us);
-    let (full_k, full_u) = (uk * 10 >= bk * 9, uu * 10 >= bu * 9);
-    let new_k = match (full_k, full_u) {
-        (true, false) => total.saturating_sub((uu + uu / 4).max(MIN_BUDGET_US)),
-        (false, true) => (uk + uk / 4).max(MIN_BUDGET_US),
-        (true, true) => (bk + total / 2) / 2,
-        (false, false) => return None,
+    if uk * 10 < bk * 9 && uu * 10 < bu * 9 {
+        return None;
     }
-    .clamp(MIN_BUDGET_US, total - MIN_BUDGET_US);
+    let new_k = (total * ck / (ck + cu)).clamp(MIN_BUDGET_US, total - MIN_BUDGET_US);
     // Reconfigure only for a real change.
     if new_k.abs_diff(bk) * 16 < total {
         return None;

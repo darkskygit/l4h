@@ -1,0 +1,25 @@
+#!/bin/sh
+# dom0 init for tests/run-capperf.sh: run the timing guest uncapped, then
+# under each cap given on the command line, sampling l4hctl top.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+caps=$(sed -n 's/.*capperf_caps=\([0-9,]*\).*/\1/p' /proc/cmdline | tr , ' ')
+for cap in 0 $caps; do
+    id=$(l4hctl create perfvm --kernel /bin/vmlinux --initrd /bin/perfvm.cpio.gz --mem 256 \
+        --cmdline "console=hvc0 quiet") || { echo "CAPPERF: create failed"; break; }
+    [ "$cap" = 0 ] || l4hctl sched "$id" "$cap"
+    t=0
+    while [ $t -lt 600 ]; do
+        l4hctl console "$id" >/tmp/con.log
+        grep -q "PERFVM: done" /tmp/con.log && break
+        l4hctl top | awk -v id="$id" '$1 == id { print "CAPPERF: cap '"$cap"' top " $3 "% of a core" }'
+        sleep 1
+        t=$((t + 1))
+    done
+    grep "PERFVM" /tmp/con.log | sed "s/^/CAPPERF: cap $cap: /"
+    l4hctl destroy "$id"
+done
+echo "CAPPERF: end"
+poweroff -f

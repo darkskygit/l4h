@@ -1,0 +1,19 @@
+#!/bin/sh
+# Guest of tests/run-capperf.sh: time fork+exec and CPU-bound work.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+now() { cut -d' ' -f1 /proc/uptime; }
+sleep 1
+echo "PERFVM: ready"
+t0=$(now)
+i=0
+while [ $i -lt 200 ]; do /bin/true; i=$((i + 1)); done
+t1=$(now)
+i=0
+while [ $i -lt 200000 ]; do i=$((i + 1)); done
+t2=$(now)
+echo "PERFVM: fork+exec x200 $t0 $t1   shell-loop $t1 $t2"
+echo "PERFVM: done"
+while :; do sleep 10; done
