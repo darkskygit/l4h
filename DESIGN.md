@@ -1506,6 +1506,23 @@ memory the guest can retype.
   moved into the guest's boot (create-to-ready minus create, about 130 ms
   for 128 MiB, was 57 ms). Phase 1 made create and destroy faster because
   the VMM no longer maps guest RAM.
+- **Throughput** (`tests/run-bench.sh`, 1 vCPU). These runs were taken on
+  a shared, heavily loaded development machine (load average about 10 on
+  8 CPUs). Repeated runs of the same build differed by up to 3x, so the
+  numbers below are only indicative and need repeating on a quiet host:
+
+  | | main | this branch |
+  |---|---|---|
+  | disk write, 1 MiB direct | 376–1236 MB/s, 51–68 % CPU | 429–512 MB/s, 68–78 % CPU |
+  | disk read, 1 MiB direct | 316–1167 MB/s, 88–91 % CPU | 447–598 MB/s, 82–88 % CPU |
+  | disk 4K read latency | 69–163 µs | 351–374 µs |
+  | guest↔guest TCP | 9–10 MB/s | 15–18 MB/s |
+
+  A slower disk path is expected, because every request is now copied
+  through the swiotlb pool. Earlier runs on a quieter machine gave phase 1
+  974 MB/s write and 750 MB/s read, against 1148–1210 and 910–1182 on
+  main. The 4K latency gap is larger than the copy alone explains, and
+  has not been investigated yet.
 
 ### 15.3 Converting blocks between frames and objects (phase 3)
 
