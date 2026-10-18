@@ -4,7 +4,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/guest
 mkdir -p "$out"
-"$root/tools/build-linux.sh" vmlinux 2>&1 | grep -E "error|undefined" && exit 1 || true
+"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
 (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
 "$root/tools/mkinitramfs.sh" "$out/densvm.cpio.gz" "$root/tests/guest/init-densvm" >/dev/null

@@ -5,7 +5,11 @@
 # Usage: ci-setup.sh [x86_64|debian]...   (default: x86_64)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-LINUX_VERSION=${LINUX_VERSION:-6.18.57}
+# Downloads are pinned by checksum.
+LINUX_VERSION=6.18.57
+LINUX_SHA256=5bd9acdc82ec5efc3790ae840e5aaa40dfde7efff261cf6dde902dc570acf98c
+RUSTUP_VERSION=1.29.1
+RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
 want=" ${*:-x86_64} "
 
 pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
@@ -22,7 +26,13 @@ apt-get install -y -q --no-install-recommends "${pkgs[@]}"
 # Rust: stable for the dom0 tools and tests, the pinned nightly for the host
 # (host/rust-toolchain.toml).
 if ! command -v rustup >/dev/null; then
-    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    init=$(mktemp)
+    curl -sSfL -o "$init" \
+        "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/x86_64-unknown-linux-gnu/rustup-init"
+    echo "$RUSTUP_SHA256  $init" | sha256sum -c --quiet
+    chmod +x "$init"
+    "$init" -y --profile minimal --default-toolchain stable
+    rm -f "$init"
 fi
 export PATH=$HOME/.cargo/bin:$PATH
 rustup toolchain install stable --profile minimal
@@ -38,6 +48,7 @@ if [ ! -f "$root/build/linux-6.18/Makefile" ]; then
     tarball=$root/build/dl/linux-$LINUX_VERSION.tar.xz
     [ -f "$tarball" ] || curl -sSfL -o "$tarball" \
         "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_VERSION.tar.xz"
+    echo "$LINUX_SHA256  $tarball" | sha256sum -c --quiet
     tar -C "$root/build" -xJf "$tarball"
     mv "$root/build/linux-$LINUX_VERSION" "$root/build/linux-6.18"
 fi

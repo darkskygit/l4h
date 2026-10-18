@@ -10,7 +10,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 img=$root/build/debian.img
 [ -f "$img" ] || { echo "no $img: run tests/mkdebian.sh" >&2; exit 1; }
-"$root/tools/build-linux.sh" vmlinux 2>&1 | grep -E "error|undefined" && exit 1 || true
+"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
 L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" L4H_DOM0_INITRD= \
     L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-1024} L4H_DOM0_VCPUS=${1:-2} \
