@@ -1,4 +1,4 @@
-# l4h: Design Proposal
+# l4h: Design and implementation
 
 l4h is a hypervisor built on seL4 that runs Linux VMs without hardware
 virtualization. It targets public-cloud instances where VT-x and SVM are
@@ -7,8 +7,12 @@ the guest Linux kernel is ported to run as an ordinary seL4 user-level program,
 and guest user processes run natively in their own seL4 address spaces. l4h
 never emulates an instruction.
 
-Status: **design accepted, with the review decisions recorded in §14**.
-Nothing here is implemented yet.
+Status: **v0.1 implemented on x86_64**, including SMP Linux guests,
+block and network I/O, dom0 control, CPU caps and balancing, and GCE N2
+bring-up. On aarch64, the host and ABI test guest run on QEMU `virt`;
+Linux guests and PCI drivers remain to be ported (§11). The original
+review decisions are recorded in §14. Future work is identified below;
+§15 records the implemented guest-owned memory design.
 
 ---
 
@@ -18,11 +22,11 @@ Nothing here is implemented yet.
 |---|-------------|-------------------------|
 | R1 | No hardware virtualization. Paravirtualize, as Xen PV does. Avoid instruction emulation. | The guest kernel is a new Linux architecture, `ARCH=l4h`, that runs in ring 3 as an seL4 thread and calls seL4 directly. Guest user code runs unmodified. Its `syscall` instructions and exceptions reach the guest kernel as seL4 fault IPC. |
 | R2 | x86_64 first, but friendly to aarch64. | Each layer is split into ISA-independent and ISA-specific parts (§11). seL4, rust-sel4 and sDDF already support aarch64. Nothing in the design relies on an x86-only mechanism such as segmentation, rings 1/2 or Xen-style page-table validation. |
-| R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a new paravirtual transport, `virtio-l4h`, with no trapped MMIO (§8). Block requests are forwarded zero-copy to a physical disk, partition or namespace assigned to that guest. For networking, the hypervisor provides **only L2 virtual switches**. A VM can have several vNICs, each on a switch, and a physical NIC is just an uplink port on a switch. Routing and NAT, when wanted, are done by a VM. |
+| R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a new paravirtual transport, `virtio-l4h`, with no trapped MMIO (§8). All device buffers use a host-owned I/O pool; the guest copies block data between its RAM and the pool, and the device DMAs into the pool (§15.1). For networking, the hypervisor provides **only L2 virtual switches**. A VM can have several vNICs, each on a switch, and a physical NIC is just an uplink port on a switch. Routing and NAT, when wanted, are done by a VM. |
 | R6 | A runtime management API, available to "dom0", the first guest started at boot. | `l4h-root` exposes a control API through a `l4hctl` paravirtual device that only dom0 receives (§9.1). dom0 has no device-driver duties. |
-| R7 | Targets: QEMU with virtio devices first, then GCP. | QEMU uses virtio-net-pci, virtio-blk-pci and nvme. GCP uses gen-3+ machine types (C3, N4, C4) with NVMe disks and gVNIC (§10). |
+| R7 | Targets: QEMU with virtio devices first, then GCP. | QEMU uses virtio-net-pci, virtio-blk-pci and nvme. GCE N2 is tested with virtio-net and NVMe local SSDs; gen-3+ types (C3, N4, C4) need a future gVNIC driver (§10). |
 | R4 | SMP guests. | Each guest vCPU is an seL4 kernel-context thread with its own scheduling context. IPIs are seL4 notifications (§6). |
-| R5 | Many guests per host, e.g. 30 guests on 4 CPUs. | seL4 MCS scheduling contexts give each vCPU a budget. Idle guests consume no CPU because the guest kernel is tickless and idle means blocked in `seL4_Recv`. A host balancer moves vCPUs between cores (§7). Each guest's kernel objects are charged to an Untyped quota assigned to that guest. |
+| R5 | Many guests per host, e.g. 30 guests on 4 CPUs. | seL4 MCS scheduling contexts give each vCPU a budget. Idle guests consume no CPU because the guest kernel is tickless and idle means blocked in `seL4_Recv`. A host balancer moves vCPUs between cores (§7). Each guest makes its kernel objects from its own RAM (§15). |
 
 Non-goals for v1: running unmodified guest *kernels*, live migration, memory
 overcommit or ballooning, 32-bit guest userspace, PCI passthrough into guests,
@@ -38,14 +42,14 @@ hypervisor.
 | **Xen PV ABI on seL4.** Reuse upstream `CONFIG_XEN_PV`. | Rejected. Xen PV gives the guest control of real hardware page tables, which the hypervisor validates through `mmu_update`. It also uses a hypervisor-assisted syscall bounce, `iret` hypercalls, event channels, grant tables and xenstore. Implementing this would mean writing Xen inside the seL4 kernel. Xen PV exists only on x86, which fails R2, and upstream treats it as legacy. |
 | **lguest-style `pv_ops` subarch of x86.** | Rejected. It is x86-only and needs the guest kernel in a privileged ring. lguest was removed from Linux in 4.14. |
 | **UML (User-Mode Linux) on seL4.** | Rejected as a base, but used as a source of ideas. UML is in-tree and gained initial SMP in 6.18. However, its host layer (`arch/um/os-Linux`) assumes a POSIX host with libc, signals and mmap of a physmem file, and it is effectively x86-only. Its separate-address-space kernel model is the same as ours, so we reuse its approaches to `uaccess` and `pt_regs`. |
-| **L4Linux** (TU Dresden / Kernkonzept, Linux on Fiasco.OC). | **The closest model.** L4Linux is a maintained out-of-tree `arch/l4` with x86-64 and arm64 subarches. The guest kernel is a user-level task, and each guest process is a microkernel task whose syscalls and faults arrive as IPC. It relies on Fiasco's *vCPU mode*, which seL4 lacks. §5 shows how seL4 threads, priorities and two small kernel extensions replace it. |
+| **L4Linux** (TU Dresden / Kernkonzept, Linux on Fiasco.OC). | **The closest model.** L4Linux is a maintained out-of-tree `arch/l4` with x86-64 and arm64 subarches. The guest kernel is a user-level task, and each guest process is a microkernel task whose syscalls and faults arrive as IPC. It relies on Fiasco's *vCPU mode*, which seL4 lacks. §5 shows how seL4 threads, priorities and the kernel extensions replace it. |
 | **Wombat / OK Linux** (NICTA, L4/seL4 era). | A historical precedent for Linux para-virtualized on L4-family kernels. |
 | **gVisor systrap.** | Different goal: it reimplements Linux rather than running it. It confirms that trapping syscalls from unmodified binaries without VT-x is practical in production. |
-| **seL4 Microkit / LionsOS / sDDF / libvmm.** | **Reuse the drivers and queue protocols.** sDDF has drivers for x86 virtio-pci net and blk, NVMe and an HPET/TSC timer, plus an `extern` OS shim, so it runs outside Microkit. The libvmm hardware-virtualization VMM and Microkit's static system model do not fit dynamic cloud guests, so we do not adopt them. |
+| **seL4 Microkit / LionsOS / sDDF / libvmm.** | **Use sDDF as a design reference.** l4h's Rust drivers and shared queues support dynamic guest attachment; they do not link sDDF's C drivers. The libvmm hardware-virtualization VMM and Microkit's static system model do not fit dynamic cloud guests, so we do not adopt them. |
 
 The result: **a new Linux architecture (`arch/l4h`), modelled on L4Linux and
-UML, running on an MCS SMP seL4 kernel with two small kernel extensions. Host
-components are written in Rust on rust-sel4, with sDDF C drivers.**
+UML, running on an MCS SMP seL4 kernel with three kernel extensions. Host
+components and device drivers are written in Rust on rust-sel4.**
 
 ---
 
@@ -67,27 +71,32 @@ components are written in Rust on rust-sel4, with sDDF C drivers.**
  │  └───────┬──────────────────────┘                                          │
  │          │ shared vrings + notifications                                   │
  │  ┌───────▼──────────┐                                                       │
- │  │ l4h-vmm (A)      │ one per guest, maps guest A's RAM only                │
+ │  │ l4h-vmm (A)      │ one per guest, maps its I/O pool, never guest RAM     │
  │  │ virtio backends  │                                                       │
  │  └──┬────────────┬──┘                                                       │
- │     │ sDDF blk   │ sDDF net queues                                          │
+ │     │ blk queue  │ net port rings                                           │
  │  ┌──▼───────┐  ┌─▼─────────────┐                                            │
- │  │ blk-mux  │  │ L2 vswitch(es)│  physical NIC = one uplink port            │
+ │  │ l4h-blkd │  │ l4h-netd      │  switches and uplink NIC drivers           │
  │  └──┬───────┘  └──────┬────────┘                                            │
  │  ┌──▼───────────┐  ┌──▼───────────────┐                                     │
- │  │ sDDF NVMe /  │  │ sDDF virtio-net /│                                     │
- │  │ virtio-blk   │  │ l4h gVNIC driver │                                     │
+ │  │ NVMe /       │  │ virtio-net PCI  │                                     │
+ │  │ virtio-blk   │  │ uplink NIC(s)   │                                     │
  │  └──────────────┘  └──────────────────┘                                     │
  └─────────────────────────────────────────────────────────────────────────────┘
    seL4 microkernel (MCS, SMP, x86_64), plus l4h extensions E1–E3 (§4)
    Cloud VM hardware (QEMU/KVM, GCE …) with no VT-x exposed
 ```
 
-Trust: the seL4 kernel, `l4h-root`, the drivers, blk-mux and vswitch form
+Each `l4h-blkd` drives one attached disk. `l4h-netd` combines all switches
+and uplink NIC drivers in one component. The drivers are Rust; gVNIC is
+future work.
+
+Trust: the seL4 kernel, `l4h-root`, `l4h-blkd` and `l4h-netd` form
 the host TCB. dom0 is trusted for control-plane decisions (§9.1) but cannot
 read other guests' memory. Each `l4h-vmm` is trusted only by its own
-guest: it maps that guest's I/O pool and nothing else (§15), so a compromised
-VMM can harm only that guest. Guest kernels are untrusted. Capabilities
+guest: it maps that guest's I/O pool and host-owned device, event and
+queue pages, and never its RAM (§15), so a compromised VMM can harm only
+that guest. Guest kernels are untrusted. Capabilities
 confine them, and the hypervisor never validates guest page tables.
 
 ---
@@ -101,10 +110,11 @@ Configuration:
 - `KernelMaxNumNodes`: up to 64 cores.
 - `KernelFastpath=ON`.
 - `KernelFSGSBase=inst`.
-- `KernelXSave` with `KernelXSaveFeatureSet` covering x87, SSE and AVX (and
-  AVX-512 when present), so that guest userspace sees the same ISA as a normal
-  Linux VM.
-- Spectre/Meltdown mitigations on: `KernelSkimWindow`, IBRS options.
+- `KernelXSave=XSAVEOPT`, with `KernelXSaveFeatureSet=7` covering x87,
+  SSE and AVX. The guest hides AVX-512, AMX and PKU, which seL4 does not
+  enable.
+- `KernelSkimWindow=OFF`, required by patch 0004's preservation of user
+  RSP across syscalls. l4h targets CPUs unaffected by Meltdown (see below).
 
 Release builds keep debug syscalls off.
 
@@ -157,25 +167,26 @@ complicates `sigreturn` and `ptrace`.
 
 GCE guests are not guaranteed to have an HPET, and the PIT is too coarse to
 multiplex. The MCS kernel already programs the per-core LAPIC TSC-deadline
-timer (the generic timer on arm64) for budget enforcement, so the cheapest,
+timer, or LAPIC countdown where TSC-deadline is unavailable (the generic
+timer on arm64), for budget enforcement, so the cheapest,
 most portable option is to let user level share it.
 
-E3 adds a small `Timer` kernel object, retyped from Untyped and bound to a
-notification:
+E3 adds a deadline timer to each TCB:
 
-- `seL4_Timer_Set(timer, deadline_tsc)` arms or re-arms it, and
-  `seL4_Timer_Clear` disarms it.
-- At the deadline the kernel signals the bound notification.
-- Armed timers sit in a per-core list ordered by deadline. The kernel programs
+- `seL4_TCB_SetTimer(tcb, deadline, badge)` arms or re-arms it; a zero
+  deadline disarms it. The absolute deadline uses the kernel timer's ticks
+  (TSC on x86, generic timer counter on aarch64).
+- At the deadline the kernel signals the badge on the TCB's bound
+  notification, if any, and disarms the timer.
+- TCBs with armed timers sit in a per-core list ordered by deadline. The kernel programs
   the hardware with the minimum of the next budget event and the head of that
   list.
 - A timer fires on the core it was last armed on. Migrated vCPUs re-arm on
   their new core.
 
-Each vCPU gets one Timer object. The guest clockevent calls `Timer_Set`
-directly, so there is **no user-level timer server** and no IPC hop. We expect
-fewer than about 200 armed timers per host, so an O(n) insert is fine. The
-patch is roughly 200 lines.
+The guest clockevent invokes `seL4_TCB_SetTimer` on its vCPU's kTCB, so
+there is **no user-level timer server** and no IPC hop. No separate Timer
+object is allocated or retyped. The per-core queue uses an O(n) insert.
 
 ### Not required
 
@@ -299,52 +310,52 @@ configuration on x86. aarch64 is the better long-term path to proof coverage.
 The UML host layer (`os-Linux`) is replaced by `os-sel4`, which is built
 against libsel4. The Kconfig keeps `CONFIG_UML` defined, so generic code
 treats l4h like UML (no hardware AVX paths, and so on). The tree is
-self-contained, and the only change outside `arch/l4h` is a one-line kbuild
-patch.
+self-contained. Patches outside `arch/l4h` handle kbuild's UML-style UAPI
+headers and restricted DMA pools without a device tree (§15.1).
 
 ### 5.1 Layout in the Linux tree
 
 ```
-arch/l4h/                         ISA-independent
+arch/l4h/
   kernel/   boot, setup, irq, time, smp, process (switch_to), signal glue, ptrace glue
-  mm/       software page tables -> seL4 VSpace mirroring, uaccess, fault path
-  drivers/  virtio_l4h transport, hvc console, l4h irqchip, clockevent
-  include/asm/sel4/   vendored libsel4 headers (BSD-2) and generated invocations
-arch/l4h/x86_64/                  ISA-specific
-  pt_regs <-> seL4 fault message, syscall entry/return, sigframe (x86 rt_sigframe),
-  vDSO build (reuses arch/x86/entry/vdso sources), TLS (fs_base), ELF/hwcaps, cpufeature
-arch/l4h/arm64/                   (future) same items for AArch64
+  kernel/skas/   software page tables, uaccess and process/syscall glue
+  os-sel4/  freestanding boot, event and user-thread operations against libsel4
+  drivers/  virtio_l4h transport, hvc console, l4hctl
+  include/  kernel, shared and UAPI headers
+  x86/      ISA-specific signal frames, TLS, syscall table, vDSO and register glue
+  configs/defconfig
+guest/linux/patches/              changes outside arch/l4h
 ```
 
-As UML does with `SUBARCH`, we build with `make ARCH=l4h SUBARCH=x86_64`. The
+`tools/build-linux.sh` builds with `ARCH=l4h`; the architecture Makefile
+sets `SUBARCH=x86_64` and uses headers from the seL4 build. The
 **userspace ABI is exactly the native x86_64 Linux ABI**: the same uapi
 headers, `syscall_64.tbl`, signal frame layout and vDSO. Unmodified distro
 userlands therefore run. We maintain the code as a patch series against the
 current Linux LTS (6.18 at the time of writing), rebased once per LTS.
-Changes outside `arch/` should be close to zero; UML and L4Linux need almost
-none.
+The aarch64 Linux port remains future work.
 
 ### 5.2 Address spaces
 
 - **Guest-kernel VSpace**, one per guest:
   - the kernel image;
-  - a **direct map of all guest RAM**: guest-physical address (GPA) *g* maps
+  - a **direct map of frame-backed guest RAM**: guest-physical address (GPA) *g* maps
     to `PAGE_OFFSET + g`, using 4 KiB frames (see §5.3);
   - vmalloc/module area;
   - per-vCPU event pages;
   - virtio-l4h device pages.
 
   All vCPU kernel TCBs of the guest share it.
-- **Guest-process VSpaces**, one seL4 VSpace per Linux `mm_struct`, created by
-  the guest kernel from its own Untyped quota. They hold only user mappings,
+- **Guest-process VSpaces** cache Linux `mm_struct` mappings in a fixed
+  pool of host-provided VSpace roots (§5.3). The guest makes their page
+  tables and mapping slots from its own RAM. They hold only user mappings,
   plus vDSO and vvar.
 - The two kinds are disjoint, and that disjointness is what isolates the guest
   kernel from guest user code. Every seL4 mapping is user-accessible, so the
   kernel's memory must not be mapped into a process VSpace at all. Kernel and
-  user VA ranges do not overlap numerically either: the kernel sits near the
-  top of the 47-bit range (`seL4_UserTop = 0x7ffffffff000`), and `TASK_SIZE`
-  is slightly smaller than native, for example `0x7f0000000000`. Generic code
-  that compares against `TASK_SIZE` therefore still works.
+  user VSpaces can use the same numeric addresses independently. The
+  x86_64 guest kernel is linked at `0x60000000`; host-provided special
+  pages start at `L4H_SPECIAL_BASE`. Separate VSpaces enforce isolation.
 - **uaccess** (`copy_{to,from}_user`, `get_user` and the rest) walks the
   guest's Linux page tables in software and goes through the direct map, as
   UML and L4Linux do. A missing page calls `handle_mm_fault` inline. The cost
@@ -411,22 +422,13 @@ none.
   be named by a 64-bit CPtr, because seL4 keeps resolving through it.
   Capabilities that must be named, such as the root CNode itself and user
   threads' CSpaces, live in a "meta" CNode in root slot 1 (see `abi.h`).
-- **Guest RAM.** `l4h-root` allocates guest RAM as 4 KiB frame caps from
-  physically contiguous Untyped chunks (at most 8 chunks, 2 MiB aligned).
-  GPA→HPA translation is therefore a tiny table, which zero-copy block DMA
-  relies on (§8.2). Each guest kernel receives:
-  - its RAM frame caps;
-  - a CNode;
-  - an **Untyped quota** for its own page tables, CNodes, TCBs, reply objects
-    and endpoints.
-
-  Running out of quota is a guest-local OOM. Tearing down a guest is a single
-  revoke of its Untyped.
-
-  *Revised (guest-owned memory, §15):* guest RAM is 2 MiB blocks from
-  anywhere, which the guest receives as Untypeds (all but the boot blocks)
-  and retypes itself, into frames or into its kernel objects. There is no
-  quota and no chunk table any more; devices see only the I/O pool.
+- **Guest RAM.** `l4h-root` allocates 2 MiB blocks from anywhere in free
+  host memory. The guest receives frame caps for the boot blocks and
+  Untyped copies for the rest, which it retypes into frames or its own
+  kernel objects (§15). There is no separate object quota or DMA RAM
+  chunk table: devices see only the host-owned I/O pool. Running out of
+  RAM for objects is a guest-local OOM. Destroy revokes the original
+  block Untypeds to reclaim everything the guest made.
 - Huge pages are not in v1. A later version can back hugetlb/THP regions with
   2 MiB frame caps from dedicated chunks.
 
@@ -449,7 +451,7 @@ Each **guest task that has a user context** (each Linux thread) has a
 - its fault handler is a badged copy of `EP_v` for the vCPU it runs on, and
   the badge is the task ID.
 
-uTCBs are created lazily from the guest's quota. Keeping one TCB per thread,
+uTCBs are created lazily from object blocks in the guest's own RAM. Keeping one TCB per thread,
 rather than one per vCPU, means seL4 holds each thread's register and FPU
 context, so a context switch never copies FPU state.
 
@@ -489,12 +491,12 @@ attaches that object to the faulting task, and refills the pool.
   cheap memory load, in `local_irq_enable`, `preempt_enable` and
   `cond_resched`, and before blocking. The E3 timer only signals `N_v`, so
   the same check also compares `rdtsc` against the vCPU's armed deadline.
-  The guest kernel is built with `CONFIG_PREEMPT` or `PREEMPT_LAZY`.
-- **Phase-2 backstop.** If the event page shows an unacknowledged event older
-  than N ms while kTCB is running, the guest's `l4h-vmm` performs an *upcall
-  injection*: Suspend, ReadRegisters, push an interrupt frame, WriteRegisters
-  with IP set to `l4h_irq_entry`, and Resume. This is the pre-vCPU-mode
-  L4Linux technique, and it should rarely fire.
+  The default guest configuration uses `CONFIG_PREEMPT_VOLUNTARY`.
+- **Future backstop.** The proposed upcall injection for a kTCB that runs
+  too long without polling is not implemented. It would require suspending
+  the kTCB and changing its registers to enter an interrupt handler, with
+  a safe way to construct the interrupt frame under the guest-owned
+  memory model. Current interrupt delivery relies on guest polling.
 - **Idle.** kTCB calls `seL4_Recv(EP_v)`. Idle consumes no CPU, which is what
   makes 30 mostly-idle guests on 4 cores practical.
 
@@ -511,8 +513,8 @@ WriteRegisters `fs_base`. With `KernelFSGSBase=inst`, userspace
 **Time.** The clocksource is the TSC, read with `rdtsc` in the kernel and in
 the vDSO. The vvar page is mapped into every process, and `clock_gettime`
 never traps. `l4h-root` passes the TSC frequency, taken from seL4 bootinfo.
-The clockevent is a per-vCPU one-shot deadline on that vCPU's E3 Timer
-object, bound to `N_v`.
+The clockevent is a per-vCPU one-shot deadline armed with
+`seL4_TCB_SetTimer(kTCB, deadline, L4H_BADGE_TIMER)`, which signals `N_v`.
 
 *Revised (v1):* the wall clock at boot comes from `L4H_HC_GET_TIME`:
 `l4h-root` reads the CMOS RTC once at boot, and each VMM adds the TSC time
@@ -538,14 +540,17 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
 - Signal;
 - Call to its VMM endpoint for device configuration, power-off and reboot.
 
-**No hypercall needs validation.** Isolation follows from the CSpace that
-`l4h-root` hands the guest:
+**Direct seL4 invocations rely on capability checks.** The CSpace that
+`l4h-root` hands the guest contains:
 
 - the guest's own frames and its Untyped;
 - its vCPU SCs, which it can bind but not configure, since it holds no
   SchedControl;
 - its own endpoints;
 - an MCP no higher than `P_K`.
+
+Host hypercalls and device requests still validate their arguments,
+including pool addresses, device indices and lifecycle state.
 
 ---
 
@@ -561,12 +566,11 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
 - **TLB shootdown for guest mms** is seL4's job (§5.3), so
   `flush_tlb_mm_range` only unmaps or invalidates the mirror and never IPIs
   other vCPUs. This is a large saving over a real VM.
-- **Lock-holder preemption.** vCPUs are preempted by the host, so spinlocks use
-  a paravirt slow path. `arch/l4h` owns its spinlock implementation, using
-  qspinlock with spinning bounded at around 2^10 iterations. After that the
-  waiter blocks on its notification, and the holder kicks the next waiter on
-  unlock. This is the same idea as KVM/Xen `pv_qspinlock`, but expressed with
-  seL4 notifications.
+- **Lock-holder preemption.** The guest currently uses native qspinlocks
+  and qrwlocks. A notification-based paravirtual spinlock slow path is
+  future work; a waiter currently spins if the lock holder is descheduled.
+  Keeping a guest's vCPUs on distinct cores where possible reduces this
+  cost, but oversubscription can still make it expensive.
 - `steal_time` comes from `seL4_SchedContext_Consumed` deltas, which the
   balancer publishes in the event page. Guest CFS can then account for steal.
 
@@ -578,8 +582,7 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
 
   | Band | Components |
   |------|------------|
-  | highest | NIC/disk drivers |
-  | | vswitch, blk-mux |
+  | highest | l4h-netd (switches and NIC drivers), l4h-blkd (disk drivers) |
   | | l4h-vmm instances |
   | | guest `P_K` |
   | lowest | guest `P_U` |
@@ -587,12 +590,12 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   Every band has MCS budgets, so no component can starve the bands below it.
 - **Per-vCPU budgets.**
   - `SC_K` and `SC_U` each get period T (default 5 ms) and a budget derived
-    from the guest's CPU *weight* and *cap*, as configured. Under a cap
-    they split one budget (see the revision below).
+    from the guest's CPU cap. Under a cap they split one budget (see below);
+    CPU weights are not implemented.
   - Sums across a core may exceed 100%, which is overcommit. Inside the guest
     band, threads with budget left are scheduled round-robin.
-  - Caps are hard: a guest never exceeds its configured vCPU count times its
-    cap.
+  - Caps limit each vCPU's combined kernel and user CPU time, with the
+    reconfiguration allowance described below.
 - **Placement and balancing.** seL4 does no load balancing, so `l4h-root`
   runs a balancer thread at low frequency (about 100 ms):
   - It reads `Consumed` for every SC.
@@ -601,16 +604,15 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
     together.
   - It keeps each guest's vCPUs on distinct cores where possible, which limits
     lock-holder preemption.
-  - It optionally keeps a guest on one SMT sibling set, to reduce side
-    channels.
+  - SMT sibling placement policy is future work.
 - **Fairness caveat.** Because `P_K > P_U` for every guest, a guest's kernel
   work can briefly pre-empt another guest's user work, bounded by `SC_K`
   budgets. If measurements show this matters, the balancer can lower `P_K` for
   vCPUs that burn kernel time, or we can trial `seL4_SchedContext_YieldTo`
   from interrupt senders.
 - **Memory sizing for 30 guests.** Guest RAM is reserved in full at creation.
-  Per-guest seL4 kernel-object overhead is about 1–3% of RAM: CNode slots
-  (32 B per mapping), PTs and TCBs, all charged to that guest's quota.
+  Guest-created CNode slots, page tables and TCBs come from that RAM. Host
+  overhead is the I/O pool plus about 6 MiB of objects per guest (§15.2).
   Ballooning (virtio-balloon to revoke frames) and free-page reporting come
   later.
 
@@ -684,19 +686,12 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
     and top. A guest capped at 25% sees about 75% steal
     (`tests/run-m6test.sh`). `l4hctl top` shows each VM's CPU use over the
   last period.
-- **Memory.** Free memory is a set of untouched power-of-two Untyped
-  blocks, managed buddy-style without coalescing. An allocation splits
-  the smallest block that fits, so guest RAM chunks never lose memory to
-  alignment. Reclaimed guest memory returns as blocks. A 256 MiB guest
-  costs about 317 MiB:
-  - its RAM;
-  - its seL4 object quota, by default 16 MiB plus RAM/16, used for its
-    processes' mapping slots and page tables;
-  - about 30 MiB of host objects, including its `l4h-vmm`.
-
-  *Revised (§15):* free halves merge again (lazily), there is no quota,
-  and a guest costs its RAM plus about 10 MiB whatever its size: a 256 MiB
-  guest costs 266 MiB.
+- **Memory.** Free memory is a set of power-of-two Untyped blocks,
+  managed buddy-style. An allocation splits the smallest block that fits;
+  free halves merge lazily (§15.2). Guest RAM is allocated as independent
+  2 MiB blocks. There is no separate object quota: a guest costs its RAM,
+  its I/O pool (4 MiB by default) and about 6 MiB of host objects, so a
+  256 MiB guest costs about 266 MiB.
 
 - **Limits.** `l4h-root` checks a request's memory, ASIDs and root CNode
   slots before starting it, and refuses with ENOMEM instead of exhausting
@@ -707,7 +702,7 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   - `tests/run-limits.sh` fills the host and checks that it recovers.
   - Every size and address in a control request is range-checked before
     any arithmetic on it (no overflow), and a request that fails half way
-    (e.g. guest RAM too fragmented: at most 128 chunks) gives back what it
+    (e.g. no contiguous block large enough for the I/O pool) gives back what it
     took. Free root CNode slots are coalesced ranges, so the slot ranges
     of vNIC ports and disk DMA buffers are reused after a guest is
     destroyed, and splitting a memory block no longer keeps a slot for
@@ -752,167 +747,103 @@ for each device, with no trapped accesses:
   page, then signals `N_v`. The `l4h-irq` irqchip maps event bits to Linux
   IRQs. Interrupt affinity is set through the same `seL4_Call`.
 - Discovery happens through the boot-info device table, not PCI or DT
-  probing. Vrings live in guest RAM and are addressed by GPA.
-  `VIRTIO_F_ACCESS_PLATFORM` is not negotiated in v1.
-- *Revised (guest-owned memory, §15.1):* vrings and every buffer live in
-  the guest's host-owned I/O pool, and `VIRTIO_F_ACCESS_PLATFORM` is
+  probing. Vrings and every buffer live in the guest's host-owned I/O
+  pool and are addressed by GPA (§15.1). `VIRTIO_F_ACCESS_PLATFORM` is
   required.
 
-### 8.2 Block, passthrough (zero-copy)
+### 8.2 Block, passthrough through the I/O pool
 
-"Passthrough" here means that **a guest's virtio-blk disk is a raw physical
-backing**: a whole disk, an NVMe namespace or an LBA range or partition,
-assigned to exactly one guest. There is no image format, no host filesystem
-and no copy.
+"Passthrough" means that **a guest's virtio-blk disk is a raw physical
+backing**: a whole disk, an NVMe namespace or an LBA window, assigned to
+exactly one guest. There is no image format or host filesystem.
 
-- **Path.** Guest `virtio_blk` → `l4h-vmm` (parses descriptor chains) → sDDF
-  blk queue → `blk-mux` → sDDF NVMe or virtio-blk driver → device.
-- **Zero-copy DMA.**
-  - The VMM puts the **GPA** of each guest data segment into sDDF requests.
-    The guest's RAM is registered with `blk-mux` as that client's data region.
-  - `blk-mux` bounds-checks each segment against the client's RAM extents and
-    LBA window, then translates GPA→HPA with the chunk table (§5.3).
-  - The device then DMAs directly into guest memory.
-
-  This is the existing sDDF `io_or_offset` scheme, extended from one region to
-  a chunk table.
-- **No IOMMU.** Cloud VMs rarely expose one. Isolation therefore depends on the
-  trusted `blk-mux` and driver validating addresses; the untrusted guest never
-  touches device registers. If an IOMMU is present, seL4 VT-d IOSpaces can
-  confine the device itself, as defence in depth.
-- **blk-mux, written in Rust.** It replaces sDDF's static `blk/components/virt.c`
-  with dynamic client attach and detach. It also adds per-guest LBA windows,
-  read-only flags, flush and FUA passthrough, discard/write-zeroes, and
-  per-guest IOPS and bandwidth limits using token buckets.
-- Multi-queue: one virtqueue per guest vCPU (`VIRTIO_BLK_F_MQ`), and one sDDF
-  queue pair per guest.
-- **Revised during implementation (v1).**
-  - One `blkd` per attached disk, with no blk-mux: a disk, or a window of
-    one, belongs to exactly one guest.
-  - blkd has two drivers behind one trait:
-    - virtio-blk PCI, which uses an indirect descriptor table per request;
-    - NVMe, with one I/O queue pair and namespace 1. Its 4 KiB pages and
-      PRP lists are sized to the controller's MDTS. A request is split
-      into several commands when its pieces cannot share one PRP list.
-  - The common part checks every request:
-    - each segment's GPA lies in the client's RAM (*revised, §15.1:* in
-      the client's I/O pool, translated with one offset);
-    - the data direction matches the operation;
-    - the request is aligned to the logical block size, which is passed to
-      the guest as virtio `blk_size`, both within the window and on the
-      disk;
-    - it stays within the LBA window (`start`/`sectors`).
-    Writes are refused on read-only attachments. Windows must start and
-    end on 4 KiB, the largest block size blkd supports (`l4h-root`
-    refuses others with EINVAL): the NVMe driver addresses whole blocks,
-    so a window starting inside one would reach the sectors before it.
-  - There is still a single queue: no `VIRTIO_BLK_F_MQ`, discard or write
-    zeroes yet.
-  - A device or queue reset waits until blkd has completed every request
-    of the old queue (the device may still DMA into its buffers) before
-    the hypercall returns. The VMM counts the requests it gave blkd, and
-    ignores a chain whose head is already in flight: a guest listing a
-    head twice cannot make the reset return early.
-  - Tested with QEMU NVMe at 512-byte and 4 KiB LBAs
-    (`BLKTEST_DEV=nvme tests/run-blktest.sh`), and with a read-only window
-    in `tests/run-ctltest.sh`.
+- **Path.** Guest `virtio_blk` → `l4h-vmm` (parses descriptor chains) →
+  shared block queue → `l4h-blkd` → NVMe or virtio-blk PCI device. One blkd
+  component serves each attached disk; there is no blk-mux.
+- **DMA.** All rings and buffers live in the guest's host-owned I/O pool
+  (§15.1). The guest kernel copies data between its RAM and the pool using
+  restricted DMA/swiotlb. The VMM forwards pool GPAs; blkd validates and
+  translates them to physical addresses with one offset. The device DMAs
+  directly into the pool, and host components add no data copy.
+- **Drivers.** blkd has two Rust drivers behind one trait:
+  - virtio-blk PCI, with an indirect descriptor table per request;
+  - NVMe, with one I/O queue pair and namespace 1. Its 4 KiB pages and
+    PRP lists are sized to the controller's MDTS. A request is split into
+    several commands when its pieces cannot share one PRP list.
+- **Validation.** Every segment must lie in the I/O pool, its direction
+  must match the operation, and the request must be aligned to the logical
+  block size and stay within the LBA window and the disk. The logical
+  block size is passed to the guest as virtio `blk_size`. Writes are
+  refused on read-only attachments. Windows must start and end on 4 KiB,
+  the largest block size blkd supports: root refuses others with EINVAL.
+- **Semantics.** Flushes reach the device. There is one queue per disk;
+  multi-queue, discard, write-zeroes and I/O rate limits are future work.
+- **Reset.** A device or queue reset waits until blkd has completed every
+  request from the old queue before the hypercall returns. The VMM counts
+  outstanding requests and ignores a chain whose head is already in
+  flight. Destroy resets the physical device before reusing its buffers
+  (§9.1).
+- **No IOMMU.** Isolation depends on the trusted driver validating every
+  address; the untrusted guest has no device registers. IOMMU confinement
+  of a device would be a future defence in depth.
+- **Tests.** QEMU NVMe at 512-byte and 4 KiB LBAs
+  (`BLKTEST_DEV=nvme tests/run-blktest.sh`), read-only windows and destroy
+  during disk I/O (`tests/run-ctltest.sh`), and hostile descriptors aimed
+  outside the pool (`tests/testguest` and `tests/fuzz-virtq`).
 
 ### 8.3 Network: L2 virtual switches only
 
-**Principle.** The hypervisor implements only Ethernet switching. Any L3
-function, such as routing, NAT, DHCP or firewalling, belongs in a VM.
+**Principle.** The hypervisor implements Ethernet switching. Routing,
+NAT, DHCP and firewalling belong in a VM.
 
-- **Path.** Guest `virtio_net` → `l4h-vmm` (net backend) → sDDF net queues →
-  `vswitch` → (uplink) NIC driver. The NIC driver is the sDDF virtio-net-pci
-  driver on QEMU and the l4h gVNIC driver on GCP (§10).
-- **Multiple vNICs per VM.** A guest may have up to 16 virtio-net devices.
-  Each one is a port on exactly one switch, has its own MAC and queue pairs,
-  and appears to the guest as a separate `ethN`.
-- **Switches.** The control API (§9.1) can create any number of switches.
-  Each is an isolated L2 broadcast domain. One vswitch component serves all
-  of them, with per-switch tables, and can be sharded per core later.
-- **Uplinks.** A physical NIC is attached as an ordinary *uplink port* on one
-  switch, so frames are switched to and from it like any other port. A NIC
-  can be attached to at most one switch, and a switch can have no uplink,
-  which makes it internal-only.
-- **vswitch, written in Rust.** It reuses the sDDF net queue format but
-  replaces sDDF's static `vswitch.c`, which has 63 clients and fixed
-  allow-lists, with dynamic ports. It provides:
-  - MAC learning with ageing, plus optional static MAC entries;
-  - broadcast, multicast and unknown-unicast flooding, with per-port rate
-    limits;
-  - optional 802.1Q access and trunk ports;
-  - per-port MTU, including jumbo frames where the uplink allows.
-  - **L2 port security:** a port can be locked to its configured source MAC.
-    It is on by default for guest ports. Nothing above L2 is inspected.
-- **Routing is done by a VM.** On GCP the VPC delivers only frames for the
-  instance's own MAC and IP addresses (or alias IP ranges). The usual topology
-  is therefore:
-  - The uplink switch holds the gVNIC and one vNIC of a *router VM*. That VM
-    may be dom0 or a dedicated guest, and the control API configures its vNIC
-    to use the gVNIC's MAC.
-  - Internal switches connect the other guests to the router VM's other
-    vNICs.
-  - The router VM does NAT, or routes GCP alias IP ranges to the guests,
-    using standard Linux tooling.
-
-  On QEMU or bare metal, guests can sit directly on the uplink switch instead.
-- **Copies.** v1 has two copies on each path:
-  - tx: guest buffer → vswitch-owned buffer, done by the VMM;
-  - rx: vswitch buffer → guest buffer, done by the VMM.
-
-  The vswitch only moves descriptors. Guest-to-guest traffic costs one copy
-  into a shared buffer and one copy out.
-- **Later optimization.** A per-guest *I/O window* inside guest RAM would act
-  as the sDDF client data region. The guest would use a restricted-DMA pool,
-  forcing swiotlb for `virtio_net` with `ACCESS_PLATFORM`, so the vswitch
-  copies window to window and the VMM copies nothing.
-  *Revised (§15.1):* the restricted-DMA pool exists now, as a host-owned
-  I/O pool outside guest RAM; making netd's port region the pool of a
-  vNIC would remove the VMM's copy.
-- **Revised during implementation (v1).**
-  - One component, `netd`, holds every switch and also drives the uplink
-    NICs (virtio-net PCI on QEMU). Uplinks are ports of a switch like any
-    other, so a separate driver component would only add a hop.
-  - A guest vNIC is a netd *port*: a shared region with TX and RX rings of
-    2 KiB frame slots between the guest's `l4h-vmm` and netd. `l4h-root`
-    adds and removes ports with calls to netd (`NETD_ADD_PORT`,
-    `NETD_REMOVE_PORT`); port memory belongs to the guest's arena.
-  - Copies: the VMM copies guest buffers to and from slots, and netd copies
-    slot to slot, or slot to NIC DMA buffer. That is one copy more than the
-    plan above, and it keeps netd's memory independent of every guest.
-  - Offloads: checksum and TSO metadata in the virtio-net header pass
-    through. netd validates the header of every guest frame (flags,
-    checksum offsets, GSO type and that a GSO frame really is TCP over
-    IPv4/IPv6) and drops incoherent ones. A GSO frame for a port that
-    cannot take it (a guest without GUEST_TSO, an uplink without
-    HOST_TSO) is segmented in netd, with full checksums.
-  - MAC learning has 300 s ageing, at most 1024 entries per switch and
-    8192 in all; a full table first drops expired entries, then stops
-    learning (those sources' frames are flooded). Unknown unicast,
-    broadcast and multicast are flooded within the switch. netd processes
-    at most one ring's worth of frames per kick and ignores a ring whose
-    indices claim more. Locked ports (the default) drop frames
-    whose source MAC is not the port's MAC.
-  - `tests/run-router.sh` covers the routing gate. A Debian router VM has
-    one vNIC on the uplink switch and one on an internal switch, and NATs
-    with nftables masquerade. A guest that is only on the internal switch
-    reaches the outside through it.
-  - `tests/run-nettest.sh` covers DHCP and ping over the QEMU user-net
-    uplink, guest-to-guest pings on internal switches, a guest with two
-    vNICs, switch isolation and MAC lock.
-- Offloads: checksum offload and TSO/GSO are passed through as metadata
-  (virtio-net header). Software segmentation and checksumming happen at the
-  uplink port when the NIC lacks the feature; this is still L2 framing work,
-  not routing. mrg_rxbuf and multiqueue are on.
+- **Path.** Guest `virtio_net` → `l4h-vmm` → shared net port rings →
+  `l4h-netd` → destination port or uplink NIC. netd combines all switches
+  and the virtio-net PCI drivers in one Rust component. It supports modern
+  and legacy virtio-net; gVNIC is future work (§10).
+- **Multiple vNICs.** Each vNIC is on one switch and appears as a separate
+  `ethN`. It shares the guest's limit of 16 devices with the console,
+  disks and, in dom0, control device. There are 48 guest ports in all.
+- **Switches and uplinks.** The API creates switches dynamically. Each is
+  an L2 broadcast domain with its own learned MAC table. A physical NIC
+  can be the uplink of one switch; a switch without an uplink is internal.
+  A single netd serves all switches. VLANs, jumbo MTUs, static MAC entries
+  and port rate limits are future work.
+- **Ports and copies.** A vNIC has TX and RX rings of 2 KiB frame slots
+  shared by its VMM and netd. Root adds/removes ports through
+  `NETD_ADD_PORT`/`NETD_REMOVE_PORT`; port memory belongs to the guest's
+  arena. The guest first bounces buffers through its host-owned I/O pool.
+  The VMM copies between that pool and port slots; netd copies slot to
+  slot, or slot to NIC DMA buffer. Making the I/O pool itself a netd port
+  region could remove the VMM copy in future.
+- **Offloads.** Checksum and TSO metadata pass through in the virtio-net
+  header. netd validates flags, checksum offsets and GSO type, including
+  that a GSO frame is TCP over IPv4/IPv6. Incoherent headers are dropped.
+  A frame for a port that cannot take its offload is segmented and
+  checksummed in software. Guest vNICs have one RX/TX queue pair.
+- **Learning and security.** MAC entries age after 300 s, with at most
+  1024 per switch and 8192 in all. A full table drops expired entries and
+  then stops learning; unknown unicast, broadcast and multicast are
+  flooded within the switch. netd handles at most one ring's worth of
+  frames per kick and ignores rings whose indices claim more. MAC lock
+  is on by default. Isolated ports exchange no frames with each other,
+  but can reach normal ports and the uplink (`--nic ...,isolated`).
+- **Router VMs.** On GCE, the router's uplink vNIC uses the instance's MAC
+  address. dom0's first vNIC takes the uplink NIC's MAC by default. The
+  router's other vNICs join internal switches and Linux provides NAT or
+  routing. QEMU guests can also sit directly on the uplink switch.
+- **Tests.** `tests/run-nettest.sh` covers DHCP and ping over the QEMU
+  uplink, internal switches, multiple vNICs, isolation and MAC lock.
+  `tests/run-router.sh` uses a Debian router with nftables masquerade to
+  connect an internal guest to the outside.
 
 ### 8.4 Console and other devices
 
-- **Console**: an `hvc_l4h` driver, a shared ring to the VMM, which feeds the
-  sDDF serial virtualiser (pc99 UART) and per-guest log buffers.
-- virtio-rng is backed by RDRAND/RDSEED in the VMM.
-- `l4hctl`, dom0 only (§9.1).
-- Later: virtio-vsock, virtio-balloon.
+- **Console.** `hvc_l4h` sends output to the VMM using hypercalls. The VMM
+  appends it to a host-owned per-guest ring and writes to the serial port;
+  root reads the ring for `console_read`. Console input and power requests
+  use the shared console device page.
+- **Control.** `l4hctl`, dom0 only (§9.1).
+- **Future devices.** virtio-rng, virtio-vsock and virtio-balloon.
 
 ---
 
@@ -921,8 +852,8 @@ function, such as routing, NAT, DHCP or firewalling, belongs in a VM.
 All host components are Rust: no_std, using the rust-sel4 crates `sel4` and
 `sel4-root-task`.
 
-**Revised during implementation.** Device drivers are also written in
-Rust, following sDDF's design (shared queues, zero-copy block requests,
+Device drivers are also written in Rust, following sDDF's design
+(shared queues and block requests that add no host data copy,
 virtualiser/switch components) rather than linking sDDF's C drivers.
 sDDF's components assume a static, Microkit-shaped system, while l4h
 attaches and detaches guests at runtime. A single language and runtime for
@@ -930,88 +861,82 @@ the host keeps that dynamic plumbing simple.
 
 | Component | Instances | Role |
 |-----------|-----------|------|
-| `l4h-root` | 1 | Root task. Takes all Untyped and device memory from bootinfo, creates the services, and runs the guest lifecycle: create, start, stop and destroy. Allocates RAM chunks, quotas, SCs and Timer objects, runs the balancer, and is the authority for blk and net attachments. It implements the control API (§9.1). |
-| `l4h-vmm` | 1 per guest | Boots the guest: loads the ELF and initramfs, then builds the boot-info page and the kernel VSpace with the direct map. Hosts the guest's virtio backends and console, handles power events, and runs the upcall-injection backstop. dom0's VMM also hosts the `l4hctl` backend. |
-| `blk-mux` | 1 | Multiplexes physical disks for blk clients (§8.2). |
-| `vswitch` | 1 (n switches) | §8.3. |
-| drivers | 1 per device | sDDF NVMe, virtio-blk-pci, virtio-net-pci and pc99 serial, plus the sDDF PCI library. Also the l4h gVNIC driver, ported from Linux `gve`, which is dual MIT/GPL licensed. |
+| `l4h-root` | 1 | Allocates guest RAM blocks, I/O pools, host objects and vCPU scheduling contexts. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's embedded images and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
+| `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
+| `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk PCI or NVMe disk. |
+| `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and virtio-net PCI uplink drivers. |
 
-**Guest boot protocol.** The guest boots with no BIOS and no bootloader.
-`l4h-vmm` maps the `vmlinux` ELF and an initramfs, then starts vCPU0 at the
-entry point with `rdi` pointing at an `l4h_boot_info` page. The page holds:
+The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
+protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
+Serial output uses seL4's printing syscall; root drives COM1 input for the
+monitor. There is no separate serial virtualiser or gVNIC driver.
 
-- an ABI version;
-- the RAM extents;
-- the vCPU count;
-- the CSpace layout, meaning cap slot indices for frames, Untyped, the vCPU
-  objects and device endpoints;
+**Guest boot protocol.** The guest boots without firmware or a bootloader.
+Root parses dom0's embedded ELF. For runtime guests, the dom0 `l4hctl`
+client parses the ELF and root copies uploaded segments and initramfs
+bytes into the new guest's boot frames. Root constructs the kernel VSpace
+and `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
+(`x0` on aarch64) pointing at boot info. It holds:
+
+- the guest ABI version (currently 3);
+- RAM size, direct-map base, block count and boot-block count;
+- the I/O pool GPA and size;
+- the vCPU count and pre-assigned VSpace count;
 - the device table;
 - the command line;
-- the TSC frequency;
-- the event-page addresses.
+- the time-counter frequency and flags.
 
-The ABI header (`l4h_abi.h`) is the single source of truth. Rust bindings are
-generated from it with bindgen, and the guest includes it directly.
+Capability slots and special mappings, including event-page addresses,
+are defined by `include/l4h/abi.h`, the single source of truth. The guest
+includes it directly. `host/l4h-abi/src/lib.rs` is a handwritten Rust
+mirror with layout assertions; bindings are not generated with bindgen.
+The control protocol has its own version, currently 1.
 
 ### 9.1 Control plane: dom0 and the runtime API
 
-**Starting dom0.** At boot, `l4h-root` reads a small *host manifest*, a boot
-module in TOML. The manifest describes host-level settings and **dom0 only**:
+**Starting dom0.** `tools/build-host.sh` builds the services and root.
+`host/l4h-root/build.rs` embeds their ELFs, dom0's kernel and initramfs,
+and its command line. `L4H_DOM0_*` environment variables set its memory,
+vCPUs, I/O pool, disks and NICs; rebuilding root applies changes. There
+is no runtime TOML manifest. The user manual lists the variables.
 
-- dom0's kernel, initramfs and cmdline (also boot modules);
-- its vCPUs and memory;
-- its disks, for example a partition of the boot disk plus any disks to
-  manage;
-- its vNICs, for example one on a management switch with the uplink.
+dom0 is guest #0 and receives a host-owned `l4hctl` device page. Its VMM
+has a control forwarding capability to root. Other guests' VMMs do not.
+dom0 runs no host hardware drivers; those stay in blkd and netd.
 
-dom0 is guest #0. It is a normal l4h Linux guest with one extra device,
-**`l4hctl`**, which carries a badged capability to the control endpoint of
-`l4h-root`. No other guest ever receives that capability. dom0 runs no host
-device drivers: disks and NICs stay with the host components. This makes it
-much smaller in role than Xen's dom0.
+**API surface.** Requests and responses are synchronous, fixed-layout,
+little-endian structs defined in `include/l4h/abi.h` and mirrored in
+`l4h-abi`. The control version is 1.
 
-**API surface.** Requests and responses are fixed-layout, little-endian,
-versioned structs defined in `l4h-abi`.
+| Area | Implemented operations |
+|------|------------------------|
+| Host | `host_info`: cores, free/total bytes, disk, VM and NIC counts |
+| Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores for the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched` |
+| Block | `blk_attach`: disk, read-only flag and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
+| Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports and counters), `nic_info` (PCI address, switch, MAC) |
+| Console | `console_read` (offset, bytes and lost-byte count), `console_write` |
 
-| Area | Operations |
-|------|------------|
-| Host | `host_info` (cores, memory free/total, physical disks and namespaces, physical NICs, ABI version), `host_stats` |
-| Guests | `vm_create` (vCPUs, memory, CPU weight/cap, kernel cmdline), `vm_load_image` (kernel/initramfs bytes, see below), `vm_start`, `vm_shutdown` (ACPI-like request to the guest), `vm_destroy` (hard kill and reclaim), `vm_pause`/`vm_resume`, `vm_list`, `vm_info`/`vm_stats` (CPU consumed, steal, I/O counters), `vm_set_sched` |
-| Block | `blk_attach(vm, backing, ro)`, where the backing is a whole disk, an NVMe namespace or an LBA range. `blk_detach`, with hotplug through the virtio-l4h device table. `blk_set_limits` (IOPS/bandwidth). |
-| Network | `switch_create`/`switch_destroy`, `switch_attach_uplink(switch, nic)`, `nic_create(vm, switch, mac, queues, mac_lock, vlan)`, `nic_destroy`, `switch_info` (ports, MAC table, counters) |
-| Console | `console_open(vm)` returns a stream of guest console bytes in and out, multiplexed over the l4hctl device |
-| Events | an asynchronous event queue for guest exits, crashes and console data |
+Devices are attached before start and removed on destroy. Pause/resume,
+hotplug, switch deletion, I/O limits and asynchronous event queues remain
+future work. A Rust userspace library and CLI live in `tools/l4hctl`;
+external orchestration can run in dom0.
 
-**Transport.**
-
-- `l4hctl` is a virtio-l4h device of a private type, with a request virtqueue
-  and an event virtqueue.
-- Image upload is chunked: `vm_load_image` names a buffer in dom0's RAM, and
-  `l4h-vmm`/`l4h-root` copies it into the new guest's RAM. dom0 can therefore
-  fetch images from anywhere, such as a disk, the network or GCS.
-- In dom0 the driver exposes `/dev/l4hctl` and passes messages through
-  unchanged.
-- A Rust userspace tool and library, `l4hctl`, provides a CLI. Cloud
-  orchestration (a REST or gRPC agent) can be built on it later, in dom0
-  userspace and outside the hypervisor.
-
-**Revised during implementation (v1).**
+**Transport and lifecycle.**
 
 - The `l4hctl` device is a single shared page rather than virtqueues:
   dom0 writes a fixed-layout request (`struct l4h_ctl_req` in `abi.h`) and
   issues `L4H_HC_CTL`. dom0's `l4h-vmm` forwards the call to `l4h-root`,
   which executes it synchronously and writes the response into the same
-  page. Requests are short except image loads, which are bounded at 4 MiB
-  per call.
+  page. Image loads are bounded at 1 MiB per call.
 - `/dev/l4hctl` takes one ioctl that carries a request, its response and,
-  for `VM_LOAD`, a user buffer. The driver stages the buffer in physically
-  contiguous memory and passes its GPA. *Revised (§15.1):* it stages it in
-  the control device's data area, 1 MiB of host-owned frames mapped into
-  dom0, and passes an offset: `l4h-root` never reads a guest's RAM.
+  for `VM_LOAD`, a user buffer. The driver stages it in the control
+  device's data area, 1 MiB of host-owned frames mapped into dom0, and
+  sets the request's source offset to 0 and length to the ioctl buffer
+  length: `l4h-root` never reads dom0's RAM.
 - `l4hctl` parses the guest kernel ELF in dom0 userspace and loads it with
   raw `VM_LOAD(vm, gpa, bytes)` writes. `l4h-root` copies page by page from
   the data area to the new guest's frames and never parses guest images.
-  The lifecycle is `vm_create` → `blk_attach`* → `vm_load`* → `vm_start`
+  The lifecycle is `vm_create` → (`blk_attach` / `nic_create` / `vm_load`)* → `vm_start`
   (writes the boot info and spawns the guest's `l4h-vmm`) → `vm_destroy`.
 - `vm_shutdown` (`l4hctl shutdown [--reboot]`) is the ACPI-power-button
   equivalent. `l4h-root` sets `power_request` in the guest's console page
@@ -1023,17 +948,16 @@ versioned structs defined in `l4h-abi`.
   `l4h-root` reads for `console_read`. It is also copied to the serial port
   with a `[vmN]` line prefix. Console input is a ring in the guest's
   console device page, which hvc polls.
-- **Reclaim.** Each guest's objects come from its arena: arena Untypeds,
-  RAM chunks, quota and the arenas of its blkds. Root CNode slots allocated
+- **Reclaim.** Each guest holds RAM block Untypeds, its I/O pool, a
+  host-object arena and its blkds' arenas. Root CNode slots allocated
   on the guest's behalf are tracked. `vm_destroy` first quiesces the
   attached disks, then revokes those Untypeds, returns them to the free
   pool and deletes the tracked slots. ASIDs are released by the kernel
   when VSpaces die. Repeated create/destroy leaves free memory unchanged
   (`tests/run-ctltest.sh`).
 - **Disk detach.** A disk is detached only when its guest is destroyed.
-  The device may hold commands that address the guest's RAM and blkd's
-  DMA memory (queues, PRP lists, request headers), so `l4h-root`
-  (*revised, §15.1:* the guest's I/O pool, not its RAM):
+  The device may hold commands that address the guest's I/O pool and
+  blkd's DMA memory (queues, PRP lists, request headers), so `l4h-root`:
   1. suspends blkd, so that nothing more is submitted;
   2. resets the device itself, through a mapping of its registers: NVMe
      clears CC.EN and waits up to CAP.TO for CSTS.RDY to clear, which
@@ -1049,10 +973,9 @@ versioned structs defined in `l4h-abi`.
   command it already started, and it keeps its queue addresses, which it
   would use again when the next attach turns bus mastering back on. If a
   device does not confirm the reset, it is marked failed and never enabled
-  again (`blk_attach` returns EIO, `l4hctl disks` says so). The guest's RAM
-  chunks and blkd's DMA memory are then kept out of the free pool for
-  good; their objects are still destroyed (*revised, §15.1:* the guest's
-  I/O pool and blkd's DMA memory). Disks are also reset at boot,
+  again (`blk_attach` returns EIO, `l4hctl disks` says so). The guest's I/O pool
+  and blkd's DMA memory are then kept out of the free pool; guest RAM
+  and other host objects are reclaimed (§15.1). Disks are also reset at boot,
   with bus mastering off, before anything enables them, since firmware
   may leave a controller running. There is no IOMMU (§8.2), so nothing
   else confines a device.
@@ -1070,7 +993,7 @@ versioned structs defined in `l4h-abi`.
   invalid requests. dom0 cannot breach host isolation, but it is fully trusted
   to decide *what* runs. In particular, dom0 can attach any disk to itself.
 - If dom0 crashes, the other guests keep running. `l4h-root` restarts dom0
-  according to the manifest's restart policy, and the new dom0 recovers state
+  from its embedded images and settings, and the new dom0 recovers state
   with `vm_list` and `switch_info`. The authoritative state lives in
   `l4h-root`.
 - Debugging fallback: a minimal serial monitor in `l4h-root` (`list`,
@@ -1081,15 +1004,12 @@ versioned structs defined in `l4h-abi`.
 
 ## 10. Boot and deployment
 
-- **Firmware.** UEFI → GRUB (EFI) → multiboot2, which seL4 supports. On QEMU
-  this is OVMF, or plain `-kernel` multiboot for quick development loops. The
-  modules are:
-  - the seL4 kernel;
-  - `l4h-root`, which embeds the service ELFs as a CPIO archive;
-  - the host manifest;
-  - dom0's kernel and initramfs.
+- **Firmware.** UEFI → GRUB (EFI) → multiboot2. QEMU uses OVMF for this
+  path, or plain `-kernel` multiboot for development. The boot files are
+  the seL4 kernel and `l4h-root`, the latter loaded as a module and
+  embedding the service ELFs, dom0 images and settings. Images for other
+  guests come through the dom0 API.
 
-  Images for the other guests come through the dom0 API.
 - **Platform discovery** is done by seL4 using ACPI: MADT, cores and IOAPIC.
   `l4h-root` handles PCI enumeration over MCFG/ECAM, or port I/O config, and
   MSI/MSI-X allocation through `seL4_IRQControl_GetMSI`.
@@ -1098,26 +1018,23 @@ versioned structs defined in `l4h-abi`.
 
 1. **QEMU (development and CI).** `-cpu host,-vmx` with KVM used only as a
    fast CPU. Devices: virtio-net-pci, virtio-blk-pci, nvme and a 16550 UART.
-   All the drivers already exist in sDDF.
+   l4h drives these with its Rust blkd/netd drivers and serial monitor.
 2. **GCP.**
-   - **Machine types:** third-generation and later (C3, C3D, N4, C4).
-     These support only gVNIC and expose Persistent Disk / Hyperdisk as NVMe.
-   - **Drivers:** we need one new driver, gVNIC, ported from Linux `gve`.
-     NVMe is reused from sDDF.
-   - **Early bring-up:** a second-generation type (N2), where virtio-net is
-     still offered and the boot disk is attached with the NVMe interface, so
-     it runs with only existing drivers.
+   - **Current target:** N2 with virtio-net and NVMe local SSDs. N2 boot
+     disks use virtio-scsi, read only by firmware and GRUB; l4h does not
+     drive that interface.
+   - **Future target:** third-generation and later types (C3, C3D, N4,
+     C4), which require gVNIC. A gVNIC driver, potentially ported from
+     Linux `gve`, is not implemented. NVMe already has a Rust driver.
    - **Boot:** a custom image with GRUB EFI and seL4. Secure Boot is off
      (Shielded VM vTPM and integrity monitoring are optional). The serial
      console is enabled for seL4 and monitor output.
-   - **Timer:** E3 uses the LAPIC TSC-deadline timer, which KVM-based GCE
-     exposes, so there is no HPET dependency. Invariant TSC frequency comes
-     from CPUID leaf 0x15/0x40000010 or calibration, as seL4 does today.
-   - **Networking:** the gVNIC sits on an uplink switch, and a router VM
-     (often dom0) owns the instance MAC (§8.3). Multi-NIC instances give one
-     uplink switch per gVNIC.
-   - **To verify at first GCE boot:** ACPI tables, MSI-X, gVNIC queue format
-     (GQI vs DQO; C3 and later use DQO), and whether x2APIC is present.
+   - **Timer:** E3 shares seL4's LAPIC timer (TSC-deadline where available,
+     APIC countdown on N2), so there is no HPET dependency. Patch 0014
+     stabilizes TSC/APIC calibration on N2 (§4).
+   - **Networking:** virtio-net is the uplink of a switch, and a router VM
+     (often dom0) owns the instance MAC (§8.3). A future gVNIC driver would
+     use the same topology.
 3. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
    adding one NIC driver.
 
@@ -1160,16 +1077,16 @@ versioned structs defined in `l4h-abi`.
 | FPU access (E2) | XSAVE area | V-regs + FPSR/FPCR |
 | Guest VA | 47-bit | 48-bit TTBR0 |
 | TLS | `fs_base` | `TPIDR_EL0` (`seL4_TCB_SetTLSBase`) |
-| Timer (E3) | LAPIC TSC-deadline | ARM generic timer |
+| Timer (E3) | LAPIC TSC-deadline or countdown | ARM generic timer |
 | vDSO clock | `rdtsc` | `cntvct_el0` |
-| Drivers | sDDF virtio-pci, NVMe | sDDF virtio-mmio/pci, NVMe; ENA on Graviton |
+| Drivers | Rust virtio-net/blk PCI, NVMe | PCI/ECAM and hardware drivers not ported yet |
 | Boot | multiboot2 | seL4 elfloader / UEFI |
 
 Rules that keep the port cheap:
 
 1. ISA code lives only in `arch/l4h/<isa>/` and in `host/*/src/arch/<isa>.rs`.
 2. Nothing in the protocols depends on the ISA: boot info, event pages,
-   virtio-l4h, sDDF queues. Fields are fixed-width and little-endian.
+   virtio-l4h, host block and net queues. Fields are fixed-width and little-endian.
 3. No use of x86-only seL4 features such as I/O ports outside drivers, EPT or
    `GetStatusBits`.
 4. Guest RAM uses 4 KiB frames, which every ISA supports.
@@ -1214,9 +1131,8 @@ Rules that keep the port cheap:
 | context switch | ~1–2 µs | ~2–3 µs | Two `SetSchedParams` and a reply. No FPU copying. |
 | `clock_gettime` | vDSO | vDSO (rdtsc) | No trap. |
 | fork+exec | baseline | 1.5–3× | Lazy refault. |
-| disk I/O | | near native | Zero-copy; the main overhead is two queue hops. *Revised (§15.1):* one copy, by the guest kernel, through its I/O pool. |
-
-| network | | ~2 copies per direction | Needs the I/O-window optimization to compete. |
+| disk I/O | | near native | One copy by the guest kernel through its I/O pool, plus two host queue hops. |
+| network | | copies through pool and port slots | The guest bounces through its I/O pool; VMM and netd copy between pool, port and NIC buffers (§8.3). |
 
 **Distribution check.** `tests/run-debian.sh` boots Debian 13 with
 systemd as dom0 from a passed-through virtio-blk disk, on 2 vCPUs:
@@ -1233,7 +1149,9 @@ vCPUs:
 - a clean `e2fsck -f` of the disk on the host;
 - a checksum intact after a second boot.
 
-**Measured (v1, `tests/run-bench.sh`).** The test machine is unusual: the
+**Measured before the I/O pool and RAM blocks (`tests/run-bench.sh`).**
+These figures describe the earlier memory design; §15.2 records the
+measurements after those changes. The test machine is unusual: the
 dev box is itself a Hyper-V VM, so QEMU/KVM runs *nested*. Every VM exit
 of seL4 (timer MSR writes, IPIs, EOIs, HLT wakeups) costs tens of
 microseconds, against roughly one on a single-level cloud hypervisor.
@@ -1269,10 +1187,10 @@ l4h/
   DESIGN.md
   kernel/            seL4 (git submodule, pinned) + patches/ (E1–E3) + configs
   guest/linux/       arch/l4h sources, patches/ for anything outside arch/, defconfig (Linux 6.18 LTS)
-  host/              Cargo workspace: l4h-abi, l4h-root, l4h-vmm, vswitch, blk-mux, gvnic, sddf-shim
+  host/              Rust workspace: l4h-abi, l4h-host, l4h-rt, l4h-root, l4h-vmm, l4h-blkd, l4h-netd, l4h-virtio
   tools/l4hctl/      dom0 userspace CLI and library for the control API
-  third_party/sddf/  submodule (drivers)
-  tools/             build.sh, mkimage (multiboot2 ISO / GCE image), run-qemu, guest rootfs builder (busybox)
+  third_party/sddf/  submodule (design reference; no linked C drivers)
+  tools/             build-kernel.sh, build-linux.sh, build-host.sh, mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh
   tests/             host-level integration tests driven by QEMU + expect-style console scripting
 ```
 
@@ -1283,24 +1201,29 @@ plain multiboot. seL4 never uses VT-x. The dev box has 32 GiB of RAM, which
 is reported as less because of host ballooning. The 30-guest test therefore
 uses a 16 GiB QEMU machine and guests of 256–512 MiB.
 
-**Milestones:**
+**Original milestones and gates.** These record the development plan,
+not a claim that every proposed gate or feature has been completed.
+M0–M6 have working v1 implementations, with the tests and limitations
+described above. M7 has reached N2; gVNIC remains. M8 has aarch64 host/ABI
+bring-up and virtqueue fuzzing, while the Linux port, upcall injection and
+paravirtual spinlocks remain future work.
 
 1. **M0, platform.**
    - Toolchains and the seL4 MCS SMP build.
    - A Rust `l4h-root` hello world boots in QEMU on 4 cores.
    - E1, E2 and E3 implemented, each with sel4test-style unit tests.
 2. **M1, single-vCPU guest (dom0 only).**
-   - The manifest-driven dom0 boots `arch/l4h` to an initramfs shell over the
-     hvc console.
+   - dom0 with embedded images and build-time settings boots `arch/l4h`
+     to an initramfs shell over the hvc console.
    - Covers syscalls, page faults, signals, fork/exec, mmap/mprotect and
      futex, plus the E3 timer and the vDSO.
    - Gate: busybox, then a static test suite (LTP subset).
 3. **M2, SMP guests.**
-   - vCPU bring-up, IPIs and PV spinlocks.
+   - vCPU bring-up and IPIs; PV spinlocks remain future work.
    - Gate: `stress-ng` and LTP on 4 vCPUs; `make -j4` of a kernel inside the
      guest.
 4. **M3, virtio-l4h and blk passthrough.**
-   - blk-mux and the sDDF virtio-blk and NVMe drivers.
+   - One Rust blkd per attached disk, with virtio-blk and NVMe drivers.
    - Gate: fio and fsck, with data integrity across guest reboots.
 5. **M4, control API.**
    - The `l4hctl` device and `/dev/l4hctl`, the dom0 CLI, and the
@@ -1309,7 +1232,7 @@ uses a 16 GiB QEMU machine and guests of 256–512 MiB.
      attach works.
 6. **M5, networking.**
    - vswitch with multiple switches, multiple vNICs per VM, and uplink ports.
-   - The sDDF virtio-net driver and the netback in the VMM.
+   - The Rust netd virtio-net driver and the net backend in the VMM.
    - `switch_*` and `nic_*` operations.
    - Gate: guest↔guest iperf3 and ping, a router VM doing NAT to the outside,
      and MAC-lock tests.
@@ -1323,8 +1246,9 @@ uses a 16 GiB QEMU machine and guests of 256–512 MiB.
    - A GCE image builder.
    - Gate: the M3–M6 tests pass on GCE.
 9. **M8, hardening and portability.**
-   - The upcall-injection backstop, the I/O window, and fuzzing of the VMM,
-     vswitch and control-API parsers.
+   - The upcall-injection backstop (future), the host-owned I/O pool
+     (implemented, §15.1), and fuzzing of the VMM, switch and control-API
+     parsers (virtqueue and pool fuzzing implemented).
    - aarch64 bring-up on QEMU virt.
 
 ---

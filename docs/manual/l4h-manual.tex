@@ -174,8 +174,8 @@ This is version 0.1. Before you depend on it, note the following.
   \item The Linux guest runs on x86\_64 only. On aarch64, seL4, the host
         components and a freestanding test guest run on QEMU \texttt{virt};
         the Linux guest, PCI, disks and NICs are not ported yet.
-  \item The UEFI image is built for GCE N2-class machines with virtio-net,
-        but it has only been tested locally, under QEMU with OVMF. gVNIC,
+  \item The UEFI image has been tested locally under QEMU with OVMF and on
+        GCE \texttt{n2-standard-4} instances with virtio-net. gVNIC,
         which C3, C4 and N4 machines require, is not supported.
   \item There is no pause or resume, live migration, memory ballooning,
         multi-queue disks, discard, I/O rate limits or VLANs.
@@ -508,7 +508,7 @@ nic 0: pci 00:05.0 virtio-net, uplink of switch 0
 l4hctl create NAME --kernel FILE [--initrd FILE] [--mem MB] [--vcpus N]
        [--cmdline STRING] [--io-pool MB]
        [--disk DISK[,ro][,start=SECTOR][,sectors=N]]...
-       [--nic SWITCH[,mac=MAC][,nolock]]...
+       [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
 \end{lstlisting}
 
 \cmd{create} builds a VM, attaches its devices, loads its kernel and
@@ -876,14 +876,17 @@ several vCPUs. CAP\% 0 means no cap.
 
 \paragraph{CPU caps.} \cmd{l4hctl sched VM CAP} limits every vCPU of a VM to
 \texttt{CAP} percent (1--100) of a core, enforced by seL4; \texttt{0} removes
-the cap. A capped VM never uses more than its vCPU count times its cap, even
-when cores are idle. Caps can be changed while a VM runs.
+the cap. The limit applies even when cores are idle. Caps can be changed
+while a VM runs.
 
-A vCPU's guest kernel and user code share its budget: the host shifts it,
-every 100\,ms, towards whichever of them runs out, so a VM that is busy in
-user space gets nearly its whole cap. The cap holds over each 5\,ms period,
-or a longer one for caps below 8\% (40\,ms at 1\%), since the kernel and
-user parts each need a minimum budget of 200\,$\mu$s.
+A vCPU's guest kernel and user code share its budget. Every 100\,ms, if
+either used at least 90\% of its share, the host adjusts the split in
+proportion to the CPU time each consumed. Each part keeps at least
+200\,$\mu$s, so caps below 8\% use a period longer than the usual 5\,ms
+(40\,ms at 1\%). Reconfiguring an idle or unbound scheduling context can
+grant a fresh budget, allowing up to one extra period's budget per
+adjustment. A workload that alternates between kernel and user code may
+use less than its cap when one part runs out before the other.
 
 \paragraph{Steal time.} Guests see the time they were ready to run but
 waiting for a core as \emph{steal}, in the \texttt{st} column of
@@ -995,8 +998,9 @@ Message & Usual cause \\
   exist. \\
 \texttt{out of memory} & The host lacks the memory, or another kernel
   resource, for the request. See \cmd{l4hctl info}; destroy stopped VMs,
-  which still hold their memory. When free memory is fragmented, a large VM
-  can fail even though \cmd{info} shows enough. \\
+  which still hold their memory. RAM uses separate 2~MiB blocks, but the
+  I/O pool needs one contiguous block: fragmentation can prevent creation
+  even when \cmd{info} shows enough free memory. \\
 \texttt{busy} & The disk already has an owner; the VM is not in the right
   state, for example \cmd{shutdown} on a stopped VM, or devices added
   after the VM started. \\
@@ -1050,7 +1054,9 @@ The integration tests boot hosts in QEMU and print \texttt{PASS} or
 \texttt{FAIL}. They need KVM and about 4~GiB of free memory; the density test
 needs 16~GiB. The Debian tests need \cmd{tests/mkdebian.sh} to have run once.
 
-\begin{longtable}{@{}p{5.6cm}p{8.9cm}@{}}
+\begingroup
+\small
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{5.6cm}>{\raggedright\arraybackslash}p{8.9cm}@{}}
 \toprule
 Test & What it checks \\
 \midrule
@@ -1072,6 +1078,10 @@ Test & What it checks \\
 \cmd{run-density.sh 30 256} & 30 guests of 256 MiB on 4 cores stay
   responsive \\
 \cmd{run-m6test.sh} & dom0 restart, CPU caps, steal time \\
+\cmd{run-captest.sh [cap\%] [rounds]} & self-test and fork loops in a guest
+  capped from boot \\
+\cmd{run-capperf.sh [caps]} & fork/exec and CPU-bound timings, uncapped and
+  under each cap (use a release seL4; timings are reported, not checked) \\
 \cmd{run-limits.sh} & the host refuses what it cannot afford and recovers,
   and runs a large guest on a fragmented host \\
 \cmd{run-vmbench.sh} & per-guest host memory overhead; create, boot,
@@ -1086,6 +1096,7 @@ Test & What it checks \\
   I/O pool checks \\
 \bottomrule
 \end{longtable}
+\endgroup
 
 %======================================================================
 \appendix
@@ -1136,7 +1147,8 @@ Op & Name & Arguments & Results \\
   formerly an object quota), I/O pool bytes (0: 4 MiB); name in data & VM
   id \\
 
-3 & \texttt{VM\_LOAD} & VM, guest-physical address; bytes in the buffer
+3 & \texttt{VM\_LOAD} & VM, guest-physical address, source offset, length;
+  bytes in the ioctl buffer
   (at most 1 MiB), which the driver stages in the control device's
   host-owned data area & -- \\
 
@@ -1149,21 +1161,26 @@ Op & Name & Arguments & Results \\
 8 & \texttt{CONSOLE\_READ} & VM, offset & next offset, bytes, bytes lost;
   output in data \\
 9 & \texttt{CONSOLE\_WRITE} & VM, length; input in data & bytes accepted \\
-10 & \texttt{DISK\_INFO} & disk & PCI address, owner (or $2^{64}-1$), --,
+10 & \texttt{DISK\_INFO} & disk & PCI address, owner (or $2^{64}-1$), failed
+  flag (reset did not complete),
   kind (0 virtio-blk, 1 NVMe) \\
 11 & \texttt{SWITCH\_CREATE} & -- & switch \\
 12 & \texttt{SWITCH\_ATTACH\_\allowbreak UPLINK} & switch, NIC & -- \\
-13 & \texttt{NIC\_CREATE} & VM, switch, MAC (0: default), flags (1: no MAC
-  lock) & MAC \\
+13 & \texttt{NIC\_CREATE} & VM, switch, MAC (0: default), flags (bit 0:
+  no MAC lock; bit 1: isolated) & MAC \\
 14 & \texttt{SWITCH\_INFO} & switch & ports, uplink NIC; \texttt{struct
   l4h\_ctl\_port} entries in data \\
-15 & \texttt{NIC\_INFO} & NIC & PCI address, switch (or $2^{64}-1$) \\
+15 & \texttt{NIC\_INFO} & NIC & PCI address, switch (or $2^{64}-1$), MAC \\
 16 & \texttt{VM\_SET\_SCHED} & VM, cap percent & -- \\
 17 & \texttt{VM\_INFO} & VM & host core of vCPUs 0--5 \\
 18 & \texttt{VM\_STATS} & VM & CPU use in tenths of a percent, cap \\
 19 & \texttt{VM\_SHUTDOWN} & VM, 0 power off / 1 reboot & -- \\
 \bottomrule
 \end{longtable}
+
+A \texttt{VM\_LOAD} ioctl supplies its bytes through
+\texttt{l4hctl\_call.buf} and \texttt{len}; the driver stages them and sets
+the request's source offset to 0 and length to the ioctl buffer length.
 
 A VM is built in this order: \texttt{VM\_CREATE}, then any
 \texttt{BLK\_ATTACH}, \texttt{NIC\_CREATE} and \texttt{VM\_LOAD} requests,
