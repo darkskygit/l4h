@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod nic;
+mod offload;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -24,9 +25,15 @@ use l4h_rt::{Info, cap, host};
 use sel4::cap_type;
 
 use crate::nic::Nic;
+use crate::offload::{complete_csum, is_gso};
 
 /// Seconds after which a learned MAC is forgotten.
 const FDB_AGE_SECS: u64 = 300;
+/// Learned MACs per switch and in all.  When a table is full, expired
+/// entries go; if none has, new sources are not learned (their frames are
+/// still switched, by flooding).
+const FDB_MAX: usize = 1024;
+const FDB_MAX_TOTAL: usize = 8192;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PortId {
@@ -52,37 +59,6 @@ struct Switch {
     fdb: BTreeMap<[u8; 6], (PortId, u64)>,
 }
 
-/// Complete a checksum the sender left to the device (NEEDS_CSUM): the
-/// ones'-complement sum from csum_start, stored at csum_start + csum_offset
-/// (which holds the pseudo-header sum already).
-fn complete_csum(frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
-    if hdr[0] & net::HDR_F_NEEDS_CSUM == 0 {
-        return;
-    }
-    let start = u16::from_le_bytes([hdr[6], hdr[7]]) as usize;
-    let at = start + u16::from_le_bytes([hdr[8], hdr[9]]) as usize;
-    if at + 2 <= frame.len() && start < frame.len() {
-        let mut sum: u32 = 0;
-        let mut i = start;
-        while i + 1 < frame.len() {
-            sum += u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
-            i += 2;
-        }
-        if i < frame.len() {
-            sum += (frame[i] as u32) << 8;
-        }
-        while sum >> 16 != 0 {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-        frame[at..at + 2].copy_from_slice(&(!(sum as u16)).to_be_bytes());
-    }
-    hdr[0] &= !net::HDR_F_NEEDS_CSUM;
-}
-
-fn is_gso(hdr: &[u8; net::HDR_SIZE]) -> bool {
-    hdr[1] != net::GSO_NONE
-}
-
 struct Netd {
     ports: Vec<Option<GuestPort>>,
     nics: Vec<Nic>,
@@ -90,6 +66,10 @@ struct Netd {
     tsc_hz: u64,
     /// Frame being switched.
     buf: Vec<u8>,
+    /// Segments of a GSO frame for a port that cannot take it whole.
+    seg_buf: Vec<u8>,
+    /// Entries in all forwarding tables.
+    fdb_total: usize,
 }
 
 fn rdtsc() -> u64 {
@@ -123,17 +103,31 @@ impl Netd {
         v
     }
 
+    /// Whether port `to` takes GSO frames whole.
+    fn takes_gso(&self, to: PortId) -> bool {
+        match to {
+            PortId::Guest(i) => self.ports[i]
+                .as_ref()
+                .is_some_and(|p| unsafe { addr_of!((*p.chan).rx_gso).read_volatile() != 0 }),
+            PortId::Uplink(n) => self.nics[n].tso,
+        }
+    }
+
     fn deliver(&mut self, to: PortId, frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
+        if is_gso(hdr) && !self.takes_gso(to) {
+            let mut buf = core::mem::take(&mut self.seg_buf);
+            offload::segment(frame, hdr, &mut buf, |f, h| self.deliver_one(to, f, h));
+            self.seg_buf = buf;
+            return;
+        }
+        self.deliver_one(to, frame, hdr);
+    }
+
+    fn deliver_one(&mut self, to: PortId, frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
         match to {
             PortId::Guest(i) => {
                 let Some(p) = self.ports[i].as_mut() else { return };
-                let (rx_csum, rx_gso) = unsafe {
-                    (addr_of!((*p.chan).rx_csum).read_volatile() != 0, addr_of!((*p.chan).rx_gso).read_volatile() != 0)
-                };
-                if is_gso(hdr) && !rx_gso {
-                    p.drops += 1;
-                    return;
-                }
+                let rx_csum = unsafe { addr_of!((*p.chan).rx_csum).read_volatile() != 0 };
                 if !rx_csum {
                     complete_csum(frame, hdr);
                 }
@@ -156,9 +150,6 @@ impl Netd {
             }
             PortId::Uplink(n) => {
                 let nic = &mut self.nics[n];
-                if is_gso(hdr) && !nic.tso {
-                    return;
-                }
                 if !nic.csum {
                     complete_csum(frame, hdr);
                 }
@@ -177,7 +168,7 @@ impl Netd {
         let src: [u8; 6] = frame[6..12].try_into().unwrap();
         if let PortId::Guest(i) = from {
             let p = self.ports[i].as_mut().unwrap();
-            if p.lock && src != p.mac {
+            if (p.lock && src != p.mac) || !offload::sanitize(hdr, frame) {
                 p.drops += 1;
                 return;
             }
@@ -187,13 +178,26 @@ impl Netd {
         let age = FDB_AGE_SECS * self.tsc_hz;
         let sw = self.switches.entry(switch).or_default();
         if src[0] & 1 == 0 {
-            sw.fdb.insert(src, (from, now));
+            if let Some(e) = sw.fdb.get_mut(&src) {
+                *e = (from, now);
+            } else {
+                if sw.fdb.len() >= FDB_MAX || self.fdb_total >= FDB_MAX_TOTAL {
+                    let before = sw.fdb.len();
+                    sw.fdb.retain(|_, &mut (_, seen)| now.wrapping_sub(seen) < age);
+                    self.fdb_total -= before - sw.fdb.len();
+                }
+                if sw.fdb.len() < FDB_MAX && self.fdb_total < FDB_MAX_TOTAL {
+                    sw.fdb.insert(src, (from, now));
+                    self.fdb_total += 1;
+                }
+            }
         }
         let known = if dst[0] & 1 == 0 {
             match sw.fdb.get(&dst) {
                 Some(&(port, seen)) if now.wrapping_sub(seen) < age => Some(port),
                 Some(_) => {
                     sw.fdb.remove(&dst);
+                    self.fdb_total -= 1;
                     None
                 }
                 None => None,
@@ -217,7 +221,17 @@ impl Netd {
         let Some(p) = self.ports[i].as_ref() else { return };
         let chan = p.chan;
         let mut frame = core::mem::take(&mut self.buf);
-        loop {
+        // The indices are the client's: at most one ring's worth per kick,
+        // and nothing at all from a ring that claims more.
+        let pending = unsafe { addr_of!((*chan).tx.head).read_volatile().wrapping_sub(addr_of!((*chan).tx.tail).read_volatile()) };
+        if pending as usize > net::RING_SIZE {
+            if let Some(p) = self.ports[i].as_mut() {
+                p.drops += 1;
+            }
+            self.buf = frame;
+            return;
+        }
+        for _ in 0..pending {
             let (n, mut hdr) = unsafe {
                 let tail = addr_of!((*chan).tx.tail).read_volatile();
                 if tail == addr_of!((*chan).tx.head).read_volatile() {
@@ -264,7 +278,9 @@ impl Netd {
     fn remove_port(&mut self, i: usize) {
         if self.ports.get_mut(i).and_then(|p| p.take()).is_some() {
             for sw in self.switches.values_mut() {
+                let before = sw.fdb.len();
                 sw.fdb.retain(|_, (p, _)| *p != PortId::Guest(i));
+                self.fdb_total -= before - sw.fdb.len();
             }
         }
     }
@@ -286,6 +302,8 @@ fn main(info: &'static Info) -> ! {
         switches: BTreeMap::new(),
         tsc_hz: info.header().tsc_hz,
         buf: alloc::vec![0u8; net::MAX_FRAME],
+        seg_buf: alloc::vec![0u8; net::MAX_FRAME],
+        fdb_total: 0,
     };
     for (n, c) in cfg.nics[..cfg.nr_nics as usize].iter().enumerate() {
         d.nics.push(Nic::new(n, c));
