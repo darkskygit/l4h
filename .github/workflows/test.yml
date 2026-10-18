@@ -78,6 +78,11 @@ jobs:
         run: tests/run-m6test.sh
       - name: Resource limits
         run: tests/run-limits.sh
+      - name: Guest memory overhead and lifecycle latency
+        run: |
+          tests/run-vmbench.sh | tee build/vmbench.txt
+          { echo '### Guest memory overhead and lifecycle latency'; echo '```';
+            sed 's/^VMBENCH: //' build/vmbench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Serial monitor
         run: tests/run-monitor.sh
       - name: UEFI boot image
