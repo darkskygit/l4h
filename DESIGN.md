@@ -118,8 +118,8 @@ turns the debug build off. `KernelMaxNumNodes` is 64. XSAVE covers x87,
 SSE and AVX; the guest hides AVX-512, AMX and PKU, which seL4 does not
 enable, from its CPU feature set.
 
-The kernel is pinned to a recent seL4 master; at review time that was
-16.0.0-dev at `357c600`. We carry a **small, upstreamable patch set**:
+The kernel is pinned to the seL4 16.0.0 release (`6e7c3b7`, the `16.0.0`
+tag). We carry a **small, upstreamable patch set**:
 
 ### E1. `seL4_TCBFlag_trapSyscalls` (required)
 
