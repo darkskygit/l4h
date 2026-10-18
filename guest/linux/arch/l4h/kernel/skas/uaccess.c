@@ -43,36 +43,100 @@ pte_t *virt_to_pte(struct mm_struct *mm, unsigned long addr)
 	return pte_offset_kernel(pmd, addr);
 }
 
-static pte_t *maybe_map(unsigned long virt, int is_write)
+/*
+ * The page mapped at user address @virt, with a reference, if its PTE allows
+ * the access: present, readable (not PROT_NONE) or writable.  The caller
+ * holds mmap_lock and has checked that a VMA covers @virt, so the page
+ * tables stay in place (munmap frees them only after removing the VMA); the
+ * PTE lock keeps the entry stable while we check it and take the reference.
+ */
+static struct page *get_mapped_page(struct mm_struct *mm, unsigned long virt,
+				    int is_write)
 {
-	pte_t *pte = virt_to_pte(current->mm, virt);
-	int err, dummy_code;
+	struct page *page = NULL;
+	spinlock_t *ptl;
+	pte_t *ptep, pte;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
 
-	if ((pte == NULL) || !pte_present(*pte) ||
-	    (is_write && !pte_write(*pte))) {
-		err = handle_page_fault(virt, 0, is_write, 0, 1, &dummy_code);
-		if (err)
-			return NULL;
-		pte = virt_to_pte(current->mm, virt);
+	pgd = pgd_offset(mm, virt);
+	if (!pgd_present(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, virt);
+	if (!p4d_present(*p4d))
+		return NULL;
+	pud = pud_offset(p4d, virt);
+	if (!pud_present(*pud))
+		return NULL;
+	pmd = pmd_offset(pud, virt);
+	if (!pmd_present(*pmd))
+		return NULL;
+	ptep = pte_offset_map_lock(mm, pmd, virt, &ptl);
+	if (!ptep)
+		return NULL;
+	pte = ptep_get(ptep);
+	if (pte_present(pte) && (is_write ? pte_write(pte) : pte_read(pte)) &&
+	    pfn_valid(pte_pfn(pte))) {
+		page = pte_page(pte);
+		get_page(page);
 	}
-	if (!pte_present(*pte))
-		pte = NULL;
+	pte_unmap_unlock(ptep, ptl);
+	return page;
+}
 
-	return pte;
+/*
+ * Pin the page that backs user address @virt for an access through the
+ * direct map, faulting it in if needed; NULL if the access must fail.
+ *
+ * Another vCPU may unmap the page meanwhile (munmap, madvise, reclaim) and
+ * free it: the reference keeps it from being reused until the caller's
+ * put_page(), as get_user_pages() does.  In atomic context (futex
+ * operations, *_nofault copies) the walk only tries mmap_lock and never
+ * faults; callers then fault the page in themselves and retry.
+ */
+static struct page *pin_user_page(unsigned long virt, int is_write)
+{
+	struct mm_struct *mm = current->mm;
+	bool atomic = faulthandler_disabled();
+	int tries, dummy_code;
+
+	/* Interrupts can arrive with this vCPU holding the PTE lock. */
+	if (mm == NULL || in_interrupt())
+		return NULL;
+	for (tries = 0; tries < 4; tries++) {
+		struct page *page = NULL;
+
+		if (atomic) {
+			if (!mmap_read_trylock(mm))
+				return NULL;
+		} else {
+			mmap_read_lock(mm);
+		}
+		if (vma_lookup(mm, virt))
+			page = get_mapped_page(mm, virt, is_write);
+		mmap_read_unlock(mm);
+		if (page)
+			return page;
+		/* Checks the VMA's permissions; fails when atomic. */
+		if (handle_page_fault(virt, 0, is_write, 0, 1, &dummy_code))
+			return NULL;
+	}
+	/* Unmapped again after every fault: give up. */
+	return NULL;
 }
 
 static int do_op_one_page(unsigned long addr, int len, int is_write,
 		 int (*op)(unsigned long addr, int len, void *arg), void *arg)
 {
 	struct page *page;
-	pte_t *pte;
 	int n;
 
-	pte = maybe_map(addr, is_write);
-	if (pte == NULL)
+	page = pin_user_page(addr, is_write);
+	if (page == NULL)
 		return -1;
 
-	page = pte_page(*pte);
 #ifdef CONFIG_64BIT
 	pagefault_disable();
 	addr = (unsigned long) page_address(page) +
@@ -88,6 +152,7 @@ static int do_op_one_page(unsigned long addr, int len, int is_write,
 #else
 	kunmap_atomic((void *)addr);
 #endif
+	put_page(page);
 
 	return n;
 }
@@ -253,17 +318,15 @@ int arch_futex_atomic_op_inuser(int op, u32 oparg, int *oval, u32 __user *uaddr)
 	int oldval, ret;
 	struct page *page;
 	unsigned long addr = (unsigned long) uaddr;
-	pte_t *pte;
 
 	ret = -EFAULT;
 	if (!access_ok(uaddr, sizeof(*uaddr)))
 		return -EFAULT;
 	preempt_disable();
-	pte = maybe_map(addr, 1);
-	if (pte == NULL)
+	page = pin_user_page(addr, 1);
+	if (page == NULL)
 		goto out_inuser;
 
-	page = pte_page(*pte);
 #ifdef CONFIG_64BIT
 	pagefault_disable();
 	addr = (unsigned long) page_address(page) +
@@ -321,6 +384,7 @@ int arch_futex_atomic_op_inuser(int op, u32 oparg, int *oval, u32 __user *uaddr)
 #else
 	kunmap_atomic((void *)addr);
 #endif
+	put_page(page);
 
 out_inuser:
 	preempt_enable();
@@ -351,18 +415,16 @@ int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
 			      u32 oldval, u32 newval)
 {
 	struct page *page;
-	pte_t *pte;
 	int ret = -EFAULT;
 
 	if (!access_ok(uaddr, sizeof(*uaddr)))
 		return -EFAULT;
 
 	preempt_disable();
-	pte = maybe_map((unsigned long) uaddr, 1);
-	if (pte == NULL)
+	page = pin_user_page((unsigned long) uaddr, 1);
+	if (page == NULL)
 		goto out_inatomic;
 
-	page = pte_page(*pte);
 #ifdef CONFIG_64BIT
 	pagefault_disable();
 	uaddr = page_address(page) + (((unsigned long) uaddr) & ~PAGE_MASK);
@@ -378,6 +440,7 @@ int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
 #else
 	kunmap_atomic(uaddr);
 #endif
+	put_page(page);
 	ret = 0;
 
 out_inatomic:

@@ -82,6 +82,115 @@ static void test_mmap(void)
 	CHECK(munmap(p, len) == 0, "munmap");
 }
 
+/* Kernel copies to and from user memory honour its protection. */
+static void test_uaccess_prot(void)
+{
+	unsigned char *p = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	char buf[16];
+	int fds[2];
+	ssize_t r;
+
+	CHECK(p != MAP_FAILED, "mmap: %s", strerror(errno));
+	CHECK(pipe(fds) == 0, "pipe: %s", strerror(errno));
+	memcpy(p, "protected data", 15);
+	CHECK(mprotect(p, 4096, PROT_NONE) == 0, "mprotect: %s", strerror(errno));
+	errno = 0;
+	r = write(fds[1], p, 15);
+	CHECK(r == -1 && errno == EFAULT, "write from a PROT_NONE page: %zd (%s)", r, strerror(errno));
+	/* Never touched before PROT_NONE. */
+	CHECK(mprotect(p + 4096, 4096, PROT_NONE) == 0, "mprotect: %s", strerror(errno));
+	errno = 0;
+	r = write(fds[1], p + 4096, 15);
+	CHECK(r == -1 && errno == EFAULT, "write from an untouched PROT_NONE page: %zd (%s)", r,
+	      strerror(errno));
+	/* Read-only: the kernel cannot write into it either. */
+	CHECK(mprotect(p, 4096, PROT_READ) == 0, "mprotect: %s", strerror(errno));
+	CHECK(write(fds[1], "0123456789abcde", 15) == 15, "write: %s", strerror(errno));
+	errno = 0;
+	r = read(fds[0], p, 15);
+	CHECK(r == -1 && errno == EFAULT, "read into a PROT_READ page: %zd (%s)", r, strerror(errno));
+	CHECK(memcmp(p, "protected data", 15) == 0, "PROT_READ page changed");
+	CHECK(write(fds[1], p, 15) == 15, "write from a PROT_READ page: %s", strerror(errno));
+	r = read(fds[0], buf, sizeof(buf));
+	CHECK(r == 16, "read back: %zd", r);
+	CHECK(memcmp(buf, "0123456789abcde", 15) == 0, "pipe data");
+	close(fds[0]);
+	close(fds[1]);
+	munmap(p, 2 * 4096);
+}
+
+/*
+ * Kernel copies race with another thread dropping the pages (and other
+ * threads reusing freed pages): a copy sees the buffer's data or zeroes
+ * (MADV_DONTNEED), never another page's, and does not fail (an unlocked
+ * walk losing the race returned EFAULT).
+ */
+static unsigned char *volatile race_buf;
+static atomic_int race_stop;
+
+static void *uaccess_dropper(void *arg)
+{
+	while (!atomic_load(&race_stop)) {
+		memset(race_buf, 0xa5, 4 * 4096);
+		madvise(race_buf, 4 * 4096, MADV_DONTNEED);
+	}
+	return NULL;
+}
+
+static void *uaccess_reuser(void *arg)
+{
+	while (!atomic_load(&race_stop)) {
+		unsigned char *q = mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE,
+					MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		if (q == MAP_FAILED)
+			continue;
+		memset(q, 0x5a, 16 * 4096);
+		munmap(q, 16 * 4096);
+	}
+	return NULL;
+}
+
+static void test_uaccess_race(void)
+{
+	static unsigned char out[4 * 4096];
+	pthread_t dropper, reuser;
+	int fds[2], i, bad = 0;
+	size_t j;
+
+	race_buf = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	CHECK(race_buf != MAP_FAILED, "mmap: %s", strerror(errno));
+	CHECK(pipe(fds) == 0, "pipe: %s", strerror(errno));
+	atomic_store(&race_stop, 0);
+	pthread_create(&dropper, NULL, uaccess_dropper, NULL);
+	pthread_create(&reuser, NULL, uaccess_reuser, NULL);
+	for (i = 0; i < 2000 && !bad; i++) {
+		ssize_t n = write(fds[1], race_buf, sizeof(out)), got = 0;
+
+		if (n <= 0) {
+			bad = -1;
+			break;
+		}
+		while (got < n) {
+			ssize_t m = read(fds[0], out + got, n - got);
+
+			if (m <= 0)
+				break;
+			got += m;
+		}
+		for (j = 0; j < (size_t)got; j++)
+			if (out[j] != 0xa5 && out[j] != 0)
+				bad = out[j];
+	}
+	atomic_store(&race_stop, 1);
+	pthread_join(dropper, NULL);
+	pthread_join(reuser, NULL);
+	close(fds[0]);
+	close(fds[1]);
+	munmap(race_buf, 4 * 4096);
+	CHECK(bad == 0, "copy from user saw byte %#x (write: %s)", bad, bad < 0 ? strerror(errno) : "ok");
+}
+
 static sigjmp_buf segv_jmp;
 static volatile void *segv_addr;
 
@@ -569,6 +678,7 @@ static const struct test tests[] = {
 	{ "mmap", test_mmap },
 	{ "segv", test_segv },
 	{ "nx", test_nx },
+	{ "uaccess_prot", test_uaccess_prot },
 	{ "fork", test_fork },
 	{ "many_forks", test_many_forks },
 	{ "signals_fpu", test_signals_fpu },
@@ -580,6 +690,7 @@ static const struct test tests[] = {
 	{ "files", test_files },
 	{ "smp_mm_stress", test_smp_mm_stress },
 	{ "smp_unmap_vis", test_smp_unmap_visibility },
+	{ "uaccess_race", test_uaccess_race },
 	{ "smp_fork_storm", test_smp_fork_storm },
 	{ "vspace_evict", test_vspace_evict },
 };

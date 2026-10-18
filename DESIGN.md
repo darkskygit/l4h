@@ -327,6 +327,12 @@ none.
   guest's Linux page tables in software and goes through the direct map, as
   UML and L4Linux do. A missing page calls `handle_mm_fault` inline. The cost
   is a few hundred ns per page-crossing access, which is acceptable.
+  - Each page is looked up under `mmap_lock` (VMA present) and the PTE
+    lock, checked like a hardware access (present, readable but not
+    `PROT_NONE`, or writable) and pinned with a page reference for the
+    copy, so an unmap on another vCPU cannot free and reuse it meanwhile.
+  - In atomic context (futex operations, `*_nofault`) `mmap_lock` is only
+    tried and nothing faults: callers fault the page in and retry.
 
 ### 5.3 Memory management: Linux page tables mirrored into seL4
 
