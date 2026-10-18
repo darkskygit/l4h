@@ -113,9 +113,11 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 {
 	seL4_CapRights_t r = (prot & L4H_PROT_WRITE) ? seL4_ReadWrite :
 			     (prot & (L4H_PROT_READ | L4H_PROT_EXEC)) ? seL4_CanRead : seL4_NoRights;
-	seL4_X86_VMAttributes attr = seL4_X86_Default_VMAttributes;
-	/* seL4 x86 has no separate execute permission: readable pages are
-	 * executable (NX is applied only to non-readable mappings). */
+	/* Readable pages are executable unless marked execute-never (seL4
+	 * patch 0009); there is no execute-only. */
+	seL4_X86_VMAttributes attr = (prot & L4H_PROT_EXEC) ? seL4_X86_Default_VMAttributes :
+				     seL4_X86_ExecuteNever;
+
 	return seL4_X86_Page_Map(frame, vspace, va, r, attr);
 }
 

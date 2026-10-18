@@ -50,7 +50,7 @@ static pte_t *maybe_map(unsigned long virt, int is_write)
 
 	if ((pte == NULL) || !pte_present(*pte) ||
 	    (is_write && !pte_write(*pte))) {
-		err = handle_page_fault(virt, 0, is_write, 1, &dummy_code);
+		err = handle_page_fault(virt, 0, is_write, 0, 1, &dummy_code);
 		if (err)
 			return NULL;
 		pte = virt_to_pte(current->mm, virt);
@@ -273,26 +273,46 @@ int arch_futex_atomic_op_inuser(int op, u32 oparg, int *oval, u32 __user *uaddr)
 		((unsigned long) addr & ~PAGE_MASK);
 #endif
 	uaddr = (u32 *) addr;
-	oldval = *uaddr;
 
+	/*
+	 * Other vCPUs (and user threads on them) update the word
+	 * concurrently: the update must be one atomic operation, and oldval
+	 * the value it replaced.
+	 */
 	ret = 0;
-
 	switch (op) {
 	case FUTEX_OP_SET:
-		*uaddr = oparg;
+		oldval = xchg(uaddr, oparg);
 		break;
 	case FUTEX_OP_ADD:
-		*uaddr += oparg;
-		break;
 	case FUTEX_OP_OR:
-		*uaddr |= oparg;
-		break;
 	case FUTEX_OP_ANDN:
-		*uaddr &= ~oparg;
+	case FUTEX_OP_XOR: {
+		u32 old = READ_ONCE(*uaddr), new, seen;
+
+		for (;;) {
+			switch (op) {
+			case FUTEX_OP_ADD:
+				new = old + oparg;
+				break;
+			case FUTEX_OP_OR:
+				new = old | oparg;
+				break;
+			case FUTEX_OP_ANDN:
+				new = old & ~oparg;
+				break;
+			default:
+				new = old ^ oparg;
+				break;
+			}
+			seen = cmpxchg(uaddr, old, new);
+			if (seen == old)
+				break;
+			old = seen;
+		}
+		oldval = old;
 		break;
-	case FUTEX_OP_XOR:
-		*uaddr ^= oparg;
-		break;
+	}
 	default:
 		ret = -ENOSYS;
 	}
@@ -350,9 +370,8 @@ int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
 	uaddr = kmap_atomic(page) + ((unsigned long) uaddr & ~PAGE_MASK);
 #endif
 
-	*uval = *uaddr;
-
-	ret = cmpxchg(uaddr, oldval, newval);
+	/* The value the compare-and-exchange saw, not an earlier read. */
+	*uval = cmpxchg(uaddr, oldval, newval);
 
 #ifdef CONFIG_64BIT
 	pagefault_enable();

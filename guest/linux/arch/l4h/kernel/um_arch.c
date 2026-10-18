@@ -167,6 +167,36 @@ enum {
 	CPUID_8000_0001_ECX = 6, CPUID_7_0_EBX = 9, CPUID_7_ECX = 16, CPUID_7_EDX = 18,
 };
 
+/*
+ * seL4 enables only some XSAVE state components (KernelXSaveFeatureSet);
+ * instructions using the others fault even if CPUID lists them.
+ */
+static void __init l4h_mask_xsave_features(void)
+{
+	u32 *cap = boot_cpu_data.x86_capability;
+	u32 lo, hi;
+	u64 xcr0 = 0;
+
+	if (cap[CPUID_1_ECX] & BIT(27)) {	/* OSXSAVE */
+		asm volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+		xcr0 = lo | (u64)hi << 32;
+	}
+	if ((xcr0 & 0x6) != 0x6) {		/* SSE + AVX state */
+		cap[CPUID_1_ECX] &= ~(BIT(12) | BIT(28) | BIT(29));	/* FMA, AVX, F16C */
+		cap[CPUID_7_0_EBX] &= ~BIT(5);				/* AVX2 */
+	}
+	if ((xcr0 & 0xe6) != 0xe6) {		/* AVX-512 state */
+		cap[CPUID_7_0_EBX] &= ~(BIT(16) | BIT(17) | BIT(21) | BIT(26) | BIT(27) |
+					BIT(28) | BIT(30) | BIT(31));
+		cap[CPUID_7_ECX] &= ~(BIT(1) | BIT(6) | BIT(11) | BIT(12) | BIT(14));
+		cap[CPUID_7_EDX] &= ~(BIT(2) | BIT(3) | BIT(8) | BIT(23));
+	}
+	if ((xcr0 & (BIT(17) | BIT(18))) != (BIT(17) | BIT(18)))	/* AMX state */
+		cap[CPUID_7_EDX] &= ~(BIT(22) | BIT(24) | BIT(25));
+	if (!(xcr0 & BIT(9)))			/* PKRU */
+		cap[CPUID_7_ECX] &= ~(BIT(3) | BIT(4));
+}
+
 /* CPU features as seen by user code: cpuid is not intercepted. */
 static void __init l4h_cpu_features(void)
 {
@@ -190,6 +220,7 @@ static void __init l4h_cpu_features(void)
 		boot_cpu_data.x86_capability[CPUID_8000_0001_EDX] = d;
 		boot_cpu_data.x86_capability[CPUID_8000_0001_ECX] = c;
 	}
+	l4h_mask_xsave_features();
 }
 
 void __init setup_machinename(char *machine_out)

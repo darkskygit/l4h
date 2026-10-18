@@ -62,10 +62,13 @@ static int sync_one_pte(pte_t *pte, unsigned long addr, struct vm_ops *ops)
 			r = pte_read(v);
 			w = pte_write(v);
 			x = pte_exec(v);
-			if (!pte_young(v)) {
-				r = 0;
-				w = 0;
-			} else if (!pte_dirty(v))
+			/*
+			 * Old pages stay mapped readable (seL4 has no accessed
+			 * bit to emulate; unmapping them only costs faults), and
+			 * clean ones read-only so that the first write marks
+			 * them dirty.
+			 */
+			if (!pte_young(v) || !pte_dirty(v))
 				w = 0;
 
 			prot = (r ? UM_PROT_READ : 0) |

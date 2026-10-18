@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/personality.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -106,6 +107,36 @@ static void test_segv(void)
 		CHECK(0, "no fault on read-only write");
 	}
 	CHECK(segv_addr == p + 100, "si_addr %p (expected %p)", segv_addr, p + 100);
+	signal(SIGSEGV, SIG_DFL);
+	munmap(p, 4096);
+}
+
+/* Data pages are not executable; mprotect(PROT_EXEC) makes them so. */
+static void test_nx(void)
+{
+	struct sigaction sa = { .sa_sigaction = segv_handler, .sa_flags = SA_SIGINFO };
+	unsigned char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	int (*fn)(void) = (int (*)(void))p;
+
+	CHECK(p != MAP_FAILED, "mmap: %s", strerror(errno));
+	/* mov $42, %eax; ret */
+	memcpy(p, "\xb8\x2a\x00\x00\x00\xc3", 6);
+	sigaction(SIGSEGV, &sa, NULL);
+	segv_addr = NULL;
+	if (sigsetjmp(segv_jmp, 1) == 0) {
+		fn();
+		CHECK(0, "executed from a PROT_READ|PROT_WRITE page (personality %#x)", personality(0xffffffff));
+	}
+	CHECK(segv_addr == p, "si_addr %p (expected %p)", segv_addr, p);
+	CHECK(mprotect(p, 4096, PROT_READ | PROT_EXEC) == 0, "mprotect: %s", strerror(errno));
+	CHECK(fn() == 42, "PROT_EXEC page did not run");
+	CHECK(mprotect(p, 4096, PROT_READ) == 0, "mprotect: %s", strerror(errno));
+	segv_addr = NULL;
+	if (sigsetjmp(segv_jmp, 1) == 0) {
+		fn();
+		CHECK(0, "executed after PROT_EXEC was removed");
+	}
+	CHECK(segv_addr == p, "si_addr %p (expected %p)", segv_addr, p);
 	signal(SIGSEGV, SIG_DFL);
 	munmap(p, 4096);
 }
@@ -422,6 +453,112 @@ static void test_smp_fork_storm(void)
 	CHECK(atomic_load(&stress_errors) == 0, "%d errors", atomic_load(&stress_errors));
 }
 
+/* More live processes than the guest has seL4 VSpaces (64): sleeping ones
+ * lose theirs and get one back when they run again. */
+static void test_vspace_evict(void)
+{
+	enum { N = 96 };
+	int fds[N][2], i, status, ok = 1;
+	pid_t pids[N];
+
+	for (i = 0; i < N; i++) {
+		CHECK(pipe(fds[i]) == 0, "pipe: %s", strerror(errno));
+		pids[i] = fork();
+		CHECK(pids[i] >= 0, "fork %d: %s", i, strerror(errno));
+		if (pids[i] == 0) {
+			char c;
+			volatile int touch[1024];
+
+			touch[i] = i;
+			if (read(fds[i][0], &c, 1) != 1)
+				_exit(1);
+			_exit(touch[i] == i && c == 'x' ? 0 : 2);
+		}
+	}
+	/* Wake them in turn: each one's VSpace was probably given away. */
+	for (i = 0; i < N; i++) {
+		if (write(fds[i][1], "x", 1) != 1)
+			ok = 0;
+		if (waitpid(pids[i], &status, 0) != pids[i] || !WIFEXITED(status) || WEXITSTATUS(status))
+			ok = 0;
+		close(fds[i][0]);
+		close(fds[i][1]);
+	}
+	CHECK(ok, "a child failed");
+}
+
+/* FUTEX_WAKE_OP updates the second word atomically, while user threads on
+ * other vCPUs update it with atomic instructions. */
+static atomic_int wake_op_word;
+static atomic_int wake_op_running;
+
+static void *wake_op_fn(void *arg)
+{
+	int i, dummy = 0;
+
+	for (i = 0; i < 20000; i++)
+		syscall(SYS_futex, &dummy, FUTEX_WAKE_OP_PRIVATE, 0, NULL, &wake_op_word,
+			FUTEX_OP(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_EQ, 0));
+	atomic_fetch_sub(&wake_op_running, 1);
+	return NULL;
+}
+
+static void *wake_op_user_fn(void *arg)
+{
+	long n = 0;
+
+	while (atomic_load(&wake_op_running)) {
+		atomic_fetch_add(&wake_op_word, 1);
+		n++;
+	}
+	return (void *)n;
+}
+
+static void test_futex_wake_op(void)
+{
+	pthread_t th[4];
+	long total = 2 * 20000;
+	void *n;
+	int i;
+
+	atomic_store(&wake_op_word, 0);
+	atomic_store(&wake_op_running, 2);
+	for (i = 0; i < 2; i++)
+		pthread_create(&th[i], NULL, wake_op_fn, NULL);
+	for (i = 2; i < 4; i++)
+		pthread_create(&th[i], NULL, wake_op_user_fn, NULL);
+	for (i = 0; i < 4; i++) {
+		pthread_join(th[i], &n);
+		if (i >= 2)
+			total += (long)n;
+	}
+	CHECK(atomic_load(&wake_op_word) == (int)total, "counter %d, expected %ld (updates lost)",
+	      atomic_load(&wake_op_word), total);
+}
+
+/* sched_getcpu() (the vDSO) agrees with the CPU a thread is pinned to. */
+static void test_getcpu(void)
+{
+	long n = sysconf(_SC_NPROCESSORS_ONLN), cpu;
+	cpu_set_t set, old;
+
+	sched_getaffinity(0, sizeof(old), &old);
+	for (cpu = 0; cpu < n; cpu++) {
+		unsigned int c = ~0u;
+		int vdso;
+
+		CPU_ZERO(&set);
+		CPU_SET(cpu, &set);
+		sched_setaffinity(0, sizeof(set), &set);
+		vdso = sched_getcpu();
+		syscall(SYS_getcpu, &c, NULL, NULL);
+		/* Unpin before checking: later tests must not run pinned. */
+		sched_setaffinity(0, sizeof(old), &old);
+		CHECK(c == cpu, "getcpu syscall %u on CPU %ld", c, cpu);
+		CHECK(vdso == cpu, "sched_getcpu %d on CPU %ld", vdso, cpu);
+	}
+}
+
 struct test {
 	const char *name;
 	void (*fn)(void);
@@ -431,16 +568,20 @@ static const struct test tests[] = {
 	{ "syscall_regs", test_syscall_regs },
 	{ "mmap", test_mmap },
 	{ "segv", test_segv },
+	{ "nx", test_nx },
 	{ "fork", test_fork },
 	{ "many_forks", test_many_forks },
 	{ "signals_fpu", test_signals_fpu },
 	{ "timers", test_timers },
 	{ "threads", test_threads },
 	{ "futex", test_futex },
+	{ "futex_wake_op", test_futex_wake_op },
+	{ "getcpu", test_getcpu },
 	{ "files", test_files },
 	{ "smp_mm_stress", test_smp_mm_stress },
 	{ "smp_unmap_vis", test_smp_unmap_visibility },
 	{ "smp_fork_storm", test_smp_fork_storm },
+	{ "vspace_evict", test_vspace_evict },
 };
 
 int main(int argc, char **argv)

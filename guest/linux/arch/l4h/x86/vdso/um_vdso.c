@@ -62,16 +62,15 @@ __kernel_old_time_t time(__kernel_old_time_t *t) __attribute__((weak, alias("__v
 long
 __vdso_getcpu(unsigned int *cpu, unsigned int *node, struct getcpu_cache *unused)
 {
-	/*
-	 * UML does not support SMP, we can cheat here. :)
-	 */
+	long ret;
 
-	if (cpu)
-		*cpu = 0;
-	if (node)
-		*node = 0;
+	/* l4h guests are SMP: ask the kernel. */
+	asm("syscall"
+		: "=a" (ret)
+		: "0" (__NR_getcpu), "D" (cpu), "S" (node), "d" (unused)
+		: "rcx", "r11", "memory");
 
-	return 0;
+	return ret;
 }
 
 long getcpu(unsigned int *cpu, unsigned int *node, struct getcpu_cache *tcache)

@@ -140,7 +140,7 @@ fail:
  * segv().
  */
 int handle_page_fault(unsigned long address, unsigned long ip,
-		      int is_write, int is_user, int *code_out)
+		      int is_write, int is_exec, int is_user, int *code_out)
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
@@ -170,6 +170,10 @@ retry:
 		if (!(vma->vm_flags & VM_WRITE))
 			goto out;
 		flags |= FAULT_FLAG_WRITE;
+	} else if (is_exec) {
+		flags |= FAULT_FLAG_INSTRUCTION;
+		if (!(vma->vm_flags & VM_EXEC))
+			goto out;
 	} else {
 		/* Don't require VM_READ|VM_EXEC for write faults! */
 		if (!(vma->vm_flags & (VM_READ | VM_EXEC)))
@@ -288,7 +292,7 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
 		panic("Segfault with no mm");
 
 	if (SEGV_IS_FIXABLE(&fi))
-		err = handle_page_fault(address, ip, is_write, is_user, &si_code);
+		err = handle_page_fault(address, ip, is_write, FAULT_EXEC(fi), is_user, &si_code);
 	else {
 		err = -EFAULT;
 		si_code = SEGV_MAPERR;

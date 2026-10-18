@@ -281,6 +281,7 @@ unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 	}
 	if (list_empty(&vs_free)) {
 		struct vs_slot *victim = NULL, *it;
+		struct l4h_mm *vm;
 
 		list_for_each_entry(it, &vs_lru, lru) {
 			if (!atomic_read(&mm_l4h(it->owner)->running)) {
@@ -290,9 +291,11 @@ unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 		}
 		if (!victim)
 			panic("l4h: all %d process VSpaces are in use by running threads\n", nr_vs);
-		raw_spin_lock(&mm_l4h(victim->owner)->lock);
+		/* vs_detach() clears the owner: unlock the lock we took. */
+		vm = mm_l4h(victim->owner);
+		raw_spin_lock(&vm->lock);
 		vs_detach(victim);
-		raw_spin_unlock(&mm_l4h(victim->owner)->lock);
+		raw_spin_unlock(&vm->lock);
 	}
 	s = list_first_entry(&vs_free, struct vs_slot, lru);
 	raw_spin_lock(&m->lock);
@@ -396,7 +399,9 @@ void l4h_map_fault(struct mm_struct *mm, unsigned long address)
 		return;
 	entry = *pte;
 	if (pte_present(entry) && pte_young(entry) && pte_read(entry)) {
-		prot = UM_PROT_READ | UM_PROT_EXEC;
+		prot = UM_PROT_READ;
+		if (pte_exec(entry))
+			prot |= UM_PROT_EXEC;
 		if (pte_write(entry) && pte_dirty(entry))
 			prot |= UM_PROT_WRITE;
 		map(&mm->context.id, va, PAGE_SIZE, prot, pte_val(entry) & PAGE_MASK);
