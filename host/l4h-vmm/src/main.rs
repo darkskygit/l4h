@@ -10,6 +10,7 @@ extern crate alloc;
 mod blk;
 mod dev;
 mod guest;
+mod mem;
 mod net;
 mod virtq;
 
@@ -89,9 +90,19 @@ fn set_mr(i: usize, v: u64) {
     sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
 }
 
+/// Nanoseconds since the Unix epoch (0 if the host does not know).
+fn wall_clock_ns(cfg: &VmmConfig, hz: u64) -> u64 {
+    if cfg.epoch_ns == 0 || hz == 0 {
+        return 0;
+    }
+    let ticks = host::ticks::now().wrapping_sub(cfg.epoch_ticks);
+    cfg.epoch_ns + (ticks as u128 * 1_000_000_000 / hz as u128) as u64
+}
+
 fn main(info: &'static Info) -> ! {
     let cfg: &VmmConfig = unsafe { info.config() };
-    let mem = GuestMem { size: cfg.ram_size };
+    let tsc_hz = info.header().tsc_hz;
+    let mem = GuestMem { base: host::GUEST_RAM_VA, size: cfg.ram_size };
     let vcpus = Vcpus { n: cfg.nr_vcpus as usize };
 
     // Block backends announce themselves ready (capacity known) on the
@@ -198,7 +209,7 @@ fn main(info: &'static Info) -> ! {
                     None => u64::MAX,
                 }
             }
-            abi::HC_GET_TIME => 0,
+            abi::HC_GET_TIME => wall_clock_ns(cfg, tsc_hz),
             _ => u64::MAX,
         };
         set_mr(0, resp);

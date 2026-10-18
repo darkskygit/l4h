@@ -120,7 +120,9 @@ impl Blk {
 
         let mut req = blk::Req { id: 0, op: ty, nr_segs: 0, sector, segs: Default::default() };
         let mut data_len: u64 = 0;
-        let mut written: u32 = 1;
+        // Bytes the device writes, the status byte included (u64: a
+        // hostile chain can describe more than 4 GiB).
+        let mut written: u64 = 1;
         let mut seg = |gpa: u64, len: u32, write: bool, req: &mut blk::Req| -> bool {
             if len == 0 {
                 return true;
@@ -132,7 +134,7 @@ impl Blk {
             req.nr_segs += 1;
             data_len += len as u64;
             if write {
-                written += len;
+                written += len as u64;
             }
             true
         };
@@ -181,6 +183,7 @@ impl Blk {
             return false;
         }
         req.id = ((self.generation as u64) << 32) | head as u64;
+        let written = u32::try_from(written).unwrap_or(u32::MAX);
         self.inflight[head as usize] = Some(Inflight { status_gpa, written });
         unsafe {
             let h = addr_of!((*self.chan).sq.head).read_volatile();
@@ -280,6 +283,31 @@ impl Backend for Blk {
             }
         }
         returned
+    }
+
+    fn drain(&mut self) {
+        self.stalled = None;
+        while self.inflight.iter().any(|i| i.is_some()) {
+            unsafe {
+                let tail = addr_of!((*self.chan).cq.tail).read_volatile();
+                if tail == addr_of!((*self.chan).cq.head).read_volatile() {
+                    // blkd runs at a higher priority, on its own core or
+                    // as soon as we yield.
+                    sel4::r#yield();
+                    continue;
+                }
+                fence(Ordering::Acquire);
+                let resp = addr_of!((*self.chan).resps[tail as usize % blk::RING_SIZE]).read_volatile();
+                addr_of_mut!((*self.chan).cq.tail).write_volatile(tail.wrapping_add(1));
+                if (resp.id >> 32) as u32 == self.generation {
+                    if let Some(i) = self.inflight.get_mut(resp.id as u16 as usize) {
+                        *i = None;
+                    }
+                }
+            }
+        }
+        // Requests completed from now on belong to the next generation.
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn reset(&mut self) {

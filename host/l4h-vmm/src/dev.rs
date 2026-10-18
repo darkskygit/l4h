@@ -29,7 +29,11 @@ pub trait Backend {
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool;
     /// Backend completions arrived.  Returns true if buffers were returned.
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool;
-    /// The driver reset the device.
+    /// Wait until no request can still access guest memory (devices DMA
+    /// into it), dropping the completions: the driver is resetting the
+    /// device or a queue and may reuse the buffers once we return.
+    fn drain(&mut self) {}
+    /// The driver reset the device (after `drain`).
     fn reset(&mut self);
     /// The driver accepted `features` (FEATURES_OK).
     fn features_accepted(&mut self, _features: u64) {}
@@ -83,6 +87,7 @@ impl<B: Backend> Device<B> {
     }
 
     fn reset(&mut self) {
+        self.backend.drain();
         for q in self.queues.iter_mut() {
             q.reset();
         }
@@ -139,6 +144,11 @@ impl<B: Backend> Device<B> {
                     return u64::MAX;
                 }
                 let regs = unsafe { addr_of!((*self.regs).queues[q]).read_volatile() };
+                if self.queues[q].ready {
+                    // Reconfiguring a live queue: its requests must not
+                    // complete into the new one.
+                    self.backend.drain();
+                }
                 if regs.ready == 0 {
                     self.queues[q].reset();
                     return 0;
