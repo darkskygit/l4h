@@ -147,7 +147,24 @@ fail_tcb:
 	return -ENOMEM;
 }
 
+/*
+ * The user context (TCB and reply object) of a task about to run in user
+ * mode, made where we may sleep: if there is no memory for the objects,
+ * wait for a block to be converted, else it is guest OOM.  The victim may
+ * be us.
+ */
+static void uctx_ensure(struct task_struct *t)
+{
+	while (t->thread.uctx.state == L4H_UCTX_NONE && uctx_create(t)) {
+		if (!l4h_objmem_wait())
+			l4h_objmem_oom();
+		if (fatal_signal_pending(current))
+			do_exit(SIGKILL);
+	}
+}
+
 void l4h_uctx_destroy(struct task_struct *t)
+
 {
 	struct thread_struct *th = &t->thread;
 	struct l4h_uctx *u = &th->uctx;
@@ -200,6 +217,7 @@ static void prepare_user(struct task_struct *t)
 	unsigned long root;
 	u64 gen;
 
+	/* userspace() created the context (uctx_ensure). */
 	if (u->state == L4H_UCTX_NONE && uctx_create(t))
 		panic("l4h: out of seL4 objects creating a user context\n");
 
@@ -314,6 +332,7 @@ void userspace(struct uml_pt_regs *regs)
 
 	while (1) {
 		current_mm_sync();
+		uctx_ensure(t);
 		prepare_user(t);
 
 		stop = l4h_user_run(u, regs->gp, 0);

@@ -331,8 +331,14 @@ static struct mm_struct *idp_mm(struct mm_id *mm_idp)
 	return container_of(mm_idp, struct mm_struct, context.id);
 }
 
-/* tlb.c: map [virt, virt+len) to physical `phys` with UM_PROT_* `prot`. */
-int map(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot, unsigned long phys)
+/*
+ * Map [virt, virt+len) to physical `phys` with UM_PROT_* `prot`.  With
+ * `skip_enomem`, a page that cannot be mapped for lack of seL4 objects is
+ * left unmapped (any old mapping of it is gone) and the others are still
+ * done: its next access faults, and the fault path waits for memory.
+ */
+static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot,
+		     unsigned long phys, bool skip_enomem)
 {
 	struct l4h_mm *m = mm_l4h(idp_mm(mm_idp));
 	unsigned long flags, off;
@@ -345,12 +351,22 @@ int map(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot, u
 		if (!prot) {
 			as_unmap_range(as, virt, virt + len);
 		} else {
-			for (off = 0; off < len && !err; off += PAGE_SIZE)
+			for (off = 0; off < len && !err; off += PAGE_SIZE) {
 				err = as_map_page(as, virt + off, phys + off, prot);
+				if (err == -ENOMEM && skip_enomem)
+					err = 0;
+			}
 		}
 	}
 	raw_spin_unlock_irqrestore(&m->lock, flags);
 	return err;
+}
+
+/* tlb.c: a TLB sync must apply every unmap in its range, so pages it
+ * cannot map do not stop it. */
+int map(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot, unsigned long phys)
+{
+	return map_pages(mm_idp, virt, len, prot, phys, true);
 }
 
 int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)
@@ -369,9 +385,10 @@ int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)
  * After a successful page fault, install the PTE for `address` directly,
  * with the protection UML's TLB sync would use (it emulates the accessed
  * and dirty bits by mapping old pages inaccessible and clean ones
- * read-only).
+ * read-only).  Returns -ENOMEM if there was no memory for the seL4
+ * objects the mapping needs.
  */
-void l4h_map_fault(struct mm_struct *mm, unsigned long address)
+int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 {
 	unsigned long va = address & PAGE_MASK;
 	pgd_t *pgd;
@@ -380,25 +397,25 @@ void l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	pmd_t *pmd;
 	pte_t *pte, entry;
 	spinlock_t *ptl;
-	int prot;
+	int prot, err = 0;
 
 	pgd = pgd_offset(mm, va);
 	if (!pgd_present(*pgd))
-		return;
+		return 0;
 	p4d = p4d_offset(pgd, va);
 	if (!p4d_present(*p4d))
-		return;
+		return 0;
 	pud = pud_offset(p4d, va);
 	if (!pud_present(*pud))
-		return;
+		return 0;
 	pmd = pmd_offset(pud, va);
 	if (!pmd_present(*pmd))
-		return;
+		return 0;
 	/* Hold the PTE lock so that a concurrent unmap on another vCPU cannot
 	 * complete (and sync) between reading the PTE and installing it. */
 	pte = pte_offset_map_lock(mm, pmd, va, &ptl);
 	if (!pte)
-		return;
+		return 0;
 	entry = *pte;
 	if (pte_present(entry) && pte_young(entry) && pte_read(entry)) {
 		prot = UM_PROT_READ;
@@ -406,10 +423,12 @@ void l4h_map_fault(struct mm_struct *mm, unsigned long address)
 			prot |= UM_PROT_EXEC;
 		if (pte_write(entry) && pte_dirty(entry))
 			prot |= UM_PROT_WRITE;
-		map(&mm->context.id, va, PAGE_SIZE, prot, pte_val(entry) & PAGE_MASK);
+		err = map_pages(&mm->context.id, va, PAGE_SIZE, prot, pte_val(entry) & PAGE_MASK, false);
 	}
 	pte_unmap_unlock(pte, ptl);
+	return err == -ENOMEM ? err : 0;
 }
+
 
 void __init l4h_vspace_init(void)
 {

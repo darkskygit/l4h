@@ -1506,3 +1506,65 @@ memory the guest can retype.
   moved into the guest's boot (create-to-ready minus create, about 130 ms
   for 128 MiB, was 57 ms). Phase 1 made create and destroy faster because
   the VMM no longer maps guest RAM.
+
+### 15.3 Converting blocks between frames and objects (phase 3)
+
+- **At boot** the guest makes object blocks only of what onlining needs
+  (a 16 KiB RAM CNode and a 4 KiB page table per frame block, and a slot
+  CNode), plus the reserve; everything else starts as frames. A
+  4-vCPU 256 MiB dom0 boots with 6 object blocks (12 MiB), of which
+  2.6 MiB is used.
+- **Classes.** Objects come from chunks of four classes, each with its
+  own open block: small objects, 4 KiB objects (TCBs), page tables, and
+  CNodes. Page tables have a class of their own because they die
+  together when a process exits or loses its VSpace; mixed with TCBs,
+  they pinned their chunks and blocks did not drain.
+- **Free blocks.** A block is free when none of its chunks has live
+  objects; it then forgets its chunks. Free blocks are either in the
+  **reserve** or **spare**. Allocations (in atomic context, under
+  page-table and capability locks) take a spare block, else a reserve
+  block, and never wait. A worker (`objmem_balance`, on the unbound
+  workqueue, also run synchronously by `l4h_objmem_wait`) keeps the
+  reserve at its target and returns spare blocks beyond the watermark to
+  frame mode. Both targets default to one block per vCPU, at most 1/32 of
+  RAM.
+  - Deviation: the design's per-vCPU reserve is one reserve counted per
+    vCPU; allocations take a global lock anyway.
+- **Frame -> object** (`frames_to_objects`): an order-9 allocation from the
+  page allocator (`GFP_KERNEL | __GFP_RETRY_MAYFAIL`, so it reclaims and
+  compacts; an order-9 page is a whole aligned block), retrying past boot
+  blocks, which have no Untyped. Revoking the block's Untyped copy then
+  deletes its 512 frames with every mapping and copy of them; the pages
+  stay allocated, so they are out of the page allocator. Deviation: no
+  `alloc_contig_range` fallback; the order-9 allocation with compaction
+  was enough in the tests.
+- **Object -> frame** (`objects_to_frames`): the highest spare block is
+  revoked (it has no children), gets its 512 frames back in its RAM CNode
+  (which is kept), is mapped again, and its pages go back to the page
+  allocator (`__free_pages`, or `free_reserved_page` for blocks that were
+  object blocks since boot).
+- **When there is no memory for objects.** Atomic callers get `-ENOMEM`:
+  a TLB sync that cannot map a page leaves it unmapped and goes on (its
+  unmaps must all happen; before, an error ended the sync early), so the
+  page faults again. The fault path and the creation of a user context,
+  which may sleep, call `l4h_objmem_wait()`; if no block could be
+  converted (no free 2 MiB range), `l4h_objmem_oom()` calls the OOM
+  killer, as a failed page-table allocation would on native Linux.
+  Creating a user context no longer panics on a failure.
+- **Accounting.** `/proc/meminfo` has `L4hObjects` (RAM in object blocks,
+  out of the page allocator) and `L4hObjectsUsed`; `/proc/l4h_objmem`
+  shows block counts, targets and conversions.
+- **Test** (`tests/run-objtest.sh`, 4 vCPUs, 256 MiB): 8 processes each
+  touch a page every 2 MiB of a 1 GiB mapping (4096 page tables, 16 MiB):
+  object blocks grow from 14 to 32 MiB by converting frame blocks, and go
+  back when they exit. The same three times while `selftest`'s
+  `smp_mm_stress`, `smp_unmap_vis` and `smp_fork_storm` run, five times.
+  Then a process maps sparse memory without end: page tables take 64 MiB,
+  a conversion fails for lack of a 2 MiB range, the OOM killer kills the
+  process, and the guest carries on; conversions work afterwards.
+- **Fragmentation** (§9 of the design) is visible: after the OOM round,
+  12 MiB stay in chunks that long-lived objects pin, against 3.5 MiB
+  before it. Compaction (rebuilding VSpace mirrors into fresh blocks)
+  remains future work.
+- aarch64 has no Linux guest yet, so phase 3 is x86_64 only; nothing in it
+  is ISA-specific except the paging-structure types.

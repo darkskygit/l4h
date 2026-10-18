@@ -18,6 +18,8 @@
 #include <skas.h>
 #include <l4h_vspace.h>
 #include <l4h_uctx.h>
+#include <l4h_caps.h>
+
 
 /*
  * NOTE: UML does not have exception tables. As such, this is almost a copy
@@ -300,7 +302,11 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
 	}
 
 	if (!err) {
-		l4h_map_fault(current->mm, address);
+		/* No memory for the seL4 objects of the mapping: wait for a
+		 * block to be converted, or else it is guest OOM.  Either way
+		 * the access faults again. */
+		if (l4h_map_fault(current->mm, address) == -ENOMEM && !l4h_objmem_wait())
+			l4h_objmem_oom();
 		return 0;
 	}
 

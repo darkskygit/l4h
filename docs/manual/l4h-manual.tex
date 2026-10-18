@@ -829,8 +829,14 @@ therefore costs 266~MiB. \cmd{l4hctl info} shows free memory.
 The guest kernel makes the seL4 objects it needs, such as its processes'
 page tables, capability slots and threads, out of its own RAM: a guest
 with many processes has less free memory, as on native Linux, but never
-costs the host more. In the guest, \file{/proc/meminfo} shows them as
-\texttt{L4hObjects}.
+costs the host more. The guest kernel takes 2~MiB blocks of its RAM for
+objects as it needs them (compacting memory to find one), and gives free
+ones back. In the guest, \file{/proc/meminfo} shows them as
+\texttt{L4hObjects}, and \file{/proc/l4h\_objmem} counts the blocks and
+conversions. When no free 2~MiB block can be found, the guest runs out of
+memory: its OOM killer ends a process, as it would when page tables could
+not be allocated on a native machine.
+
 
 
 \texttt{l4h-root} checks every request against the memory and other kernel
@@ -1053,6 +1059,8 @@ Test & What it checks \\
   and seL4 extensions, with a freestanding guest \\
 \cmd{run-selftest.sh [vcpus]} & system calls, memory, signals, fork,
   threads, futexes, SMP stress \\
+\cmd{run-objtest.sh} & guest RAM blocks becoming seL4 objects and back
+  under page-table pressure and SMP stress; guest OOM \\
 \cmd{run-blktest.sh} & disk pass-through and data integrity
   (\texttt{BLKTEST\_DEV=nvme} for NVMe) \\
 \cmd{run-ctltest.sh} & VM lifecycle, console, clean shutdown, disk windows,
@@ -1064,7 +1072,8 @@ Test & What it checks \\
 \cmd{run-density.sh 30 256} & 30 guests of 256 MiB on 4 cores stay
   responsive \\
 \cmd{run-m6test.sh} & dom0 restart, CPU caps, steal time \\
-\cmd{run-limits.sh} & the host refuses what it cannot afford and recovers \\
+\cmd{run-limits.sh} & the host refuses what it cannot afford and recovers,
+  and runs a large guest on a fragmented host \\
 \cmd{run-vmbench.sh} & per-guest host memory overhead; create, boot,
   shutdown and destroy latency (reported, not checked) \\
 \cmd{run-monitor.sh} & the serial monitor \\
@@ -1073,7 +1082,8 @@ Test & What it checks \\
 \cmd{run-debian.sh}, \cmd{run-workload.sh} & Debian with systemd, fio
   verification, a parallel build, fsck, data surviving a reboot \\
 \cmd{run-bench.sh} & micro-benchmarks \\
-\cmd{run-fuzz.sh} & a hostile guest fuzzing the VMM's virtqueues \\
+\cmd{run-fuzz.sh} & a hostile guest fuzzing the VMM's virtqueues and the
+  I/O pool checks \\
 \bottomrule
 \end{longtable}
 

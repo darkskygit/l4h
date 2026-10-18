@@ -859,8 +859,14 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("SELFTEST: start (%ld CPUs online)\n", sysconf(_SC_NPROCESSORS_ONLN));
 	for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
-		int before = failures;
+		int before = failures, j, want = argc < 2;
 		double t0 = now();
+
+		/* selftest NAME...: only those tests. */
+		for (j = 1; j < argc; j++)
+			want |= !strcmp(argv[j], tests[i].name);
+		if (!want)
+			continue;
 
 		tests[i].fn();
 		printf("  %-14s %s (%.3f s)\n", tests[i].name, failures == before ? "ok" : "FAILED",

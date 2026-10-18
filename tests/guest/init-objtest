@@ -1,0 +1,9 @@
+#!/bin/sh
+# dom0 init for tests/run-objtest.sh.
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t tmpfs tmp /tmp
+cat /proc/l4h_objmem
+/bin/objtest
+cat /proc/l4h_objmem
+/bin/busybox poweroff -f

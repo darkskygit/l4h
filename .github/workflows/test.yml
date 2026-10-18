@@ -66,6 +66,8 @@ jobs:
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs
         run: tests/run-selftest.sh 4
+      - name: Guest RAM blocks (conversion, smp_mm_stress, OOM)
+        run: tests/run-objtest.sh
       - name: Block pass-through (virtio-blk)
         run: tests/run-blktest.sh
       - name: Block pass-through (NVMe)

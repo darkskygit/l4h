@@ -16,5 +16,9 @@ void l4h_obj_free(struct l4h_obj *o);
 unsigned long l4h_cap_copy(unsigned long src, int rights);
 unsigned long l4h_cap_mint_root(unsigned long root_slot, int rights, unsigned long badge);
 void l4h_caps_init(void);
+/* Make room for seL4 objects (may sleep); true if there is room. */
+bool l4h_objmem_wait(void);
+/* No memory for seL4 objects: the OOM killer. */
+void l4h_objmem_oom(void);
 
 #endif
