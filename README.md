@@ -31,7 +31,8 @@ current status of each part.
   destroy VMs; console access; disks; switches; NICs; CPU caps. Destroying
   a VM returns all its memory.
 - **Boot.** Multiboot under QEMU, or a UEFI disk image for GCE
-  (`tools/mkimage.sh`, `tools/gce-image.sh`).
+  (`tools/mkimage.sh`, `tools/gce-image.sh`). On a host with a display
+  the UEFI image shows a read-only status dashboard.
 - **aarch64.** seL4, the host components and the ABI test guest run on
   QEMU `virt` at EL1. The Linux guest is still x86_64-only.
 

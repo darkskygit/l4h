@@ -593,6 +593,10 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
     the parent.
   - Interrupt vectors are split: NICs 0–3, the serial monitor 8, disks
     16–79 (at most 64 disks are used).
+- **Dashboard.** With a linear framebuffer from the boot loader (GRUB on
+  UEFI; seL4 patch 0011 makes the multiboot2 header ask for one),
+  `l4h-root` draws a read-only status screen every second: host, VMs,
+  disks, switches. Changed character cells only; 8x8 public-domain font.
 - **Serial monitor.** `l4h-root` reads COM1 (I/O ports and IOAPIC IRQ 4)
   and runs `help`, `list`, `info`, `destroy <vm>` and `restart-dom0`. The
   kernel keeps using the port for output (`tests/run-monitor.sh`).

@@ -25,7 +25,7 @@ menuentry "l4h" {
 }
 CFG
 grub-mkstandalone -O x86_64-efi -o "$work/BOOTX64.EFI" \
-    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile" \
+    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile efi_gop video video_fb" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg"
 

@@ -10,8 +10,10 @@ extern crate alloc;
 mod blkd;
 mod component;
 mod ctl;
+mod dashboard;
 mod devmem;
 mod elf;
+mod font;
 mod guest;
 mod mem;
 mod monitor;
@@ -181,6 +183,7 @@ pub struct Host {
     pub guests: Vec<Option<Guest>>,
     pub total_bytes: usize,
     pub monitor: Option<monitor::Monitor>,
+    pub dashboard: Option<dashboard::Dashboard>,
 }
 
 impl Host {
@@ -409,8 +412,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         guests: Vec::new(),
         total_bytes,
         monitor: None,
+        dashboard: None,
     };
     h.monitor = monitor::Monitor::new(&mut h.alloc, wd_ntfn);
+    h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem);
 
     if DOM0_KERNEL.is_empty() {
         sel4::debug_println!("l4h-root: no dom0 kernel embedded, nothing to do");
@@ -518,6 +523,7 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             let now = rdtsc();
             sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
             last_balance = now;
+            dashboard::Dashboard::tick(h);
             if WATCHDOG_SECS != 0 && rdtsc() >= next_watchdog {
                 watchdog_dump(h);
                 next_watchdog = rdtsc() + h.info.tsc_hz * WATCHDOG_SECS as u64;

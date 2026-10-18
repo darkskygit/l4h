@@ -22,6 +22,12 @@ set(KernelRootCNodeSizeBits "19" CACHE STRING "")
 set(KernelMaxNumBootinfoUntypedCaps "230" CACHE STRING "")
 set(KernelRetypeFanOutLimit "16384" CACHE STRING "")
 set(KernelMultiboot2Header ON CACHE BOOL "")
+# Ask a multiboot2 loader (GRUB on UEFI) for a linear framebuffer, for the
+# host dashboard; optional, and ignored by QEMU's multiboot1 loader.
+set(KernelMultibootGFXMode "linear" CACHE STRING "")
+set(KernelMultibootGFXDepth "32" CACHE STRING "")
+set(KernelMultibootGFXWidth "1024" CACHE STRING "")
+set(KernelMultibootGFXHeight "768" CACHE STRING "")
 set(KernelHugePage ON CACHE BOOL "")
 set(KernelTimerTickMS "2" CACHE STRING "")
 # Debug builds by default; L4H_RELEASE=1 tools/build-kernel.sh turns

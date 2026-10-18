@@ -832,6 +832,17 @@ dom0 finds them with \cmd{l4hctl list} and can manage them as before.
 nothing to recover it. Disks and vNICs that dom0 had are recreated from the
 image's settings.
 
+\section{The dashboard}
+
+When the host has a display and boots from the UEFI image, \texttt{l4h-root}
+shows a status dashboard on the screen, refreshed every second: cores,
+memory in use, every VM with its state, vCPUs, memory, CPU use, cap and
+cores, the disks and their owners, and each switch with its uplink and
+ports. It is read-only: there is no keyboard input. Hosts without a display,
+such as GCE VMs, or booted directly by QEMU, run without it. With
+\cmd{tools/run-uefi.sh}, QEMU's display shows it when you drop
+\texttt{-nographic}.
+
 \section{The serial monitor}
 
 \texttt{l4h-root} reads commands from the host's first serial port (COM1,
