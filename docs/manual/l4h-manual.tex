@@ -256,6 +256,18 @@ kernel, initramfs or any \texttt{L4H\_DOM0\_*} variable, since they are
 embedded in \texttt{l4h-root}.
 \end{caveat}
 
+\section{Debug and release kernels}
+
+\cmd{tools/build-kernel.sh} builds a debug seL4 kernel by default: it checks
+assertions, and prints diagnostics on the serial port. For production, build
+it with \texttt{L4H\_RELEASE=1 tools/build-kernel.sh}, then rebuild the host
+and images. Both builds keep printing on, since the host components log
+through the kernel.
+
+seL4's debug system calls need no capability, and some of them stop the
+machine. The l4h kernel reserves them to host components, so guests cannot
+use them in either build.
+
 \section{The guest kernel configuration}
 
 \file{guest/linux/arch/l4h/configs/defconfig} gives a kernel that can boot a
@@ -677,7 +689,12 @@ PORT  VM MAC                     RX       TX  DROPS
 \end{lstlisting}
 RX and TX count frames, from the guest's point of view, and DROPS counts
 frames the switch dropped for that port, for example because the guest was
-not receiving.
+not receiving, or sent a frame with another source MAC address while MAC
+lock is on.
+
+A switch remembers up to 1024 MAC addresses, forgetting each after 5
+minutes without traffic. When a switch's table is full, frames from new
+addresses are still delivered, by flooding.
 
 \section{vNICs}
 
@@ -696,16 +713,11 @@ not receiving.
 
 Each vNIC appears as a virtio-net device with a 1500-byte MTU. Checksum
 offload and TSO pass through the switch, so guests do not compute checksums
-or segment TCP for traffic that stays on the host. When a frame leaves
-through a NIC without checksum offload, the switch computes the checksum
-itself.
-
-\begin{caveat}
-The switch does not segment TCP itself. If an uplink NIC does not offer TSO,
-large TCP frames that guests send to it are dropped. In that case turn TSO
-off in the guests that talk to the outside (\cmd{ethtool -K eth0 tso off}).
-virtio-net on QEMU and GCE offers TSO.
-\end{caveat}
+or segment TCP for traffic that stays on the host. When a frame goes to a
+port that cannot take it whole, such as a NIC without TSO or a guest that
+turned the offload off, the switch segments it and computes the checksums
+itself. The switch drops frames whose offload information does not match
+their contents, and counts them in DROPS.
 
 \section{A router VM}
 \label{sec:router}
@@ -850,13 +862,17 @@ available only on x86\_64.
 A guest runs an unmodified userspace on the \texttt{ARCH=l4h} kernel. From
 inside, it looks like a small x86\_64 machine:
 \begin{itemize}
-  \item x86\_64 binaries from any distribution run unchanged, although
-        \texttt{uname -m} reports \texttt{l4h};
+  \item \texttt{uname -m} reports \texttt{x86\_64}, and x86\_64 binaries
+        from any distribution run unchanged;
   \item the console is \texttt{hvc0};
   \item disks are \file{/dev/vda}, \file{/dev/vdb}, \ldots{} and vNICs are
         \texttt{eth0}, \texttt{eth1}, \ldots;
   \item there is no PCI, ACPI, firmware or framebuffer;
-  \item time comes from the host's TSC, and steal time is reported.
+  \item time comes from the host's TSC; the wall clock starts from the
+        host's real-time clock at boot (correct it with NTP as usual), and
+        steal time is reported;
+  \item memory protection works as on any x86\_64 machine, including
+        non-executable data pages.
 \end{itemize}
 
 What does not work:
@@ -897,7 +913,8 @@ Message & Usual cause \\
   exist. \\
 \texttt{out of memory} & The host lacks the memory, or another kernel
   resource, for the request. See \cmd{l4hctl info}; destroy stopped VMs,
-  which still hold their memory. \\
+  which still hold their memory. When free memory is fragmented, a large VM
+  can fail even though \cmd{info} shows enough. \\
 \texttt{busy} & The disk already has an owner; the VM is not in the right
   state, for example \cmd{shutdown} on a stopped VM, or devices added
   after the VM started. \\
@@ -987,12 +1004,15 @@ Test & What it checks \\
 \toprule
 Limit & Value \\
 \midrule
+Host cores & 64 \\
+Host disks & 64 \\
 Guests per host, including dom0 & about 61 (64 ids) \\
 vCPUs per guest & $4\times$ host cores, at most 64 \\
-RAM per guest & 8 MiB to 64 GiB \\
+RAM per guest (in at most 128 contiguous chunks) & 8 MiB to 64 GiB \\
 Devices per guest (console, disks, vNICs) & 16 \\
 Host NICs & 4 \\
 Switch ports, all switches together & 48 \\
+Learned MAC addresses & 1024 per switch, 8192 in all \\
 Guest name & 31 bytes \\
 Kernel command line & 1983 bytes \\
 Console output buffer per guest & about 16 KiB \\

@@ -108,6 +108,16 @@ Configuration:
 
 Release builds keep debug syscalls off.
 
+**Revised (security audit, v1).** Development builds keep
+`KernelDebugBuild` on, and debug syscalls need no capability: one of them,
+`seL4_DebugHalt`, stops the machine. Patch 0008 therefore reserves debug
+syscalls to threads with an MCP of at least `KernelDebugSyscallMinMCP`
+(101 for l4h). Guest threads are confined to MCP 100, so in a guest they
+are unknown syscalls in every build. `L4H_RELEASE=1 tools/build-kernel.sh`
+turns the debug build off. `KernelMaxNumNodes` is 64. XSAVE covers x87,
+SSE and AVX; the guest hides AVX-512, AMX and PKU, which seL4 does not
+enable, from its CPU feature set.
+
 The kernel is pinned to a recent seL4 master; at review time that was
 16.0.0-dev at `357c600`. We carry a **small, upstreamable patch set**:
 
@@ -183,6 +193,20 @@ We need no IOMMU, since no device is passed into a guest.
     reprogram.
   - Most switches only move the deadline later, so most writes
     disappear: trapped syscalls got 16× faster under nested KVM.
+- **0008, debug syscalls need a minimum MCP** (see above).
+- **0009, `seL4_X86_ExecuteNever`.** seL4 on x86 had no way to map a
+  readable user page without execute permission. The new VM attribute sets
+  XD on 4 KiB, 2 MiB and 1 GiB mappings, and boot code enables EFER.NXE when
+  the CPU has it. The guest maps pages without `PROT_EXEC` with it, so
+  `mmap`/`mprotect` execute permissions are enforced.
+- **0010, SMP remote calls.** `handleIPI()` read a remote call's operation
+  and arguments before checking that the call was pending for this core.
+  A late hardware IPI for a call already handled from the lock's wait loop
+  could then run the previous call's operation in the next round. With
+  Linux guests unmapping memory on 4 cores this skipped TLB invalidations
+  (user memory corruption) or replayed an invalidation on a reused VSpace
+  root (triple fault). The flag is now checked first. This is an upstream
+  bug.
 
 
 - **0004, x86_64 user RSP across syscalls.** seL4's fast `syscall` entry
@@ -419,6 +443,11 @@ never traps. `l4h-root` passes the TSC frequency, taken from seL4 bootinfo.
 The clockevent is a per-vCPU one-shot deadline on that vCPU's E3 Timer
 object, bound to `N_v`.
 
+*Revised (v1):* the wall clock at boot comes from `L4H_HC_GET_TIME`:
+`l4h-root` reads the CMOS RTC once at boot, and each VMM adds the TSC time
+since. Guests may correct it with NTP. Without an RTC (aarch64 for now) it
+is 0, the epoch.
+
 **Signals.** The kernel builds the native x86 `rt_sigframe` in user memory
 through the direct map. It fetches FPU and XSAVE state with E2, then rewrites
 the uTCB's registers with `WriteRegisters`. `rt_sigreturn` reverses this.
@@ -555,6 +584,15 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
     VSpace, its pool of 64 process VSpaces, and its VMM. That allows about
     61 guests per host; `MAX_GUESTS` is 64.
   - `tests/run-limits.sh` fills the host and checks that it recovers.
+  - Every size and address in a control request is range-checked before
+    any arithmetic on it (no overflow), and a request that fails half way
+    (e.g. guest RAM too fragmented: at most 128 chunks) gives back what it
+    took. Free root CNode slots are coalesced ranges, so the slot ranges
+    of vNIC ports and disk DMA buffers are reused after a guest is
+    destroyed, and splitting a memory block no longer keeps a slot for
+    the parent.
+  - Interrupt vectors are split: NICs 0–3, the serial monitor 8, disks
+    16–79 (at most 64 disks are used).
 - **Serial monitor.** `l4h-root` reads COM1 (I/O ports and IOAPIC IRQ 4)
   and runs `help`, `list`, `info`, `destroy <vm>` and `restart-dom0`. The
   kernel keeps using the port for output (`tests/run-monitor.sh`).
@@ -637,6 +675,9 @@ and no copy.
     Writes are refused on read-only attachments.
   - There is still a single queue: no `VIRTIO_BLK_F_MQ`, discard or write
     zeroes yet.
+  - A device or queue reset waits until blkd has completed every request
+    of the old queue (the device may still DMA into its buffers) before
+    the hypercall returns.
   - Tested with QEMU NVMe at 512-byte and 4 KiB LBAs
     (`BLKTEST_DEV=nvme tests/run-blktest.sh`), and with a read-only window
     in `tests/run-ctltest.sh`.
@@ -702,9 +743,18 @@ function, such as routing, NAT, DHCP or firewalling, belongs in a VM.
   - Copies: the VMM copies guest buffers to and from slots, and netd copies
     slot to slot, or slot to NIC DMA buffer. That is one copy more than the
     plan above, and it keeps netd's memory independent of every guest.
-  - Offloads are not negotiated yet: guests compute checksums.
-  - MAC learning has 300 s ageing. Unknown unicast, broadcast and multicast
-    are flooded within the switch. Locked ports (the default) drop frames
+  - Offloads: checksum and TSO metadata in the virtio-net header pass
+    through. netd validates the header of every guest frame (flags,
+    checksum offsets, GSO type and that a GSO frame really is TCP over
+    IPv4/IPv6) and drops incoherent ones. A GSO frame for a port that
+    cannot take it (a guest without GUEST_TSO, an uplink without
+    HOST_TSO) is segmented in netd, with full checksums.
+  - MAC learning has 300 s ageing, at most 1024 entries per switch and
+    8192 in all; a full table first drops expired entries, then stops
+    learning (those sources' frames are flooded). Unknown unicast,
+    broadcast and multicast are flooded within the switch. netd processes
+    at most one ring's worth of frames per kick and ignores a ring whose
+    indices claim more. Locked ports (the default) drop frames
     whose source MAC is not the port's MAC.
   - `tests/run-router.sh` covers the routing gate. A Debian router VM has
     one vNIC on the uplink switch and one on an internal switch, and NATs
@@ -844,7 +894,8 @@ versioned structs defined in `l4h-abi`.
 **Policy and safety.**
 
 - `l4h-root` enforces resource accounting (memory, cores, disk ownership: a
-  backing is attached to at most one VM unless it is read-only) and rejects
+  backing is attached to at most one VM; v1 does not share read-only
+  backings either) and rejects
   invalid requests. dom0 cannot breach host isolation, but it is fully trusted
   to decide *what* runs. In particular, dom0 can attach any disk to itself.
 - If dom0 crashes, the other guests keep running. `l4h-root` restarts dom0
