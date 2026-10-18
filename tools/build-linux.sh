@@ -22,6 +22,10 @@ mkdir -p "$out"
 mk=(make -C "$src" O="$out" ARCH=l4h
     L4H_SEL4_INCLUDE="$root/build/sel4/libsel4/include"
     L4H_ABI_INCLUDE="$root/include")
+# L4H_LINUX_CC overrides the compiler, e.g. "ccache gcc" in CI.
+if [ -n "${L4H_LINUX_CC:-}" ]; then
+    mk+=(CC="$L4H_LINUX_CC")
+fi
 if [ ! -f "$out/.config" ]; then
     "${mk[@]}" defconfig
 fi

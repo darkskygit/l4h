@@ -1,0 +1,143 @@
+# Build l4h and run its integration tests in QEMU.  KVM serves only as a
+# fast CPU (the scripts hide VMX from the machine, as on a cloud VM), so the
+# standard GitHub-hosted Linux runners, which expose /dev/kvm, suffice.
+# Jobs run in Debian 13 containers, the distribution l4h is developed on;
+# tools/ci-setup.sh installs everything else.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  LINUX_VERSION: 6.18.57
+  L4H_LINUX_CC: ccache gcc
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+  CARGO_TERM_COLOR: always
+
+jobs:
+  x86_64:
+    name: x86_64 (QEMU/KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    container:
+      image: debian:trixie
+      options: --device /dev/kvm
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/cache@v4
+        with:
+          path: build/dl
+          key: linux-${{ env.LINUX_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-x86_64-${{ github.sha }}
+          restore-keys: ccache-x86_64-
+      - name: Set up
+        run: tools/ci-setup.sh x86_64
+      - name: Check KVM
+        run: |
+          test -c /dev/kvm && test -w /dev/kvm
+          grep -c ^processor /proc/cpuinfo; free -g
+      - name: Build seL4
+        run: tools/build-kernel.sh
+      - name: Build Linux
+        run: tools/build-linux.sh vmlinux && ccache -s
+      - name: Guest ABI (freestanding test guest)
+        run: tests/run-testguest.sh
+      - name: Linux self-test, 1 vCPU
+        run: tests/run-selftest.sh 1
+      - name: Linux self-test, 4 vCPUs
+        run: tests/run-selftest.sh 4
+      - name: Block pass-through (virtio-blk)
+        run: tests/run-blktest.sh
+      - name: Block pass-through (NVMe)
+        run: BLKTEST_DEV=nvme tests/run-blktest.sh
+      - name: Control API
+        run: tests/run-ctltest.sh
+      - name: Network
+        run: tests/run-nettest.sh
+      - name: dom0 restart, CPU caps, steal time
+        run: tests/run-m6test.sh
+      - name: Resource limits
+        run: tests/run-limits.sh
+      - name: Serial monitor
+        run: tests/run-monitor.sh
+      - name: UEFI boot image
+        run: tests/run-uefitest.sh
+      - name: Virtqueue fuzzing
+        run: tests/run-fuzz.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-x86_64
+          path: |
+            build/*.log
+            build/*/*.log
+
+  debian:
+    name: Debian guests (QEMU/KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    container:
+      image: debian:trixie
+      # debootstrap mounts filesystems in its chroot.
+      options: --privileged
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/cache@v4
+        with:
+          path: build/dl
+          key: linux-${{ env.LINUX_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-debian-${{ github.sha }}
+          restore-keys: |
+            ccache-debian-
+            ccache-x86_64-
+      - name: Set up
+        run: tools/ci-setup.sh x86_64 debian
+      - name: Check KVM
+        run: test -c /dev/kvm && test -w /dev/kvm
+      - name: Build seL4
+        run: tools/build-kernel.sh
+      - name: Build Linux
+        run: tools/build-linux.sh vmlinux
+      - name: Build the Debian image
+        run: tests/mkdebian.sh
+      - name: Debian with systemd
+        run: tests/run-debian.sh
+      - name: NAT router VM
+        run: tests/run-router.sh
+      - name: Workload (fio verify, parallel build, fsck, reboot)
+        run: tests/run-workload.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-debian
+          path: |
+            build/*.log
+            build/*/*.log

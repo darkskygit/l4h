@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Prepare a fresh Debian 13 (trixie) system, run as root, to build and test
+# l4h: packages, Rust toolchains, the seL4 Python environment and the Linux
+# source.  Used by .github/workflows/test.yml; also works in a container.
+# Usage: ci-setup.sh [x86_64|debian]...   (default: x86_64)
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+LINUX_VERSION=${LINUX_VERSION:-6.18.57}
+want=" ${*:-x86_64} "
+
+pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
+    build-essential gcc g++ make cmake ninja-build python3 python3-venv
+    libxml2-utils device-tree-compiler clang libclang-dev
+    flex bison bc libelf-dev libssl-dev cpio rsync ccache
+    busybox-static e2fsprogs
+    qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin mtools fdisk)
+[[ $want == *" debian "* ]] && pkgs+=(debootstrap debian-archive-keyring)
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q --no-install-recommends "${pkgs[@]}"
+
+# Rust: stable for the dom0 tools and tests, the pinned nightly for the host
+# (host/rust-toolchain.toml).
+if ! command -v rustup >/dev/null; then
+    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+fi
+export PATH=$HOME/.cargo/bin:$PATH
+rustup toolchain install stable --profile minimal
+(cd "$root/host" && rustup toolchain install)
+
+# seL4's build tools.
+[ -x "$root/.venv/bin/python" ] || python3 -m venv "$root/.venv"
+"$root/.venv/bin/pip" install -q "$root/kernel/seL4/tools/python-deps"
+
+# Linux, unless already there.
+if [ ! -f "$root/build/linux-6.18/Makefile" ]; then
+    mkdir -p "$root/build/dl"
+    tarball=$root/build/dl/linux-$LINUX_VERSION.tar.xz
+    [ -f "$tarball" ] || curl -sSfL -o "$tarball" \
+        "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_VERSION.tar.xz"
+    tar -C "$root/build" -xJf "$tarball"
+    mv "$root/build/linux-$LINUX_VERSION" "$root/build/linux-6.18"
+fi
+
+if [ -n "${GITHUB_PATH:-}" ]; then
+    echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+fi
