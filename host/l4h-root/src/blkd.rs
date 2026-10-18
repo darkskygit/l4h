@@ -22,6 +22,11 @@ static BLKD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-blkd.elf"
 
 const PAGE: usize = 4096;
 
+/// Disk windows start and end on a multiple of this many 512-byte sectors
+/// (4 KiB), the largest logical block size blkd supports: devices address
+/// whole blocks, so an unaligned window would reach outside itself.
+pub const WINDOW_ALIGN: u64 = 8;
+
 /// Mapping attributes for device registers.
 #[cfg(target_arch = "x86_64")]
 const DEVICE_ATTRS: VmAttributes = VmAttributes::CACHE_DISABLED;

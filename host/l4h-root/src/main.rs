@@ -255,7 +255,11 @@ impl Host {
 
     /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
     /// of it; 0 = to the end) through to guest `id` before it starts.
+    /// The window must be aligned to blkd::WINDOW_ALIGN sectors.
     pub fn attach_disk(&mut self, id: usize, disk: usize, read_only: bool, lba_start: u64, lba_count: u64) -> Result<(), i64> {
+        if lba_start % blkd::WINDOW_ALIGN != 0 || lba_count % blkd::WINDOW_ALIGN != 0 {
+            return Err(ctl::EINVAL);
+        }
         if self.disks.get(disk).ok_or(ctl::ENOENT)?.owner.is_some() {
             return Err(ctl::EBUSY);
         }

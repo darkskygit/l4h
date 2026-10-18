@@ -125,13 +125,16 @@ impl Blkd {
         if req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
             return Err(blk::STATUS_IOERR);
         }
-        if bytes == 0 || bytes % bs != 0 || (req.sector * 512) % bs != 0 {
+        // The sector on the disk must be block aligned too: drivers that
+        // address blocks would round it down, outside the window.
+        let sector = self.lba_start + req.sector;
+        if bytes == 0 || bytes % bs != 0 || (sector * 512) % bs != 0 {
             return Err(blk::STATUS_IOERR);
         }
         if !self.translate(req, pieces) {
             return Err(blk::STATUS_IOERR);
         }
-        self.drv.start(req.id, req.op, self.lba_start + req.sector, pieces)
+        self.drv.start(req.id, req.op, sector, pieces)
     }
 
     /// Take requests from the channel while the device has room.
@@ -188,6 +191,17 @@ fn main(info: &'static Info) -> ! {
     if cfg.lba_count != 0 {
         sectors = sectors.min(cfg.lba_count);
     }
+    // The device addresses whole blocks: the window must start on one
+    // (l4h-root checks this too) and is cut to whole blocks.
+    let block_sectors = (dev.block_size as u64 / 512).max(1);
+    if lba_start % block_sectors != 0 {
+        sel4::debug_println!(
+            "blkd {:#x}: window start {} is not aligned to {}-byte blocks; disk disabled",
+            id, lba_start, dev.block_size
+        );
+        sectors = 0;
+    }
+    sectors -= sectors % block_sectors;
     let read_only = dev.read_only || cfg.read_only != 0;
     let chan = cfg.chan_va as *mut Channel;
     unsafe {

@@ -638,7 +638,10 @@ whose suboptions are:
     window of \texttt{N} sectors from \texttt{SECTOR}, as a disk of its own
     starting at sector 0. Without \texttt{sectors}, the window extends to the
     end of the disk. Sectors are 512 bytes, as in Linux, regardless of the
-    device's block size.
+    device's block size. \texttt{SECTOR} and \texttt{N} must be multiples
+    of 8 (4\,KiB), the largest block size l4h supports, or the attach fails
+    with \texttt{invalid argument}: a device with 4\,KiB blocks cannot
+    address a window that starts or ends inside a block.
 \end{description}
 
 For example, to give a guest the second partition of disk 1 read-only, take

@@ -49,6 +49,17 @@ sleep 1
 l4hctl console "$id" > /tmp/out
 grep -q "GUEST: vda size 16384 ro 1" /tmp/out || { cat /tmp/out; fail "disk window"; }
 l4hctl destroy "$id" || fail "destroy window"
+# Windows not aligned to 4 KiB are refused (an NVMe disk with 4 KiB blocks
+# would round them down, outside the window).
+for w in start=8193 start=8192,sectors=16383; do
+    if l4hctl create badwin --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
+        --disk 0,ro,$w 2>/tmp/err; then
+        fail "unaligned window $w accepted"
+    fi
+    grep -q "invalid argument" /tmp/err || { cat /tmp/err; fail "unaligned window $w"; }
+done
+l4hctl list | grep -q badwin && fail "refused VM left behind"
+echo "CTLTEST: unaligned windows refused"
 l4hctl disks
 echo "CTLTEST: PASS"
 poweroff -f

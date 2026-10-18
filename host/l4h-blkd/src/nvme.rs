@@ -318,6 +318,10 @@ impl Driver for Nvme {
                 return self.issue_flush(r);
             }
             let opcode = if op == blk::OP_READ { OP_READ } else { OP_WRITE };
+            // Never round a sector down to the block holding it.
+            if (sector << 9) & ((1 << self.lba_shift) - 1) != 0 {
+                return Err(blk::STATUS_IOERR);
+            }
             let mut lba = (sector << 9) >> self.lba_shift;
             // The pieces of the command being built.
             let mut cmd = [Seg { pa: 0, len: 0 }; MAX_PIECES];
