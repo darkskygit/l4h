@@ -588,6 +588,13 @@ static void test_files(void)
 
 /* ---- SMP stress: concurrent faults, mmap/munmap and forks */
 static atomic_int stress_errors;
+/* First wrong value read back, and what was expected there. */
+static _Atomic uint64_t stress_got, stress_want;
+
+/* Each page holds its owner thread, round and page index, so a wrong
+ * value tells whose page was read instead. */
+#define STRESS_TAG(id, round, pg) \
+	(0xa5ull << 56 | (uint64_t)(id) << 48 | (uint64_t)(round) << 24 | (pg))
 
 static void *mm_stress_fn(void *arg)
 {
@@ -596,19 +603,24 @@ static void *mm_stress_fn(void *arg)
 
 	for (round = 0; round < 200; round++) {
 		size_t len = (1 + (round % 7)) * 65536;
-		volatile unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
-						 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		volatile uint64_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+					    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		size_t i;
 
 		if (p == MAP_FAILED) {
 			atomic_fetch_add(&stress_errors, 1);
 			continue;
 		}
-		for (i = 0; i < len; i += 4096)
-			p[i] = (unsigned char)(id + i);
-		for (i = 0; i < len; i += 4096)
-			if (p[i] != (unsigned char)(id + i))
-				atomic_fetch_add(&stress_errors, 1);
+		for (i = 0; i < len / 4096; i++)
+			p[i * 512] = STRESS_TAG(id, round, i);
+		for (i = 0; i < len / 4096; i++) {
+			uint64_t got = p[i * 512], want = STRESS_TAG(id, round, i);
+
+			if (got != want && atomic_fetch_add(&stress_errors, 1) == 0) {
+				atomic_store(&stress_got, got);
+				atomic_store(&stress_want, want);
+			}
+		}
 		if (round & 1)
 			mprotect((void *)p, len, PROT_READ);
 		munmap((void *)p, len);
@@ -626,7 +638,9 @@ static void test_smp_mm_stress(void)
 		pthread_create(&th[i], NULL, mm_stress_fn, (void *)i);
 	for (i = 0; i < 8; i++)
 		pthread_join(th[i], NULL);
-	CHECK(atomic_load(&stress_errors) == 0, "%d errors", atomic_load(&stress_errors));
+	CHECK(atomic_load(&stress_errors) == 0, "%d errors, first read %016llx for %016llx "
+	      "(tags: a5, thread, round, page)", atomic_load(&stress_errors),
+	      (unsigned long long)atomic_load(&stress_got), (unsigned long long)atomic_load(&stress_want));
 }
 
 /* A use-after-munmap from another thread must fault, not read stale data. */

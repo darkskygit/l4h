@@ -376,6 +376,19 @@ none.
   TLB entries. With several vCPUs, `flush_tlb_*` syncs synchronously, so a
   page is never freed while another vCPU can still reach it. The fault-path
   mapping runs under the PTE lock.
+
+  *Revised (v1):* every vCPU also syncs `current->mm` before returning to
+  user, and a sync takes the whole pending range of the mm at once. A
+  flush may therefore find that its range has already been taken by a
+  sync on another vCPU that has not yet applied it. Syncs of an mm are
+  serialised by a per-mm lock, held from taking the range until it is
+  applied, so that such a flush waits for that sync instead of returning
+  while the old mappings are still in the VSpace. Without the lock, the
+  freed pages were reused while another thread could still write to them
+  through the old mapping. This showed up as `smp_mm_stress` data errors
+  on oversubscribed hosts. The lock also keeps two syncs from racing on
+  one PTE, where one could map a value that the other had already
+  replaced and marked synced.
 - **VSpace pool.** x86_64 seL4 has only 4096 ASIDs in total (8 pools of
   512). Each guest therefore gets a fixed pool of pre-assigned VSpace roots,
   and the guest kernel recycles them least recently used first. An mm that

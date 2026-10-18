@@ -170,12 +170,33 @@ static inline int update_p4d_range(pgd_t *pgd, unsigned long addr,
 	return ret;
 }
 
+/*
+ * Apply the pending range of `mm` to its seL4 address space.
+ *
+ * Every vCPU syncs current->mm before returning to user, so the range a
+ * flush has just marked may be taken by another vCPU's sync.  The flush
+ * must not return before that sync is complete: its caller goes on to free
+ * the pages (or page tables), and a thread of the mm on a third vCPU could
+ * still write to them through the old mapping.  Two concurrent syncs would
+ * also race on a PTE: one maps the value it read, after the other has
+ * unmapped the newer value and marked it synced.  Syncs of an mm therefore
+ * hold sync_walk_lock from taking the range until it is applied.
+ *
+ * Callers include flushes under a PTE lock, so this must not sleep.  Kernel
+ * syncs are rare and short and also keep interrupts off; user syncs may be
+ * long and leave them on (no interrupt handler syncs a user mm).
+ */
 int um_tlb_sync(struct mm_struct *mm)
 {
 	pgd_t *pgd;
 	struct vm_ops ops;
-	unsigned long addr, end, next, flags;
+	unsigned long addr, end, next, flags, wflags = 0;
 	int ret = 0;
+
+	if (mm == &init_mm)
+		raw_spin_lock_irqsave(&mm->context.sync_walk_lock, wflags);
+	else
+		raw_spin_lock(&mm->context.sync_walk_lock);
 
 	/* Take the pending range; marks made from now on go to the next sync. */
 	raw_spin_lock_irqsave(&mm->context.sync_lock, flags);
@@ -185,7 +206,7 @@ int um_tlb_sync(struct mm_struct *mm)
 	mm->context.sync_tlb_range_to = 0;
 	raw_spin_unlock_irqrestore(&mm->context.sync_lock, flags);
 	if (end == 0)
-		return 0;
+		goto out;
 
 	ops.mm_idp = &mm->context.id;
 	if (mm == &init_mm) {
@@ -208,6 +229,12 @@ int um_tlb_sync(struct mm_struct *mm)
 		} else
 			ret = update_p4d_range(pgd, addr, next, &ops);
 	} while (pgd++, addr = next, ((addr < end) && !ret));
+
+out:
+	if (mm == &init_mm)
+		raw_spin_unlock_irqrestore(&mm->context.sync_walk_lock, wflags);
+	else
+		raw_spin_unlock(&mm->context.sync_walk_lock);
 
 	if (ret == -ENOMEM)
 		report_enomem();

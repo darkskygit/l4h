@@ -10,6 +10,7 @@
 
 int init_new_context(struct task_struct *task, struct mm_struct *mm)
 {
+	raw_spin_lock_init(&mm->context.sync_walk_lock);
 	raw_spin_lock_init(&mm->context.sync_lock);
 	mm->context.sync_tlb_range_from = 0;
 	mm->context.sync_tlb_range_to = 0;
