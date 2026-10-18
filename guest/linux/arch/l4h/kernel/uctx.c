@@ -199,10 +199,12 @@ void l4h_uctx_switch_out(struct task_struct *t)
 
 	if (!t->thread.mm_running)
 		return;
-	/* A preempted context would keep running on the vCPU's SC_U once the
-	 * kernel thread blocks; take the SC away. */
-	if (u->state == L4H_UCTX_PREEMPTED)
-		l4h_user_deschedule(u);
+	/* Release even a faulted context before the task can migrate.  Leaving
+	 * it bound lets the old vCPU's bind_sc() race with its new vCPU over
+	 * sc_owner/sc_vcpu, and retain a pointer to a task that can exit there.
+	 * A preempted context must also lose SC_U so it cannot run behind the
+	 * kernel's back.  Ownership is consequently local to the current vCPU. */
+	l4h_user_deschedule(u);
 	if (t->mm)
 		atomic_dec(&t->mm->context.l4h.running);
 	t->thread.mm_running = 0;

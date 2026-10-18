@@ -148,28 +148,14 @@ void l4h_user_sync_regs(struct l4h_uctx *u, unsigned long *gp)
 	u->regs_valid = 1;
 }
 
-/* Bind this vCPU's SC_U to u (taking it over from wherever it was). */
+/* Bind this vCPU's SC_U to u.  Switch-out releases it before migration. */
 static void bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u)
 {
-	struct l4h_uctx *old = v->sc_owner;
 	int err;
 
-	if (old == u && u->sc_vcpu == v->id)
+	if (v->sc_owner == u && u->sc_vcpu == v->id)
 		return;
-	if (old) {
-		/* Only unbinds if still bound to `old`'s TCB. */
-		seL4_SchedContext_UnbindObject(v->sc_u, old->tcb);
-		__atomic_compare_exchange_n(&old->sc_vcpu, &(int){ v->id }, -1, 0,
-					    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
-		v->sc_owner = 0;
-	}
-	if (u->sc_vcpu >= 0 && u->sc_vcpu != v->id) {
-		struct l4h_vcpu *o = &l4h_vcpus[u->sc_vcpu];
-
-		seL4_SchedContext_UnbindObject(o->sc_u, u->tcb);
-		__atomic_compare_exchange_n(&o->sc_owner, &(struct l4h_uctx *){ u }, 0, 0,
-					    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
-	}
+	l4h_BUG_ON(v->sc_owner || u->sc_vcpu >= 0);
 	/* seL4 refuses to bind a scheduling context without budget available
 	 * (capped vCPUs exhaust SC_U) to a blocked thread, which u is: wait
 	 * until the budget is refilled, within one period.  Not with
@@ -190,16 +176,11 @@ void l4h_user_deschedule(struct l4h_uctx *u)
 
 	if (cpu < 0)
 		return;
+	l4h_BUG_ON(cpu != l4h_this_vcpu_id());
 	v = &l4h_vcpus[cpu];
-	{
-		int err = seL4_SchedContext_UnbindObject(v->sc_u, u->tcb);
-
-		if (err)
-			printk("l4h: deschedule %lx from vCPU %d SC failed: %d (on vCPU %d)\n",
-			       u->badge, cpu, err, l4h_this_vcpu_id());
-	}
-	__atomic_compare_exchange_n(&v->sc_owner, &(struct l4h_uctx *){ u }, 0, 0,
-				    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+	l4h_BUG_ON(v->sc_owner != u);
+	l4h_BUG_ON(seL4_SchedContext_UnbindObject(v->sc_u, u->tcb));
+	v->sc_owner = 0;
 	u->sc_vcpu = -1;
 }
 

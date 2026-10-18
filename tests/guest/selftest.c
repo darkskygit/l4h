@@ -824,6 +824,48 @@ static void test_getcpu(void)
 	}
 }
 
+/* A syscall can move a faulted user context to another vCPU.  Its old
+ * vCPU must release it before running another task, including when the
+ * migrated thread immediately exits and its task_struct is freed. */
+static void *migrate_exit_fn(void *arg)
+{
+	long n = (long)arg;
+	cpu_set_t set;
+
+	for (int i = 0; i < 8; i++) {
+		unsigned int cpu = ~0u;
+		int target = (n + i) % sysconf(_SC_NPROCESSORS_ONLN);
+
+		CPU_ZERO(&set);
+		CPU_SET(target, &set);
+		if (sched_setaffinity(0, sizeof(set), &set))
+			return (void *)1;
+		if (syscall(SYS_getcpu, &cpu, NULL, NULL) || cpu != target)
+			return (void *)1;
+		sched_yield();
+	}
+	return NULL;
+}
+
+static void test_smp_migrate_exit(void)
+{
+	pthread_t th[8];
+
+	if (sysconf(_SC_NPROCESSORS_ONLN) < 2)
+		return;
+	for (int round = 0; round < 64; round++) {
+		for (long i = 0; i < 8; i++)
+			CHECK(!pthread_create(&th[i], NULL, migrate_exit_fn, (void *)i),
+			      "pthread_create");
+		for (int i = 0; i < 8; i++) {
+			void *result;
+
+			CHECK(!pthread_join(th[i], &result) && !result,
+			      "migrated thread failed");
+		}
+	}
+}
+
 struct test {
 	const char *name;
 	void (*fn)(void);
@@ -844,6 +886,7 @@ static const struct test tests[] = {
 	{ "futex", test_futex },
 	{ "futex_wake_op", test_futex_wake_op },
 	{ "getcpu", test_getcpu },
+	{ "smp_migrate_exit", test_smp_migrate_exit },
 	{ "files", test_files },
 	{ "smp_mm_stress", test_smp_mm_stress },
 	{ "smp_unmap_vis", test_smp_unmap_visibility },

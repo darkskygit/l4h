@@ -1,0 +1,9 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+ulimit -c 0
+/bin/node --expose-gc --max-old-space-size=128 /bin/nodetest.js
+status=$?
+[ "$status" = 0 ] || echo "NODETEST: FAIL exit $status"
+poweroff -f
