@@ -8,6 +8,7 @@
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <asm/ptrace-abi.h>
+#include <l4h_uctx.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/syscalls.h>
@@ -67,6 +68,7 @@ long arch_ptrace(struct task_struct *child, long request,
 			ret = -EIO;
 			break;
 		}
+		l4h_sync_seg(child);
 		for ( i = 0; i < MAX_REG_OFFSET; i += sizeof(long) ) {
 			__put_user(getreg(child, i), p);
 			p++;
@@ -82,11 +84,13 @@ long arch_ptrace(struct task_struct *child, long request,
 			ret = -EIO;
 			break;
 		}
+		l4h_sync_seg(child);
 		for ( i = 0; i < MAX_REG_OFFSET; i += sizeof(long) ) {
 			__get_user(tmp, p);
 			putreg(child, i, tmp);
 			p++;
 		}
+		l4h_seg_dirty(child);
 		ret = 0;
 		break;
 	}

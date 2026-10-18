@@ -290,6 +290,7 @@ static void test_fork(void)
 /* ---- ptrace */
 #define PT_GS1 0x12345000UL
 #define PT_GS2 0x6789a000UL
+#define PT_GS3 0x2468a000UL
 
 static long get_base(int code)
 {
@@ -307,6 +308,9 @@ static void ptrace_child(void)
 	raise(SIGSTOP);
 	if (get_base(ARCH_GET_GS) != PT_GS2)
 		_exit(10);
+	raise(SIGSTOP);
+	if (get_base(ARCH_GET_GS) != PT_GS3)
+		_exit(11);
 	_exit(0);
 }
 
@@ -386,6 +390,17 @@ static void ptrace_tracer(pid_t pid)
 	      "clearing DR7/DR1 failed");
 #undef PT_DR
 #undef PT_USER_SIZE
+
+	CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "PTRACE_CONT: %s", strerror(errno));
+	CHECK(ptrace_stopped(pid), "child did not stop again");
+
+	/* PEEKUSER/POKEUSER of fs/gs base reach the tracee's thread. */
+	CHECK(peek_user(pid, offsetof(struct user_regs_struct, fs_base), &v) == 0 && v == fs,
+	      "PEEKUSER fs_base: %#lx, expected %#lx", v, fs);
+	CHECK(poke_user(pid, offsetof(struct user_regs_struct, gs_base), PT_GS3) == 0,
+	      "POKEUSER gs_base failed");
+	CHECK(peek_user(pid, offsetof(struct user_regs_struct, gs_base), &v) == 0 && v == PT_GS3,
+	      "PEEKUSER gs_base after POKEUSER: %#lx", v);
 
 	CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "PTRACE_CONT: %s", strerror(errno));
 	CHECK(waitpid(pid, &status, 0) == pid, "waitpid: %s", strerror(errno));

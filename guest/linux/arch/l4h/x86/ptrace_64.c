@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <registers.h>
 #include <asm/ptrace-abi.h>
+#include <l4h_uctx.h>
 
 /*
  * determines which flags the user has access to.
@@ -121,6 +122,16 @@ int poke_user(struct task_struct *child, long addr, long data)
 	if (bad_user_offset(addr))
 		return -EIO;
 
+	if (addr == FS_BASE || addr == GS_BASE) {
+		/* Keep the other base: user code may have changed it. */
+		int err;
+
+		l4h_sync_seg(child);
+		err = putreg(child, addr, data);
+		if (!err)
+			l4h_seg_dirty(child);
+		return err;
+	}
 	if (addr < MAX_REG_OFFSET)
 		return putreg(child, addr, data);
 	else if ((addr >= offsetof(struct user, u_debugreg[0])) &&
@@ -185,6 +196,8 @@ int peek_user(struct task_struct *child, long addr, long data)
 		return -EIO;
 
 	tmp = 0;  /* Default return condition */
+	if (addr == FS_BASE || addr == GS_BASE)
+		l4h_sync_seg(child);
 	if (addr < MAX_REG_OFFSET)
 		tmp = getreg(child, addr);
 	else if ((addr >= offsetof(struct user, u_debugreg[0])) &&
