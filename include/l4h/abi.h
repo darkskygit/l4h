@@ -266,7 +266,11 @@ enum l4h_virtio_op {
 struct l4h_console_page {
 	l4h_u32 in_head;        /* written by the host */
 	l4h_u32 in_tail;        /* written by the guest */
-	l4h_u32 reserved[14];
+	/* Set by the host, which then raises the device's event line: the
+	 * guest should shut down cleanly (L4H_POWER_OFF + 1) or reboot
+	 * (L4H_POWER_REBOOT + 1).  0 = no request. */
+	l4h_u32 power_request;
+	l4h_u32 reserved[13];
 	l4h_u8 in[L4H_CONSOLE_IN_SIZE];
 };
 
@@ -337,6 +341,9 @@ enum l4h_ctl_op {
 	/* args: vm -> vals[0..] = core of each vCPU (up to 6), vals[5] = number
 	 * of vCPUs if more */
 	L4H_CTL_VM_INFO = 17,
+	/* args: vm, L4H_POWER_OFF or L4H_POWER_REBOOT: ask the guest to shut
+	 * down or reboot cleanly */
+	L4H_CTL_VM_SHUTDOWN = 19,
 	/* args: vm -> vals[0] = CPU used in the last 100 ms (permille of a core,
 	 * all vCPUs), vals[1] = CPU cap (percent per vCPU, 0 = none) */
 	L4H_CTL_VM_STATS = 18,

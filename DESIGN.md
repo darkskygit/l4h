@@ -816,6 +816,12 @@ versioned structs defined in `l4h-abi`.
   dom0's frames to the new guest's frames and never parses guest images.
   The lifecycle is `vm_create` → `blk_attach`* → `vm_load`* → `vm_start`
   (writes the boot info and spawns the guest's `l4h-vmm`) → `vm_destroy`.
+- `vm_shutdown` (`l4hctl shutdown [--reboot]`) is the ACPI-power-button
+  equivalent. `l4h-root` sets `power_request` in the guest's console page
+  and raises the console's event line on vCPU 0. The guest runs
+  `orderly_poweroff()` or `orderly_reboot()`, which signals init.
+  `vm_pause` is not implemented: suspending the vCPU kernel thread does
+  not stop a user thread that holds SC_U.
 - Console output goes into a per-guest ring that `l4h-vmm` writes and
   `l4h-root` reads for `console_read`. It is also copied to the serial port
   with a `[vmN]` line prefix. Console input is a ring in the guest's

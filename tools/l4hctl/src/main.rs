@@ -31,6 +31,7 @@ const NIC_NO_MAC_LOCK: u64 = 1;
 const CTL_VM_SET_SCHED: u32 = 16;
 const CTL_VM_INFO: u32 = 17;
 const CTL_VM_STATS: u32 = 18;
+const CTL_VM_SHUTDOWN: u32 = 19;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -314,6 +315,7 @@ const USAGE: &str = "usage: l4hctl <command>
          [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
                                create and start a VM; prints its id
          [--nic SWITCH[,mac=MAC][,nolock]]...
+  shutdown VM [--reboot]       ask the VM to shut down (or reboot) cleanly
   destroy VM                   stop a VM and free its resources
   sched VM CAP                 cap each vCPU of VM at CAP% of a core (0: none)
   cores VM                     host core of each vCPU of VM
@@ -527,6 +529,11 @@ fn run(args: &[String]) -> Result<i32> {
                 };
                 println!("{:>4} {:>3} {:<17} {:>8} {:>8} {:>6}", p.port, p.vm, fmt_mac(p.mac), p.rx_frames, p.tx_frames, p.drops);
             }
+        }
+        "shutdown" => {
+            let vm = parse_num(args.get(1).ok_or(Error("shutdown: missing VM".into()))?)?;
+            let how = if args.get(2).map(|s| s.as_str()) == Some("--reboot") { 1 } else { 0 };
+            ctl.call(CTL_VM_SHUTDOWN, &[vm, how], &[], &[])?;
         }
         "destroy" => {
             let vm = parse_num(args.get(1).ok_or(Error("destroy: missing VM".into()))?)?;

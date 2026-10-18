@@ -13,6 +13,10 @@ cp "$busybox" "$dir/bin/busybox"
 for app in $("$busybox" --list); do
     [ "$app" = busybox ] || ln -sf busybox "$dir/bin/$app"
 done
+# The kernel runs /sbin/poweroff and /sbin/reboot for host shutdown requests.
+for app in poweroff reboot halt; do
+    ln -sf ../bin/busybox "$dir/sbin/$app"
+done
 if [ -n "$init" ]; then
     cp "$init" "$dir/init"
 else

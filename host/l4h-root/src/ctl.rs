@@ -248,6 +248,20 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             }
             if crate::sched::set_cap(h, id, a[1] as u32) { Ok(()) } else { Err(ENOENT) }
         }
+        abi::CTL_VM_SHUTDOWN => {
+            let id = vm_arg(a[0])?;
+            if a[1] != abi::POWER_OFF && a[1] != abi::POWER_REBOOT {
+                return Err(EINVAL);
+            }
+            let g = h.guests.get(id).and_then(|g| g.as_ref()).ok_or(ENOENT)?;
+            if g.state != State::Running {
+                return Err(EBUSY);
+            }
+            unsafe { addr_of_mut!((*g.console_page()).power_request).write_volatile(a[1] as u32 + 1) };
+            // The console is device 0.
+            g.raise_event(&mut h.alloc, crate::guest::dev_event(0));
+            Ok(())
+        }
         abi::CTL_VM_STATS => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             resp.vals[0] = g.vcpus.iter().map(|v| v.usage as u64).sum();

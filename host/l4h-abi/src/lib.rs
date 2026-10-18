@@ -186,7 +186,8 @@ pub const CONSOLE_IN_SIZE: usize = 4032;
 pub struct ConsolePage {
     pub in_head: u32,
     pub in_tail: u32,
-    pub reserved: [u32; 14],
+    pub power_request: u32,
+    pub reserved: [u32; 13],
     pub input: [u8; CONSOLE_IN_SIZE],
 }
 
@@ -231,6 +232,7 @@ pub const CTL_NIC_INFO: u32 = 15;
 pub const CTL_VM_SET_SCHED: u32 = 16;
 pub const CTL_VM_INFO: u32 = 17;
 pub const CTL_VM_STATS: u32 = 18;
+pub const CTL_VM_SHUTDOWN: u32 = 19;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 
 #[repr(C)]

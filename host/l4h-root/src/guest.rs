@@ -284,6 +284,21 @@ impl Guest {
         (root_guest_va(self.id) + PAGE) as *mut abi::ConsolePage
     }
 
+    /// Raise event line `ev` on vCPU 0, as l4h-vmm does for devices.
+    pub fn raise_event(&self, alloc: &mut Alloc, ev: u32) {
+        let page = self.event_page(0);
+        unsafe {
+            let w = core::ptr::addr_of_mut!((*page).pending[(ev / 64) as usize]) as *const core::sync::atomic::AtomicU64;
+            (*w).fetch_or(1 << (ev % 64), core::sync::atomic::Ordering::SeqCst);
+        }
+        let s = alloc.slots.alloc();
+        let badged = root_cap::<cap_type::Notification>(s);
+        abs(badged).mint(&abs(self.vcpus[0].ntfn), CapRights::write_only(), abi::BADGE_EVENT).expect("event cap");
+        badged.signal();
+        abs(badged).delete().expect("delete event cap");
+        alloc.slots.free(s);
+    }
+
     /// Event page of vCPU `v`, as mapped in the root task.
     pub fn event_page(&self, v: usize) -> *mut abi::EventPage {
         (root_guest_va(self.id) + 0x2_0000 + v * PAGE) as *mut abi::EventPage

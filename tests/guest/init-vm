@@ -4,6 +4,8 @@
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+# busybox poweroff/reboot signal init (l4hctl shutdown).
+trap 'echo "GUEST: shutting down"; poweroff -f' USR2 TERM
 echo "GUEST: ready, $(nproc) cpus"
 if [ -b /dev/vda ]; then
     echo "GUEST: vda size $(cat /sys/block/vda/size) ro $(cat /sys/block/vda/ro)"
