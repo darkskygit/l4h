@@ -3,7 +3,6 @@
 
 use alloc::vec::Vec;
 
-use sel4::init_thread::slot;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
@@ -144,13 +143,11 @@ pub fn spawn(
         }
         // Interrupt.
         let irq_slot = alloc.slots.alloc();
-        slot::IRQ_CONTROL
-            .cap()
-            .irq_control_get_msi(
-                d.bus as u64, d.dev as u64, d.func as u64, 0, NIC_MSI_BASE + n as u64,
-                &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()),
-            )
-            .expect("NIC MSI");
+        pci::msi_irq(
+            &d,
+            NIC_MSI_BASE + n as u64,
+            &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()),
+        );
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let ntfn_slot = alloc.slots.alloc();
         let ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(ntfn_slot).cap();

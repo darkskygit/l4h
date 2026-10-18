@@ -162,3 +162,30 @@ pub const fn vmm_chan_va(d: usize) -> usize {
 /// bit 32 + d = completion from the backend of device d.
 pub const VMM_BADGE_KICK_SHIFT: u32 = 0;
 pub const VMM_BADGE_DONE_SHIFT: u32 = 32;
+
+/// The architectural time counter that seL4 deadlines (seL4_TCB_SetTimer)
+/// are expressed in: the TSC on x86_64, the virtual counter on aarch64.
+pub mod ticks {
+    #[cfg(target_arch = "x86_64")]
+    pub fn now() -> u64 {
+        let lo: u32;
+        let hi: u32;
+        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+        ((hi as u64) << 32) | lo as u64
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+
+    /// Counter frequency, where the architecture defines a register for it.
+    #[cfg(target_arch = "aarch64")]
+    pub fn hz() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+}

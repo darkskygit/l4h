@@ -895,7 +895,7 @@ versioned structs defined in `l4h-abi`.
 | Concern | x86_64 | aarch64 |
 |---------|--------|---------|
 | seL4 support | MCS, SMP | MCS, SMP, and the best proof coverage |
-| syscall trap (E1) | `syscall`, number in `rdx` | `svc`, number in `x7`; the same flag applies |
+| syscall trap (E1) | `syscall`, number in `rdx` | `svc`, number in `x7`; the same flag applies, and the fault carries Linux's x8 (patch 0007) |
 | FPU access (E2) | XSAVE area | V-regs + FPSR/FPCR |
 | Guest VA | 47-bit | 48-bit TTBR0 |
 | TLS | `fs_base` | `TPIDR_EL0` (`seL4_TCB_SetTLSBase`) |
@@ -913,6 +913,34 @@ Rules that keep the port cheap:
    `GetStatusBits`.
 4. Guest RAM uses 4 KiB frames, which every ISA supports.
 5. CI builds both ISAs from day one, even before arm64 boots.
+
+**Status (v1).**
+
+- **Kernel.** seL4 aarch64 (QEMU `virt`, MCS, SMP, EL1, no hypervisor
+  support) builds with all l4h patches, from `kernel/configs/l4h-aarch64.cmake`
+  via `tools/build-kernel-aarch64.sh`.
+  - E1 (trapSyscalls), E2 (FPU access), E3 (timers), patch 0005 (IPI
+    barrier) and patch 0006 (lazy timer) are ISA-neutral.
+  - Patch 0007 makes aarch64 report **x8**, the Linux syscall number,
+    in the UnknownSyscall fault of trapping threads. seL4's own number is
+    in x7, and x8 is not otherwise part of the fault message.
+  - FaultIP points at the `svc` instruction, so the guest advances it by
+    4 (x86_64: by 2).
+- **Boot.** rust-sel4's kernel loader only entered EL2 kernels.
+  `third_party/patches/rust-sel4/0001` adds the EL1 path: it drops from EL2
+  with the EL1 translation regime set up and no traps.
+  `tools/build-loader-aarch64.sh` applies the patch and builds the loader.
+  Booting at EL1 directly, as cloud VMs do, still needs loader work.
+- **Host.** l4h-root and all components build for aarch64
+  (`tools/build-host-aarch64.sh`). The ISA-specific pieces are page tables
+  (`vspace.rs`), the time counter (`l4h_host::ticks`: TSC or `cntvct_el0`)
+  and PCI. PCI (ECAM, GIC interrupts) is not implemented on aarch64 yet,
+  so no host devices exist there.
+- **Test.** `tests/run-testguest-aarch64.sh` passes on 4 TCG cores: dom0
+  is the ABI test guest, served by its l4h-vmm. The test covers E1 with
+  an x7 sweep (#477), E2 on v0, user page faults and E3.
+- **Not done.** The Linux side (`arch/l4h` for arm64) and the aarch64
+  PCI/ECAM drivers.
 
 ---
 

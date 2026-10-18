@@ -1,0 +1,102 @@
+diff --git a/crates/sel4-kernel-loader/asm/aarch64/tail.S b/crates/sel4-kernel-loader/asm/aarch64/tail.S
+index b56f077c..06327053 100644
+--- a/crates/sel4-kernel-loader/asm/aarch64/tail.S
++++ b/crates/sel4-kernel-loader/asm/aarch64/tail.S
+@@ -46,3 +46,52 @@ BEGIN_FUNC(switch_translation_tables_el2)
+     ret
+ 
+ END_FUNC(switch_translation_tables_el2)
++
++/*
++ * Enter a kernel built for EL1 (no ARM_HYPERVISOR_SUPPORT) from EL2:
++ * x0-x5 kernel arguments, x6 kernel entry, x7 kernel boot level 0 table,
++ * which maps both the identity range and (in its upper half) the kernel
++ * window, so it serves as TTBR0_EL1 and TTBR1_EL1.  The caller has cleaned
++ * the data cache.
++ */
++BEGIN_FUNC(enter_kernel_el1)
++    ldr     x8, =MAIR(0x00, MT_DEVICE_nGnRnE) | \
++                 MAIR(0x04, MT_DEVICE_nGnRE) | \
++                 MAIR(0x0c, MT_DEVICE_GRE) | \
++                 MAIR(0x44, MT_NORMAL_NC) | \
++                 MAIR(0xff, MT_NORMAL) | \
++                 MAIR(0xaa, MT_NORMAL_WT)
++    msr     mair_el1, x8
++    /* 48-bit VA in both halves, 4 KiB granules, write-back inner shareable
++     * walks, IPS = the CPU's physical address range. */
++    ldr     x8, =(16 | (1 << 8) | (1 << 10) | (3 << 12) | (0 << 14) | \
++                  (16 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | (2 << 30))
++    mrs     x9, id_aa64mmfr0_el1
++    and     x9, x9, #7
++    orr     x8, x8, x9, lsl #32
++    msr     tcr_el1, x8
++    msr     ttbr0_el1, x7
++    msr     ttbr1_el1, x7
++    /* EL1 is AArch64; no stage 2, no traps of timers, FP or system
++     * registers. */
++    mov     x8, #(1 << 31)
++    msr     hcr_el2, x8
++    mov     x8, #3
++    msr     cnthctl_el2, x8
++    msr     cntvoff_el2, xzr
++    mov     x8, #0x33ff
++    msr     cptr_el2, x8
++    msr     hstr_el2, xzr
++    /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
++    ldr     x8, =0x30d01805
++    msr     sctlr_el1, x8
++    isb
++    tlbi    vmalle1is
++    dsb     ish
++    isb
++    /* EL1h with interrupts masked. */
++    mov     x8, #0x3c5
++    msr     spsr_el2, x8
++    msr     elr_el2, x6
++    eret
++END_FUNC(enter_kernel_el1)
+diff --git a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
+index dd11fca6..4d3904bb 100644
+--- a/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
++++ b/crates/sel4-kernel-loader/src/arch/arm/arch/aarch64/mod.rs
+@@ -18,6 +18,17 @@ pub(crate) mod exception_handler;
+ 
+ unsafe extern "C" {
+     fn switch_translation_tables_el2();
++    fn clean_and_invalideate_dcache();
++    fn enter_kernel_el1(
++        ui_p_reg_start: usize,
++        ui_p_reg_end: usize,
++        pv_offset: usize,
++        v_entry: usize,
++        dtb_addr_p: usize,
++        dtb_size: usize,
++        kernel_entry: usize,
++        level_0_table: usize,
++    ) -> !;
+ }
+ 
+ #[unsafe(no_mangle)]
+@@ -63,6 +74,22 @@ impl Arch for ArchImpl {
+             set_tpidr(core_id);
+         }
+ 
++        // A kernel built for EL1: drop from EL2 into the EL1 translation
++        // regime (no hardware virtualization is used).
++        if !sel4_config::sel4_cfg_bool!(ARM_HYPERVISOR_SUPPORT) {
++            unsafe { clean_and_invalideate_dcache() };
++            unsafe { enter_kernel_el1(
++                payload_info.user_image.ui_p_reg_start.to_usize(),
++                payload_info.user_image.ui_p_reg_end.to_usize(),
++                payload_info.user_image.pv_offset.to_usize(),
++                payload_info.user_image.v_entry.to_usize(),
++                dtb_addr_p,
++                dtb_size,
++                payload_info.kernel_entry.to_usize(),
++                *crate::this_image::kernel_boot_level_0_table.get(),
++            ) };
++        }
++
+         unsafe {
+             switch_translation_tables_el2();
+         }

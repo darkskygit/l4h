@@ -130,6 +130,12 @@ impl AsidPools {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn tsc_hz(_bootinfo: &sel4::BootInfoPtr) -> u64 {
+    host::ticks::hz()
+}
+
+#[cfg(target_arch = "x86_64")]
 fn tsc_hz(bootinfo: &sel4::BootInfoPtr) -> u64 {
     for extra in bootinfo.extra() {
         if extra.id == sel4::BootInfoExtraId::X86TscFreq {
@@ -383,10 +389,7 @@ fn restart_dom0(h: &mut Host, id: usize) {
 }
 
 fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-    ((hi as u64) << 32) | lo as u64
+    host::ticks::now()
 }
 
 /// The root task's periodic timer: balancer and watchdog.

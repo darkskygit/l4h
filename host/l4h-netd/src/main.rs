@@ -93,10 +93,7 @@ struct Netd {
 }
 
 fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi) };
-    ((hi as u64) << 32) | lo as u64
+    host::ticks::now()
 }
 
 fn mac_of(v: u64) -> [u8; 6] {

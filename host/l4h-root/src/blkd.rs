@@ -3,7 +3,6 @@
 
 use alloc::vec::Vec;
 
-use sel4::init_thread::slot;
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
@@ -22,6 +21,12 @@ use crate::{AsidPools, HostInfo};
 static BLKD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-blkd.elf"));
 
 const PAGE: usize = 4096;
+
+/// Mapping attributes for device registers.
+#[cfg(target_arch = "x86_64")]
+const DEVICE_ATTRS: VmAttributes = VmAttributes::CACHE_DISABLED;
+#[cfg(target_arch = "aarch64")]
+const DEVICE_ATTRS: VmAttributes = VmAttributes::EXECUTE_NEVER;
 const DMA_BITS: usize = 21;
 /// Each BAR is mapped at MMIO_VA + bar * BAR_STRIDE.
 const BAR_STRIDE: usize = 0x100_0000;
@@ -193,10 +198,7 @@ pub fn attach(
 
     // ---- Interrupt, notifications.
     let irq_slot = alloc.slots.global(|s| s.alloc());
-    slot::IRQ_CONTROL
-        .cap()
-        .irq_control_get_msi(d.bus as u64, d.dev as u64, d.func as u64, 0, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()))
-        .expect("MSI IRQ handler");
+    pci::msi_irq(d, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()));
     let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
     let irq_ntfn_slot = alloc.slots.alloc();
     let irq_ntfn = sel4::init_thread::Slot::<cap_type::Notification>::from_index(irq_ntfn_slot).cap();
@@ -316,7 +318,7 @@ pub fn map_bars(
                 &abs_of(*f),
                 bar_va(b) + i * PAGE,
                 CapRights::read_write(),
-                VmAttributes::CACHE_DISABLED,
+                DEVICE_ATTRS,
                 keep(),
             );
         }

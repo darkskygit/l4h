@@ -1,7 +1,7 @@
 From 890a60da97d63c9dd333a0488971aecd4b3629e8 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 17:13:04 -0700
-Subject: [PATCH 6/6] mcs: do not reprogram the timer for a later deadline
+Subject: [PATCH 6/7] mcs: do not reprogram the timer for a later deadline
 
 setNextInterrupt() wrote the deadline on every scheduling-context
 change.  Keep the armed deadline when it is still pending and not later

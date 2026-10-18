@@ -1,0 +1,36 @@
+From 70e546c22fd2d71d5c6acaca1b7c89905a610c47 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sat, 17 Oct 2026 17:39:47 -0700
+Subject: [PATCH 7/7] aarch64: report x8 in UnknownSyscall faults of trapping
+ threads
+
+With seL4_TCBFlag_trapSyscalls, the Syscall word of the UnknownSyscall
+fault carries x8 on aarch64 instead of the (meaningless) seL4 syscall
+number.  x8 holds the syscall number in the Linux aarch64 ABI and is not
+otherwise part of the fault message, so a guest kernel can handle a
+syscall without reading the thread's registers.
+---
+ src/api/syscall.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/api/syscall.c b/src/api/syscall.c
+index dc17ee69f..82014adaf 100644
+--- a/src/api/syscall.c
++++ b/src/api/syscall.c
+@@ -97,6 +97,13 @@ exception_t handleInterruptEntry(void)
+ exception_t handleUnknownSyscall(word_t w)
+ {
+     if (unlikely(threadTrapsSyscalls(NODE_STATE(ksCurThread)))) {
++#ifdef CONFIG_ARCH_AARCH64
++        /* The seL4 syscall number (x7) means nothing to a thread that
++         * traps all syscalls; report x8 instead, which is where Linux and
++         * most aarch64 ABIs keep the syscall number and which the fault
++         * message does not otherwise carry. */
++        w = getRegister(NODE_STATE(ksCurThread), X8);
++#endif
+         MCS_DO_IF_BUDGET({
+             current_fault = seL4_Fault_UnknownSyscall_new(w);
+             handleFault(NODE_STATE(ksCurThread));
+-- 
+2.47.3
+

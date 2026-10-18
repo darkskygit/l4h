@@ -17,6 +17,15 @@ __thread seL4_IPCBuffer *__sel4_ipc_buffer;
 
 static const struct l4h_bootinfo *bi;
 
+/* The compiler may emit calls to these. */
+void *memset(void *d, int c, size_t n)
+{
+	unsigned char *p = d;
+	while (n--)
+		*p++ = (unsigned char)c;
+	return d;
+}
+
 static size_t slen(const char *s)
 {
 	size_t n = 0;
@@ -80,12 +89,43 @@ static void fail(const char *what, uint64_t v)
 
 #define CHECK(cond, what, v) do { if (!(cond)) fail(what, (uint64_t)(v)); } while (0)
 
+/* The time counter seL4 deadlines are in: TSC / virtual counter. */
 static inline uint64_t rdtsc(void)
 {
+#ifdef __aarch64__
+	uint64_t v;
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#else
 	uint32_t lo, hi;
 	__asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
 	return ((uint64_t)hi << 32) | lo;
+#endif
 }
+
+/* Architecture differences of the test. */
+#ifdef __aarch64__
+#define SYS_getpid		172
+#define SYS_exit		93
+/* Linux syscall number (x8; patch 0007) and the seL4 one (x7). */
+#define MR_SYSNO		seL4_UnknownSyscall_Syscall
+#define MR_SEL4NO		seL4_UnknownSyscall_X7
+#define MR_RET			seL4_UnknownSyscall_X0
+#define MR_ARG0			seL4_UnknownSyscall_X0
+#define MR_COUNT		seL4_UnknownSyscall_Length
+#define SYSCALL_INSN_LEN	4
+#define FPU_V0_OFFSET		0
+#else
+#define SYS_getpid		39
+#define SYS_exit		60
+#define MR_SYSNO		seL4_UnknownSyscall_RAX
+#define MR_SEL4NO		seL4_UnknownSyscall_RDX
+#define MR_RET			seL4_UnknownSyscall_RAX
+#define MR_ARG0			seL4_UnknownSyscall_RDI
+#define MR_COUNT		seL4_UnknownSyscall_Syscall
+#define SYSCALL_INSN_LEN	2
+#define FPU_V0_OFFSET		160
+#endif
 
 /* ---- object allocation from the untyped quota into dynamic root slots */
 static seL4_Word next_slot = L4H_SLOT_DYN_BASE;
@@ -119,6 +159,22 @@ static seL4_CPtr mint_cap(seL4_Word src_slot, seL4_CapRights_t rights, seL4_Word
 	return L4H_CPTR(slot);
 }
 
+#ifdef __aarch64__
+static void map_user_page(seL4_CPtr vspace, seL4_CPtr frame, seL4_Word va, seL4_CapRights_t rights)
+{
+	for (int tries = 0; tries < 5; tries++) {
+		int err = seL4_ARM_Page_Map(frame, vspace, va, rights, seL4_ARM_Default_VMAttributes);
+		if (err == 0)
+			return;
+		CHECK(err == seL4_FailedLookup, "page map err=", err);
+		/* A page table goes in at the first missing level. */
+		err = seL4_ARM_PageTable_Map(alloc_obj(seL4_ARM_PageTableObject, 0), vspace, va,
+					     seL4_ARM_Default_VMAttributes);
+		CHECK(err == 0, "pt map err=", err);
+	}
+	fail("map_user_page va=", va);
+}
+#else
 static void map_user_page(seL4_CPtr vspace, seL4_CPtr frame, seL4_Word va, seL4_CapRights_t rights)
 {
 	for (int tries = 0; tries < 4; tries++) {
@@ -140,6 +196,7 @@ static void map_user_page(seL4_CPtr vspace, seL4_CPtr frame, seL4_Word va, seL4_
 	}
 	fail("map_user_page va=", va);
 }
+#endif
 
 extern char user_prog[];
 
@@ -147,6 +204,9 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 {
 	bi = bootinfo;
 	__sel4_ipc_buffer = (seL4_IPCBuffer *)L4H_VCPU_IPCBUF_VA(0);
+#ifdef __aarch64__
+	puts("testguest: aarch64\n");
+#endif
 	puts("testguest: hello from the guest kernel\n");
 	CHECK(bi->magic == L4H_BOOTINFO_MAGIC, "magic=", bi->magic);
 	CHECK(bi->abi_version == L4H_ABI_VERSION, "abi=", bi->abi_version);
@@ -181,8 +241,13 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 	CHECK(fl.error == 0 && fl.flags == seL4_TCBFlag_trapSyscalls, "setflags=", fl.flags);
 
 	seL4_UserContext regs = { 0 };
+#ifdef __aarch64__
+	regs.pc = (seL4_Word)user_prog;
+	regs.sp = 0x7f0000000000;
+#else
 	regs.rip = (seL4_Word)user_prog;
 	regs.rsp = 0x7f0000000000;
+#endif
 	err = seL4_TCB_WriteRegisters(utcb, 1, 0, sizeof(regs) / sizeof(seL4_Word), &regs);
 	CHECK(err == 0, "write regs err=", err);
 
@@ -192,26 +257,27 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 	CHECK(badge == (L4H_EP_BADGE_TASK | 1), "badge1=", badge);
 	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "label1=",
 	      seL4_MessageInfo_get_label(info));
-	CHECK(seL4_GetMR(seL4_UnknownSyscall_RAX) == 39, "rax=", seL4_GetMR(seL4_UnknownSyscall_RAX));
-	CHECK(seL4_GetMR(seL4_UnknownSyscall_RDX) == (seL4_Word)-1, "rdx=", seL4_GetMR(seL4_UnknownSyscall_RDX));
-	seL4_Word sysregs[seL4_UnknownSyscall_Syscall];
-	for (int i = 0; i < seL4_UnknownSyscall_Syscall; i++)
+	CHECK(seL4_GetMR(MR_SYSNO) == SYS_getpid, "sysno=", seL4_GetMR(MR_SYSNO));
+	CHECK(seL4_GetMR(MR_SEL4NO) == (seL4_Word)-1, "sel4 sysno reg=", seL4_GetMR(MR_SEL4NO));
+	seL4_Word sysregs[MR_COUNT];
+	for (int i = 0; i < MR_COUNT; i++)
 		sysregs[i] = seL4_GetMR(i);
+	puthex("testguest: syscall FaultIP - user_prog = ", sysregs[seL4_UnknownSyscall_FaultIP] - (seL4_Word)user_prog);
 	puts("testguest: E1 trapped Linux syscall from user thread\n");
 
 	/* E2: the user thread's xmm0 is visible through ReadFPU. */
 	err = seL4_TCB_ReadFPU(utcb, L4H_CPTR(vcpu + L4H_VCPU_IPCBUF), L4H_FPU_SCRATCH_OFFSET);
 	CHECK(err == 0, "readfpu err=", err);
-	uint64_t xmm0 = *(volatile uint64_t *)(L4H_VCPU_IPCBUF_VA(0) + L4H_FPU_SCRATCH_OFFSET + 160);
+	uint64_t xmm0 = *(volatile uint64_t *)(L4H_VCPU_IPCBUF_VA(0) + L4H_FPU_SCRATCH_OFFSET + FPU_V0_OFFSET);
 	CHECK(xmm0 == 0x1122334455667788ull, "xmm0=", xmm0);
 	puts("testguest: E2 read user FPU state\n");
 
 	/* Return pid 777 and step over the syscall instruction. */
-	sysregs[seL4_UnknownSyscall_RAX] = 777;
-	sysregs[seL4_UnknownSyscall_FaultIP] += 2;
-	for (int i = 0; i < seL4_UnknownSyscall_Syscall; i++)
+	sysregs[MR_RET] = 777;
+	sysregs[seL4_UnknownSyscall_FaultIP] += SYSCALL_INSN_LEN;
+	for (int i = 0; i < MR_COUNT; i++)
 		seL4_SetMR(i, sysregs[i]);
-	seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, seL4_UnknownSyscall_Syscall));
+	seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, MR_COUNT));
 
 	/* 2: the load from 0x500000 is a VM fault. */
 	info = seL4_Recv(ep, &badge, reply);
@@ -232,17 +298,16 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 		info = seL4_Recv(ep, &badge, reply);
 		CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "sweep label=",
 		      seL4_MessageInfo_get_label(info));
-		CHECK(seL4_GetMR(seL4_UnknownSyscall_RDX) == (seL4_Word)n, "sweep rdx=",
-		      seL4_GetMR(seL4_UnknownSyscall_RDX));
-		CHECK(seL4_GetMR(seL4_UnknownSyscall_RAX) == 39, "sweep rax=",
-		      seL4_GetMR(seL4_UnknownSyscall_RAX));
-		seL4_Word r[seL4_UnknownSyscall_Syscall];
-		for (int i = 0; i < seL4_UnknownSyscall_Syscall; i++)
+		CHECK(seL4_GetMR(MR_SEL4NO) == (seL4_Word)n, "sweep sel4 sysno reg=",
+		      seL4_GetMR(MR_SEL4NO));
+		CHECK(seL4_GetMR(MR_SYSNO) == SYS_getpid, "sweep sysno=", seL4_GetMR(MR_SYSNO));
+		seL4_Word r[MR_COUNT];
+		for (int i = 0; i < MR_COUNT; i++)
 			r[i] = seL4_GetMR(i);
-		r[seL4_UnknownSyscall_FaultIP] += 2;
-		for (int i = 0; i < seL4_UnknownSyscall_Syscall; i++)
+		r[seL4_UnknownSyscall_FaultIP] += SYSCALL_INSN_LEN;
+		for (int i = 0; i < MR_COUNT; i++)
 			seL4_SetMR(i, r[i]);
-		seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, seL4_UnknownSyscall_Syscall));
+		seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, MR_COUNT));
 	}
 	puts("testguest: E1 traps every seL4 syscall number (seL4 issue #477)\n");
 	puthex("testguest: trapped syscall round trip, ticks=", (rdtsc() - sweep_t0) / 64);
@@ -251,8 +316,8 @@ void tg_main(const struct l4h_bootinfo *bootinfo)
 	info = seL4_Recv(ep, &badge, reply);
 	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_UnknownSyscall, "label3=",
 	      seL4_MessageInfo_get_label(info));
-	CHECK(seL4_GetMR(seL4_UnknownSyscall_RAX) == 60, "rax3=", seL4_GetMR(seL4_UnknownSyscall_RAX));
-	CHECK(seL4_GetMR(seL4_UnknownSyscall_RDI) == 777, "exit code=", seL4_GetMR(seL4_UnknownSyscall_RDI));
+	CHECK(seL4_GetMR(MR_SYSNO) == SYS_exit, "sysno3=", seL4_GetMR(MR_SYSNO));
+	CHECK(seL4_GetMR(MR_ARG0) == 777, "exit code=", seL4_GetMR(MR_ARG0));
 	puts("testguest: syscall return value reached user mode\n");
 	seL4_TCB_Suspend(utcb);
 

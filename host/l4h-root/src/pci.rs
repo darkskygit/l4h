@@ -1,10 +1,14 @@
 //! PCI enumeration through the legacy configuration mechanism (I/O ports
-//! 0xcf8/0xcfc), which every x86 platform l4h targets provides.
+//! 0xcf8/0xcfc), which every x86 platform l4h targets provides.  Other
+//! architectures (aarch64: ECAM and GIC interrupts) have no PCI support
+//! yet: there, no devices are found.
 
 use alloc::vec::Vec;
 
-use sel4::init_thread::slot;
+#[cfg(target_arch = "x86_64")]
 use sel4::cap_type;
+#[cfg(target_arch = "x86_64")]
+use sel4::init_thread::slot;
 
 use crate::mem::Alloc;
 
@@ -57,6 +61,35 @@ pub struct VirtioCap {
     pub notify_off_multiplier: u32,
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+impl Pci {
+    pub fn new(_alloc: &mut Alloc) -> Self {
+        Pci { port: 0 }
+    }
+    pub fn enumerate(&self) -> Vec<Device> {
+        let _ = (self.port, CONFIG_ADDRESS, CONFIG_DATA);
+        Vec::new()
+    }
+    pub fn enable(&self, _d: &Device) {}
+    pub fn disable(&self, _d: &Device) {}
+    pub fn enable_msix(&self, _d: &Device) {}
+}
+
+/// An IRQ handler for MSI vector `vector` of `d`, into `dst`.
+pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
+    #[cfg(target_arch = "x86_64")]
+    sel4::init_thread::slot::IRQ_CONTROL
+        .cap()
+        .irq_control_get_msi(d.bus as u64, d.dev as u64, d.func as u64, 0, vector, dst)
+        .expect("MSI IRQ handler");
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (d, vector, dst);
+        unreachable!("no PCI devices on this architecture");
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 impl Pci {
     pub fn new(alloc: &mut Alloc) -> Self {
         let s = alloc.slots.alloc();
