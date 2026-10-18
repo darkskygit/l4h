@@ -1,5 +1,7 @@
 //! Driver side of a virtio 1.x PCI device ("modern" interface) and its
-//! split virtqueues, shared by blkd and netd.  The device structures are
+//! split virtqueues, shared by blkd and netd.  Split virtqueues of legacy
+//! (0.9.5) devices are supported too; their registers are I/O ports, which
+//! the driver accesses itself.  The device structures are
 //! mapped uncached by l4h-root; DMA memory is physically contiguous.
 
 #![no_std]
@@ -171,7 +173,7 @@ impl Device {
             desc: desc_va,
             avail: avail_va,
             used: used_va,
-            notify: Mmio(self.notify.0 + notify_off),
+            notify: Some(Mmio(self.notify.0 + notify_off)),
             avail_idx: 0,
             last_used: 0,
         })
@@ -185,12 +187,36 @@ pub struct Virtq {
     desc: usize,
     avail: usize,
     used: usize,
-    notify: Mmio,
+    notify: Option<Mmio>,
     avail_idx: u16,
     last_used: u16,
 }
 
+/// Bytes of a legacy virtqueue of `num` entries: descriptors and available
+/// ring, then the used ring at the next 4 KiB boundary.
+pub fn legacy_ring_size(num: u16) -> usize {
+    let n = num as usize;
+    (16 * n + 6 + 2 * n).next_multiple_of(4096) + (6 + 8 * n).next_multiple_of(4096)
+}
+
 impl Virtq {
+    /// Queue `idx` of a legacy device, in the zeroed, page-aligned
+    /// `legacy_ring_size(num)` bytes at `va`.  The driver notifies the
+    /// device itself (`notify` does nothing).
+    pub fn legacy(idx: u16, num: u16, va: usize) -> Self {
+        let n = num as usize;
+        Virtq {
+            idx,
+            num,
+            desc: va,
+            avail: va + 16 * n,
+            used: va + (16 * n + 6 + 2 * n).next_multiple_of(4096),
+            notify: None,
+            avail_idx: 0,
+            last_used: 0,
+        }
+    }
+
     pub fn set_desc(&self, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
         let d = Mmio(self.desc + 16 * i as usize);
         d.w64(0, addr);
@@ -210,7 +236,9 @@ impl Virtq {
 
     pub fn notify(&self) {
         fence(Ordering::SeqCst);
-        self.notify.w16(0, self.idx);
+        if let Some(n) = self.notify {
+            n.w16(0, self.idx);
+        }
     }
 
     /// Next used element: (id, written length).

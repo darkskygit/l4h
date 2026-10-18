@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Run l4h on a Google Compute Engine VM: build the UEFI image with the test
+# dom0 (tests/guest/init-gce), import it, boot an instance with an NVMe
+# local SSD and a virtio-net NIC, and collect the results
+# from the serial port.  Creates, then deletes, an image, an instance and a
+# bucket object (KEEP=1 keeps the instance and image).  The boot disk is
+# only read by the firmware and GRUB: N2 attaches it with virtio-scsi,
+# which l4h does not drive; BOOT_DISK_INTERFACE=NVME (C3, N4, ...) makes it
+# a host disk too.
+# Usage: gce-test.sh PROJECT [ZONE] [MACHINE_TYPE]
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+project=$1
+zone=${2:-us-west1-b}
+machine=${3:-n2-standard-4}
+region=${zone%-*}
+name=l4h-test-$(date +%Y%m%d-%H%M%S)
+bucket=gs://$project-l4h-test
+out=$root/build/gce; mkdir -p "$out"
+log=$out/$name.serial.log
+
+# ---- image
+"$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
+    || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
+objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$out/vmlinux"
+(cd "$root/tools/l4hctl" && cargo +stable build -q --release)
+gcc -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
+"$root/tools/mkinitramfs.sh" "$out/selftest.cpio.gz" "$root/tests/guest/init-selftest" "$out/selftest" >/dev/null
+"$root/tools/mkinitramfs.sh" "$out/disk.cpio.gz" "$root/tests/guest/init-gcedisk" >/dev/null
+"$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
+"$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-gce" \
+    "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" "$out/vmlinux" \
+    "$out/selftest.cpio.gz" "$out/disk.cpio.gz" "$out/vm.cpio.gz" >/dev/null
+L4H_DOM0_KERNEL="$out/vmlinux" L4H_DOM0_INITRD="$out/dom0.cpio.gz" L4H_DOM0_DISKS=0 \
+    L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLINE=console=hvc0 L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} \
+    "$root/tools/build-host.sh"
+"$root/tools/mkimage.sh" "$out/$name.raw" >/dev/null
+"$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
+rm -f "$out/$name.raw"
+
+# ---- cloud resources
+cleanup() {
+    [ "${KEEP:-0}" = 1 ] && { echo "kept instance and image $name"; return; }
+    gcloud compute instances delete "$name" --project="$project" --zone="$zone" --quiet >/dev/null 2>&1 || true
+    gcloud compute images delete "$name" --project="$project" --quiet >/dev/null 2>&1 || true
+    gcloud storage rm "$bucket/$name.tar.gz" --project="$project" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+gcloud storage buckets describe "$bucket" --project="$project" >/dev/null 2>&1 \
+    || gcloud storage buckets create "$bucket" --project="$project" --location="$region" --quiet
+gcloud storage cp "$out/$name.tar.gz" "$bucket/" --project="$project" --quiet
+rm -f "$out/$name.tar.gz"
+gcloud compute images create "$name" --project="$project" \
+    --source-uri="$bucket/$name.tar.gz" --guest-os-features=UEFI_COMPATIBLE --quiet
+gcloud compute instances create "$name" --project="$project" --zone="$zone" \
+    --machine-type="$machine" --image="$name" ${BOOT_DISK_INTERFACE:+--boot-disk-interface=$BOOT_DISK_INTERFACE} \
+    --local-ssd=interface=NVME --network-interface=nic-type=VIRTIO_NET \
+    --metadata=serial-port-enable=TRUE --no-shielded-secure-boot --quiet
+
+# ---- results from the serial port
+end=$((SECONDS + ${GCE_TIMEOUT:-1200}))
+while [ $SECONDS -lt $end ]; do
+    sleep 20
+    gcloud compute instances get-serial-port-output "$name" --project="$project" --zone="$zone" \
+        >"$log" 2>/dev/null || continue
+    # Serial lines end in CR LF.
+    tr -d '\r' <"$log" | grep -aq "GCETEST: \(PASS\|FAIL\)$" && break
+done
+grep -a "GCETEST\|Got framebuffer\|l4h-root: [0-9]* core\|panic\|fault" "$log" || true
+echo "serial log: $log"
+grep -aq "GCETEST: PASS" "$log"

@@ -74,6 +74,8 @@ pub const fn nic_dma_va(n: usize) -> usize {
 /// netd CSpace: IRQ handler of NIC n, notification of the client of port p
 /// (badged with its "done" bit).
 pub const NETD_SLOT_IRQ_BASE: u64 = 32;
+/// I/O port capability of a legacy virtio NIC n (NicConfig::legacy_io).
+pub const NETD_SLOT_IOPORT_BASE: u64 = 40;
 pub const NETD_SLOT_CLIENT_BASE: u64 = 64;
 
 /// Calls from l4h-root to netd's service endpoint.
@@ -86,6 +88,8 @@ pub const NETD_REMOVE_PORT: u64 = 2;
 pub const NETD_ATTACH_UPLINK: u64 = 3;
 /// MR0 = port -> MR0 = rx frames, MR1 = tx frames, MR2 = drops.
 pub const NETD_PORT_STATS: u64 = 4;
+/// MR0 = NIC -> MR0 = its MAC address (low 48 bits).
+pub const NETD_NIC_MAC: u64 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -95,7 +99,10 @@ pub struct NicConfig {
     pub common: crate::blk::PciRegion,
     pub notify: crate::blk::PciRegion,
     pub notify_off_multiplier: u32,
-    pub reserved0: u32,
+    /// Legacy (virtio 0.9.5) device: the I/O port base of its registers,
+    /// with the capability in NETD_SLOT_IOPORT_BASE + n; 0 for a modern
+    /// device (common/notify/isr/device are then used).
+    pub legacy_io: u32,
     pub isr: crate::blk::PciRegion,
     pub device: crate::blk::PciRegion,
     pub msix_table: crate::blk::PciRegion,

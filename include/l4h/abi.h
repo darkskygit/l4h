@@ -334,7 +334,7 @@ enum l4h_ctl_op {
 	/* args: switch -> vals[0] = ports, vals[1] = uplink NIC (or -1);
 	 * data: struct l4h_ctl_port[] */
 	L4H_CTL_SWITCH_INFO = 14,
-	/* args: NIC index -> vals: bdf, switch (or -1) */
+	/* args: NIC index -> vals: bdf, switch (or -1), MAC */
 	L4H_CTL_NIC_INFO = 15,
 	/* args: vm, CPU cap per vCPU in percent of a core (0 = none) */
 	L4H_CTL_VM_SET_SCHED = 16,

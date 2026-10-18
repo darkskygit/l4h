@@ -1,0 +1,23 @@
+#!/bin/sh
+# Guest of tests/guest/init-gce: write and read back a pattern on the
+# passed-through disk, unless it holds a partition table (a boot disk).
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "DISKTEST: FAIL: $*"; poweroff -f; }
+[ -b /dev/vda ] || fail "no /dev/vda"
+echo "DISKTEST: vda $(( $(cat /sys/block/vda/size) / 2048 )) MiB, block $(cat /sys/block/vda/queue/logical_block_size)"
+if dd if=/dev/vda bs=512 skip=1 count=1 2>/dev/null | grep -q "EFI PART"; then
+    echo "DISKTEST: has a GPT, not writing"; echo "DISKTEST: SKIP"; poweroff -f
+fi
+dd if=/dev/urandom of=/tmp/pat bs=1M count=64 2>/dev/null
+t0=$(date +%s)
+dd if=/tmp/pat of=/dev/vda bs=1M conv=fsync 2>/dev/null || fail "write"
+echo 3 > /proc/sys/vm/drop_caches
+# rootfs is a tmpfs of half the guest's RAM: compare without a second copy.
+dd if=/dev/vda bs=1M count=64 2>/dev/null | cmp - /tmp/pat || fail "readback mismatch"
+echo "DISKTEST: 64 MiB written and verified in $(( $(date +%s) - t0 )) s"
+echo 3 > /proc/sys/vm/drop_caches
+dd if=/dev/vda of=/dev/null bs=1M count=1024 2>&1 | tail -1 | sed 's/^/DISKTEST: read /'
+echo "DISKTEST: PASS"
+poweroff -f

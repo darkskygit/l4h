@@ -44,6 +44,7 @@ pub struct Component {
     pub vspace: cap::VSpace,
     pub ntfn: cap::Notification,
     pub service_ep: cap::Endpoint,
+    pub sc: cap::SchedContext,
 }
 
 impl Component {
@@ -126,7 +127,7 @@ pub fn create(
     drop(ctx);
     asids.assign(alloc, vspace);
 
-    let c = Component { id: args.id, tcb, cnode, vspace, ntfn, service_ep };
+    let c = Component { id: args.id, tcb, cnode, vspace, ntfn, service_ep, sc };
 
     // ---- Load the ELF image, one fresh frame per page; pages are writable
     // only if a writable segment covers them.

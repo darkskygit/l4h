@@ -5,7 +5,8 @@
 #
 # Supported machine shapes for now: N2/N2D/C2 etc. with
 #   --network-interface=nic-type=VIRTIO_NET   (gVNIC is not supported yet)
-#   NVMe boot disks (the guest OS feature below makes GCE attach NVMe)
+#   any boot disk interface: only the firmware and GRUB read it; l4h passes
+#   NVMe disks (local SSDs, NVMe persistent disks on C3/N4) through
 # Hardware virtualization is neither needed nor used.
 set -euo pipefail
 disk=$1

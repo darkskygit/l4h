@@ -1,0 +1,66 @@
+#!/bin/sh
+# dom0 init of the GCE test image (tests/gce-test.sh): report the host,
+# networking through the uplink, and guests (self-test on all cores, disk
+# pass-through, a batch of small guests).  Results go to the serial port.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+cd / && mv /bin/vmlinux /bin/*.cpio.gz / 2>/dev/null
+ok=0; bad=0
+pass() { echo "GCETEST: ok: $*"; ok=$((ok + 1)); }
+step() { echo "GCETEST: [$(cut -d' ' -f1 /proc/uptime)s] $*"; }
+fail() { echo "GCETEST: FAIL: $*"; bad=$((bad + 1)); }
+echo "GCETEST: dom0 up, Linux $(uname -r)"
+l4hctl info; l4hctl disks; l4hctl nics
+cores=$(l4hctl info | sed -n 's/^cores: *//p')
+
+step network
+ip link set lo up; ip link set eth0 up
+if udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script >/dev/null 2>&1; then
+    pass "DHCP: $(ip -4 -o addr show eth0 | awk '{print $4}'), gateway $(ip route | sed -n 's/^default via \([^ ]*\).*/\1/p')"
+    name=$(wget -q -T 10 -O - --header 'Metadata-Flavor: Google' \
+        http://169.254.169.254/computeMetadata/v1/instance/name 2>/dev/null)
+    [ -n "$name" ] && pass "metadata server: instance $name" || fail "metadata server"
+    if wget -q -T 15 -O /tmp/idx http://deb.debian.org/debian/dists/trixie/Release 2>/dev/null; then
+        pass "internet: fetched $(wc -c < /tmp/idx) bytes from deb.debian.org"
+    else
+        fail "internet (DNS or NAT)"
+    fi
+else
+    fail "DHCP"
+fi
+
+step "self-test guest"
+vm=$(l4hctl create selftest --kernel /vmlinux --initrd /selftest.cpio.gz --mem 512 --vcpus "$cores")
+l4hctl console "$vm" --until "reboot: Power down" --timeout 900 > /tmp/st
+sleep 1; l4hctl console "$vm" > /tmp/st
+grep -E "^  |SELFTEST" /tmp/st | sed 's/^/GCETEST: selftest: /'
+grep -q "SELFTEST: PASS" /tmp/st && pass "guest self-test on $cores vCPUs" || fail "guest self-test"
+l4hctl destroy "$vm"
+
+step disks
+n=$(l4hctl info | sed -n 's/^disks: *//p')
+for d in $(seq 0 $((n - 1))); do
+    l4hctl disks | grep -q "^disk $d:.*owner -" || continue
+    vm=$(l4hctl create disk$d --kernel /vmlinux --initrd /disk.cpio.gz --mem 256 --disk $d) || { fail "disk $d guest"; continue; }
+    l4hctl console "$vm" --until "reboot: Power down" --timeout 300 > /tmp/dt
+    sleep 1; l4hctl console "$vm" | grep DISKTEST | sed "s/^/GCETEST: disk $d: /"
+    l4hctl console "$vm" | grep -q "DISKTEST: PASS" && pass "disk $d pass-through"
+    l4hctl console "$vm" | grep -q "DISKTEST: FAIL" && fail "disk $d pass-through"
+    l4hctl destroy "$vm"
+done
+
+step "small guests"
+t0=$(date +%s); ids=""
+for i in $(seq 1 12); do ids="$ids $(l4hctl create small$i --kernel /vmlinux --initrd /vm.cpio.gz --mem 128)"; done
+up=0
+for id in $ids; do l4hctl console "$id" --until "GUEST: ready" --timeout 120 >/dev/null && up=$((up + 1)); done
+[ "$up" = 12 ] && pass "12 small guests up in $(( $(date +%s) - t0 )) s" || fail "only $up of 12 small guests up"
+l4hctl list
+l4hctl top
+for id in $ids; do l4hctl destroy "$id"; done
+l4hctl info | sed 's/^/GCETEST: after destroy: /'
+
+echo "GCETEST: done, $ok ok, $bad failed"
+[ "$bad" = 0 ] && echo "GCETEST: PASS" || echo "GCETEST: FAIL"
+exec sleep 1000000

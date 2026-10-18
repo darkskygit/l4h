@@ -218,6 +218,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             let p = &n.pci;
             resp.vals[0] = ((p.bus as u64) << 8) | ((p.dev as u64) << 3) | p.func as u64;
             resp.vals[1] = n.switch.map_or(u64::MAX, |s| s as u64);
+            resp.vals[2] = h.netd.nic_mac(a[0] as usize).unwrap_or(0);
             Ok(())
         }
         abi::CTL_SWITCH_INFO => {

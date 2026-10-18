@@ -381,6 +381,14 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
             d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
         );
+        if d.vendor == 0x1af4 {
+            let caps: Vec<u8> = d.virtio_caps.iter().map(|c| c.cfg_type).collect();
+            let bars: Vec<_> = d.bars.iter().filter(|b| b.size != 0).map(|b| (b.addr, b.size, b.is_io)).collect();
+            sel4::debug_println!(
+                "l4h-root:   virtio caps {:?}, msix {:?}, bars {:x?}",
+                caps, d.msix.map(|m| (m.table_bar, m.table_size)), bars
+            );
+        }
         if blkd::is_disk(&d) {
             if disks.len() == pci::MAX_DISKS {
                 sel4::debug_println!("l4h-root: more than {} disks, ignoring this one", pci::MAX_DISKS);
@@ -448,8 +456,13 @@ pub fn boot_dom0(h: &mut Host) {
             h.netd.attach_uplink(sw, 0).expect("uplink");
         }
     }
-    for _ in 0..DOM0_NICS {
-        h.create_nic(id, sw, 0, true).expect("dom0 NIC");
+    // dom0's first vNIC takes the uplink NIC's MAC address: networks
+    // like GCE's only deliver frames for the instance's own address, so
+    // dom0 is then the host's router (DESIGN.md §8.3).
+    let uplink = h.netd.nics.iter().position(|n| n.switch == Some(sw));
+    for i in 0..DOM0_NICS {
+        let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };
+        h.create_nic(id, sw, mac, true).expect("dom0 NIC");
     }
     h.with_guest(id, |h, g| {
         assert!(
@@ -480,6 +493,10 @@ fn arm_timer(info: &HostInfo) {
 }
 
 fn watchdog_dump(h: &Host) {
+    sel4::debug_println!(
+        "l4h-root: watchdog: netd used {} ms since the last dump",
+        h.netd.consumed() * 1000 / h.info.tsc_hz.max(1)
+    );
     for g in h.guests.iter().flatten() {
         if g.state != State::Running {
             continue;

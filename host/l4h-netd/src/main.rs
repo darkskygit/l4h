@@ -375,6 +375,10 @@ fn main(info: &'static Info) -> ! {
                     None => u64::MAX,
                 }
             }
+            net::NETD_NIC_MAC => match d.nics.get(mr(0) as usize) {
+                Some(n) => n.mac.iter().fold(0u64, |m, &b| (m << 8) | b as u64),
+                None => u64::MAX,
+            },
             net::NETD_PORT_STATS => match d.ports.get(mr(0) as usize).and_then(|p| p.as_ref()) {
                 Some(p) => {
                     set_mr(1, p.tx_frames);

@@ -430,11 +430,12 @@ after the EFI partition, but it must not modify the partition itself.
 
 \section{Google Compute Engine}
 
-\begin{caveat}
-GCE deployment is untested. The image follows GCE's requirements, but no
-l4h host has booted on GCE yet. Report the serial console log of your first
-attempt.
-\end{caveat}
+l4h has been tested on \texttt{n2-standard-4} instances: networking through
+the instance's NIC, a 4-vCPU guest, a local SSD passed through to a guest and
+a dozen small guests. \cmd{tests/gce-test.sh PROJECT [ZONE] [MACHINE\_TYPE]}
+repeats that test: it builds an image with a test dom0, imports it, runs an
+instance, prints the results from its serial port, and deletes what it
+created.
 
 \cmd{tools/gce-image.sh DISK.raw [NAME]} packages the image as GCE expects
 (\file{NAME.tar.gz} containing \file{disk.raw}). It uploads nothing; it prints
@@ -452,10 +453,16 @@ Use a second-generation machine type (N2, N2D, C2) with
 \texttt{nic-type=VIRTIO\_NET}: later generations offer only gVNIC. Secure
 Boot must be off. l4h needs no nested virtualization.
 
+On N2 the boot disk is attached through virtio-scsi, which l4h does not
+drive: only the firmware and GRUB read it. Disks for guests are NVMe: local
+SSDs (\texttt{--local-ssd=interface=NVME}), or NVMe persistent disks on
+machine types that offer them.
+
 GCE's network delivers only frames addressed to the instance's own MAC
-address. On GCE, therefore, put a router VM on the uplink switch (switch 0)
-and connect the other guests to it through internal switches
-(Section~\ref{sec:router}). dom0 can be that router.
+address. dom0's first vNIC therefore takes the MAC address of the uplink
+NIC, and dom0 gets the instance's address by DHCP. Put other guests on
+internal switches and let dom0, or another router VM with that MAC, route
+for them (Section~\ref{sec:router}).
 
 %======================================================================
 \chapter{Managing VMs with l4hctl}

@@ -3,6 +3,12 @@ case "$1" in
 bound|renew)
     ip addr flush dev "$interface"
     ip addr add "$ip/${mask:-24}" dev "$interface"
-    [ -n "$router" ] && ip route add default via "${router%% *}" dev "$interface"
+    if [ -n "$router" ]; then
+        gw=${router%% *}
+        # The gateway may be outside the subnet (GCE leases a /32).
+        ip route add "$gw" dev "$interface" 2>/dev/null
+        ip route add default via "$gw" dev "$interface"
+    fi
+    [ -n "$dns" ] && for s in $dns; do echo "nameserver $s"; done > /etc/resolv.conf
     ;;
 esac

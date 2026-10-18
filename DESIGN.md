@@ -970,9 +970,17 @@ versioned structs defined in `l4h-abi`.
 - **Deployment.** `tools/gce-image.sh` packages the image as
   `disk.raw.tar.gz` and prints the `gcloud` import and instance commands
   (N2, `nic-type=VIRTIO_NET`, `UEFI_COMPATIBLE`).
-- **Not yet tried on GCE itself.** gVNIC, which C3 and later need, is not
-  implemented: QEMU cannot emulate it, so the driver could not be tested
-  here.
+- **Tested on GCE** (`tests/gce-test.sh`, n2-standard-4): UEFI boot,
+  DHCP and internet access through the NIC, a 4-vCPU guest self-test, a
+  local SSD (NVMe, 4 KiB blocks) passed through, 12 small guests.
+  - GCE's virtio-net is a legacy (0.9.5) device: registers in I/O BAR 0,
+    no virtio capabilities. netd drives both kinds; root gives it the I/O
+    port capability.
+  - dom0's first vNIC takes the uplink NIC's MAC address, since the VPC
+    only delivers frames for it.
+  - N2 boot disks are virtio-scsi, which l4h does not drive; the firmware
+    and GRUB only need them.
+  - gVNIC, which C3 and later need, is not implemented.
 
 ---
 

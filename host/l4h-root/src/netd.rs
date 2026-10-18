@@ -33,8 +33,14 @@ const NETD_ID: u32 = 0x200;
 pub fn is_virtio_net(d: &pci::Device) -> bool {
     d.vendor == 0x1af4
         && (d.device == 0x1041 || d.device == 0x1000)
-        && d.virtio_caps.iter().any(|c| c.cfg_type == 1)
+        && (d.virtio_caps.iter().any(|c| c.cfg_type == 1) || is_legacy(d))
         && d.msix.is_some()
+}
+
+/// A virtio 0.9.5 ("legacy") device: registers in I/O BAR 0, no virtio
+/// capabilities.  GCE's virtio-net is one.
+fn is_legacy(d: &pci::Device) -> bool {
+    d.device == 0x1000 && d.virtio_caps.is_empty() && d.bars[0].is_io && d.bars[0].size >= 0x20
 }
 
 pub struct Nic {
@@ -85,8 +91,24 @@ pub fn spawn(
     cfg.nr_nics = nics.len() as u32;
     let mut dma = Vec::new();
     for (n, d) in nics.iter().enumerate() {
-        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } =
-            virtio_regions(d, |b| net::nic_bar_va(n, b as usize));
+        let bar_va = |b: u8| net::nic_bar_va(n, b as usize);
+        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) {
+            let msix = d.msix.unwrap();
+            let none = l4h_host::blk::PciRegion { va: 0, len: 0 };
+            VirtioRegions {
+                common: none,
+                notify: none,
+                notify_mult: 0,
+                isr: none,
+                device: none,
+                msix_table: l4h_host::blk::PciRegion {
+                    va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
+                    len: msix.table_size as u64 * 16,
+                },
+            }
+        } else {
+            virtio_regions(d, bar_va)
+        };
         let s = alloc.slots.alloc();
         let region = alloc.split(NIC_DMA_BITS, s).expect("NIC DMA memory");
         let paddr = region.paddr;
@@ -101,7 +123,7 @@ pub fn spawn(
             common,
             notify,
             notify_off_multiplier: notify_mult,
-            reserved0: 0,
+            legacy_io: if is_legacy(d) { d.bars[0].addr as u32 } else { 0 },
             isr,
             device,
             msix_table,
@@ -144,6 +166,11 @@ pub fn spawn(
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena.pool, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
+        }
+        if is_legacy(&d) {
+            let (base, len) = (d.bars[0].addr as u16, d.bars[0].size as u16);
+            let io = pci::io_ports(alloc, base, len).expect("NIC I/O ports");
+            comp.give(net::NETD_SLOT_IOPORT_BASE + n as u64, io, CapRights::all());
         }
         // Interrupt.
         let irq_slot = alloc.slots.alloc();
@@ -246,6 +273,17 @@ impl Netd {
     }
 
     /// (rx frames, tx frames, drops) of port `p`.
+    /// CPU time netd used since the last call, in timer ticks.
+    pub fn consumed(&self) -> u64 {
+        crate::sched::consumed(self.comp.sc)
+    }
+
+    /// The MAC address of host NIC `n`.
+    pub fn nic_mac(&self, n: usize) -> Option<u64> {
+        let m = call(self.comp.service_ep, net::NETD_NIC_MAC, &[n as u64]);
+        (m != u64::MAX).then_some(m)
+    }
+
     pub fn port_stats(&self, p: usize) -> (u64, u64, u64) {
         let rx = call(self.comp.service_ep, net::NETD_PORT_STATS, &[p as u64]);
         (rx, mr(1), mr(2))

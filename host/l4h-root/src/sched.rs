@@ -20,7 +20,7 @@ const LIGHT_PCT: u64 = 50;
 /// A vCPU that moved stays put for this many periods.
 const COOLDOWN: u32 = 10;
 
-fn consumed(sc: sel4::cap::SchedContext) -> u64 {
+pub fn consumed(sc: sel4::cap::SchedContext) -> u64 {
     let r = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_SchedContext_Consumed(sc.bits()));
     if r.error != 0 {
         sel4::debug_println!("l4h-root: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);

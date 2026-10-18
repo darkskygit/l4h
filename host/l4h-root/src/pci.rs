@@ -75,7 +75,6 @@ impl Pci {
     pub fn enable_msix(&self, _d: &Device) {}
 }
 
-/// An IRQ handler for MSI vector `vector` of `d`, into `dst`.
 /// seL4 user interrupt vectors (CPU vector 0x30 + n, n <= 107 on x86),
 /// split between the users so that they never collide.
 pub const VECTOR_NIC_BASE: u64 = 0;
@@ -84,6 +83,27 @@ pub const VECTOR_DISK_BASE: u64 = 16;
 /// Disks beyond this many are left alone.
 pub const MAX_DISKS: usize = 64;
 
+/// A capability for I/O ports [base, base + len), in a new root slot.
+#[cfg(target_arch = "x86_64")]
+pub fn io_ports(alloc: &mut Alloc, base: u16, len: u16) -> Option<sel4::cap::Null> {
+    let s = alloc.slots.alloc();
+    let cap = sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap();
+    let dst = slot::CNODE.cap().absolute_cptr(cap);
+    match slot::IO_PORT_CONTROL.cap().ioport_control_issue(base as u64, base as u64 + len as u64 - 1, &dst) {
+        Ok(()) => Some(cap),
+        Err(_) => {
+            alloc.slots.free(s);
+            None
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn io_ports(_alloc: &mut Alloc, _base: u16, _len: u16) -> Option<sel4::cap::Null> {
+    None
+}
+
+/// An IRQ handler for MSI vector `vector` of `d`, into `dst`.
 pub fn msi_irq(d: &Device, vector: u64, dst: &sel4::AbsoluteCPtr) {
     #[cfg(target_arch = "x86_64")]
     sel4::init_thread::slot::IRQ_CONTROL
