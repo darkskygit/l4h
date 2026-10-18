@@ -11,6 +11,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -308,6 +310,17 @@ static void ptrace_child(void)
 	_exit(0);
 }
 
+static long peek_user(pid_t pid, long off, unsigned long *v)
+{
+	*v = ~0UL;
+	return syscall(SYS_ptrace, PTRACE_PEEKUSER, pid, off, v) ? -errno : 0;
+}
+
+static long poke_user(pid_t pid, long off, unsigned long v)
+{
+	return syscall(SYS_ptrace, PTRACE_POKEUSER, pid, off, v) ? -errno : 0;
+}
+
 static int ptrace_stopped(pid_t pid)
 {
 	int status;
@@ -345,6 +358,34 @@ static void ptrace_tracer(pid_t pid)
 	      "ARCH_PRCTL GET_FS after SET_FS: %#lx", v);
 	CHECK(syscall(SYS_ptrace, PTRACE_ARCH_PRCTL, pid, fs, ARCH_SET_FS) == 0,
 	      "ARCH_PRCTL SET_FS (restore): %s", strerror(errno));
+
+	/* User area: only word-aligned offsets inside struct user.  The
+	 * kernel's ends with error_code and fault_address, which glibc's lacks. */
+#define PT_USER_SIZE (offsetof(struct user, u_debugreg) + 10 * sizeof(long))
+	CHECK(peek_user(pid, 4, &v) == -EIO, "PEEKUSER at 4 accepted");
+	CHECK(poke_user(pid, 4, 0) == -EIO, "POKEUSER at 4 accepted");
+	CHECK(peek_user(pid, offsetof(struct user_regs_struct, rip) + 4, &v) == -EIO,
+	      "PEEKUSER at rip + 4 accepted");
+	CHECK(peek_user(pid, -8, &v) == -EIO, "PEEKUSER at -8 accepted");
+	CHECK(peek_user(pid, PT_USER_SIZE, &v) == -EIO, "PEEKUSER past struct user accepted");
+	CHECK(poke_user(pid, PT_USER_SIZE, 0) == -EIO, "POKEUSER past struct user accepted");
+	CHECK(peek_user(pid, PT_USER_SIZE - 8, &v) == 0, "PEEKUSER of the last word failed");
+	CHECK(peek_user(pid, offsetof(struct user_regs_struct, gs_base), &v) == 0 && v == PT_GS2,
+	      "PEEKUSER gs_base: %#lx", v);
+	CHECK(peek_user(pid, sizeof(struct user_regs_struct), &v) == 0 && v == 0,
+	      "PEEKUSER after the registers: %#lx", v);
+	/* Debug registers are eight bytes apart; DR4/DR5 cannot be set. */
+#define PT_DR(n) (offsetof(struct user, u_debugreg) + (n) * sizeof(long))
+	CHECK(poke_user(pid, PT_DR(1), 0x1000) == 0, "POKEUSER DR1 failed");
+	CHECK(poke_user(pid, PT_DR(7), 0x4) == 0, "POKEUSER DR7 failed");
+	CHECK(poke_user(pid, PT_DR(4), 0) == -EIO, "POKEUSER DR4 accepted");
+	CHECK(peek_user(pid, PT_DR(1), &v) == 0 && v == 0x1000, "PEEKUSER DR1: %#lx", v);
+	CHECK(peek_user(pid, PT_DR(7), &v) == 0 && v == 0x4, "PEEKUSER DR7: %#lx", v);
+	CHECK(peek_user(pid, PT_DR(4), &v) == 0 && v == 0, "PEEKUSER DR4: %#lx", v);
+	CHECK(poke_user(pid, PT_DR(7), 0) == 0 && poke_user(pid, PT_DR(1), 0) == 0,
+	      "clearing DR7/DR1 failed");
+#undef PT_DR
+#undef PT_USER_SIZE
 
 	CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "PTRACE_CONT: %s", strerror(errno));
 	CHECK(waitpid(pid, &status, 0) == pid, "waitpid: %s", strerror(errno));

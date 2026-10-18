@@ -102,16 +102,23 @@ int putreg(struct task_struct *child, int regno, unsigned long value)
 		return 0;
 
 	default:
-		panic("Bad register in putreg(): %d\n", regno);
+		return -EIO;
 	}
 
 	child->thread.regs.regs.gp[reg_offsets[regno >> 3]] = value;
 	return 0;
 }
 
+/* A user-area offset must be word aligned and inside struct user. */
+static int bad_user_offset(long addr)
+{
+	return (addr & (sizeof(long) - 1)) || addr < 0 ||
+		addr >= sizeof(struct user);
+}
+
 int poke_user(struct task_struct *child, long addr, long data)
 {
-	if ((addr & 3) || addr < 0)
+	if (bad_user_offset(addr))
 		return -EIO;
 
 	if (addr < MAX_REG_OFFSET)
@@ -119,7 +126,7 @@ int poke_user(struct task_struct *child, long addr, long data)
 	else if ((addr >= offsetof(struct user, u_debugreg[0])) &&
 		(addr <= offsetof(struct user, u_debugreg[7]))) {
 		addr -= offsetof(struct user, u_debugreg[0]);
-		addr = addr >> 3;
+		addr = addr / sizeof(long);
 		if ((addr == 4) || (addr == 5))
 			return -EIO;
 		child->thread.arch.debugregs[addr] = data;
@@ -164,7 +171,7 @@ unsigned long getreg(struct task_struct *child, int regno)
 		mask = 0xffff;
 		break;
 	default:
-		panic("Bad register in getreg: %d\n", regno);
+		return 0;
 	}
 	return mask & child->thread.regs.regs.gp[reg_offsets[regno >> 3]];
 }
@@ -174,7 +181,7 @@ int peek_user(struct task_struct *child, long addr, long data)
 	/* read the word at location addr in the USER area. */
 	unsigned long tmp;
 
-	if ((addr & 3) || addr < 0)
+	if (bad_user_offset(addr))
 		return -EIO;
 
 	tmp = 0;  /* Default return condition */
@@ -183,8 +190,8 @@ int peek_user(struct task_struct *child, long addr, long data)
 	else if ((addr >= offsetof(struct user, u_debugreg[0])) &&
 		(addr <= offsetof(struct user, u_debugreg[7]))) {
 		addr -= offsetof(struct user, u_debugreg[0]);
-		addr = addr >> 2;
-		tmp = child->thread.arch.debugregs[addr];
+		/* DR4 and DR5 cannot be set, so they read as 0 (as on x86). */
+		tmp = child->thread.arch.debugregs[addr / sizeof(long)];
 	}
 	return put_user(tmp, (unsigned long *) data);
 }
