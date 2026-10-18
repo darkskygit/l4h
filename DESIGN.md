@@ -241,6 +241,19 @@ We need no IOMMU, since no device is passed into a guest.
   up. Only a schedulable thread is enqueued now; for a postponed one the
   remote core is still told to reprogram its timer. This is an upstream
   bug.
+- **0014, x86 timer calibration (MCS).** Every core measured the TSC and
+  APIC timer rates again at boot and overwrote the shared values, each
+  from a single PIT wraparound. A virtualised PIT can end that wait
+  early: on GCE about one boot in three had a core measure the TSC at
+  1 MHz or the APIC timer at ~490 kHz.
+  - A bad last core gave every core a wrong clock. A ratio of 0, which
+    means TSC deadline mode, stopped the timer on N2, which has no TSC
+    deadline mode: the whole machine stalled.
+  - A bad boot core left the root task with an initial budget below the
+    minimum, failing `refill_sufficient` in `switchToThread`.
+  - The rates are now measured once, on the boot core, as the median of
+    5 wraparounds each, and the APIC ratio is at least 1. This is an
+    upstream bug.
 
 
 - **0004, x86_64 user RSP across syscalls.** seL4's fast `syscall` entry

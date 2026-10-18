@@ -1,0 +1,200 @@
+From 1d681ff88a3f80632f3982ed4aa590a64b443d02 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Sun, 18 Oct 2026 06:49:04 -0700
+Subject: [PATCH] x86, mcs: measure the TSC and APIC timer rates once, robustly
+
+Every core measured the TSC and APIC timer rates again in apic_init()
+and overwrote the shared x86KStscMhz and x86KSapicRatio, so the clock
+of every core came from whichever core measured last, and the root
+task's initial budget, converted on the boot core, from the first.
+
+Each rate was a single measurement against one PIT wraparound, and a
+virtualised PIT can make that wait end early: on Google Compute Engine
+about one boot in three had a core measure the TSC at 1 MHz or the
+APIC timer at ~490 kHz. A bad last core gave every core a wrong clock
+(a ratio of 0, read as TSC deadline mode on a machine without it,
+stopped the timer altogether); a bad boot core left the root task with
+a budget below the minimum, failing assert(refill_sufficient(...)) in
+switchToThread().
+
+Measure the rates once, on the boot core, as the median of 5
+wraparounds each, and keep the APIC ratio at least 1.
+---
+ include/arch/x86/arch/machine/timer.h |  1 +
+ src/arch/x86/kernel/apic.c            | 51 +++++++++++++++++----------
+ src/plat/pc99/machine/hardware.c      | 41 +++++++++++++++++++--
+ 3 files changed, 72 insertions(+), 21 deletions(-)
+
+diff --git a/include/arch/x86/arch/machine/timer.h b/include/arch/x86/arch/machine/timer.h
+index 3367f7d33..791af37fe 100644
+--- a/include/arch/x86/arch/machine/timer.h
++++ b/include/arch/x86/arch/machine/timer.h
+@@ -92,4 +92,5 @@ static inline void resetTimer(void)
+ 
+ 
+ BOOT_CODE uint32_t tsc_init(void);
++BOOT_CODE uint32_t median_khz(uint32_t *s, int n);
+ 
+diff --git a/src/arch/x86/kernel/apic.c b/src/arch/x86/kernel/apic.c
+index 290ec5745..dbc71124b 100644
+--- a/src/arch/x86/kernel/apic.c
++++ b/src/arch/x86/kernel/apic.c
+@@ -16,21 +16,28 @@
+ #define APIC_TIMER_MODE_ONE_SHOT 0
+ #define APIC_TIMER_MODE_TSC_DEADLINE  2
+ 
++#define APIC_FREQ_SAMPLES 5
++
+ static BOOT_CODE uint32_t apic_measure_freq(void)
+ {
++    uint32_t samples[APIC_FREQ_SAMPLES];
++
+     pit_init();
+     /* wait for 1st PIT wraparound */
+     pit_wait_wraparound();
+ 
+-    /* start APIC timer countdown */
+     apic_write_reg(APIC_TIMER_DIVIDE, 0xb); /* divisor = 1 */
+-    apic_write_reg(APIC_TIMER_COUNT, 0xffffffff);
++    for (int i = 0; i < APIC_FREQ_SAMPLES; i++) {
++        /* start APIC timer countdown */
++        apic_write_reg(APIC_TIMER_COUNT, 0xffffffff);
+ 
+-    /* wait for 2nd PIT wraparound */
+-    pit_wait_wraparound();
++        /* wait for the next PIT wraparound */
++        pit_wait_wraparound();
+ 
+-    /* calculate APIC/bus cycles per ms = frequency in kHz */
+-    return (0xffffffff - apic_read_reg(APIC_TIMER_CURRENT)) / PIT_WRAPAROUND_MS;
++        /* calculate APIC/bus cycles per ms = frequency in kHz */
++        samples[i] = (0xffffffff - apic_read_reg(APIC_TIMER_CURRENT)) / PIT_WRAPAROUND_MS;
++    }
++    return median_khz(samples, APIC_FREQ_SAMPLES);
+ }
+ 
+ BOOT_CODE paddr_t apic_get_base_paddr(void)
+@@ -52,18 +59,26 @@ BOOT_CODE bool_t apic_init(bool_t mask_legacy_irqs)
+     }
+ 
+ #ifdef CONFIG_KERNEL_MCS
+-    /* find tsc KHz */
+-    x86KStscMhz = tsc_init();
+-
+-    /* can we use tsc deadline mode? */
+-    uint32_t cpuid = x86_cpuid_ecx(0x1, 0x0);
+-    if (!(cpuid & BIT(CPUID_TSC_DEADLINE_BIT))) {
+-        apic_khz = apic_measure_freq();
+-        x86KSapicRatio = div64((uint64_t)x86KStscMhz * 1000llu, apic_khz);
+-        printf("Apic Khz %lu, TSC Mhz %lu, ratio %lu\n", (long) apic_khz, (long) x86KStscMhz, (long) x86KSapicRatio);
+-    } else {
+-        // use tsc deadline mode
+-        x86KSapicRatio = 0;
++    /* The TSC and the APIC timer run at the same rates on every core:
++     * measure them once, on the boot core. The other cores used to measure
++     * again and overwrite the shared values, so that one bad measurement
++     * on any core gave every core a wrong clock. */
++    if (x86KStscMhz == 0) {
++        /* find tsc KHz */
++        x86KStscMhz = tsc_init();
++
++        /* can we use tsc deadline mode? */
++        uint32_t cpuid = x86_cpuid_ecx(0x1, 0x0);
++        if (!(cpuid & BIT(CPUID_TSC_DEADLINE_BIT))) {
++            apic_khz = apic_measure_freq();
++            /* 0 means TSC deadline mode */
++            x86KSapicRatio = MAX(1, div64((uint64_t)x86KStscMhz * 1000llu, apic_khz));
++            printf("Apic Khz %lu, TSC Mhz %lu, ratio %lu\n", (long) apic_khz, (long) x86KStscMhz, (long) x86KSapicRatio);
++        } else {
++            // use tsc deadline mode
++            x86KSapicRatio = 0;
++            printf("TSC Mhz %lu, TSC deadline mode\n", (long) x86KStscMhz);
++        }
+     }
+ #else
+     apic_khz = apic_measure_freq();
+diff --git a/src/plat/pc99/machine/hardware.c b/src/plat/pc99/machine/hardware.c
+index 3c3de243a..f71791f0c 100644
+--- a/src/plat/pc99/machine/hardware.c
++++ b/src/plat/pc99/machine/hardware.c
+@@ -33,6 +33,22 @@ BOOT_CODE bool_t platAddDevices(void)
+ /* ============================== timer ============================== */
+ 
+ #define TSC_FREQ_RETRIES 10
++#define TSC_FREQ_SAMPLES 5
++
++/* The median of n samples, which it sorts. A virtualised PIT can make a
++ * wraparound wait end early or late (seen on Google Compute Engine), so a
++ * single measurement may be far off. */
++BOOT_CODE uint32_t median_khz(uint32_t *s, int n)
++{
++    for (int i = 1; i < n; i++) {
++        for (int j = i; j > 0 && s[j - 1] > s[j]; j--) {
++            uint32_t t = s[j];
++            s[j] = s[j - 1];
++            s[j - 1] = t;
++        }
++    }
++    return s[n / 2];
++}
+ 
+ BOOT_CODE static inline uint32_t measure_tsc_khz(void)
+ {
+@@ -47,7 +63,10 @@ BOOT_CODE static inline uint32_t measure_tsc_khz(void)
+      * the expectation that it will eventually yield a sensible
+      * result.
+      */
+-    for (int i = 0; i < TSC_FREQ_RETRIES; i++) {
++    uint32_t samples[TSC_FREQ_SAMPLES];
++    int n = 0;
++
++    for (int i = 0; i < TSC_FREQ_RETRIES && n < TSC_FREQ_SAMPLES; i++) {
+ 
+         /* read tsc */
+         uint64_t old_ticks = x86_rdtsc();
+@@ -60,20 +79,25 @@ BOOT_CODE static inline uint32_t measure_tsc_khz(void)
+         uint64_t diff = new_ticks - old_ticks;
+ 
+         if ((uint32_t)diff == diff && new_ticks > old_ticks) {
+-            return (uint32_t)diff / PIT_WRAPAROUND_MS;
++            samples[n++] = (uint32_t)diff / PIT_WRAPAROUND_MS;
++            continue;
+         }
+ 
+         printf("warning: TSC frequency too high (%d retries remaining)\n",
+                TSC_FREQ_RETRIES - i - 1);
+     }
+ 
++    if (n == TSC_FREQ_SAMPLES) {
++        return median_khz(samples, n);
++    }
++
+     fail("TSC frequency too high");
+ 
+     /* should never get here */
+     return 0;
+ }
+ 
+-BOOT_CODE uint32_t tsc_init(void)
++BOOT_CODE static uint32_t tsc_measure_mhz(void)
+ {
+ 
+ #if CONFIG_PC99_TSC_FREQUENCY > 0
+@@ -133,3 +157,14 @@ BOOT_CODE uint32_t tsc_init(void)
+     /* finally, return mhz */
+     return tsc_khz / 1000u;
+ }
++
++/* The TSC frequency, measured once: it is the same on every core. */
++BOOT_CODE uint32_t tsc_init(void)
++{
++    static uint32_t tsc_mhz;
++
++    if (tsc_mhz == 0) {
++        tsc_mhz = tsc_measure_mhz();
++    }
++    return tsc_mhz;
++}
+-- 
+2.47.3
+
