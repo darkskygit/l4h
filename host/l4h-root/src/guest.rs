@@ -144,6 +144,8 @@ pub struct Guest {
     pub disks: Vec<usize>,
     /// netd ports of its virtio-net devices.
     pub ports: Vec<usize>,
+    /// ASIDs held by its VSpaces (its own, its processes', its components').
+    pub asids: usize,
 }
 
 fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -470,6 +472,7 @@ pub fn create(
         cpu_cap_pct: 0,
         disks: Vec::new(),
         ports: Vec::new(),
+        asids: 0,
     };
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();

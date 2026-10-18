@@ -61,6 +61,11 @@ impl Slots {
         self.recycled.push(s);
     }
 
+    /// Slots that can still be allocated.
+    pub fn available(&self) -> usize {
+        self.free.len() + self.recycled.len()
+    }
+
     /// Start recording allocations into `set`.
     pub fn track(&mut self, set: BTreeSet<Slot>) {
         assert!(self.track.is_none(), "nested slot tracking");

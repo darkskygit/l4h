@@ -37,6 +37,9 @@ use crate::window::{Window, Windows};
 
 pub const RETYPE_FAN_OUT: usize = 16384;
 pub const MAX_GUESTS: usize = 64;
+/// Memory and root CNode slots kept back from guest requests.
+const RESERVE_BYTES: usize = 32 << 20;
+const RESERVE_SLOTS: usize = 32768;
 
 static DOM0_KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-kernel"));
 static DOM0_INITRD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-initrd"));
@@ -95,12 +98,22 @@ impl HostInfo {
 /// ASID pools; x86_64 seL4 has 8 pools of 512 ASIDs each in total.
 pub struct AsidPools {
     pools: Vec<(cap::AsidPool, usize)>,
+    /// ASIDs assigned to live VSpaces (exact: guests return theirs).
+    pub in_use: usize,
 }
+
+const ASID_CAPACITY: usize = (1 << sel4::sys::seL4_NumASIDPoolsBits) * ASIDS_PER_POOL;
 
 const ASIDS_PER_POOL: usize = 1 << sel4::sys::seL4_ASIDPoolIndexBits;
 
 impl AsidPools {
+    pub fn available(&self) -> usize {
+        ASID_CAPACITY.saturating_sub(self.in_use)
+    }
+
     pub fn assign(&mut self, alloc: &mut Alloc, vspace: cap::VSpace) {
+        assert!(self.in_use < ASID_CAPACITY, "out of ASIDs");
+        self.in_use += 1;
         for (pool, used) in self.pools.iter_mut() {
             if *used < ASIDS_PER_POOL {
                 if pool.asid_pool_assign(vspace).is_ok() {
@@ -166,7 +179,9 @@ impl Host {
     pub fn with_guest<R>(&mut self, id: usize, f: impl FnOnce(&mut Host, &mut Guest) -> R) -> Option<R> {
         let mut g = self.guests.get_mut(id)?.take()?;
         self.alloc.slots.track(core::mem::take(&mut g.slots));
+        let asids = self.asids.in_use;
         let r = f(self, &mut g);
+        g.asids += self.asids.in_use - asids;
         g.slots = self.alloc.slots.untrack();
         self.guests[id] = Some(g);
         Some(r)
@@ -176,16 +191,29 @@ impl Host {
         self.guests.get(id)?.as_ref()
     }
 
+    /// Resources a guest operation may need, checked before starting it so
+    /// that requests fail cleanly instead of exhausting the root task.
+    fn can_afford(&self, bytes: usize, asids: usize) -> bool {
+        self.alloc.free_bytes() >= bytes + RESERVE_BYTES
+            && self.asids.available() >= asids
+            && self.alloc.slots.available() >= RESERVE_SLOTS
+    }
+
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
+        if !self.can_afford(cfg.ram + cfg.untyped_quota, cfg.vspaces + 4) {
+            return None;
+        }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
         if self.guests.len() <= id {
             self.guests.resize_with(id + 1, || None);
         }
         self.alloc.slots.track(Default::default());
+        let asids = self.asids.in_use;
         let g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info);
         let slots = self.alloc.slots.untrack();
         let mut g = g?;
         g.slots = slots;
+        g.asids = self.asids.in_use - asids;
         self.guests[id] = Some(g);
         Some(id)
     }
@@ -195,6 +223,9 @@ impl Host {
     pub fn attach_disk(&mut self, id: usize, disk: usize, read_only: bool, lba_start: u64, lba_count: u64) -> Result<(), i64> {
         if self.disks.get(disk).ok_or(ctl::ENOENT)?.owner.is_some() {
             return Err(ctl::EBUSY);
+        }
+        if !self.can_afford(16 << 20, 2) {
+            return Err(ctl::ENOMEM);
         }
         self.with_guest(id, |h, g| {
             if g.state != State::Created {
@@ -239,6 +270,9 @@ impl Host {
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
     /// Returns the MAC.
     pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool) -> Result<u64, i64> {
+        if !self.can_afford(8 << 20, 0) {
+            return Err(ctl::ENOMEM);
+        }
         self.with_guest(id, |h, g| {
             if g.state != State::Created || g.vmm.is_some() {
                 return Err(ctl::EBUSY);
@@ -267,6 +301,7 @@ impl Host {
             blkd::detach(&mut self.disks[d], &self.pci, &mut self.alloc);
         }
         let name = g.name.clone();
+        self.asids.in_use -= g.asids;
         g.destroy(&mut self.alloc);
         sel4::debug_println!(
             "l4h-root: guest {} '{}' destroyed, {} MiB free",
@@ -297,7 +332,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         timeslice_us: 5000,
         placement: core::cell::Cell::new(0),
     };
-    let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)] };
+    let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
     let wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
 
     // PCI devices: virtio-blk disks can be passed through to guests.

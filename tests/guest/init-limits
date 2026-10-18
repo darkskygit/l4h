@@ -1,0 +1,23 @@
+#!/bin/sh
+# dom0 init for tests/run-limits.sh: exhaust the host with guests; the
+# root task must refuse cleanly, and recover after the guests are gone.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "LIMITS: FAIL: $*"; poweroff -f; }
+ids=""
+n=0
+while [ $n -lt 80 ]; do
+    id=$(l4hctl create "g$n" --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 32 --quota 8 2>/tmp/err) || break
+    ids="$ids $id"
+    n=$((n + 1))
+done
+echo "LIMITS: created $n guests, then: $(cat /tmp/err)"
+[ $n -ge 40 ] || fail "only $n guests"
+l4hctl info | grep memory
+for id in $ids; do l4hctl destroy "$id" || fail "destroy $id"; done
+id=$(l4hctl create again --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 64) || fail "create after recovery"
+l4hctl console "$id" --until "GUEST: ready" --timeout 60 >/dev/null || fail "guest after recovery"
+l4hctl destroy "$id"
+echo "LIMITS: PASS"
+poweroff -f

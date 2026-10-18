@@ -548,6 +548,13 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
   - its seL4 object quota, by default 16 MiB plus RAM/16, used for its
     processes' mapping slots and page tables;
   - about 30 MiB of host objects, including its `l4h-vmm`.
+- **Limits.** `l4h-root` checks a request's memory, ASIDs and root CNode
+  slots before starting it, and refuses with ENOMEM instead of exhausting
+  itself.
+  - x86_64 seL4 has 4096 ASIDs, and a guest holds 66 of them: its
+    VSpace, its pool of 64 process VSpaces, and its VMM. That allows about
+    61 guests per host; `MAX_GUESTS` is 64.
+  - `tests/run-limits.sh` fills the host and checks that it recovers.
 - **dom0 restart.** If dom0 reboots or crashes, `l4h-root` destroys it and
   boots it again from the boot image. Other guests keep running, and the
   new dom0 sees them through the control API (`tests/run-m6test.sh`).
