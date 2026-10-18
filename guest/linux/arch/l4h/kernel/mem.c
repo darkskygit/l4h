@@ -113,3 +113,26 @@ void mark_rodata_ro(void)
 {
 	/* The host maps guest RAM read-write; rodata stays writable. */
 }
+
+/*
+ * set_ptes() with nr > 1 must map consecutive pages.  Without THP this
+ * kernel has no large folios, so nothing calls it with nr > 1 at run time:
+ * check the stride once at boot instead.  A scratch mm takes the sync mark.
+ */
+static struct mm_struct set_ptes_mm __initdata;
+
+static int __init set_ptes_check(void)
+{
+	pte_t ptes[4];
+	unsigned long pfn = 0x1234;
+	int i;
+
+	raw_spin_lock_init(&set_ptes_mm.context.sync_lock);
+	set_ptes(&set_ptes_mm, 0, ptes, pfn_pte(pfn, PAGE_READONLY), ARRAY_SIZE(ptes));
+	for (i = 0; i < ARRAY_SIZE(ptes); i++)
+		if (pte_pfn(ptes[i]) != pfn + i)
+			panic("l4h: set_ptes() entry %d maps pfn %lx, not %lx\n",
+			      i, pte_pfn(ptes[i]), pfn + i);
+	return 0;
+}
+early_initcall(set_ptes_check);
