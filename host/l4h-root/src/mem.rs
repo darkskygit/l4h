@@ -334,13 +334,27 @@ impl Alloc {
     /// The Untyped capabilities move to fresh slots, leaving the owner's
     /// slots empty.
     pub fn reclaim(&mut self, arena: Arena) {
+        self.reclaim_pinning(arena, |_| false);
+    }
+
+    /// `reclaim`, except that the Untypeds at a physical address for which
+    /// `pin` is true never return to the free pool: a device that could not
+    /// be stopped may still write to them.  Their objects are destroyed all
+    /// the same.  Returns the bytes kept out of use.
+    pub fn reclaim_pinning(&mut self, arena: Arena, pin: impl Fn(usize) -> bool) -> usize {
+        let mut pinned = 0;
         for (slot, paddr, bits) in arena.owned {
             let cap = untyped_at(slot);
             slot::CNODE.cap().absolute_cptr(cap).revoke().expect("revoke arena untyped");
+            if pin(paddr) {
+                pinned += 1 << bits;
+                continue;
+            }
             let s = self.slots.global(|s| s.alloc());
             slot::CNODE.cap().absolute_cptr(untyped_at(s)).move_(&slot::CNODE.cap().absolute_cptr(cap)).expect("move block");
             self.blocks.push(UtRegion::fresh(untyped_at(s), paddr, bits));
         }
+        pinned
     }
 
     /// Undo a partly built arena: reclaim its memory and free its slots.

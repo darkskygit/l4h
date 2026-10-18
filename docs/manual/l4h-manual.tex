@@ -610,7 +610,13 @@ again to restart it. Only running VMs accept \cmd{shutdown}.
 
 \cmd{destroy} stops a VM immediately, without telling the guest, and frees
 everything it held: memory, disks and vNICs. Destroying a running VM is like
-pulling its power cord. To stop a VM cleanly:
+pulling its power cord: disk requests in flight are aborted, and writes the
+guest had not flushed may be lost or torn. Before any of the VM's memory is
+reused, \texttt{l4h-root} resets each of its disks (NVMe controller reset,
+virtio-blk device reset) so that no request still in a device can write to
+it. A disk that does not complete the reset is disabled until the host
+reboots, and the memory it may still write to is not reused
+(Section~\ref{sec:disk-failed}). To stop a VM cleanly:
 \begin{lstlisting}
 # l4hctl shutdown 1
 # l4hctl console 1 --until "reboot: Power down" --timeout 60 > /dev/null
@@ -659,6 +665,16 @@ Attaching an owned disk fails with \texttt{busy}. A disk becomes free when its
 owner is destroyed. Disks that dom0 received at boot stay dom0's: to make
 disks available for other guests, build the host with
 \texttt{L4H\_DOM0\_DISKS} set to the number dom0 should keep.
+
+\paragraph{Failed disks.}\label{sec:disk-failed} When its owner is
+destroyed, a disk is reset before it becomes free. If the device does not
+complete the reset (an NVMe controller that stays ready past its timeout,
+up to two minutes, or a virtio-blk device that does not reset within two
+seconds), the serial log shows \texttt{device did not reset}, \cmd{l4hctl
+disks} marks it \texttt{failed}, and attaching it fails with \texttt{I/O
+error}. The destroyed VM's RAM and the driver's DMA memory stay out of use,
+since the device may still write to them, so \cmd{l4hctl info} shows less
+free memory. Reboot the host to recover both.
 
 \begin{caveat}
 dom0 decides which guest gets which disk, and can attach any free disk to
@@ -949,6 +965,9 @@ Message & Usual cause \\
   below 8 MiB, a cap above 100, a multicast MAC, a kernel that does not fit in the VM's RAM, or a request
   that targets dom0 itself. \\
 \texttt{no space for devices} & The VM already has 16 devices. \\
+\texttt{I/O error} & The disk failed to reset when its last owner was
+  destroyed and is disabled until the host reboots
+  (Section~\ref{sec:disk-failed}). \\
 \texttt{operation not permitted} & dom0 tried to destroy itself. \\
 \texttt{not a 64-bit little-endian ELF} & \texttt{--kernel} does not name a
   kernel ELF; pass \file{vmlinux}, not a compressed image. \\
@@ -1004,7 +1023,7 @@ Test & What it checks \\
 \cmd{run-blktest.sh} & disk pass-through and data integrity
   (\texttt{BLKTEST\_DEV=nvme} for NVMe) \\
 \cmd{run-ctltest.sh} & VM lifecycle, console, clean shutdown, disk windows,
-  memory reclaim \\
+  memory reclaim, destroying VMs during disk I/O (virtio-blk and NVMe) \\
 \cmd{run-nettest.sh} & DHCP over the uplink, switches, several vNICs,
   isolation, MAC lock \\
 \cmd{run-router.sh} & a Debian NAT router VM between an internal switch and

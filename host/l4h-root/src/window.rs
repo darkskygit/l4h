@@ -31,11 +31,16 @@ impl Window {
     /// Temporarily map the frame `frame` (a capability anywhere reachable
     /// from the root CSpace) and run `f` on its contents.
     pub fn with_frame<R>(&mut self, frame: &sel4::AbsoluteCPtr, f: impl FnOnce(*mut u8) -> R) -> R {
+        self.with_frame_attrs(frame, VmAttributes::DEFAULT, f)
+    }
+
+    /// `with_frame` with mapping attributes `attrs` (device registers are
+    /// mapped uncached).
+    pub fn with_frame_attrs<R>(&mut self, frame: &sel4::AbsoluteCPtr, attrs: VmAttributes, f: impl FnOnce(*mut u8) -> R) -> R {
         let dst = slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(self.slot).cap());
         dst.copy(frame, CapRights::read_write()).expect("window copy");
         let cap = sel4::init_thread::Slot::<cap_type::Granule>::from_index(self.slot).cap();
-        cap.frame_map(slot::VSPACE.cap(), self.va, CapRights::read_write(), VmAttributes::DEFAULT)
-            .expect("window map");
+        cap.frame_map(slot::VSPACE.cap(), self.va, CapRights::read_write(), attrs).expect("window map");
         let r = f(self.va as *mut u8);
         cap.frame_unmap().unwrap();
         dst.delete().unwrap();

@@ -119,6 +119,7 @@ fn errno_name(e: i64) -> &'static str {
     match e {
         1 => "operation not permitted",
         2 => "no such VM or device",
+        5 => "I/O error (the disk failed to reset)",
         12 => "out of memory",
         16 => "busy",
         22 => "invalid argument",
@@ -356,7 +357,8 @@ fn run(args: &[String]) -> Result<i32> {
                 let bdf = r.vals[0];
                 let owner = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("vm {}", r.vals[1]) };
                 let kind = if r.vals[3] == 1 { "nvme" } else { "virtio-blk" };
-                println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+                let failed = if r.vals[2] != 0 { ", failed (did not reset)" } else { "" };
+                println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
             }
         }
         "list" => {

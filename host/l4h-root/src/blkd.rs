@@ -52,13 +52,16 @@ pub struct Disk {
     bars: Vec<(u8, Vec<cap::Granule>)>,
     pub owner: Option<usize>,
     pub read_only: bool,
+    /// The device did not confirm a reset: it may still access memory it
+    /// was given, so it is never enabled again.
+    pub failed: bool,
     driver: Option<Blkd>,
 }
 
 impl Disk {
     pub fn new(pci: pci::Device, vector: u64) -> Self {
         let kind = if is_nvme(&pci) { blk::BLKD_NVME } else { blk::BLKD_VIRTIO };
-        Disk { pci, kind, vector, bars: Vec::new(), owner: None, read_only: false, driver: None }
+        Disk { pci, kind, vector, bars: Vec::new(), owner: None, read_only: false, failed: false, driver: None }
     }
 }
 
@@ -82,6 +85,8 @@ struct Blkd {
     comp: Component,
     arena: Arena,
     irq_slot: usize,
+    /// Physical address of its DMA memory (queues, PRP lists, headers).
+    dma_paddr: usize,
 }
 
 fn bdf(d: &pci::Device) -> u32 {
@@ -225,23 +230,108 @@ pub fn attach(
     component::start(&comp);
 
     disk.owner = Some(client.id);
-    disk.driver = Some(Blkd { comp, arena, irq_slot });
+    disk.driver = Some(Blkd { comp, arena, irq_slot, dma_paddr });
     vmm::Backend::Blk { chan, kick }
 }
 
-/// Stop the driver of `disk` and free it.  Device DMA is stopped first, so
-/// that the client's memory can be reused afterwards.
-pub fn detach(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc) {
-    pci.disable(&disk.pci);
-    if let Some(b) = disk.driver.take() {
+/// Stop the driver of `disk`, quiesce the device and free the driver.
+///
+/// The driver is suspended first (no more submissions), then the device is
+/// reset, which ends or aborts every command it holds; only then are bus
+/// mastering and MSI-X turned off.  Clearing bus mastering alone is not
+/// enough: a device may finish a command it already started, and it keeps
+/// its queues to resume on the next enable.  Returns false if the device
+/// did not confirm the reset: it may still write to the client's memory,
+/// which the caller must then not reuse.  The driver's DMA memory is kept
+/// out of use in that case, and the disk is never enabled again.
+pub fn detach(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
+    let b = disk.driver.take();
+    if let Some(b) = &b {
         let _ = b.comp.tcb.tcb_suspend();
+    }
+    let quiet = reset(disk, pci, alloc, devmem, win, ticks_per_ms);
+    pci.disable(&disk.pci);
+    if let Some(b) = b {
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(b.irq_slot).cap();
         let _ = irq.irq_handler_clear();
         abs_of(irq).delete().expect("delete IRQ handler");
         alloc.slots.free(b.irq_slot);
-        alloc.reclaim(b.arena);
+        let pinned = alloc.reclaim_pinning(b.arena, |p| !quiet && p == b.dma_paddr);
+        if pinned != 0 {
+            let p = &disk.pci;
+            sel4::debug_println!(
+                "l4h-root: disk {:02x}:{:02x}.{}: {} MiB of DMA memory kept out of use",
+                p.bus, p.dev, p.func, pinned >> 20
+            );
+        }
     }
     disk.owner = None;
+    quiet
+}
+
+/// NVMe controller registers (in BAR 0).
+const NVME_CAP: usize = 0x00;
+const NVME_CC: usize = 0x14;
+const NVME_CSTS: usize = 0x1c;
+/// Offset of `device_status` in the virtio-pci common configuration.
+const VIRTIO_DEVICE_STATUS: usize = 20;
+/// The virtio spec sets no bound on a reset.
+const VIRTIO_RESET_MS: u64 = 2000;
+
+/// Reset `disk` so that it can no longer access memory: NVMe clears
+/// CC.EN and waits for CSTS.RDY to clear (within CAP.TO), which aborts all
+/// commands and deletes the queues; virtio-blk writes 0 to the device
+/// status and waits until it reads back 0.  Memory decoding is turned on
+/// for this; bus mastering is left as it is, so that DMA the device
+/// finishes while resetting lands in memory that is still the client's.
+/// On failure, marks the disk failed and returns false.
+pub fn reset(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
+    if disk.failed {
+        return false;
+    }
+    let nvme = disk.kind == blk::BLKD_NVME;
+    let (bar, off) = if nvme {
+        (0, 0)
+    } else {
+        let c = disk.pci.virtio_caps.iter().find(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG).unwrap();
+        (c.bar, c.offset as usize + VIRTIO_DEVICE_STATUS)
+    };
+    let frame = bar_frames(alloc, devmem, &disk.pci, &mut disk.bars, bar)[off / PAGE];
+    pci.enable_memory(&disk.pci);
+    let ok = win.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| unsafe {
+        let r32 = |o: usize| (page.add(o) as *const u32).read_volatile();
+        let w32 = |o: usize, v: u32| (page.add(o) as *mut u32).write_volatile(v);
+        let wait = |ms: u64, done: &dyn Fn() -> bool| {
+            let end = host::ticks::now() + ms * ticks_per_ms;
+            while !done() {
+                if host::ticks::now() > end {
+                    return false;
+                }
+                core::hint::spin_loop();
+            }
+            true
+        };
+        if nvme {
+            if r32(NVME_CSTS) == u32::MAX {
+                return false;
+            }
+            // CAP.TO: the worst-case time to become (not) ready, in 500 ms.
+            let to_ms = ((r32(NVME_CAP) >> 24) & 0xff).max(1) as u64 * 500;
+            // Clear EN and any shutdown request.
+            w32(NVME_CC, r32(NVME_CC) & !(1 | (3 << 14)));
+            wait(to_ms, &|| r32(NVME_CSTS) & 1 == 0)
+        } else {
+            let status = page.add(off % PAGE);
+            status.write_volatile(0);
+            wait(VIRTIO_RESET_MS, &|| status.read_volatile() == 0)
+        }
+    });
+    if !ok {
+        let p = &disk.pci;
+        sel4::debug_println!("l4h-root: disk {:02x}:{:02x}.{}: device did not reset; it stays disabled", p.bus, p.dev, p.func);
+        disk.failed = true;
+    }
+    ok
 }
 
 /// The virtio-pci structures of a device, at the addresses its BARs are
@@ -306,16 +396,7 @@ pub fn map_bars(
     bars.sort();
     bars.dedup();
     for b in bars {
-        if !cache.iter().any(|(i, _)| *i == b) {
-            let bar = d.bars[b as usize];
-            assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio BAR {} unusable", b);
-            let frames = alloc
-                .slots
-                .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
-                .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr));
-            cache.push((b, frames));
-        }
-        let frames = &cache.iter().find(|(i, _)| *i == b).unwrap().1;
+        let frames = bar_frames(alloc, devmem, d, cache, b);
         for (i, f) in frames.iter().enumerate() {
             comp.map_copy(
                 alloc,
@@ -328,4 +409,24 @@ pub fn map_bars(
             );
         }
     }
+}
+
+/// The frames of BAR `b` of `d`, carved on first use and cached in `cache`.
+fn bar_frames<'a>(
+    alloc: &mut Alloc,
+    devmem: &mut DevMem,
+    d: &pci::Device,
+    cache: &'a mut Vec<(u8, Vec<cap::Granule>)>,
+    b: u8,
+) -> &'a [cap::Granule] {
+    if !cache.iter().any(|(i, _)| *i == b) {
+        let bar = d.bars[b as usize];
+        assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio BAR {} unusable", b);
+        let frames = alloc
+            .slots
+            .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
+            .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr));
+        cache.push((b, frames));
+    }
+    &cache.iter().find(|(i, _)| *i == b).unwrap().1
 }

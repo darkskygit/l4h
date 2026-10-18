@@ -238,7 +238,7 @@ impl Host {
                 match partial {
                     Some(mut g) => {
                         g.slots = slots;
-                        g.destroy(&mut self.alloc);
+                        g.destroy(&mut self.alloc, false);
                     }
                     None => {
                         for s in slots {
@@ -260,7 +260,11 @@ impl Host {
         if lba_start % blkd::WINDOW_ALIGN != 0 || lba_count % blkd::WINDOW_ALIGN != 0 {
             return Err(ctl::EINVAL);
         }
-        if self.disks.get(disk).ok_or(ctl::ENOENT)?.owner.is_some() {
+        let dk = self.disks.get(disk).ok_or(ctl::ENOENT)?;
+        if dk.failed {
+            return Err(ctl::EIO);
+        }
+        if dk.owner.is_some() {
             return Err(ctl::EBUSY);
         }
         if !self.can_afford(16 << 20, 2) {
@@ -336,12 +340,15 @@ impl Host {
         for &p in &g.ports {
             self.netd.remove_port(p);
         }
+        // Disks are quiesced before any memory they were given is reused.
+        let mut quiet = true;
         for &d in &g.disks {
-            blkd::detach(&mut self.disks[d], &self.pci, &mut self.alloc);
+            let ticks_per_ms = self.info.tsc_hz / 1000;
+            quiet &= blkd::detach(&mut self.disks[d], &self.pci, &mut self.alloc, &mut self.devmem, &mut self.wins.a, ticks_per_ms);
         }
         let name = g.name.clone();
         self.asids.in_use -= g.asids;
-        g.destroy(&mut self.alloc);
+        g.destroy(&mut self.alloc, !quiet);
         sel4::debug_println!(
             "l4h-root: guest {} '{}' destroyed, {} MiB free",
             id, name, self.alloc.free_bytes() >> 20
@@ -374,10 +381,11 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         placement: core::cell::Cell::new(0),
     };
     let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
-    let wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
+    let mut wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
 
     // PCI devices: virtio-blk disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc);
+    let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
     let mut disks = Vec::new();
     let mut nics = Vec::new();
     for d in pci.enumerate() {
@@ -398,17 +406,20 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
                 sel4::debug_println!("l4h-root: more than {} disks, ignoring this one", pci::MAX_DISKS);
                 continue;
             }
-            // Stop whatever the firmware left running.
+            // Stop whatever the firmware left running: no DMA at all (the
+            // memory it was given is not known), and a reset, since bus
+            // mastering is enabled again on attach.
             pci.disable(&d);
             let v = pci::VECTOR_DISK_BASE + disks.len() as u64;
-            disks.push(Disk::new(d, v));
+            let mut disk = Disk::new(d, v);
+            blkd::reset(&mut disk, &pci, &mut alloc, &mut devmem, &mut wins.a, info.tsc_hz / 1000);
+            pci.disable(&disk.pci);
+            disks.push(disk);
         } else if netd::is_virtio_net(&d) {
             pci.disable(&d);
             nics.push(d);
         }
     }
-    let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
-    let mut wins = wins;
     let mut asids = asids;
     let netd = netd::spawn(nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
@@ -450,7 +461,9 @@ pub fn boot_dom0(h: &mut Host) {
     };
     let id = h.create_guest(&cfg).expect("cannot create dom0");
     for d in 0..h.disks.len().min(DOM0_DISKS) {
-        h.attach_disk(id, d, false, 0, 0).expect("attach disk to dom0");
+        if let Err(e) = h.attach_disk(id, d, false, 0, 0) {
+            sel4::debug_println!("l4h-root: cannot give disk {} to dom0: error {}", d, e);
+        }
     }
     // Switch 0, with the first NIC (if any) as its uplink (on first boot).
     let sw = 0;

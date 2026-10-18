@@ -403,10 +403,16 @@ impl Guest {
     }
 
     /// Destroy the guest and return all its memory and root slots.  The
-    /// caller has detached its devices.
-    pub fn destroy(mut self, alloc: &mut Alloc) {
+    /// caller has detached its devices.  With `pin_ram`, a disk could not
+    /// be stopped and may still write to the guest's RAM: the RAM chunks
+    /// are kept out of use for good.
+    pub fn destroy(mut self, alloc: &mut Alloc, pin_ram: bool) {
         self.stop();
-        alloc.reclaim(self.arena);
+        let ram = core::mem::take(&mut self.ram);
+        let pinned = alloc.reclaim_pinning(self.arena, |p| pin_ram && ram.iter().any(|c| c.paddr == p));
+        if pinned != 0 {
+            sel4::debug_println!("l4h-root: guest {}: {} MiB of RAM kept out of use", self.id, pinned >> 20);
+        }
         // Capabilities that do not derive from the arena (badged endpoints,
         // copies of global objects) are left in their slots.
         for s in self.slots {

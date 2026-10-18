@@ -288,7 +288,14 @@ impl Pci {
         self.write16(d.bus, d.dev, d.func, 4, cmd | 0x2 | 0x4 | 0x400);
     }
 
-    /// Stop the device: no DMA, no memory decoding, MSI-X off.
+    /// Enable memory decoding only (to reach the registers), disable INTx.
+    pub fn enable_memory(&self, d: &Device) {
+        let cmd = self.read16(d.bus, d.dev, d.func, 4);
+        self.write16(d.bus, d.dev, d.func, 4, cmd | 0x2 | 0x400);
+    }
+
+    /// Stop the device: no DMA, no memory decoding, MSI-X off.  This alone
+    /// does not quiesce a device that has commands (blkd::reset does).
     pub fn disable(&self, d: &Device) {
         let cmd = self.read16(d.bus, d.dev, d.func, 4);
         self.write16(d.bus, d.dev, d.func, 4, (cmd & !0x6) | 0x400);

@@ -321,8 +321,8 @@ enum l4h_ctl_op {
 	L4H_CTL_CONSOLE_READ = 8,
 	/* args: vm, len; data: console input */
 	L4H_CTL_CONSOLE_WRITE = 9,
-	/* args: disk index -> vals: bdf, owner vm (or -1), -, kind (0 virtio-blk,
-	 * 1 NVMe) */
+	/* args: disk index -> vals: bdf, owner vm (or -1), failed (did not
+	 * reset: attaching it fails with EIO), kind (0 virtio-blk, 1 NVMe) */
 	L4H_CTL_DISK_INFO = 10,
 	/* -> vals[0] = switch */
 	L4H_CTL_SWITCH_CREATE = 11,

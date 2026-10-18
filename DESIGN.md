@@ -985,11 +985,40 @@ versioned structs defined in `l4h-abi`.
   console device page, which hvc polls.
 - **Reclaim.** Each guest's objects come from its arena: arena Untypeds,
   RAM chunks, quota and the arenas of its blkds. Root CNode slots allocated
-  on the guest's behalf are tracked. `vm_destroy` stops the attached devices'
-  DMA (clears PCI bus mastering), revokes those Untypeds, returns them to
-  the free pool and deletes the tracked slots. ASIDs are released by the
-  kernel when VSpaces die. Repeated create/destroy leaves free memory
-  unchanged (`tests/run-ctltest.sh`).
+  on the guest's behalf are tracked. `vm_destroy` first quiesces the
+  attached disks, then revokes those Untypeds, returns them to the free
+  pool and deletes the tracked slots. ASIDs are released by the kernel
+  when VSpaces die. Repeated create/destroy leaves free memory unchanged
+  (`tests/run-ctltest.sh`).
+- **Disk detach.** A disk is detached only when its guest is destroyed.
+  The device may hold commands that address the guest's RAM and blkd's
+  DMA memory (queues, PRP lists, request headers), so `l4h-root`:
+  1. suspends blkd, so that nothing more is submitted;
+  2. resets the device itself, through a mapping of its registers: NVMe
+     clears CC.EN and waits up to CAP.TO for CSTS.RDY to clear, which
+     aborts every command and deletes the queues; virtio-blk writes 0 to
+     `device_status` and waits until it reads back 0. Bus mastering stays
+     on meanwhile, so DMA the device finishes while resetting lands in
+     memory that still belongs to the guest;
+  3. clears bus mastering, memory decoding and MSI-X, and deletes the IRQ
+     handler;
+  4. only then reclaims blkd's arena and the guest's.
+
+  Clearing bus mastering alone is not a drain: a device can complete a
+  command it already started, and it keeps its queue addresses, which it
+  would use again when the next attach turns bus mastering back on. If a
+  device does not confirm the reset, it is marked failed and never enabled
+  again (`blk_attach` returns EIO, `l4hctl disks` says so). The guest's RAM
+  chunks and blkd's DMA memory are then kept out of the free pool for
+  good; their objects are still destroyed. Disks are also reset at boot,
+  with bus mastering off, before anything enables them, since firmware
+  may leave a controller running. There is no IOMMU (§8.2), so nothing
+  else confines a device.
+  `tests/run-ctltest.sh` destroys guests in the middle of throttled reads,
+  on virtio-blk and NVMe, and checks that the next guest, which reuses the
+  memory, sees no disk data appear in it. Before the reset was added, the
+  NVMe case wrote 1 MiB of disk data into the next guest, whose init then
+  crashed.
 
 **Policy and safety.**
 

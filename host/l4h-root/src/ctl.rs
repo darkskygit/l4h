@@ -12,6 +12,7 @@ use crate::{Host, MAX_GUESTS};
 
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
+pub const EIO: i64 = 5;
 pub const ENOMEM: i64 = 12;
 pub const EBUSY: i64 = 16;
 pub const EINVAL: i64 = 22;
@@ -63,6 +64,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             let p = &d.pci;
             resp.vals[0] = ((p.bus as u64) << 8) | ((p.dev as u64) << 3) | p.func as u64;
             resp.vals[1] = d.owner.map_or(u64::MAX, |o| o as u64);
+            resp.vals[2] = d.failed as u64;
             resp.vals[3] = d.kind as u64;
             Ok(())
         }
