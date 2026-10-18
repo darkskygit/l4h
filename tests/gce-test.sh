@@ -20,6 +20,8 @@ out=$root/build/gce; mkdir -p "$out"
 log=$out/$name.serial.log
 
 # ---- image
+"$root/tools/build-kernel.sh" >"$root/build/kernel-build.log" 2>&1 \
+    || { tail -20 "$root/build/kernel-build.log"; exit 1; }
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$out/vmlinux"
