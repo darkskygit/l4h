@@ -1043,8 +1043,7 @@ external orchestration can run in dom0.
    l4h drives these with its Rust blkd/netd drivers and serial monitor.
 2. **GCP.**
    - **Current target:** N2 with virtio-net and NVMe local SSDs. N2 boot
-     disks use virtio-scsi, which blkd drives as a legacy device (tested
-     under QEMU with `disable-modern=on`, not yet on GCE).
+     disks use virtio-scsi, which blkd drives as a legacy device.
    - **Future target:** third-generation and later types (C3, C3D, N4,
      C4), which require gVNIC. A gVNIC driver, potentially ported from
      Linux `gve`, is not implemented. NVMe already has a Rust driver.
@@ -1084,8 +1083,10 @@ external orchestration can run in dom0.
     port capability.
   - dom0's first vNIC takes the uplink NIC's MAC address, since the VPC
     only delivers frames for it.
-  - N2 boot disks are virtio-scsi. Before blkd supported it, only the
-    firmware and GRUB read them.
+  - N2 attaches the boot disk and SCSI persistent disks to one legacy
+    virtio-scsi controller without indirect descriptors, as targets 1, 2,
+    ... (LUN 0). Each is a host disk; `SCSI_DISK_GB=10 tests/gce-test.sh`
+    reads the boot disk and writes an extra blank one.
   - gVNIC, which C3 and later need, is not implemented.
 
 ---

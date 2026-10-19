@@ -41,7 +41,8 @@ l4hctl destroy "$vm"
 step disks
 n=$(l4hctl info | sed -n 's/^disks: *//p')
 for d in $(seq 0 $((n - 1))); do
-    l4hctl disks | grep -q "^disk $d:.*owner -" || continue
+    l4hctl disks > /tmp/disks
+    grep -q "^disk $d:.*owner -" /tmp/disks || continue
     vm=$(l4hctl create disk$d --kernel /vmlinux --initrd /disk.cpio.gz --mem 256 --disk $d) || { fail "disk $d guest"; continue; }
     l4hctl console "$vm" --until "reboot: Power down" --timeout 300 > /tmp/dt
     sleep 1; l4hctl console "$vm" | grep DISKTEST | sed "s/^/GCETEST: disk $d: /"

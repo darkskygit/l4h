@@ -3,10 +3,11 @@
 # dom0 (tests/guest/init-gce), import it, boot an instance with an NVMe
 # local SSD and a virtio-net NIC, and collect the results
 # from the serial port.  Creates, then deletes, an image, an instance and a
-# bucket object (KEEP=1 keeps the instance and image).  The boot disk is
-# only read by the firmware and GRUB: N2 attaches it with virtio-scsi,
-# which l4h does not drive; BOOT_DISK_INTERFACE=NVME (C3, N4, ...) makes it
-# a host disk too.
+# bucket object (KEEP=1 keeps the instance and image).  N2 attaches the
+# boot disk with virtio-scsi (BOOT_DISK_INTERFACE=NVME on C3, N4, ...): it
+# is a host disk, only read by the test since it has a GPT.
+# SCSI_DISK_GB=n adds a blank persistent disk of n GB on the same SCSI
+# controller, deleted with the instance, which the test writes.
 # Usage: gce-test.sh PROJECT [ZONE] [MACHINE_TYPE]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -57,6 +58,7 @@ gcloud compute images create "$name" --project="$project" \
 gcloud compute instances create "$name" --project="$project" --zone="$zone" \
     --machine-type="$machine" --image="$name" ${BOOT_DISK_INTERFACE:+--boot-disk-interface=$BOOT_DISK_INTERFACE} \
     --local-ssd=interface=NVME --network-interface=nic-type=VIRTIO_NET \
+    ${SCSI_DISK_GB:+--create-disk=size=${SCSI_DISK_GB}GB,type=pd-balanced,interface=SCSI,auto-delete=yes} \
     --metadata=serial-port-enable=TRUE --no-shielded-secure-boot --quiet
 
 # ---- results from the serial port
