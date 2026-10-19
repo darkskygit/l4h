@@ -432,7 +432,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
             d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
         );
-        if d.vendor == 0x1af4 {
+        if d.vendor == 0x1af4 || d.vendor == 0x1ae0 {
             let caps: Vec<u8> = d.virtio_caps.iter().map(|c| c.cfg_type).collect();
             let bars: Vec<_> = d.bars.iter().filter(|b| b.size != 0).map(|b| (b.addr, b.size, b.is_io)).collect();
             sel4::debug_println!(
@@ -454,7 +454,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             blkd::reset(&mut ctrl, &pci, &mut alloc, &mut devmem, &mut wins.a, info.tsc_hz / 1000);
             pci.disable(&ctrl.pci);
             ctrls.push(ctrl);
-        } else if netd::is_virtio_net(&d) {
+        } else if netd::is_uplink(&d) {
             pci.disable(&d);
             nics.push(d);
         }

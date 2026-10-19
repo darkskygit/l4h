@@ -38,6 +38,7 @@ pub struct Device {
     pub class: u8,
     pub subclass: u8,
     pub prog_if: u8,
+    pub revision: u8,
     pub bars: [Bar; 6],
     /// MSI-X capability: config offset, table BAR/offset, table size.
     pub msix: Option<Msix>,
@@ -302,6 +303,7 @@ impl Pci {
                         class: (class >> 24) as u8,
                         subclass: (class >> 16) as u8,
                         prog_if: (class >> 8) as u8,
+                        revision: class as u8,
                         bars,
                         msix,
                         virtio_caps,

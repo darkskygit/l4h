@@ -3,8 +3,9 @@
 # print the commands that import it and start a VM.  Nothing is uploaded.
 # Usage: gce-image.sh <disk.raw> [image-name]
 #
-# Supported machine shapes for now: N2/N2D/C2 etc. with
-#   --network-interface=nic-type=VIRTIO_NET   (gVNIC is not supported yet)
+# Supported machine shapes: N2/N2D/C2 etc. with
+#   --network-interface=nic-type=VIRTIO_NET, and C3/N4/C4 etc. with
+#   --network-interface=nic-type=GVNIC (DQO queue format)
 #   any boot disk interface; l4h passes virtio-scsi (N2 boot and persistent
 #   disks) and NVMe disks (local SSDs, NVMe persistent disks on C3/N4) through
 # Hardware virtualization is neither needed nor used.
@@ -24,7 +25,7 @@ To deploy (replace BUCKET, PROJECT and ZONE):
   gsutil cp $tarball gs://BUCKET/
   gcloud compute images create $name --project=PROJECT \\
       --source-uri=gs://BUCKET/$name.tar.gz \\
-      --guest-os-features=UEFI_COMPATIBLE
+      --guest-os-features=UEFI_COMPATIBLE,GVNIC
   gcloud compute instances create $name --project=PROJECT --zone=ZONE \\
       --machine-type=n2-standard-4 --image=$name \\
       --network-interface=nic-type=VIRTIO_NET \\

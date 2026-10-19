@@ -24,7 +24,7 @@ review decisions are recorded in §14. Future work is identified below;
 | R2 | x86_64 first, but friendly to aarch64. | Each layer is split into ISA-independent and ISA-specific parts (§11). seL4, rust-sel4 and sDDF already support aarch64. Nothing in the design relies on an x86-only mechanism such as segmentation, rings 1/2 or Xen-style page-table validation. |
 | R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a new paravirtual transport, `virtio-l4h`, with no trapped MMIO (§8). All device buffers use a host-owned I/O pool; the guest copies block data between its RAM and the pool, and the device DMAs into the pool (§15.1). For networking, the hypervisor provides **only L2 virtual switches**. A VM can have several vNICs, each on a switch, and a physical NIC is just an uplink port on a switch. Routing and NAT, when wanted, are done by a VM. |
 | R6 | A runtime management API, available to "dom0", the first guest started at boot. | `l4h-root` exposes a control API through a `l4hctl` paravirtual device that only dom0 receives (§9.1). dom0 has no device-driver duties. |
-| R7 | Targets: QEMU with virtio devices first, then GCP. | QEMU uses virtio-net-pci, virtio-blk-pci, virtio-scsi-pci and nvme. GCE N2 is tested with virtio-net and NVMe local SSDs; gen-3+ types (C3, N4, C4) need a future gVNIC driver (§10). |
+| R7 | Targets: QEMU with virtio devices first, then GCP. | QEMU uses virtio-net-pci, virtio-blk-pci, virtio-scsi-pci and nvme. GCE N2 is tested with virtio-net and C3 with gVNIC, both with NVMe local SSDs (§10). |
 | R4 | SMP guests. | Each guest vCPU is an seL4 kernel-context thread with its own scheduling context. IPIs are seL4 notifications (§6). |
 | R5 | Many guests per host, e.g. 30 guests on 4 CPUs. | seL4 MCS scheduling contexts give each vCPU a budget. Idle guests consume no CPU because the guest kernel is tickless and idle means blocked in `seL4_Recv`. A host balancer moves vCPUs between cores (§7). Each guest makes its kernel objects from its own RAM (§15). |
 
@@ -79,8 +79,8 @@ components and device drivers are written in Rust on rust-sel4.**
  │  │ l4h-blkd │  │ l4h-netd      │  switches and uplink NIC drivers           │
  │  └──┬───────┘  └──────┬────────┘                                            │
  │  ┌──▼───────────┐  ┌──▼───────────────┐                                     │
- │  │ NVMe /       │  │ virtio-net PCI  │                                     │
- │  │ virtio-blk   │  │ uplink NIC(s)   │                                     │
+ │  │ NVMe /       │  │ virtio-net /    │                                     │
+ │  │ virtio-blk   │  │ gVNIC uplinks   │                                     │
  │  └──────────────┘  └──────────────────┘                                     │
  └─────────────────────────────────────────────────────────────────────────────┘
    seL4 microkernel (MCS, SMP, x86_64), plus l4h extensions E1–E3 (§4)
@@ -88,8 +88,8 @@ components and device drivers are written in Rust on rust-sel4.**
 ```
 
 Each `l4h-blkd` drives one attached disk. `l4h-netd` combines all switches
-and uplink NIC drivers in one component. The drivers are Rust; gVNIC is
-future work.
+and uplink NIC drivers in one component. The drivers are Rust: virtio-net,
+and gVNIC after Linux `gve`.
 
 Trust: the seL4 kernel, `l4h-root`, `l4h-blkd` and `l4h-netd` form
 the host TCB. dom0 is trusted for control-plane decisions (§9.1) but cannot
@@ -853,8 +853,8 @@ NAT, DHCP and firewalling belong in a VM.
 
 - **Path.** Guest `virtio_net` → `l4h-vmm` → shared net port rings →
   `l4h-netd` → destination port or uplink NIC. netd combines all switches
-  and the virtio-net PCI drivers in one Rust component. It supports modern
-  and legacy virtio-net; gVNIC is future work (§10).
+  and the uplink NIC drivers in one Rust component: modern and legacy
+  virtio-net, and gVNIC (below).
 - **Multiple vNICs.** Each vNIC is on one switch and appears as a separate
   `ethN`. It shares the guest's limit of 16 devices with the console,
   disks and, in dom0, control device. There are 48 guest ports in all.
@@ -899,6 +899,25 @@ NAT, DHCP and firewalling belong in a VM.
   one GSO frame with a partial checksum. Segments without a checksum
   verdict from the device are verified first. A guest thus takes one
   frame per up to 44 segments; every frame costs wakeups on its way.
+- **gVNIC.** `l4h-netd/src/gvnic.rs` follows Linux `gve` with the DQO
+  queue format and raw DMA addressing (DQO RDA), which C3 and later offer;
+  a device without it (GQI formats only) makes netd panic. It
+  configures registers in BAR 0 through a big-endian admin queue and rings
+  little-endian doorbells in BAR 2. One TX queue (with its completion
+  queue) and one RX buffer queue (2 KiB buffers, with its completion
+  queue). As Linux, it configures a notification block per MSI-X entry
+  but the last; the TX and RX queues' blocks share netd's vector, and the
+  management vector stays masked. A DQO block masks itself when it fires;
+  netd re-arms the RX block after draining and the TX block only while
+  frames wait. Transmit: checksum offload and TSO (a context descriptor;
+  the TCP checksum field loses the length, as in `gve_prep_tso`), for
+  MSS 88–9728 and headers up to 255 bytes, else netd segments. Buffers are
+  freed by packet completions, or by reinjection completions after a miss
+  completion. Receive: the device's checksum verdict (with its packet type
+  map) becomes `DATA_VALID`, then GRO as for virtio-net; the device's own
+  coalescing (RSC) is off. On the revision 0 device of C3, releasing an
+  admin queue that is not registered makes the device reset itself about
+  a second later, so netd releases only a registered one.
 - **Learning and security.** MAC entries age after 300 s, with at most
   1024 per switch and 8192 in all. A full table drops expired entries and
   then stops learning; unknown unicast, broadcast and multicast are
@@ -945,12 +964,12 @@ the host keeps that dynamic plumbing simple.
 | `l4h-root` | 1 | Allocates guest RAM blocks, I/O pools, host objects and vCPU scheduling contexts. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's embedded images and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
-| `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and virtio-net PCI uplink drivers. |
+| `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net and gVNIC uplink drivers. |
 
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
 protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
 Serial output uses seL4's printing syscall; root drives COM1 input for the
-monitor. There is no separate serial virtualiser or gVNIC driver.
+monitor. There is no separate serial virtualiser.
 
 **Guest boot protocol.** The guest boots without firmware or a bootloader.
 Root parses dom0's embedded ELF. For runtime guests, the dom0 `l4hctl`
@@ -1102,20 +1121,18 @@ external orchestration can run in dom0.
    fast CPU. Devices: virtio-net-pci, virtio-blk-pci, nvme and a 16550 UART.
    l4h drives these with its Rust blkd/netd drivers and serial monitor.
 2. **GCP.**
-   - **Current target:** N2 with virtio-net and NVMe local SSDs. N2 boot
-     disks use virtio-scsi, which blkd drives as a legacy device.
-   - **Future target:** third-generation and later types (C3, C3D, N4,
-     C4), which require gVNIC. A gVNIC driver, potentially ported from
-     Linux `gve`, is not implemented. NVMe already has a Rust driver.
+   - **Targets:** N2 with virtio-net and NVMe local SSDs; N2 boot disks
+     use virtio-scsi, which blkd drives as a legacy device. Third-generation
+     and later types (C3, C3D, N4, C4) require gVNIC (netd's DQO driver)
+     and attach disks, the boot disk included, as NVMe.
    - **Boot:** a custom image with GRUB EFI and seL4. Secure Boot is off
      (Shielded VM vTPM and integrity monitoring are optional). The serial
      console is enabled for seL4 and monitor output.
    - **Timer:** E3 shares seL4's LAPIC timer (TSC-deadline where available,
      APIC countdown on N2), so there is no HPET dependency. Patch 0014
      stabilizes TSC/APIC calibration on N2 (§4).
-   - **Networking:** virtio-net is the uplink of a switch, and a router VM
-     (often dom0) owns the instance MAC (§8.3). A future gVNIC driver would
-     use the same topology.
+   - **Networking:** virtio-net or gVNIC is the uplink of a switch, and a
+     router VM (often dom0) owns the instance MAC (§8.3).
 3. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
    adding one NIC driver.
 
@@ -1134,10 +1151,13 @@ external orchestration can run in dom0.
   through the virtio-net uplink.
 - **Deployment.** `tools/gce-image.sh` packages the image as
   `disk.raw.tar.gz` and prints the `gcloud` import and instance commands
-  (N2, `nic-type=VIRTIO_NET`, `UEFI_COMPATIBLE`).
-- **Tested on GCE** (`tests/gce-test.sh`, n2-standard-4): UEFI boot,
-  DHCP and internet access through the NIC, a 4-vCPU guest self-test, a
-  local SSD (NVMe, 4 KiB blocks) passed through, 12 small guests.
+  (N2, `nic-type=VIRTIO_NET`; `nic-type=GVNIC` on C3 and later; image
+  features `UEFI_COMPATIBLE,GVNIC`).
+- **Tested on GCE** (`tests/gce-test.sh`, n2-standard-4 with virtio-net;
+  c3-standard-4-lssd with gVNIC, `BOOT_DISK_INTERFACE=NVME NIC_TYPE=GVNIC`):
+  UEFI boot, DHCP and internet access through the NIC, a 10 MB download
+  (about 96 MB/s on N2, 44 MB/s on C3), a 4-vCPU guest self-test, a local
+  SSD (NVMe, 4 KiB blocks) passed through, 12 small guests.
   - GCE's virtio-net is a legacy (0.9.5) device: registers in I/O BAR 0,
     no virtio capabilities. netd drives both kinds; root gives it the I/O
     port capability.
@@ -1147,7 +1167,8 @@ external orchestration can run in dom0.
     virtio-scsi controller without indirect descriptors, as targets 1, 2,
     ... (LUN 0). Each is a host disk; `SCSI_DISK_GB=10 tests/gce-test.sh`
     reads the boot disk and writes an extra blank one.
-  - gVNIC, which C3 and later need, is not implemented.
+  - C3's gVNIC is revision 0 (admin queue by page frame number) with DQO
+    RDA, 1024-entry rings, MTU 1460 and 9 MSI-X entries.
 
 ---
 
@@ -1307,7 +1328,7 @@ uses a 16 GiB QEMU machine and guests of 256–512 MiB.
 **Original milestones and gates.** These record the development plan,
 not a claim that every proposed gate or feature has been completed.
 M0–M6 have working v1 implementations, with the tests and limitations
-described above. M7 has reached N2; gVNIC remains. M8 includes AArch64 Linux/PCI support and virtqueue fuzzing; upcall
+described above. M7 has reached N2 and C3 (gVNIC). M8 includes AArch64 Linux/PCI support and virtqueue fuzzing; upcall
 injection and paravirtual spinlocks remain future work.
 
 1. **M0, platform.**

@@ -8,13 +8,21 @@
 # is a host disk, only read by the test since it has a GPT.
 # SCSI_DISK_GB=n adds a blank persistent disk of n GB on the same SCSI
 # controller, deleted with the instance, which the test writes.
+# NIC_TYPE=GVNIC gives the instance a gVNIC, which C3, N4 and C4 require.
+# "-lssd" machine types come with their local SSDs; LOCAL_SSD=0 asks for
+# none on others (N4 has none).
 # Usage: gce-test.sh PROJECT [ZONE] [MACHINE_TYPE]
+# e.g.   BOOT_DISK_INTERFACE=NVME NIC_TYPE=GVNIC gce-test.sh PROJECT us-west1-b c3-standard-4-lssd
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 project=$1
 zone=${2:-us-west1-b}
 machine=${3:-n2-standard-4}
 region=${zone%-*}
+nic=${NIC_TYPE:-VIRTIO_NET}
+ssd=--local-ssd=interface=NVME
+case "$machine" in *-lssd) ssd= ;; esac
+[ "${LOCAL_SSD:-1}" = 0 ] && ssd=
 name=l4h-test-$(date +%Y%m%d-%H%M%S)
 bucket=gs://$project-l4h-test
 out=$root/build/gce; mkdir -p "$out"
@@ -54,10 +62,10 @@ gcloud storage buckets describe "$bucket" --project="$project" >/dev/null 2>&1 \
 gcloud storage cp "$out/$name.tar.gz" "$bucket/" --project="$project" --quiet
 rm -f "$out/$name.tar.gz"
 gcloud compute images create "$name" --project="$project" \
-    --source-uri="$bucket/$name.tar.gz" --guest-os-features=UEFI_COMPATIBLE --quiet
+    --source-uri="$bucket/$name.tar.gz" --guest-os-features=UEFI_COMPATIBLE,GVNIC --quiet
 gcloud compute instances create "$name" --project="$project" --zone="$zone" \
     --machine-type="$machine" --image="$name" ${BOOT_DISK_INTERFACE:+--boot-disk-interface=$BOOT_DISK_INTERFACE} \
-    --local-ssd=interface=NVME --network-interface=nic-type=VIRTIO_NET \
+    $ssd --network-interface=nic-type="$nic" \
     ${SCSI_DISK_GB:+--create-disk=size=${SCSI_DISK_GB}GB,type=pd-balanced,interface=SCSI,auto-delete=yes} \
     --metadata=serial-port-enable=TRUE --no-shielded-secure-boot --quiet
 

@@ -1,8 +1,8 @@
 //! netd: L2 virtual switches (DESIGN.md §8.3) and the uplink NIC drivers.
 //!
 //! Every port belongs to one switch.  A port is either a guest vNIC (a
-//! channel to that guest's l4h-vmm) or an uplink NIC (virtio-net PCI,
-//! driven here).  Switches learn source MACs, forward known unicast to one
+//! channel to that guest's l4h-vmm) or an uplink NIC (virtio-net or gVNIC
+//! PCI, driven here).  Switches learn source MACs, forward known unicast to one
 //! port and flood everything else within the switch.  Guest ports can be
 //! locked to their configured MAC.  Nothing above L2 is looked at.
 
@@ -11,8 +11,10 @@
 
 extern crate alloc;
 
+mod gvnic;
 mod nic;
 mod offload;
+mod virtio_net;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
@@ -120,18 +122,18 @@ impl Netd {
         v
     }
 
-    /// Whether port `to` takes GSO frames whole.
-    fn takes_gso(&self, to: PortId) -> bool {
+    /// Whether port `to` takes this GSO frame whole.
+    fn takes_gso(&self, to: PortId, hdr: &[u8; net::HDR_SIZE]) -> bool {
         match to {
             PortId::Guest(i) => self.ports[i]
                 .as_ref()
                 .is_some_and(|p| unsafe { addr_of!((*p.chan).rx_gso).read_volatile() != 0 }),
-            PortId::Uplink(n) => self.nics[n].tso,
+            PortId::Uplink(n) => self.nics[n].takes_gso(hdr),
         }
     }
 
     fn deliver(&mut self, to: PortId, frame: &mut [u8], hdr: &mut [u8; net::HDR_SIZE]) {
-        if is_gso(hdr) && !self.takes_gso(to) {
+        if is_gso(hdr) && !self.takes_gso(to, hdr) {
             let mut buf = core::mem::take(&mut self.seg_buf);
             offload::segment(frame, hdr, &mut buf, |f, h| self.deliver_one(to, f, h));
             self.seg_buf = buf;
@@ -424,7 +426,7 @@ fn main(info: &'static Info) -> ! {
         backlog_total: 0,
     };
     for (n, c) in cfg.nics[..cfg.nr_nics as usize].iter().enumerate() {
-        d.nics.push(Nic::new(n, c));
+        d.nics.push(Nic::new(n, c, d.tsc_hz));
         d.gro.push(Some(offload::Gro::new()));
     }
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);

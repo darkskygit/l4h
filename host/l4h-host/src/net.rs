@@ -1,4 +1,5 @@
-//! netd: the L2 virtual switches and the uplink NIC drivers.
+//! netd: the L2 virtual switches and the uplink NIC drivers (virtio-net
+//! and Google gVNIC).
 //!
 //! A port channel is one shared region between netd and a client (a
 //! guest's l4h-vmm, one per virtio-net device) with a TX ring (client ->
@@ -95,9 +96,16 @@ pub const NETD_PORT_STATS: u64 = 4;
 /// MR0 = NIC -> MR0 = its MAC address (low 48 bits).
 pub const NETD_NIC_MAC: u64 = 5;
 
+/// NicConfig::kind.
+pub const NIC_VIRTIO: u32 = 0;
+pub const NIC_GVNIC: u32 = 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct NicConfig {
+    pub kind: u32,
+    /// PCI revision ID (gVNIC: 0 takes the admin queue by page frame).
+    pub revision: u32,
     pub pci_bdf: u32,
     pub msi_data: u32,
     pub msi_address: u64,
@@ -111,6 +119,9 @@ pub struct NicConfig {
     pub isr: crate::blk::PciRegion,
     pub device: crate::blk::PciRegion,
     pub msix_table: crate::blk::PciRegion,
+    /// gVNIC: register BAR 0 and doorbell BAR 2.
+    pub regs: crate::blk::PciRegion,
+    pub doorbells: crate::blk::PciRegion,
     pub dma_paddr: u64,
     pub dma_size: u64,
 }

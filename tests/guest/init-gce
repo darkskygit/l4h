@@ -26,6 +26,14 @@ if udhcpc -i eth0 -n -q -t 10 -s /bin/udhcpc.script >/dev/null 2>&1; then
     else
         fail "internet (DNS or NAT)"
     fi
+    t0=$(cut -d' ' -f1 /proc/uptime)
+    if wget -q -T 30 -O /tmp/big http://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.xz 2>/dev/null; then
+        t1=$(cut -d' ' -f1 /proc/uptime); bytes=$(wc -c < /tmp/big)
+        pass "download: $bytes bytes in $(awk "BEGIN { printf \"%.2f s, %.1f MB/s\", $t1 - $t0, $bytes / ($t1 - $t0 + 0.001) / 1e6 }")"
+    else
+        fail "download"
+    fi
+    rm -f /tmp/big
 else
     fail "DHCP"
 fi
