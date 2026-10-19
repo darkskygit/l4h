@@ -100,6 +100,10 @@ static void syscall_msg_to_gp(unsigned long *gp)
 	gp[HOST_SP] = seL4_GetMR(seL4_UnknownSyscall_SP);
 	gp[HOST_EFLAGS] = seL4_GetMR(seL4_UnknownSyscall_FLAGS);
 	gp[HOST_ORIG_AX] = gp[HOST_AX];
+	/* syscall left rip in rcx and rflags in r11; seL4 saves them only
+	 * as NextIP and FLAGS, so its RCX and R11 are stale. */
+	gp[HOST_CX] = gp[HOST_IP];
+	gp[HOST_R11] = gp[HOST_EFLAGS];
 }
 
 static void gp_to_syscall_msg(const unsigned long *gp)
@@ -240,7 +244,12 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 			info = seL4_ReplyRecv(v->ep, seL4_MessageInfo_new(0, 0, 0, 0), &badge, u->reply);
 
 #ifndef __aarch64__
-		} else if (u->stop == L4H_STOP_SYSCALL && !(u->regs_dirty & DIRTY_SEG)) {
+		} else if (u->stop == L4H_STOP_SYSCALL && !(u->regs_dirty & DIRTY_SEG) &&
+			   gp[HOST_CX] == gp[HOST_IP] && gp[HOST_R11] == gp[HOST_EFLAGS]) {
+			/* seL4 resumes a syscall stop with sysretq, which loads rcx
+			 * and r11 from rip and rflags: like Linux, only when they
+			 * match.  Otherwise (rt_sigreturn, ptrace, signal delivery)
+			 * write_regs() below forces a full restore. */
 			gp_to_syscall_msg(gp);
 			info = seL4_ReplyRecv(v->ep,
 					      seL4_MessageInfo_new(0, 0, 0, seL4_UnknownSyscall_Syscall),

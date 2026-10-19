@@ -618,6 +618,46 @@ static void test_signals_fpu(void)
 	signal(SIGUSR1, SIG_DFL);
 }
 
+#ifndef __aarch64__
+static void count_handler(int sig)
+{
+	sig_count++;
+}
+
+/*
+ * Every register survives a signal taken in the middle of user code.  The
+ * handler returns through rt_sigreturn, a syscall: resuming it with
+ * sysretq would load rcx and r11 from rip and rflags.
+ */
+static void test_signal_regs(void)
+{
+	struct itimerval it = { .it_interval = { 0, 1000 }, .it_value = { 0, 1000 } };
+	unsigned long rcx = 0x1111222233334444, r11 = 0x5555666677778888;
+	double t0 = now();
+
+	sig_count = 0;
+	signal(SIGALRM, count_handler);
+	setitimer(ITIMER_REAL, &it, NULL);
+	while (sig_count < 50 && now() - t0 < 5.0 &&
+	       rcx == 0x1111222233334444 && r11 == 0x5555666677778888) {
+		/* Spin with the values live; stop early if one changes. */
+		asm volatile("movq %[c], %%rcx\n\tmovq %[r], %%r11\n\tmovl $0x100000, %%eax\n"
+			     "1:\n\tcmpq %[c], %%rcx\n\tjne 2f\n\tcmpq %[r], %%r11\n\tjne 2f\n"
+			     "\tdecl %%eax\n\tjnz 1b\n"
+			     "2:\n\tmovq %%rcx, %[oc]\n\tmovq %%r11, %[or]"
+			     : [oc] "=m"(rcx), [or] "=m"(r11)
+			     : [c] "r"(0x1111222233334444ul), [r] "r"(0x5555666677778888ul)
+			     : "rax", "rcx", "r11", "cc");
+	}
+	memset(&it, 0, sizeof(it));
+	setitimer(ITIMER_REAL, &it, NULL);
+	signal(SIGALRM, SIG_DFL);
+	CHECK(rcx == 0x1111222233334444 && r11 == 0x5555666677778888,
+	      "after %d signals: rcx %#lx r11 %#lx", sig_count, rcx, r11);
+	CHECK(sig_count >= 50, "only %d signals in 5 s", sig_count);
+}
+#endif
+
 static void alarm_handler(int sig)
 {
 	sig_count = 1000;
@@ -1055,6 +1095,9 @@ static const struct test tests[] = {
 	{ "ptrace_syscall", test_ptrace_syscall },
 #endif
 	{ "signals_fpu", test_signals_fpu },
+#ifndef __aarch64__
+	{ "signal_regs", test_signal_regs },
+#endif
 	{ "timers", test_timers },
 	{ "syscall_restart", test_syscall_restart },
 	{ "threads", test_threads },
