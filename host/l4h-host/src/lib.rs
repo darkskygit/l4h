@@ -26,6 +26,9 @@ pub const IO_POOL_VA: usize = 0x4000_0000_0000;
 /// Component CSpace: one CNode of 2^CNODE_BITS slots resolving the whole
 /// CPtr, so a CPtr is simply a slot number.
 pub const CNODE_BITS: usize = 12;
+// blkd: every client's channel and "done" notification slot fit.
+const _: () = assert!(blk::CHANNEL_VA + blk::MAX_CLIENTS * blk::CHANNEL_STRIDE <= MMIO_VA);
+const _: () = assert!(blk::BLKD_SLOT_CLIENT_DONE as usize + blk::MAX_CLIENTS <= 1 << CNODE_BITS);
 pub const SLOT_CNODE: u64 = 1;
 pub const SLOT_VSPACE: u64 = 2;
 pub const SLOT_TCB: u64 = 3;

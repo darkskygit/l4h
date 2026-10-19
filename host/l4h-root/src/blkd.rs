@@ -181,6 +181,7 @@ pub struct Attachment {
     /// Host disk index.
     pub disk: usize,
     pub window: blk::DiskWindow,
+    pub read_only: bool,
 }
 
 struct Blkd {
@@ -321,7 +322,7 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 /// Attach a checked window of host disk `disk` to one client of its
 /// running shared controller.
 pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index: usize,
-    window: blk::DiskWindow, alloc: &mut Alloc) -> (usize, vmm::Backend) {
+    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc) -> (usize, vmm::Backend) {
     let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
     let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: Vec<cap::Granule> = (0..blk::CHANNEL_PAGES)
@@ -338,15 +339,15 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index:
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
-    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window });
+    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only });
     (i, vmm::Backend::Blk { chan, kick })
 }
 
 /// Publish root-owned client configuration, then activate the channel.
-pub fn activate(ctrl: &Controller, unit: u64, i: usize, client: &Guest, backend: &vmm::Backend,
-    read_only: bool, win: &mut Window) {
+pub fn activate(ctrl: &Controller, unit: u64, i: usize, client: &Guest, backend: &vmm::Backend, win: &mut Window) {
     let vmm::Backend::Blk { chan, .. } = backend else { unreachable!() };
     let a = ctrl.clients[i].as_ref().unwrap();
+    let read_only = a.read_only;
     win.with_frame(&abs_of(chan[0]), |p| unsafe {
         let c = p as *mut blk::Channel;
         core::ptr::addr_of_mut!((*c).capacity_sectors).write(a.window.sectors);

@@ -413,6 +413,7 @@ pub struct DiskAttachment {
     pub vm: u64,
     pub start: u64,
     pub sectors: u64,
+    pub read_only: bool,
 }
 
 impl Ctl {
@@ -430,7 +431,7 @@ impl Ctl {
             if r.vals[0] == 0 { return Ok(out); }
             if r.vals[0] <= first { return err("invalid attachment cursor"); }
             first = r.vals[0];
-            out.push(DiskAttachment { vm: r.vals[1], start: r.vals[2], sectors: r.vals[3] });
+            out.push(DiskAttachment { vm: r.vals[1], start: r.vals[2], sectors: r.vals[3], read_only: r.vals[4] != 0 });
         }
     }
 

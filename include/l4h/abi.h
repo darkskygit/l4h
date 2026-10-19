@@ -385,7 +385,7 @@ enum l4h_ctl_op {
      * Writes the control data buffer or zeros to an UNATTACHED range.
      * Sector and length must be 4 KiB aligned. */
     L4H_CTL_BLK_WRITE = 20,
-    /* disk, first attachment -> vals: next (0 = end), vm, start, sectors */
+    /* disk, first attachment -> vals: next (0 = end), vm, start, sectors, read-only */
     L4H_CTL_BLK_INFO = 21,
 };
 

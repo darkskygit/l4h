@@ -83,6 +83,9 @@ struct Pending {
 
 struct Blkd {
     clients: Vec<Option<Client>>,
+    /// Indices of the attached clients, in attach order: the submit loop
+    /// visits only these.
+    active: Vec<usize>,
     // Tags are allocated here, never taken from a client. Slots are not
     // reusable until the hardware has completed every command of a request.
     pending: Vec<Option<Pending>>,
@@ -143,9 +146,10 @@ impl Blkd {
         let mut started = false;
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
+        let n = self.active.len();
         for _round in 0..blk::RING_SIZE / 4 {
-            for off in 0..blk::MAX_CLIENTS {
-                let i = (self.next + off) % blk::MAX_CLIENTS;
+            for off in 0..n {
+                let i = self.active[(self.next + off) % n];
                 let Some(c) = self.clients[i].as_mut() else { continue };
                 for _ in 0..4 {
                     if !self.drv.can_start() { break; }
@@ -182,7 +186,7 @@ impl Blkd {
                 }
             }
         }
-        self.next = (self.next + 1) % blk::MAX_CLIENTS;
+        self.next = if n == 0 { 0 } else { (self.next + 1) % n };
         if started { self.drv.kick(); }
     }
 
@@ -199,6 +203,7 @@ impl Blkd {
             core::hint::spin_loop();
         }
         self.clients[i] = None;
+        self.active.retain(|&a| a != i);
         0
     }
 
@@ -246,6 +251,7 @@ fn main(info: &'static Info) -> ! {
     }
     let mut b = Blkd {
         clients: (0..blk::MAX_CLIENTS).map(|_| None).collect(),
+        active: Vec::with_capacity(blk::MAX_CLIENTS),
         pending: alloc::vec![None; 256],
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
     };
@@ -283,12 +289,15 @@ fn main(info: &'static Info) -> ! {
                         (addr_of!((*chan).lba_start).read_volatile(), addr_of!((*chan).capacity_sectors).read_volatile(),
                          addr_of!((*chan).read_only).read_volatile(), addr_of!((*chan).pool).read_volatile())
                     };
+                    let read_only = ro != 0 || dev.read_only;
                     match blk::DiskWindow::new(start, count, dev.capacity) {
-                        Some(window) if !b.clients.iter().flatten().any(|c| c.unit == unit && c.window.overlaps(window)) => {
-                            b.clients[i] = Some(Client { chan, unit, pool, window, read_only: ro != 0 || dev.read_only,
+                        Some(window) if !b.clients.iter().flatten()
+                            .any(|c| c.unit == unit && window.conflicts(read_only, c.window, c.read_only)) => {
+                            b.clients[i] = Some(Client { chan, unit, pool, window, read_only,
                                 done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0 });
+                            b.active.push(i);
                             unsafe {
-                                addr_of_mut!((*chan).read_only).write_volatile((ro != 0 || dev.read_only) as u32);
+                                addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
                                 addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
                                 fence(Ordering::Release);
                                 addr_of_mut!((*chan).ready).write_volatile(1);

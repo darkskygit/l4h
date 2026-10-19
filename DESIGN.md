@@ -758,21 +758,24 @@ for each device, with no trapped accesses:
   pool and are addressed by GPA (§15.1). `VIRTIO_F_ACCESS_PLATFORM` is
   required.
 
-### 8.2 Block, shared controllers and exclusive raw windows
+### 8.2 Block, shared controllers and raw windows
 
 A physical virtio-blk, virtio-scsi or NVMe PCI controller has one persistent blkd.
-`BLK_ATTACH` attaches a finite, 4 KiB aligned, non-overlapping LBA window
-to a guest before boot. Every window appears as a separate virtio-blk
+`BLK_ATTACH` attaches a finite, 4 KiB aligned LBA window to a guest before
+boot. A writable window overlaps no other window of its disk; read-only
+windows may overlap each other, so one seeded image can back many guests.
+Every window appears as a separate virtio-blk
 volume starting at sector zero. There is no image format, host filesystem,
 thin provisioning or copy-on-write.
 
 - Guest `virtio_blk` → l4h-vmm → per-client shared queue → blkd → device.
 - Each client has its own immutable pool/window/permission configuration,
-  channel and completion notification. The controller supports 64 clients.
+  channel and completion notification. The controller supports 512
+  clients; blkd's submit loop visits only attached ones.
 - Descriptor buffers must lie in that client's host-owned I/O pool. The
   driver translates pool GPAs to physical addresses; the device never sees
   guest RAM. Guest swiotlb performs the remaining payload copy.
-- l4h-root and blkd both enforce window exclusivity. Request validation uses
+- l4h-root and blkd both enforce the overlap rule (`DiskWindow::conflicts`). Request validation uses
   checked arithmetic and verifies block alignment, direction, permissions,
   operation and pool bounds. Hardware request tags are allocated by blkd,
   so identical IDs from different clients cannot collide.
@@ -802,11 +805,12 @@ thin provisioning or copy-on-write.
   retried. Indirect descriptors are used when offered; otherwise each
   command slot owns a fixed run of ring descriptors.
 - `DISK_INFO` additionally returns capacity and attachment count;
-  `BLK_INFO` enumerates `(vm, start, sectors)` with a cursor. The legacy
+  `BLK_INFO` enumerates `(vm, start, sectors, read-only)` with a cursor. The legacy
   owner field identifies the first attachment, or -1 when none exist.
 
 `tests/run-sharedblk.sh` checks concurrent clients, overlap and bounds
-rejection, provisioning exclusion, destroy during I/O, read-only windows,
+rejection, provisioning exclusion, destroy during I/O, read-only windows
+shared by several guests, more than 64 attachments of one disk,
 flush/readback and repeated reuse. Run it with virtio-blk, virtio-scsi (also
 with both disks as LUNs of one controller) and NVMe (512 and 4096 byte
 logical blocks). `tests/blk-windows.rs` exercises the production
@@ -1010,8 +1014,8 @@ external orchestration can run in dom0.
 **Policy and safety.**
 
 - `l4h-root` enforces resource accounting (memory, cores, disk ownership: a
-  backing is attached to at most one VM; v1 does not share read-only
-  backings either) and rejects
+  writable window is attached to at most one VM; read-only windows may be
+  shared) and rejects
   invalid requests. dom0 cannot breach host isolation, but it is fully trusted
   to decide *what* runs. In particular, dom0 can attach any disk to itself.
 - If dom0 crashes, the other guests keep running. `l4h-root` restarts dom0

@@ -47,6 +47,33 @@ for i in 1 2 3; do
     waitfor "$c" 'SHAREDVM: readonly ok'
     l4hctl destroy "$c" || fail destroy-reuse
 done
+# Read-only windows may share sectors (one system image, many guests);
+# a writable window may not overlap them, nor may provisioning.
+r1=$(create shared1 0,ro,start=2048,sectors=16384 A) || fail create-shared1
+r2=$(create shared2 0,ro,start=2048,sectors=16384 A) || fail create-shared2
+waitfor "$r1" 'SHAREDVM: readonly ok'
+waitfor "$r2" 'SHAREDVM: readonly ok'
+if create rwshared 0,start=2048,sectors=16384 A > /tmp/id 2>/tmp/err; then fail rw-over-ro; fi
+grep -q busy /tmp/err || { cat /tmp/err; fail rw-over-ro-error; }
+if l4hctl disk-write 0 2048 /tmp/a 2>/tmp/err; then fail provision-over-ro; fi
+grep -q busy /tmp/err || fail provision-over-ro-error
+echo "SHAREDBLK: read-only windows shared; writable overlap and provisioning refused"
+# More attachments than the old limit of 64: five guests with 14 views each.
+many=""
+disks=""
+for i in $(seq 14); do disks="$disks --disk 0,ro,start=2048,sectors=16384"; done
+for i in 1 2 3 4 5; do
+    id=$(l4hctl create "many$i" --kernel /bin/vmlinux --initrd /bin/sharedvm.cpio.gz --mem 128 $disks \
+        --cmdline "console=hvc0 quiet pattern=A") || fail "create-many$i"
+    many="$many $id"
+done
+l4hctl disks > /tmp/disks
+grep -q '^disk 0:.*attachments 72$' /tmp/disks || { cat /tmp/disks; fail attachment-count; }
+for id in $many; do waitfor "$id" 'SHAREDVM: readonly ok'; done
+for id in $many "$r1" "$r2"; do l4hctl destroy "$id" || fail destroy-many; done
+l4hctl disks > /tmp/disks
+grep -q '^disk 0:.*attachments 0$' /tmp/disks || { cat /tmp/disks; fail attachments-released; }
+echo "SHAREDBLK: 72 attachments of one disk"
 # Slow hardware retains more than five seconds of DMA work at destroy.
 # The controller must be quarantined and its I/O pool kept out of use.
 q=$(l4hctl create quarantine --kernel /bin/vmlinux --initrd /bin/sharedvm.cpio.gz --mem 128 \

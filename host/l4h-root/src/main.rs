@@ -316,7 +316,10 @@ impl Host {
         let (c, unit) = (self.disks[disk].ctrl, self.disks[disk].unit);
         let ctrl = &self.ctrls[c];
         let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, self.disks[disk].capacity).ok_or(ctl::EINVAL)?;
-        if ctrl.attachments(disk).any(|(_, a)| a.window.overlaps(window)) { return Err(ctl::EBUSY); }
+        let read_only = read_only || self.disks[disk].read_only;
+        if ctrl.attachments(disk).any(|(_, a)| window.conflicts(read_only, a.window, a.read_only)) {
+            return Err(ctl::EBUSY);
+        }
         if ctrl.clients.iter().all(Option::is_some) { return Err(ctl::ENOSPC); }
         if !self.can_afford(1 << 20, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
@@ -324,8 +327,8 @@ impl Host {
                 return Err(ctl::EBUSY);
             }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
-            let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, &mut h.alloc);
-            blkd::activate(&h.ctrls[c], unit, client, g, &backend, read_only, &mut h.wins.a);
+            let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, read_only, &mut h.alloc);
+            blkd::activate(&h.ctrls[c], unit, client, g, &backend, &mut h.wins.a);
             g.backends.push((d, backend));
             g.disks.push((c, client));
             Ok(())

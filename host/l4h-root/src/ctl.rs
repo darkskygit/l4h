@@ -87,7 +87,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             let disk = h.disks.get(a[0] as usize).ok_or(ENOENT)?;
             let first = usize::try_from(a[1]).map_err(|_| EINVAL)?;
             if let Some((i, att)) = h.ctrls[disk.ctrl].attachments(a[0] as usize).find(|&(i, _)| i >= first) {
-                resp.vals = [i as u64 + 1, att.vm as u64, att.window.start, att.window.sectors, 0, 0];
+                resp.vals = [i as u64 + 1, att.vm as u64, att.window.start, att.window.sectors, att.read_only as u64, 0];
             }
             Ok(())
         }

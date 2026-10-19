@@ -25,6 +25,26 @@ fn finite_aligned_nonoverlapping_windows() {
 }
 
 #[test]
+fn only_read_only_windows_share_sectors() {
+    let a = window();
+    let inside = DiskWindow::new(a.start + 8, 8, 131072).unwrap();
+    let after = DiskWindow::new(a.start + a.sectors, 8, 131072).unwrap();
+    assert!(!a.conflicts(true, a, true));
+    assert!(!a.conflicts(true, inside, true));
+    assert!(a.conflicts(false, a, true));
+    assert!(a.conflicts(true, inside, false));
+    assert!(a.conflicts(false, inside, false));
+    assert!(!a.conflicts(false, after, false));
+}
+
+#[test]
+fn channels_fit_their_stride() {
+    assert!(MAX_CLIENTS >= 512);
+    assert!(CHANNEL_PAGES * 4096 <= CHANNEL_STRIDE);
+    assert!(channel_va(MAX_CLIENTS - 1) + CHANNEL_STRIDE > channel_va(MAX_CLIENTS - 1));
+}
+
+#[test]
 fn request_bounds_include_last_block_and_reject_wraparound() {
     let mut r = request();
     assert_eq!(window().check_request(&r, pool(), 4096, false), Ok(2048));

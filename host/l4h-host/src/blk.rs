@@ -88,7 +88,9 @@ pub const BLKD_SLOT_IRQ: u64 = 16;
 pub const BLKD_SLOT_IOPORT: u64 = 17;
 /// Notification of the client, badged with its "done" bit.
 pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
-pub const MAX_CLIENTS: usize = 64;
+/// Attachments per disk: a node's sandboxes each take one or two windows of
+/// a disk, and read-only windows may be shared by many.
+pub const MAX_CLIENTS: usize = 512;
 pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
 pub const STAGING_SIZE: usize = 1 << 20;
 /// Service calls of blkd (message registers; the result is in MR 0).
@@ -111,8 +113,14 @@ pub const fn blkd_scsi_addr(target: u8, lun: u16) -> u64 {
     target as u64 | (lun as u64) << 8
 }
 
+/// Client channels have their own range: SHARED_VA holds other mappings
+/// (e.g. the console ring 8 MiB in).
+pub const CHANNEL_VA: usize = 0x2800_0000_0000;
+pub const CHANNEL_STRIDE: usize = 0x20000;
+const _: () = assert!(CHANNEL_PAGES * 4096 <= CHANNEL_STRIDE);
+
 pub const fn channel_va(client: usize) -> usize {
-    0x2000_0000_0000 + client * 0x20000
+    CHANNEL_VA + client * CHANNEL_STRIDE
 }
 
 /// A virtio-pci structure: BAR-relative location, mapped by l4h-root.
@@ -190,6 +198,13 @@ impl DiskWindow {
 
     pub fn overlaps(self, other: Self) -> bool {
         self.start < other.start + other.sectors && other.start < self.start + self.sectors
+    }
+
+    /// Whether a window may not be attached next to `other`: they overlap
+    /// and either can write. Read-only windows may share sectors, e.g. one
+    /// system image used by many guests.
+    pub fn conflicts(self, read_only: bool, other: Self, other_read_only: bool) -> bool {
+        self.overlaps(other) && !(read_only && other_read_only)
     }
 }
 
