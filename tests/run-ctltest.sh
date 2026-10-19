@@ -17,9 +17,11 @@ cp "$l4h_linux_out/vmlinux.stripped" "$out/ctlroot/vmlinux"
 rm -f "$out/ctl.img"
 mkfs.ext4 -q -F "$out/ctl.img" 32M
 # Disks 1 and 2: a byte pattern, read slowly (throttled) so that requests
-# are still in flight when their guest is destroyed.
+# are still in flight when their guest is destroyed.  The 4 MiB I/O pool
+# must drain within blkd's five-second detach deadline: 2 MiB/s leaves
+# room for throttling and scheduling delays.
 for i in 1 2; do head -c 32M /dev/zero | tr '\000' '\245' > "$out/dma$i.img"; done
-slow=throttling.bps-read=524288
+slow=throttling.bps-read=2097152
 # mkinitramfs copies extra files into /bin; move the payload to / in init.
 "$root/tools/mkinitramfs.sh" "$out/ctltest.cpio.gz" "$root/tests/guest/init-ctltest" \
     "$l4h_ctl" "$out/ctlroot/vmlinux" "$out/ctlroot/vm.cpio.gz" >/dev/null

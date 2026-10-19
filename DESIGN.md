@@ -448,7 +448,10 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   512). Each guest therefore gets a fixed pool of pre-assigned VSpace roots,
   and the guest kernel recycles them least recently used first. An mm that
   loses its VSpace simply refaults: every successful page fault installs
-  the PTE directly.
+  the PTE directly. When the last user exits, `arch_exit_mmap()` releases
+  its VSpace and page-table objects. Lazy `active_mm` references from idle
+  kernel threads and OOM bookkeeping can outlive `waitpid()`; they must
+  not retain those objects until `destroy_context()`.
 - **CSpace naming.** A CNode capability held directly in a root slot cannot
   be named by a 64-bit CPtr, because seL4 keeps resolving through it.
   Capabilities that must be named, such as the root CNode itself and user

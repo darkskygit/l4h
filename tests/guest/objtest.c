@@ -309,11 +309,12 @@ static void test_pressure(unsigned long span, const char *label)
  * see mmap fail), not hang or crash the guest. */
 static void test_oom(void)
 {
-	struct stats s;
+	struct stats before, s;
 	pid_t pid;
 	int st;
 
 	show("before OOM:");
+	read_stats(&before);
 	pid = fork();
 	if (pid == 0) {
 		/* Each 2 MiB of span costs a page table and a page; dense
@@ -330,7 +331,12 @@ static void test_oom(void)
 	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "hog status %#x", st);
 	read_stats(&s);
 	show("after OOM:");
-
+	/* waitpid() must release the victim's seL4 page tables even while
+	 * idle kernel threads or the OOM reaper still hold its mm.  Allow
+	 * room for permanent objects and partially occupied chunks. */
+	CHECK(s.used_kb <= before.used_kb + 4096,
+	      "OOM victim retained object memory after waitpid (%lu kB used, %lu before)",
+	      s.used_kb, before.used_kb);
 }
 
 static void test_mm_stress_during_conversions(unsigned long span)
