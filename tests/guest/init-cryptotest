@@ -1,0 +1,10 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
+/bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox dd if=/dev/zero of=/tmp/back bs=1M count=8 2>/dev/null
+/bin/busybox losetup /dev/loop0 /tmp/back
+args=$(/bin/busybox sed -n 's/.*cryptotest=\([^ ]*\).*/\1/p' /proc/cmdline | /bin/busybox tr , ' ')
+/bin/cryptotest $args
+/bin/busybox poweroff -f
