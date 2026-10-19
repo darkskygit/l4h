@@ -310,7 +310,20 @@ configuration on x86. aarch64 is the better long-term path to proof coverage.
 The UML host layer (`os-Linux`) is replaced by `os-sel4`, which is built
 against libsel4. The Kconfig keeps `CONFIG_UML` defined, so generic code
 treats l4h like UML (no hardware AVX paths, and so on). The tree is
-self-contained. Patches outside `arch/l4h` handle kbuild's UML-style UAPI
+self-contained.
+
+**Kernel-mode SIMD (x86_64).** Each vCPU's kTCB has its own seL4 FPU
+context, separate from every uTCB's, so kernel SIMD never sees or clobbers
+user state and `kernel_fpu_begin()` saves nothing. Its registers are shared
+only by the guest-kernel contexts on that vCPU: tasks switched with
+`setjmp`/`longjmp` (which keep no vector state) and the softirqs and
+interrupt handlers that the guest runs when it polls for events. So, as on
+x86, `kernel_fpu_begin()` disables bottom halves and preemption, sets a
+per-CPU busy flag that makes `irq_fpu_usable()` false, and loads the
+default MXCSR (`arch/l4h/x86/fpu.c`). CPU features come from CPUID masked
+by the XCR0 that seL4 sets (§4), and `cpu_has_xfeatures()` checks that XCR0.
+With this, `arch/x86/crypto` (AES-NI, VAES/AVX2 XTS for dm-crypt) is built
+for l4h (patch 0004 opens its Kconfig menu). Patches outside `arch/l4h` handle kbuild's UML-style UAPI
 headers and restricted DMA pools without a device tree (§15.1).
 
 ### 5.1 Layout in the Linux tree

@@ -166,6 +166,8 @@ void uml_finishsetup(void)
 }
 
 #ifdef CONFIG_UML_X86
+#include <asm/fpu/api.h>
+
 static void __init cpuid(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d)
 {
 	asm volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
@@ -191,6 +193,7 @@ static void __init l4h_mask_xsave_features(void)
 		asm volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 		xcr0 = lo | (u64)hi << 32;
 	}
+	l4h_xfeatures = xcr0;
 	if ((xcr0 & 0x6) != 0x6) {		/* SSE + AVX state */
 		cap[CPUID_1_ECX] &= ~(BIT(12) | BIT(28) | BIT(29));	/* FMA, AVX, F16C */
 		cap[CPUID_7_0_EBX] &= ~BIT(5);				/* AVX2 */

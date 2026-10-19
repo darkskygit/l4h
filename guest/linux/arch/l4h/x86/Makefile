@@ -3,7 +3,7 @@
 # Copyright (C) 2002 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
 #
 
-obj-y = bugs_64.o delay.o ptrace.o ptrace_64.o setjmp_64.o signal.o \
+obj-y = bugs_64.o delay.o fpu.o ptrace.o ptrace_64.o setjmp_64.o signal.o \
 	sys_call_table_64.o sysrq_64.o tls_64.o mem_64.o syscalls_64.o \
 	lib/ vdso/
 

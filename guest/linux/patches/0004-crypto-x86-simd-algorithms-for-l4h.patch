@@ -1,0 +1,6 @@
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -1445 +1445,2 @@
+-if X86
++# The l4h x86_64 guest has kernel-mode SIMD (arch/l4h/x86/fpu.c).
++if X86 || L4H_X86_SIMD
