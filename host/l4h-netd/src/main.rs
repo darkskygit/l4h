@@ -75,6 +75,8 @@ struct Switch {
 struct Netd {
     ports: Vec<Option<GuestPort>>,
     nics: Vec<Nic>,
+    /// Receive offload per NIC (taken out while it emits).
+    gro: Vec<Option<offload::Gro>>,
     switches: BTreeMap<u32, Switch>,
     tsc_hz: u64,
     /// Frame being switched.
@@ -145,6 +147,7 @@ impl Netd {
                 let rx_csum = unsafe { addr_of!((*p.chan).rx_csum).read_volatile() != 0 };
                 if !rx_csum {
                     complete_csum(frame, hdr);
+                    hdr[0] = 0;
                 }
                 // Behind a backlog, or no room: hold the frame (in order).
                 if p.backlog.is_empty() && rx_put(p.chan, frame, hdr) {
@@ -314,18 +317,43 @@ impl Netd {
         let mut frame = core::mem::take(&mut self.buf);
         self.nics[n].rx_begin();
         loop {
-            while let Some(len) = self.nics[n].receive(&mut frame) {
-                if self.nics[n].switch.is_some() {
-                    let mut hdr = [0u8; net::HDR_SIZE];
+            let mut hdr = [0u8; net::HDR_SIZE];
+            while let Some(len) = self.nics[n].receive(&mut frame, &mut hdr) {
+                if self.nics[n].switch.is_none() {
+                    continue;
+                }
+                if offload::sanitize_rx(&mut hdr, &frame[..len]) {
+                    // Merge TCP segments into one GSO frame where possible.
+                    if self.gro[n].as_mut().unwrap().add(&frame[..len], &hdr) {
+                        continue;
+                    }
+                    self.gro_flush(n);
+                    if self.gro[n].as_mut().unwrap().add(&frame[..len], &hdr) {
+                        continue;
+                    }
                     self.forward(PortId::Uplink(n), &mut frame[..len], &mut hdr);
+                } else if is_gso(&hdr) {
+                    // A large frame the device checked but did not leave
+                    // a partial checksum in: forward its segments.
+                    let mut buf = core::mem::take(&mut self.seg_buf);
+                    offload::segment(&frame[..len], &hdr, &mut buf, |f, h| self.forward(PortId::Uplink(n), f, h));
+                    self.seg_buf = buf;
                 }
             }
+            self.gro_flush(n);
             if self.nics[n].rx_done() {
                 break;
             }
         }
         self.buf = frame;
         self.nics[n].flush_tx();
+    }
+
+    /// Forward the TCP run NIC `n`'s receive offload has built.
+    fn gro_flush(&mut self, n: usize) {
+        let Some(mut g) = self.gro[n].take() else { return };
+        g.flush(|f, h| self.forward(PortId::Uplink(n), f, h));
+        self.gro[n] = Some(g);
     }
 
     fn signal_clients(&mut self) {
@@ -387,6 +415,7 @@ fn main(info: &'static Info) -> ! {
     let mut d = Netd {
         ports: (0..net::MAX_PORTS).map(|_| None).collect(),
         nics: Vec::new(),
+        gro: Vec::new(),
         switches: BTreeMap::new(),
         tsc_hz: info.header().tsc_hz,
         buf: alloc::vec![0u8; net::MAX_FRAME],
@@ -396,6 +425,7 @@ fn main(info: &'static Info) -> ! {
     };
     for (n, c) in cfg.nics[..cfg.nr_nics as usize].iter().enumerate() {
         d.nics.push(Nic::new(n, c));
+        d.gro.push(Some(offload::Gro::new()));
     }
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
@@ -418,6 +448,9 @@ fn main(info: &'static Info) -> ! {
                         .irq_handler_ack()
                         .expect("netd: IRQ ack");
                 }
+            }
+            for nic in &mut d.nics {
+                nic.kick_tx();
             }
             d.signal_clients();
             (msg, badge) = ep.recv(reply);

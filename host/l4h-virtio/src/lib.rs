@@ -281,6 +281,13 @@ impl Virtq {
         dma_fence(Ordering::SeqCst);
     }
 
+    /// Whether the device wants to hear of new buffers: it sets
+    /// VIRTQ_USED_F_NO_NOTIFY while it is processing the queue anyway.
+    pub fn wants_notify(&self) -> bool {
+        dma_fence(Ordering::SeqCst);
+        Mmio(self.used).r16(0) & 1 == 0
+    }
+
     pub fn has_used(&self) -> bool {
         dma_fence(Ordering::SeqCst);
         Mmio(self.used).r16(2) != self.last_used

@@ -13,18 +13,24 @@ use l4h_virtio::{
 };
 
 const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
+const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+const VIRTIO_NET_F_GUEST_TSO4: u64 = 1 << 7;
+const VIRTIO_NET_F_GUEST_TSO6: u64 = 1 << 8;
 const VIRTIO_NET_F_HOST_TSO4: u64 = 1 << 11;
 const VIRTIO_NET_F_HOST_TSO6: u64 = 1 << 12;
+const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
 /// struct virtio_net_hdr_v1; legacy devices use the first 10 bytes
 /// (struct virtio_net_hdr, without num_buffers).
 const HDR: usize = net::HDR_SIZE;
 const LEGACY_HDR: usize = 10;
-/// Receive buffers: MTU frames (no receive offloads).
-const RX_BUF: usize = 2048;
+/// Receive buffers.  With receive TSO, a frame of up to 64 KiB spans
+/// several (MRG_RXBUF): one frame per 40 MTU segments is what makes
+/// downloads fast, as every frame costs wakeups on its way to the guest.
+const RX_BUF: usize = 4096;
 /// Transmit buffers: whole TSO frames.
 const TX_BUF: usize = HDR + net::MAX_FRAME;
-const RX_QUEUE: u16 = 128;
+const RX_QUEUE: u16 = 256;
 const TX_BUFS: u16 = 24;
 /// Frames waiting for a TX buffer (rather than dropped), and their bytes.
 const TX_BACKLOG_FRAMES: usize = 512;
@@ -36,6 +42,8 @@ pub struct Nic {
     /// The device takes NEEDS_CSUM frames / TSO frames.
     pub csum: bool,
     pub tso: bool,
+    /// Received frames may span several buffers (num_buffers).
+    mrg: bool,
     /// Legacy devices are notified through I/O ports.
     ports: Option<Ports>,
     /// Bytes of virtio-net header in front of each frame.
@@ -48,13 +56,20 @@ pub struct Nic {
     tx_backlog: VecDeque<(Vec<u8>, [u8; HDR])>,
     tx_backlog_bytes: usize,
     pub tx_drops: u64,
+    /// Buffers were given to the device, which has not been notified.
+    rx_kick: bool,
+    tx_kick: bool,
 }
 
 /// Features this driver uses, of those the device offers.
 fn wanted(offered: u64) -> u64 {
-    let mut want = offered & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_CSUM);
+    let mut want = offered & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_CSUM | VIRTIO_NET_F_GUEST_CSUM | VIRTIO_NET_F_MRG_RXBUF);
     if want & VIRTIO_NET_F_CSUM != 0 {
         want |= offered & (VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6);
+    }
+    // Large received frames only into mergeable buffers.
+    if want & (VIRTIO_NET_F_GUEST_CSUM | VIRTIO_NET_F_MRG_RXBUF) == VIRTIO_NET_F_GUEST_CSUM | VIRTIO_NET_F_MRG_RXBUF {
+        want |= offered & (VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6);
     }
     want
 }
@@ -100,7 +115,8 @@ impl Nic {
             };
             let (rxq, txq) = (queue(0), queue(1));
             let mac: [u8; 6] = core::array::from_fn(|i| p.in8(legacy::DEVICE_CONFIG + i as u16));
-            (rxq, txq, want, mac, Some(p), LEGACY_HDR)
+            // A legacy header has num_buffers only with MRG_RXBUF.
+            (rxq, txq, want, mac, Some(p), if want & VIRTIO_NET_F_MRG_RXBUF != 0 { HDR } else { LEGACY_HDR })
         } else {
             let dev = modern_device(c);
             dev.reset();
@@ -127,6 +143,7 @@ impl Nic {
             mac,
             csum: want & VIRTIO_NET_F_CSUM != 0,
             tso: want & (VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6) == (VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6),
+            mrg: want & VIRTIO_NET_F_MRG_RXBUF != 0,
             ports,
             hdr_len,
             rxq,
@@ -137,6 +154,8 @@ impl Nic {
             tx_backlog: VecDeque::new(),
             tx_backlog_bytes: 0,
             tx_drops: 0,
+            rx_kick: false,
+            tx_kick: false,
         };
         match &nic.ports {
             Some(p) => p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK),
@@ -147,15 +166,24 @@ impl Nic {
         nic.txq.set_interrupts(false);
         nic.kick(&nic.rxq);
         sel4::debug_println!(
-            "netd: NIC {}: {:02x}:{:02x}.{} {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            "netd: NIC {}: {:02x}:{:02x}.{} {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, offloads tx{}{} rx{}{}{}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7,
             if nic.ports.is_some() { "legacy" } else { "modern" },
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            if nic.csum { " csum" } else { "" }, if nic.tso { " tso" } else { "" },
+            if want & VIRTIO_NET_F_GUEST_CSUM != 0 { " csum" } else { "" },
+            if want & (VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_GUEST_TSO6) != 0 { " tso" } else { "" },
+            if nic.mrg { " mrg" } else { "" },
         );
         nic
     }
 
     fn kick(&self, q: &Virtq) {
+        // A notification is a VM exit; skip it while the device is busy
+        // with the queue anyway.
+        if !q.wants_notify() {
+            return;
+        }
         q.notify();
         if let Some(p) = &self.ports {
             p.out16(legacy::QUEUE_NOTIFY, q.idx);
@@ -168,8 +196,12 @@ impl Nic {
     }
 
     /// RX interrupts on again; false if frames arrived meanwhile, which the
-    /// caller drains (interrupts off again).
-    pub fn rx_done(&self) -> bool {
+    /// caller drains (interrupts off again).  Returns buffers to the device
+    /// with one notification per batch.
+    pub fn rx_done(&mut self) -> bool {
+        if core::mem::take(&mut self.rx_kick) {
+            self.kick(&self.rxq);
+        }
         self.rxq.set_interrupts(true);
         if self.rxq.has_used() {
             self.rxq.set_interrupts(false);
@@ -178,19 +210,38 @@ impl Nic {
         true
     }
 
-    /// Next received frame, copied to `out`; returns its length.
-    pub fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
+    /// Next received frame, copied to `out` with the device's header in
+    /// `hdr` (num_buffers cleared); returns its length.
+    pub fn receive(&mut self, out: &mut [u8], hdr: &mut [u8; HDR]) -> Option<usize> {
         let hl = self.hdr_len;
         loop {
             let (id, len) = self.rxq.pop_used()?;
             let Some(&(va, _)) = self.rx_bufs.get(id as usize) else { continue };
-            let len = len as usize;
-            let n = len.saturating_sub(hl).min(out.len());
+            let len = (len as usize).min(RX_BUF);
+            *hdr = [0; HDR];
+            unsafe { core::ptr::copy_nonoverlapping(va as *const u8, hdr.as_mut_ptr(), hl.min(len)) };
+            let bufs = if self.mrg { u16::from_le_bytes([hdr[10], hdr[11]]) as usize } else { 1 };
+            hdr[10] = 0;
+            hdr[11] = 0;
+            let mut n = len.saturating_sub(hl).min(out.len());
             unsafe { core::ptr::copy_nonoverlapping((va + hl) as *const u8, out.as_mut_ptr(), n) };
             // Give the buffer back to the device.
             self.rxq.submit(id as u16);
-            self.kick(&self.rxq);
-            if len > hl {
+            let mut whole = len > hl && bufs >= 1;
+            // The rest of a frame that spans buffers: the device makes them
+            // all used at once.
+            for _ in 1..bufs {
+                let Some((id, len)) = self.rxq.pop_used() else { whole = false; break };
+                let Some(&(va, _)) = self.rx_bufs.get(id as usize) else { whole = false; continue };
+                let len = (len as usize).min(RX_BUF);
+                let m = len.min(out.len() - n);
+                unsafe { core::ptr::copy_nonoverlapping(va as *const u8, out.as_mut_ptr().add(n), m) };
+                whole &= m == len;
+                n += m;
+                self.rxq.submit(id as u16);
+            }
+            self.rx_kick = true;
+            if whole {
                 return Some(n);
             }
         }
@@ -247,6 +298,10 @@ impl Nic {
         if self.tx_free.is_empty() {
             self.reap_tx();
         }
+        if self.tx_free.is_empty() {
+            // Let the device start on what is queued.
+            self.kick_tx();
+        }
         let Some(i) = self.tx_free.pop() else { return false };
         let (va, pa) = self.tx_bufs[i as usize];
         unsafe {
@@ -259,7 +314,15 @@ impl Nic {
         }
         self.txq.set_desc(i, pa, (hl + frame.len()) as u32, 0, 0);
         self.txq.submit(i);
-        self.kick(&self.txq);
+        self.tx_kick = true;
         true
+    }
+
+    /// Notify the device of the frames submitted since the last call: once
+    /// per batch, not per frame.
+    pub fn kick_tx(&mut self) {
+        if core::mem::take(&mut self.tx_kick) {
+            self.kick(&self.txq);
+        }
     }
 }

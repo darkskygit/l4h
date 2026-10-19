@@ -885,10 +885,20 @@ NAT, DHCP and firewalling belong in a VM.
   costs nobody else. Dropping instead cost a TCP retransmission timeout
   per burst: downloads over the QEMU uplink ran at about 3.5 MB/s, now
   about 40 MB/s on the nested dev box.
-- **NIC interrupts.** netd turns RX interrupts off while it drains the
-  NIC's queue (re-checking after turning them on) and takes TX
-  interrupts only while frames wait for a TX buffer. Each interrupt is a
-  VM exit, which is costly when nested.
+- **NIC interrupts and notifications.** netd turns RX interrupts off while
+  it drains the NIC's queue (re-checking after turning them on) and takes
+  TX interrupts only while frames wait for a TX buffer. It notifies the
+  device once per batch, not per frame, and not while the device says it
+  is busy with the queue (`VIRTQ_USED_F_NO_NOTIFY`). Each interrupt and
+  notification is a VM exit, costly when nested.
+- **Receive offloads.** netd's NIC driver negotiates `GUEST_CSUM` and,
+  with mergeable RX buffers (`MRG_RXBUF`, 256 × 4 KiB), `GUEST_TSO4/6`,
+  so a device that has large frames delivers them whole. Frames from the
+  uplink then pass GRO (`offload::Gro`): consecutive full-size segments
+  of one TCP flow, merged only where Linux's GRO would merge them, become
+  one GSO frame with a partial checksum. Segments without a checksum
+  verdict from the device are verified first. A guest thus takes one
+  frame per up to 44 segments; every frame costs wakeups on its way.
 - **Learning and security.** MAC entries age after 300 s, with at most
   1024 per switch and 8192 in all. A full table drops expired entries and
   then stops learning; unknown unicast, broadcast and multicast are
@@ -900,7 +910,9 @@ NAT, DHCP and firewalling belong in a VM.
   address. dom0's first vNIC takes the uplink NIC's MAC by default. The
   router's other vNICs join internal switches and Linux provides NAT or
   routing. QEMU guests can also sit directly on the uplink switch.
-- **Tests.** `tests/run-nettest.sh` covers DHCP and ping over the QEMU
+- **Tests.** `tests/fuzz-virtq` checks that GRO output segments back into
+  exactly the frames that went in, and that corrupted or other-flow
+  segments do not merge. `tests/run-nettest.sh` covers DHCP and ping over the QEMU
   uplink, internal switches, multiple vNICs, isolation and MAC lock.
   `tests/run-router.sh` uses a Debian router with nftables masquerade to
   connect an internal guest to the outside.
@@ -1255,7 +1267,8 @@ Figures dominated by exits are therefore pessimistic here.
 | disk, 4 KiB read latency | ~200 µs | Two cross-core wakeups: guest → VMM → blkd and back. |
 | guest↔guest ping | 1.4 ms | Four component hops per direction, with cross-core wakeups. |
 | guest↔guest TCP | ~30 MB/s | Limited per frame (~140 µs, i.e. wakeups), not by copying. Checksum offload and TSO pass through the switch. |
-| uplink download (QEMU user net) | ~40 MB/s | 64 MiB in 1.6 s; a plain Linux VM on the same QEMU does ~470 MB/s. Was ~3.5 MB/s while full RX rings dropped frames (§8.3). |
+| dom0 ↔ host over a tap NIC (vhost) | 380–620 MB/s down, 410–490 MB/s up | 256 MiB with wget / a 256 KiB-write sender. A plain Linux VM on the same QEMU: 0.5–1.3 GB/s. Was 26 MB/s down before GRO and batched notifications (§8.3), 3.5 MB/s while full RX rings dropped frames. |
+| dom0 ↔ host over QEMU user net | ~165 MB/s down, ~37 MB/s up | QEMU's user networking caps a plain Linux VM at ~440 / ~84 MB/s; it takes no TSO, so netd segments uploads in software. |
 
 Next steps for I/O latency:
 - place each guest's VMM, blkd and netd work on the guest's core, or use

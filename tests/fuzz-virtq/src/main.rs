@@ -182,7 +182,9 @@ fn main() {
     let segs = pool_check(&mut rng, iterations * 4);
     println!("fuzz-virtq: blk-mux pool check: {} segments, {segs} accepted", iterations * 4);
     let segs = offload_check(&mut rng, iterations / 4);
+    let merged = gro_check(&mut rng, iterations / 20);
     println!("fuzz-virtq: offload: {} frames, {segs} segments checked", iterations / 4);
+    println!("fuzz-virtq: GRO: {} streams, {merged} merged frames segment back exactly", iterations / 20);
     let (reqs, bad) = blkcheck::drain_check(&mut rng, iterations / 20);
     println!("fuzz-virtq: blk: {} resets, {reqs} requests drained, {bad} chains outside the pool refused", iterations / 20);
 }
@@ -380,4 +382,73 @@ fn offload_check(rng: &mut Rng, n: u64) -> u64 {
         segs += count;
     }
     segs
+}
+
+/// netd's receive offload: a stream of segments (as a TSO sender's NIC
+/// would cut them) merges into GSO frames that segment back into exactly
+/// the same frames; a corrupted segment passes alone and unchanged; a
+/// segment of another flow ends the run.
+fn gro_check(rng: &mut Rng, n: u64) -> u64 {
+    let mut buf = vec![0u8; 70000];
+    let mut gro = offload::Gro::new();
+    let mut merged = 0u64;
+    for _ in 0..n {
+        let v6 = rng.below(2) == 0;
+        let mss = 500 + rng.below(1000) as usize;
+        let payload = 1 + rng.below(60000) as usize;
+        let vlan = rng.below(4) == 0;
+        let (mut frame, mut hdr) = tcp_frame(rng, v6, vlan, payload, mss);
+        let t = offload::parse_tcp(&frame).unwrap();
+        frame[t.tcp + 13] = if rng.below(2) == 0 { 0x10 } else { 0x18 };
+        assert!(offload::sanitize(&mut hdr, &frame));
+        let mut segs: Vec<Vec<u8>> = Vec::new();
+        offload::segment(&frame, &hdr, &mut buf, |f, _| segs.push(f.to_vec()));
+        // As received: no flags (checked here), or DATA_VALID.
+        let mut rx = [0u8; 12];
+        if rng.below(2) == 0 {
+            rx[0] = offload::F_DATA_VALID;
+        }
+        let bad = if rx[0] == 0 && rng.below(4) == 0 { Some(rng.below(segs.len() as u64) as usize) } else { None };
+        let mut input = segs.clone();
+        if let Some(b) = bad {
+            let l = input[b].len();
+            input[b][l - 1] ^= 0x55;
+        }
+        let mut out: Vec<(Vec<u8>, [u8; 12])> = Vec::new();
+        for f in &input {
+            if !gro.add(f, &rx) {
+                gro.flush(|f, h| out.push((f.to_vec(), *h)));
+                if !gro.add(f, &rx) {
+                    out.push((f.clone(), rx));
+                }
+            }
+        }
+        gro.flush(|f, h| out.push((f.to_vec(), *h)));
+        // Segment what came out again: the original stream, but for the
+        // corrupted frame, which must have passed unchanged.
+        let mut again: Vec<Vec<u8>> = Vec::new();
+        for (f, h) in &out {
+            if offload::is_gso(h) {
+                let mut h2 = *h;
+                assert!(offload::sanitize(&mut h2, f), "merged frame does not sanitize");
+                offload::segment(f, &h2, &mut buf, |s, _| again.push(s.to_vec()));
+                merged += 1;
+            } else {
+                again.push(f.clone());
+            }
+        }
+        assert_eq!(again.len(), segs.len());
+        for (i, (a, b)) in again.iter().zip(input.iter()).enumerate() {
+            assert_eq!(a, b, "segment {i} of {} differs after GRO (corrupted {:?})", segs.len(), bad);
+        }
+        // Another flow (other ports) does not merge into a run.
+        let mut other = segs[0].clone();
+        other[t.tcp] ^= 1;
+        if segs.len() > 1 && bad.is_none() && rx[0] != 0 {
+            assert!(gro.add(&segs[0], &rx));
+            assert!(!gro.add(&other, &rx), "frames of two flows merged");
+            gro.flush(|_, _| {});
+        }
+    }
+    merged
 }

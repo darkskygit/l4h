@@ -93,6 +93,23 @@ pub fn sanitize(hdr: &mut [u8; HDR_SIZE], frame: &[u8]) -> bool {
     }
 }
 
+pub const F_DATA_VALID: u8 = 2;
+
+/// Check and normalise the header the uplink device sent with `frame`:
+/// as `sanitize`, but DATA_VALID (the device checked the checksum) is
+/// kept.  A GSO frame without NEEDS_CSUM fails here (guests refuse it);
+/// the caller segments it instead.
+pub fn sanitize_rx(hdr: &mut [u8; HDR_SIZE], frame: &[u8]) -> bool {
+    let valid = hdr[0] & F_DATA_VALID;
+    if !sanitize(hdr, frame) {
+        return false;
+    }
+    if hdr[0] & F_NEEDS_CSUM == 0 {
+        hdr[0] |= valid;
+    }
+    true
+}
+
 pub fn is_gso(hdr: &[u8; HDR_SIZE]) -> bool {
     hdr[1] != GSO_NONE
 }
@@ -190,5 +207,169 @@ pub fn segment(frame: &[u8], hdr: &[u8; HDR_SIZE], buf: &mut [u8], mut emit: imp
         out[f.tcp + 16..f.tcp + 18].copy_from_slice(&c.to_be_bytes());
         let mut h = [0u8; HDR_SIZE];
         emit(out, &mut h);
+    }
+}
+
+/// Whether a received TCP segment's checksum is known good: the device
+/// says so (DATA_VALID), will not need it (NEEDS_CSUM: a partial checksum
+/// from a local sender), or it checks out here.
+fn csum_ok(frame: &[u8], hdr: &[u8; HDR_SIZE], f: &TcpFrame) -> bool {
+    if hdr[0] & (F_NEEDS_CSUM | F_DATA_VALID) != 0 {
+        return true;
+    }
+    if !f.v6 && fold(sum(0, &frame[f.ip..f.tcp])) != 0xffff {
+        return false;
+    }
+    fold(sum(pseudo(frame, f, frame.len() - f.tcp), &frame[f.tcp..])) == 0xffff
+}
+
+/// Ones' complement sum of the TCP pseudo header for `tcp_len` bytes.
+fn pseudo(frame: &[u8], f: &TcpFrame, tcp_len: usize) -> u32 {
+    let s = if f.v6 { sum(0, &frame[f.ip + 8..f.ip + 40]) } else { sum(0, &frame[f.ip + 12..f.ip + 20]) };
+    sum(s, &[0, 6]) + tcp_len as u32
+}
+
+/// Receive offload (GRO) for frames from an uplink: consecutive full-size
+/// TCP segments of one flow become one GSO frame (NEEDS_CSUM, gso_size =
+/// the segment size), so a guest takes one frame instead of up to 44.
+/// Segments merge only where Linux's GRO would merge them, and a frame
+/// on its own passes unchanged.
+pub struct Gro {
+    buf: alloc::vec::Vec<u8>,
+    len: usize,
+    hdr: [u8; HDR_SIZE],
+    f: Option<TcpFrame>,
+    segs: usize,
+    mss: usize,
+    next_seq: u32,
+    /// A short segment or PSH ended the run.
+    closed: bool,
+}
+
+/// Largest merged frame: IPv4's 64 KiB total length.
+const GRO_MAX: usize = 65535;
+
+impl Gro {
+    pub fn new() -> Self {
+        Gro { buf: alloc::vec![0; 14 + 4 + GRO_MAX], len: 0, hdr: [0; HDR_SIZE], f: None, segs: 0, mss: 0, next_seq: 0, closed: false }
+    }
+
+    /// A segment that may merge: TCP with payload, only ACK/PSH set, no IP
+    /// options or fragments, lengths that match the frame, a good checksum.
+    fn candidate(frame: &[u8], hdr: &[u8; HDR_SIZE]) -> Option<(TcpFrame, usize)> {
+        if is_gso(hdr) {
+            return None;
+        }
+        let f = parse_tcp(frame)?;
+        if f.v6 {
+            if f.ip + 40 + u16::from_be_bytes([frame[f.ip + 4], frame[f.ip + 5]]) as usize != frame.len() {
+                return None;
+            }
+        } else {
+            let total = u16::from_be_bytes([frame[f.ip + 2], frame[f.ip + 3]]) as usize;
+            let frag = u16::from_be_bytes([frame[f.ip + 6], frame[f.ip + 7]]);
+            // Ethernet pads short frames: the IP length is the truth.
+            if f.tcp != f.ip + 20 || frag & 0x3fff != 0 || f.ip + total > frame.len() || f.ip + total <= f.hdrs {
+                return None;
+            }
+        }
+        let flags = frame[f.tcp + 13];
+        if flags & !0x08 != 0x10 {
+            return None;
+        }
+        let end = if f.v6 { frame.len() } else { f.ip + u16::from_be_bytes([frame[f.ip + 2], frame[f.ip + 3]]) as usize };
+        if end <= f.hdrs || !csum_ok(&frame[..end], hdr, &f) {
+            return None;
+        }
+        Some((f, end))
+    }
+
+    /// Whether `frame` continues the run being built.
+    fn continues(&self, frame: &[u8], f: &TcpFrame, payload: usize) -> bool {
+        let Some(p) = self.f else { return false };
+        let b = &self.buf;
+        let seq = u32::from_be_bytes(frame[f.tcp + 4..f.tcp + 8].try_into().unwrap());
+        !self.closed
+            && p.hdrs == f.hdrs && p.tcp == f.tcp && p.ip == f.ip && p.v6 == f.v6
+            && payload <= self.mss
+            && self.len + payload <= p.ip + GRO_MAX
+            && seq == self.next_seq
+            // Ethernet header; IP header but lengths, IPv4 id and checksum.
+            && b[..p.ip] == frame[..f.ip]
+            && if f.v6 {
+                b[p.ip..p.ip + 4] == frame[f.ip..f.ip + 4] && b[p.ip + 6..p.tcp] == frame[f.ip + 6..f.tcp]
+            } else {
+                b[p.ip..p.ip + 2] == frame[f.ip..f.ip + 2] && b[p.ip + 6..p.ip + 10] == frame[f.ip + 6..f.ip + 10]
+                    && b[p.ip + 12..p.tcp] == frame[f.ip + 12..f.tcp]
+            }
+            // Ports; ACK number; window; options.
+            && b[p.tcp..p.tcp + 4] == frame[f.tcp..f.tcp + 4]
+            && b[p.tcp + 8..p.tcp + 12] == frame[f.tcp + 8..f.tcp + 12]
+            && b[p.tcp + 14..p.tcp + 16] == frame[f.tcp + 14..f.tcp + 16]
+            && b[p.tcp + 20..p.hdrs] == frame[f.tcp + 20..f.hdrs]
+    }
+
+    /// Take `frame` into the run (merging or starting one): true.  False
+    /// if it cannot merge; the caller then flushes and forwards it as is.
+    pub fn add(&mut self, frame: &[u8], hdr: &[u8; HDR_SIZE]) -> bool {
+        let Some((f, end)) = Self::candidate(frame, hdr) else { return false };
+        let payload = end - f.hdrs;
+        let seq = u32::from_be_bytes(frame[f.tcp + 4..f.tcp + 8].try_into().unwrap());
+        let push = frame[f.tcp + 13] & 0x08 != 0;
+        if self.f.is_none() {
+            self.buf[..end].copy_from_slice(&frame[..end]);
+            self.len = end;
+            self.hdr = *hdr;
+            self.f = Some(f);
+            self.segs = 1;
+            self.mss = payload;
+            self.next_seq = seq.wrapping_add(payload as u32);
+            self.closed = push;
+            return true;
+        }
+        if !self.continues(frame, &f, payload) {
+            return false;
+        }
+        self.buf[self.len..self.len + payload].copy_from_slice(&frame[f.hdrs..end]);
+        self.len += payload;
+        self.segs += 1;
+        self.next_seq = seq.wrapping_add(payload as u32);
+        if push {
+            self.buf[f.tcp + 13] |= 0x08;
+        }
+        self.closed = push || payload < self.mss;
+        true
+    }
+
+    /// Pass the run built so far to `emit` (as received if it is one
+    /// segment), and start afresh.
+    pub fn flush(&mut self, mut emit: impl FnMut(&mut [u8], &mut [u8; HDR_SIZE])) {
+        let Some(f) = self.f.take() else { return };
+        let len = self.len;
+        if self.segs > 1 {
+            let b = &mut self.buf[..len];
+            let tcp_len = len - f.tcp;
+            if f.v6 {
+                b[f.ip + 4..f.ip + 6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+            } else {
+                b[f.ip + 2..f.ip + 4].copy_from_slice(&((len - f.ip) as u16).to_be_bytes());
+                b[f.ip + 10..f.ip + 12].copy_from_slice(&[0, 0]);
+                let c = !fold(sum(0, &b[f.ip..f.tcp]));
+                b[f.ip + 10..f.ip + 12].copy_from_slice(&c.to_be_bytes());
+            }
+            // A partial checksum: the pseudo header's sum, as a TSO sender
+            // leaves it.
+            let p = fold(pseudo(b, &f, tcp_len));
+            b[f.tcp + 16..f.tcp + 18].copy_from_slice(&p.to_be_bytes());
+            let mut h = [0u8; HDR_SIZE];
+            h[0] = F_NEEDS_CSUM;
+            h[1] = if f.v6 { GSO_TCPV6 } else { GSO_TCPV4 };
+            put16(&mut h, 2, f.hdrs);
+            put16(&mut h, 4, self.mss);
+            put16(&mut h, 6, f.tcp);
+            put16(&mut h, 8, 16);
+            self.hdr = h;
+        }
+        emit(&mut self.buf[..len], &mut self.hdr);
     }
 }
