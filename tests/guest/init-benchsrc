@@ -12,7 +12,7 @@ ping -c 20 -i 0.05 192.168.9.2 | sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/.*/BENC
 cpu() { awk '/^cpu / { print $2 + $3 + $4 + $7 + $8, $2 + $3 + $4 + $5 + $6 + $7 + $8 }' /proc/stat; }
 c0=$(cpu)
 s=$(cat /proc/uptime | cut -d' ' -f1)
-dd if=/dev/zero bs=64k count=4096 2>/dev/null | nc 192.168.9.2 5001
+netbench send 192.168.9.2 5001 256
 e=$(cat /proc/uptime | cut -d' ' -f1)
 c1=$(cpu)
 echo "BENCH: guest-guest TCP 256 MiB in $s -> $e s" | awk '{ printf "BENCH: guest-guest TCP %.0f MB/s\n", 268.4 / ($9 - $7) }'

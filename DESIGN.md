@@ -1251,7 +1251,8 @@ vCPUs:
 
 **Measured before the I/O pool and RAM blocks (`tests/run-bench.sh`).**
 These figures describe the earlier memory design; §15.2 records the
-measurements after those changes. The test machine is unusual: the
+measurements after those changes. The network rows were measured again
+on the current design, after the netd changes of §8.3. The test machine is unusual: the
 dev box is itself a Hyper-V VM, so QEMU/KVM runs *nested*. Every VM exit
 of seL4 (timer MSR writes, IPIs, EOIs, HLT wakeups) costs tens of
 microseconds, against roughly one on a single-level cloud hypervisor.
@@ -1266,7 +1267,7 @@ Figures dominated by exits are therefore pessimistic here.
 | disk, 1 MiB direct | 830 MB/s write, 1.2–1.9 GB/s read | Zero-copy, close to the QEMU backend's own speed. |
 | disk, 4 KiB read latency | ~200 µs | Two cross-core wakeups: guest → VMM → blkd and back. |
 | guest↔guest ping | 1.4 ms | Four component hops per direction, with cross-core wakeups. |
-| guest↔guest TCP | ~30 MB/s | Limited per frame (~140 µs, i.e. wakeups), not by copying. Checksum offload and TSO pass through the switch. |
+| guest↔guest TCP | 670–710 MB/s | 1 vCPU each, sender ~70 % busy (`run-bench`, `netbench` with 256 KiB writes and 1 MiB reads). Checksum offload and TSO pass through the switch. Busybox `nc` as the tool gives ~8 MB/s with its vCPU saturated: earlier figures here (~30 MB/s) measured `nc`. |
 | dom0 ↔ host over a tap NIC (vhost) | 380–620 MB/s down, 410–490 MB/s up | 256 MiB with wget / a 256 KiB-write sender. A plain Linux VM on the same QEMU: 0.5–1.3 GB/s. Was 26 MB/s down before GRO and batched notifications (§8.3), 3.5 MB/s while full RX rings dropped frames. |
 | dom0 ↔ host over QEMU user net | ~165 MB/s down, ~37 MB/s up | QEMU's user networking caps a plain Linux VM at ~440 / ~84 MB/s; it takes no TSO, so netd segments uploads in software. |
 
@@ -1556,6 +1557,9 @@ memory the guest can retype.
   | disk read, 1 MiB direct | 316–1167 MB/s, 88–91 % CPU | 447–598 MB/s, 82–88 % CPU |
   | disk 4K read latency | 69–163 µs | 351–374 µs |
   | guest↔guest TCP | 9–10 MB/s | 15–18 MB/s |
+
+  (The TCP figures measured busybox `nc` copying in small chunks, which
+  saturates a vCPU; `run-bench` now uses `netbench`, §12.)
 
   A slower disk path is expected, because every request is now copied
   through the swiotlb pool. Earlier runs on a quieter machine gave phase 1

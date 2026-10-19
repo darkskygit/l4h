@@ -7,4 +7,4 @@ ip link set lo up
 ip addr add 192.168.9.2/24 dev eth0
 ip link set eth0 up
 echo "BENCHVM: ready"
-while true; do nc -l -p 5001 > /dev/null; done
+exec netbench recv 5001

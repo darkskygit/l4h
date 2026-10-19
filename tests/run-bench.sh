@@ -11,8 +11,9 @@ mkdir -p "$out"
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/build-l4hctl.sh"
 "$l4h_cc" -O2 -static -o "$out/bench" "$root/tests/guest/bench.c"
-"$root/tools/mkinitramfs.sh" "$out/benchvm.cpio.gz" "$root/tests/guest/init-benchvm" >/dev/null
-"$root/tools/mkinitramfs.sh" "$out/benchsrc.cpio.gz" "$root/tests/guest/init-benchsrc" >/dev/null
+"$l4h_cc" -O2 -static -o "$out/netbench" "$root/tests/guest/netbench.c"
+"$root/tools/mkinitramfs.sh" "$out/benchvm.cpio.gz" "$root/tests/guest/init-benchvm" "$out/netbench" >/dev/null
+"$root/tools/mkinitramfs.sh" "$out/benchsrc.cpio.gz" "$root/tests/guest/init-benchsrc" "$out/netbench" >/dev/null
 cp "$l4h_linux_out/vmlinux.stripped" "$out/vmlinux"
 "$root/tools/mkinitramfs.sh" "$out/bench.cpio.gz" "$root/tests/guest/init-bench" \
     "$out/bench" "$l4h_ctl" "$out/vmlinux" \
