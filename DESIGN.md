@@ -326,7 +326,7 @@ against libsel4. The Kconfig keeps `CONFIG_UML` defined, so generic code
 treats l4h like UML (no hardware AVX paths, and so on). The tree is
 self-contained.
 
-**Kernel-mode SIMD (x86_64).** Each vCPU's kTCB has its own seL4 FPU
+**Kernel-mode SIMD.** Each vCPU's kTCB has its own seL4 FPU
 context, separate from every uTCB's, so kernel SIMD never sees or clobbers
 user state and `kernel_fpu_begin()` saves nothing. Its registers are shared
 only by the guest-kernel contexts on that vCPU: tasks switched with
@@ -337,7 +337,16 @@ per-CPU busy flag that makes `irq_fpu_usable()` false, and loads the
 default MXCSR (`arch/l4h/x86/fpu.c`). CPU features come from CPUID masked
 by the XCR0 that seL4 sets (§4), and `cpu_has_xfeatures()` checks that XCR0.
 With this, `arch/x86/crypto` (AES-NI, VAES/AVX2 XTS for dm-crypt) is built
-for l4h (patch 0004 opens its Kconfig menu). Patches outside `arch/l4h` handle kbuild's UML-style UAPI
+for l4h (patch 0004 opens its Kconfig menu). AArch64 does the same in
+`kernel_neon_begin()` (`arch/l4h/arm64/neon.c`); the rest of the kernel is
+built with `-mgeneral-regs-only` and never touches V0–V31 or FPCR.
+`arch/arm64/crypto` (ARMv8 Crypto Extensions AES for dm-crypt, bit-sliced
+NEON without them) is built with a small `asm/assembler.h` of the macros it
+uses. EL0 cannot read the ID registers, so kernel patch 0018 passes the
+boot CPU's ID_AA64ISAR0/1/2 and PFR0/1 to root as a bootinfo chunk, root
+copies them into each guest's `l4h_bootinfo.cpu_id`, and the guest derives
+AT_HWCAP from them; the AES drivers bind through
+`module_cpu_feature_match()` on those HWCAPs. Patches outside `arch/l4h` handle kbuild's UML-style UAPI
 headers and restricted DMA pools without a device tree (§15.1).
 
 ### 5.1 Layout in the Linux tree
@@ -358,7 +367,9 @@ guest/linux/patches/              changes outside arch/l4h
 `tools/build-linux.sh` builds with `ARCH=l4h`, using `SUBARCH=x86_64`
 by default or `SUBARCH=aarch64` when `L4H_ARCH=aarch64`. Each subarchitecture
 uses its native UAPI headers, syscall table and signal-frame layout. AArch64
-exports FP/ASIMD HWCAPs, preserves TPIDR_EL0 and all 31 general registers,
+exports the HWCAPs of the ID registers in bootinfo (AES, PMULL, SHA*, CRC32,
+LSE atomics and others; nothing that needs state seL4 does not keep, such
+as SVE or pointer authentication), preserves TPIDR_EL0 and all 31 general registers,
 and supplies a versioned vDSO with the signal-return trampoline. Its first
 syscall argument is saved separately from the x0 return value, including
 across restarted syscalls. Executable mappings receive instruction-cache
@@ -984,7 +995,8 @@ and `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
 - the vCPU count and pre-assigned VSpace count;
 - the device table;
 - the command line;
-- the time-counter frequency and flags.
+- the time-counter frequency and flags;
+- on aarch64, the CPU feature ID registers (EL0 cannot read them).
 
 Capability slots and special mappings, including event-page addresses,
 are defined by `include/l4h/abi.h`, the single source of truth. The guest
@@ -1212,6 +1224,8 @@ Rules that keep the port cheap:
     Patch 0016 reads the architectural counter frequency at boot for MCS
     budget and consumed-time conversions; the same image handles TCG's
     62.5 MHz counter and Apple M4 HVF's 24 MHz counter.
+  - Patch 0018 passes ID_AA64ISAR0/1/2_EL1 and ID_AA64PFR0/1_EL1 to the
+    root task as an extra bootinfo chunk, for the guests' HWCAPs (§5).
 - **Boot.** rust-sel4's kernel loader only entered EL2 kernels.
   `third_party/patches/rust-sel4/0001` adds the EL1 path: it drops from EL2
   with the EL1 translation regime set up and no traps.

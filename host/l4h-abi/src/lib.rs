@@ -130,7 +130,8 @@ pub struct BootInfo {
     pub io_pool_gpa: u64,
     pub io_pool_size: u64,
     pub boot_blocks: u64,
-    pub reserved: [u64; 15],
+    pub cpu_id: [u64; 5],
+    pub reserved: [u64; 10],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
 }

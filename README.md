@@ -126,7 +126,7 @@ l4hctl console 1 --follow
 | `tests/run-testguest.sh`, `tests/run-testguest-aarch64.sh` | guest ABI and seL4 extensions (freestanding guest) |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
 | `tests/run-objtest.sh [vcpus]` | object memory growth under fragmentation, block conversion, SMP memory stress, OOM recovery |
-| `tests/run-cryptotest.sh [vcpus] [secs] [MiB]` | dm-crypt with AES-NI vs generic C (cross-check, throughput), user SIMD state under concurrent kernel crypto (x86_64) |
+| `tests/run-cryptotest.sh [vcpus] [secs] [MiB]` | dm-crypt with AES-NI (x86_64) or the ARMv8 Crypto Extensions (aarch64) vs generic C (cross-check, throughput), user SIMD state under concurrent kernel crypto |
 | `tests/run-futexbench.sh [vcpus] [rounds]` | process-shared futex handoff latency |
 | `tests/run-nodetest.sh /path/to/node [vcpus]` | Node startup/JIT, string internalization, worker threads and concurrent GC |
 | `tests/run-modtest.sh` | external kernel module relocation, load and unload |

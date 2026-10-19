@@ -86,6 +86,8 @@ const TIMER_BADGE: u64 = 1 << 40;
 pub struct HostInfo {
     pub cores: usize,
     pub tsc_hz: u64,
+    /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
+    pub cpu_id: [u64; 5],
     pub hyp_ep: cap::Endpoint,
     sched_control_base: usize,
     pub timeslice_us: u64,
@@ -173,6 +175,37 @@ fn tsc_hz(bootinfo: &sel4::BootInfoPtr) -> u64 {
         }
     }
     panic!("no TSC frequency in bootinfo");
+}
+
+/// ID_AA64ISAR0/ISAR1/ISAR2/PFR0/PFR1_EL1 of the boot CPU, from the
+/// bootinfo chunk added by kernel patch 0018; zero if it is missing.
+#[cfg(target_arch = "aarch64")]
+fn cpu_id(bootinfo: &sel4::BootInfoPtr) -> [u64; 5] {
+    // SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS: rust-sel4's extra() skips IDs
+    // it does not know, so walk the chunks here.
+    const ID_REGS: u64 = 7;
+    let granule = sel4::FrameObjectType::GRANULE.bytes();
+    let extra = unsafe {
+        core::slice::from_raw_parts(bootinfo.ptr().cast::<u8>().add(granule), bootinfo.footprint_size() - granule)
+    };
+    let word = |i: usize| u64::from_le_bytes(extra[i..i + 8].try_into().unwrap());
+    let mut off = 0;
+    while off + 16 <= extra.len() {
+        let (id, len) = (word(off), word(off + 8) as usize);
+        if len < 16 || len > extra.len() - off {
+            break;
+        }
+        if id == ID_REGS && len >= 16 + 5 * 8 {
+            return core::array::from_fn(|i| word(off + 16 + 8 * i));
+        }
+        off += len;
+    }
+    [0; 5]
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpu_id(_bootinfo: &sel4::BootInfoPtr) -> [u64; 5] {
+    [0; 5]
 }
 
 /// All state of the root task.
@@ -414,6 +447,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let info = HostInfo {
         cores,
         tsc_hz: tsc_hz(bootinfo),
+        cpu_id: cpu_id(bootinfo),
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
         timeslice_us: 5000,

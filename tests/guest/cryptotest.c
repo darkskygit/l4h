@@ -1,17 +1,21 @@
 /*
- * l4h guest dm-crypt / kernel-mode SIMD test (x86_64).
+ * l4h guest dm-crypt / kernel-mode SIMD test (x86_64 and aarch64).
  *
- * - /proc/crypto: xts(aes) resolves to an AES-NI driver whose self-test
- *   passed.
- * - Cross-check: data written through an AES-NI dm-crypt device reads back
- *   identically through a generic-C dm-crypt device over the same loop
- *   device, and the other way round.
+ * "Accelerated" is AES-NI on x86_64 and the ARMv8 Crypto Extensions on
+ * aarch64 (bit-sliced NEON if the CPU lacks them).
+ *
+ * - /proc/crypto: xts(aes) resolves to the accelerated driver, whose
+ *   self-test passed.
+ * - Cross-check: data written through an accelerated dm-crypt device reads
+ *   back identically through a generic-C dm-crypt device over the same
+ *   loop device, and the other way round.
  * - Throughput: O_DIRECT reads and writes through dm-crypt over dm-zero,
- *   generic C vs AES-NI.
+ *   generic C vs accelerated.
  * - SIMD stress: one thread per vCPU keeps its own patterns in the vector
- *   registers (YMM if AVX is usable, else XMM), MXCSR and x87 control
- *   word, and checks them across syscalls and preemption while other
- *   threads keep dm-crypt busy on every vCPU.
+ *   registers and FP control state (YMM if AVX is usable, else XMM, MXCSR
+ *   and the x87 control word on x86_64; V0-V31 and FPCR on aarch64) and
+ *   checks them across syscalls and preemption while other threads keep
+ *   dm-crypt busy on every vCPU.
  *
  * Prints "CRYPTOTEST: PASS" or "CRYPTOTEST: FAIL".
  * Usage: cryptotest [stress-seconds] [throughput-MiB]
@@ -31,7 +35,12 @@
 #include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __x86_64__
 #include <cpuid.h>
+#else
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
 #include <linux/dm-ioctl.h>
 
 static int failures;
@@ -120,8 +129,26 @@ static void dm_remove(const char *name)
 static const char key[] =
 	"0123456789abcdef0123456789abcdef00112233445566778899aabbccddeeff"
 	"fedcba9876543210fedcba9876543210ffeeddccbbaa99887766554433221100";
-#define CIPHER_AESNI	"aes-xts-plain64"
+#define CIPHER_ACCEL	"aes-xts-plain64"
 #define CIPHER_GENERIC	"capi:xts(ecb(aes-generic))-plain64"
+#ifdef __x86_64__
+#define ACCEL		"AES-NI"
+#else
+#define ACCEL		"NEON"
+#endif
+
+/* Whether `driver` is the accelerated xts(aes) driver expected here. */
+static int accel_driver(const char *driver)
+{
+#ifdef __x86_64__
+	return strstr(driver, "aesni") || strstr(driver, "vaes");
+#else
+	/* The Crypto Extensions driver if the CPU has AES, else bit-sliced NEON. */
+	if (getauxval(AT_HWCAP) & HWCAP_AES)
+		return !strcmp(driver, "xts-aes-ce");
+	return !strcmp(driver, "xts-aes-neonbs");
+#endif
+}
 
 /* ---- /proc/crypto */
 
@@ -162,15 +189,16 @@ static void test_proc_crypto(void)
 			passed = 1;
 	}
 	fclose(f);
-	if (!strstr(best, "aesni") && !strstr(best, "vaes"))
-		FAIL("xts(aes) resolves to %s, not an AES-NI driver", best[0] ? best : "nothing");
+	if (!accel_driver(best))
+		FAIL("xts(aes) resolves to %s, not the expected " ACCEL " driver",
+		     best[0] ? best : "nothing");
 	else if (!best_passed)
 		FAIL("%s self-test did not pass", best);
 	else
 		printf("  xts(aes) uses %s\n", best);
 }
 
-/* ---- cross-check AES-NI against generic C over one backing device */
+/* ---- cross-check the accelerated driver against generic C over one device */
 
 static int rw_all(int fd, void *buf, size_t len, off_t off, int wr)
 {
@@ -193,15 +221,15 @@ static void cross_check(const char *back, unsigned long long sectors)
 	unsigned char *src, *dst;
 	int fa, fg;
 
-	snprintf(params, sizeof(params), "%s %s 0 %s 0", CIPHER_AESNI, key, back);
-	if (dm_create("xc-aesni", "crypt", sectors, params, a, sizeof(a))) {
-		FAIL("create AES-NI crypt device");
+	snprintf(params, sizeof(params), "%s %s 0 %s 0", CIPHER_ACCEL, key, back);
+	if (dm_create("xc-accel", "crypt", sectors, params, a, sizeof(a))) {
+		FAIL("create " ACCEL " crypt device");
 		return;
 	}
 	snprintf(params, sizeof(params), "%s %s 0 %s 0", CIPHER_GENERIC, key, back);
 	if (dm_create("xc-generic", "crypt", sectors, params, g, sizeof(g))) {
 		FAIL("create generic crypt device");
-		dm_remove("xc-aesni");
+		dm_remove("xc-accel");
 		return;
 	}
 	if (posix_memalign((void **)&src, 4096, len) || posix_memalign((void **)&dst, 4096, len))
@@ -220,10 +248,10 @@ static void cross_check(const char *back, unsigned long long sectors)
 		}
 		if (memcmp(src, dst, len))
 			FAIL("%s-encrypted data differs when decrypted by %s",
-			     dir ? "generic" : "AES-NI", dir ? "AES-NI" : "generic");
+			     dir ? "generic" : ACCEL, dir ? ACCEL : "generic");
 		else
-			printf("  %s -> %s: %zu KiB identical\n", dir ? "generic" : "AES-NI",
-			       dir ? "AES-NI" : "generic", len / 1024);
+			printf("  %s -> %s: %zu KiB identical\n", dir ? "generic" : ACCEL,
+			       dir ? ACCEL : "generic", len / 1024);
 	}
 	if (fa < 0 || fg < 0)
 		FAIL("open crypt devices");
@@ -232,7 +260,7 @@ static void cross_check(const char *back, unsigned long long sectors)
 	free(src);
 	free(dst);
 	dm_remove("xc-generic");
-	dm_remove("xc-aesni");
+	dm_remove("xc-accel");
 }
 
 /* ---- throughput over dm-zero */
@@ -294,10 +322,15 @@ static void bench(size_t mib, int ncpu)
 	/* Optional entries name one driver and are skipped if it is absent. */
 	static const struct { const char *name, *cipher; int optional; } c[] = {
 		{ "generic", CIPHER_GENERIC, 0 },
+#ifdef __x86_64__
 		{ "aesni-sse", "capi:xts-aes-aesni-plain64", 1 },
 		{ "aesni-avx", "capi:xts-aes-aesni-avx-plain64", 1 },
 		{ "vaes-avx2", "capi:xts-aes-vaes-avx2-plain64", 1 },
-		{ "default", CIPHER_AESNI, 0 },
+#else
+		{ "neonbs", "capi:xts-aes-neonbs-plain64", 1 },
+		{ "aes-ce", "capi:xts-aes-ce-plain64", 1 },
+#endif
+		{ "default", CIPHER_ACCEL, 0 },
 	};
 	unsigned long long sectors = 64ULL << 21;	/* 64 GiB of zeroes */
 	char zero[64], dev[64], params[512];
@@ -333,6 +366,11 @@ static void bench(size_t mib, int ncpu)
 static int have_avx;
 static atomic_int stop;
 static atomic_long simd_checks, simd_errors;
+
+#ifdef __x86_64__
+#define NREGS		16	/* vector registers, each in a 32-byte slot */
+#define REG_NAME	(have_avx ? "ymm" : "xmm")
+#define REG_WIDTH	(have_avx ? 32 : 16)
 
 /*
  * Fill the vector registers from pat (16 x 32 bytes), make `nsys` getppid
@@ -393,23 +431,104 @@ static void simd_round(const unsigned char *pat, unsigned char *out, int avx, in
 	}
 }
 
+/*
+ * Set (check == 0) or check this thread's FP control state: MXCSR rounds
+ * toward zero or up, the x87 control word sets 53-bit precision and
+ * varies its rounding.  Returns 0 if the check finds it changed.
+ */
+static int fp_control(long id, int check, char *what, size_t len)
+{
+	unsigned int mxcsr = 0x7f80 ^ ((id & 1) << 13), m;
+	unsigned short fcw = 0x027f | ((id & 1) << 10), c;
+
+	if (!check) {
+		asm volatile("ldmxcsr %0" :: "m"(mxcsr));
+		asm volatile("fldcw %0" :: "m"(fcw));
+		return 1;
+	}
+	asm volatile("stmxcsr %0" : "=m"(m));
+	asm volatile("fnstcw %0" : "=m"(c));
+	snprintf(what, len, "mxcsr %#x fcw %#x", m, c);
+	return (m & ~0x3fU) == (mxcsr & ~0x3fU) && c == fcw;
+}
+
+static int avx_usable(void)
+{
+	unsigned int a, b, c, d, lo, hi;
+
+	if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 27)) || !(c & (1u << 28)))
+		return 0;
+	asm volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+	return (lo & 6) == 6;
+}
+#else
+#define NREGS		32
+#define REG_NAME	"v"
+#define REG_WIDTH	16
+
+/* As on x86_64, for V0-V31 (16 bytes each, in 32-byte slots). */
+static void simd_round(const unsigned char *pat, unsigned char *out, int avx, int nsys, int spin)
+{
+#define LD(n) "ld1 {v" #n ".16b}, [x9]\n\tadd x9, x9, #32\n\t"
+#define ST(n) "st1 {v" #n ".16b}, [x9]\n\tadd x9, x9, #32\n\t"
+#define ALL(m) m(0) m(1) m(2) m(3) m(4) m(5) m(6) m(7) m(8) m(9) m(10) m(11) m(12) \
+	m(13) m(14) m(15) m(16) m(17) m(18) m(19) m(20) m(21) m(22) m(23) m(24) \
+	m(25) m(26) m(27) m(28) m(29) m(30) m(31)
+	(void)avx;
+	asm volatile("mov x9, %[pat]\n\t" ALL(LD)
+		     "mov x10, %[nsys]\n\t"
+		     "1: cbz x10, 2f\n\t"
+		     "mov x8, #173\n\t"	/* getppid */
+		     "svc #0\n\t"
+		     "sub x10, x10, #1\n\t"
+		     "b 1b\n\t"
+		     "2: mov x10, %[spin]\n\t"
+		     "3: cbz x10, 4f\n\t"
+		     "yield\n\t"
+		     "sub x10, x10, #1\n\t"
+		     "b 3b\n\t"
+		     "4: mov x9, %[out]\n\t" ALL(ST)
+		     :: [pat] "r"(pat), [out] "r"(out), [nsys] "r"((long)nsys),
+			[spin] "r"((long)spin)
+		     : "x0", "x8", "x9", "x10", "memory",
+		       "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+		       "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+		       "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30",
+		       "v31");
+}
+
+/* As on x86_64, for FPCR: rounding toward +infinity, or toward zero with
+ * flush-to-zero. */
+static int fp_control(long id, int check, char *what, size_t len)
+{
+	unsigned long want = (id & 1) ? (3UL << 22) | (1UL << 24) : 1UL << 22, fpcr;
+
+	if (!check) {
+		asm volatile("msr fpcr, %0" :: "r"(want));
+		return 1;
+	}
+	asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+	snprintf(what, len, "fpcr %#lx", fpcr);
+	return fpcr == want;
+}
+
+static int avx_usable(void)
+{
+	return 0;
+}
+#endif
+
 static void *simd_checker(void *arg)
 {
 	long id = (long)arg;
-	unsigned char pat[16 * 32] __attribute__((aligned(32)));
-	unsigned char out[16 * 32] __attribute__((aligned(32)));
+	unsigned char pat[NREGS * 32] __attribute__((aligned(32)));
+	unsigned char out[NREGS * 32] __attribute__((aligned(32)));
 	uint64_t x = 0x9e3779b97f4a7c15ULL * (id + 1);
-	unsigned int mxcsr = 0x7f80 ^ ((id & 1) << 13);	/* rounding: toward zero or up */
-	unsigned short fcw = 0x027f | ((id & 1) << 10);	/* precision 53 bits, RC varies */
 	long checks = 0, errors = 0;
+	char what[64];
 
-	asm volatile("ldmxcsr %0" :: "m"(mxcsr));
-	asm volatile("fldcw %0" :: "m"(fcw));
+	fp_control(id, 0, NULL, 0);
 	for (int round = 0; !atomic_load_explicit(&stop, memory_order_relaxed); round++) {
-		unsigned int m;
-		unsigned short c;
-		size_t width = have_avx ? 32 : 16;
-
 		for (size_t i = 0; i < sizeof(pat); i += 8) {
 			x ^= x << 13;
 			x ^= x >> 7;
@@ -418,18 +537,16 @@ static void *simd_checker(void *arg)
 		}
 		memset(out, 0, sizeof(out));
 		simd_round(pat, out, have_avx, round & 1 ? 1000 : 0, round & 1 ? 0 : 50000);
-		for (int r = 0; r < 16; r++)
-			if (memcmp(pat + r * 32, out + r * 32, width)) {
+		for (int r = 0; r < NREGS; r++)
+			if (memcmp(pat + r * 32, out + r * 32, REG_WIDTH)) {
 				if (errors < 5)
 					printf("  thread %ld round %d: %s%d corrupted\n", id, round,
-					       have_avx ? "ymm" : "xmm", r);
+					       REG_NAME, r);
 				errors++;
 			}
-		asm volatile("stmxcsr %0" : "=m"(m));
-		asm volatile("fnstcw %0" : "=m"(c));
-		if ((m & ~0x3fU) != (mxcsr & ~0x3fU) || c != fcw) {
+		if (!fp_control(id, 1, what, sizeof(what))) {
 			if (errors < 5)
-				printf("  thread %ld round %d: mxcsr %#x fcw %#x\n", id, round, m, c);
+				printf("  thread %ld round %d: %s\n", id, round, what);
 			errors++;
 		}
 		checks++;
@@ -480,14 +597,14 @@ static void simd_stress(int seconds, int ncpu, const char *back)
 		FAIL("create dm-zero");
 		return;
 	}
-	snprintf(params, sizeof(params), "%s %s 0 %s 0", CIPHER_AESNI, key, zdev);
+	snprintf(params, sizeof(params), "%s %s 0 %s 0", CIPHER_ACCEL, key, zdev);
 	if (dm_create("st-crypt-zero", "crypt", sectors, params, zdev, sizeof(zdev))) {
 		FAIL("create crypt over dm-zero");
 		return;
 	}
 	/* Over the loop device, decryption can also run from I/O completion. */
 	snprintf(params, sizeof(params), "%s %s 0 %s 0 2 no_read_workqueue no_write_workqueue",
-		 CIPHER_AESNI, key, back);
+		 CIPHER_ACCEL, key, back);
 	if (dm_create("st-crypt-loop", "crypt", sectors, params, ldev, sizeof(ldev))) {
 		FAIL("create crypt over loop");
 		return;
@@ -513,7 +630,7 @@ static void simd_stress(int seconds, int ncpu, const char *back)
 	}
 	printf("  SIMD stress: %d checker threads (%s), %d dm-crypt threads, %ds: "
 	       "%ld checks, %ld errors, %ld MiB through dm-crypt\n",
-	       ncpu, have_avx ? "YMM" : "XMM", nld, seconds, atomic_load(&simd_checks),
+	       ncpu, NREGS == 32 ? "V" : have_avx ? "YMM" : "XMM", nld, seconds, atomic_load(&simd_checks),
 	       atomic_load(&simd_errors), total >> 20);
 	if (atomic_load(&simd_errors))
 		FAIL("user SIMD state corrupted");
@@ -522,16 +639,6 @@ static void simd_stress(int seconds, int ncpu, const char *back)
 	dm_remove("st-crypt-loop");
 	dm_remove("st-crypt-zero");
 	dm_remove("st-zero");
-}
-
-static int avx_usable(void)
-{
-	unsigned int a, b, c, d, lo, hi;
-
-	if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 27)) || !(c & (1u << 28)))
-		return 0;
-	asm volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-	return (lo & 6) == 6;
 }
 
 int main(int argc, char **argv)
@@ -545,7 +652,12 @@ int main(int argc, char **argv)
 	if (ncpu > 32)
 		ncpu = 32;
 	have_avx = avx_usable();
+#ifdef __x86_64__
 	printf("CRYPTOTEST: start, %d vCPU(s), AVX %s\n", ncpu, have_avx ? "yes" : "no");
+#else
+	printf("CRYPTOTEST: start, %d vCPU(s), AES %s\n", ncpu,
+	       getauxval(AT_HWCAP) & HWCAP_AES ? "yes" : "no");
+#endif
 	printf("proc_crypto:\n");
 	test_proc_crypto();
 	printf("cross_check:\n");

@@ -476,6 +476,7 @@ impl Guest {
         }
         bi.nr_vcpus = self.vcpus.len() as u64;
         bi.tsc_hz = host_info.tsc_hz;
+        bi.cpu_id = host_info.cpu_id;
         bi.nr_blocks = self.blocks.len() as u64;
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces as u64;

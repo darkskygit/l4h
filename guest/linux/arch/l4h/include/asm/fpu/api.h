@@ -8,7 +8,8 @@
 
 /* Copyright (c) 2020 Cambridge Greys Ltd
  * Copyright (c) 2020 Red Hat Inc.
- * A set of "dummy" defines; arm64 l4h has no kernel-mode FP/SIMD users. */
+ * A set of "dummy" defines: arm64 l4h code uses kernel_neon_begin/end
+ * (asm/neon.h) instead. */
 #define kernel_fpu_begin() (void)0
 #define kernel_fpu_end() (void)0
 

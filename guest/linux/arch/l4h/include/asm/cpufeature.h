@@ -1,5 +1,5 @@
 #ifdef CONFIG_UML_ARM64
-#include <asm/processor.h>
+#include "../../arm64/asm/cpufeature.h"
 #else
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _ASM_UM_CPUFEATURE_H

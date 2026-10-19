@@ -222,7 +222,10 @@ struct l4h_bootinfo {
 	l4h_u64 io_pool_gpa;
 	l4h_u64 io_pool_size;
 	l4h_u64 boot_blocks;      /* blocks [0, boot_blocks) are host frames */
-	l4h_u64 reserved[15];
+	/* aarch64: the CPU's ID_AA64ISAR0/ISAR1/ISAR2/PFR0/PFR1_EL1, which the
+	 * guest cannot read at EL0; all zero if unknown.  Unused on x86_64. */
+	l4h_u64 cpu_id[5];
+	l4h_u64 reserved[10];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
 };

@@ -237,10 +237,69 @@ static void __init l4h_cpu_features(void)
 }
 
 #else
+static unsigned int __init id_field(u64 reg, unsigned int shift)
+{
+	return (reg >> shift) & 0xf;
+}
+
+/*
+ * AT_HWCAP from the ID registers root passes in bootinfo (EL0 cannot read
+ * them).  Only instructions that need no state beyond what seL4 saves per
+ * thread (X0-X30, V0-V31, FPSR, FPCR): no SVE, SME, pointer
+ * authentication or MTE, and no PSTATE bits such as DIT.
+ */
 static void __init l4h_cpu_features(void)
 {
-	/* seL4 saves the base FP/ASIMD state; no SVE state is enabled. */
-	elf_aux_hwcap = HWCAP_FP | HWCAP_ASIMD;
+	const u64 *id = l4h_bootinfo->cpu_id;
+	u64 isar0 = id[0], isar1 = id[1], pfr0 = id[3];
+	long cap = HWCAP_FP | HWCAP_ASIMD;
+
+	if (id_field(isar0, 4) >= 1)
+		cap |= HWCAP_AES;
+	if (id_field(isar0, 4) >= 2)
+		cap |= HWCAP_PMULL;
+	if (id_field(isar0, 8) >= 1)
+		cap |= HWCAP_SHA1;
+	if (id_field(isar0, 12) >= 1)
+		cap |= HWCAP_SHA2;
+	if (id_field(isar0, 12) >= 2)
+		cap |= HWCAP_SHA512;
+	if (id_field(isar0, 16) >= 1)
+		cap |= HWCAP_CRC32;
+	if (id_field(isar0, 20) >= 2)
+		cap |= HWCAP_ATOMICS;
+	if (id_field(isar0, 28) >= 1)
+		cap |= HWCAP_ASIMDRDM;
+	if (id_field(isar0, 32) >= 1)
+		cap |= HWCAP_SHA3;
+	if (id_field(isar0, 36) >= 1)
+		cap |= HWCAP_SM3;
+	if (id_field(isar0, 40) >= 1)
+		cap |= HWCAP_SM4;
+	if (id_field(isar0, 44) >= 1)
+		cap |= HWCAP_ASIMDDP;
+	if (id_field(isar0, 48) >= 1)
+		cap |= HWCAP_ASIMDFHM;
+	if (id_field(isar0, 52) >= 1)
+		cap |= HWCAP_FLAGM;
+	if (id_field(isar1, 0) >= 1)
+		cap |= HWCAP_DCPOP;
+	if (id_field(isar1, 12) >= 1)
+		cap |= HWCAP_JSCVT;
+	if (id_field(isar1, 16) >= 1)
+		cap |= HWCAP_FCMA;
+	if (id_field(isar1, 20) >= 1)
+		cap |= HWCAP_LRCPC;
+	if (id_field(isar1, 20) >= 2)
+		cap |= HWCAP_ILRCPC;
+	if (id_field(isar1, 36) >= 1)
+		cap |= HWCAP_SB;
+	/* FP and AdvSIMD: 0 base, 1 with half precision (0xf: absent). */
+	if (id_field(pfr0, 16) == 1)
+		cap |= HWCAP_FPHP;
+	if (id_field(pfr0, 20) == 1)
+		cap |= HWCAP_ASIMDHP;
+	elf_aux_hwcap = cap;
 }
 #endif
 

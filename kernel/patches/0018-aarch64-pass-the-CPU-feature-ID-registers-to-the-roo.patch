@@ -1,0 +1,86 @@
+From a173d061fac66bc346b63219702899ce0f86e7c3 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Mon, 19 Oct 2026 07:32:33 -0700
+Subject: [PATCH] aarch64: pass the CPU feature ID registers to the root task
+
+EL0 cannot read ID_AA64ISAR0/1/2_EL1 or ID_AA64PFR0/1_EL1, so the root
+task has no way to learn which instructions (AES, PMULL, SHA, ...) the CPU
+implements.  Pass the boot CPU's values as an extra bootinfo chunk,
+SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS (seL4_AArch64IdRegs).
+---
+ libsel4/include/sel4/bootinfo_types.h | 11 +++++++++++
+ src/arch/arm/kernel/boot.c            | 22 ++++++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/libsel4/include/sel4/bootinfo_types.h b/libsel4/include/sel4/bootinfo_types.h
+index 66c97aa51..8f9d2db36 100644
+--- a/libsel4/include/sel4/bootinfo_types.h
++++ b/libsel4/include/sel4/bootinfo_types.h
+@@ -106,6 +106,7 @@ typedef enum {
+     SEL4_BOOTINFO_HEADER_X86_FRAMEBUFFER    = 4,
+     SEL4_BOOTINFO_HEADER_X86_TSC_FREQ       = 5, /* frequency is in MHz */
+     SEL4_BOOTINFO_HEADER_FDT                = 6, /* device tree */
++    SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS    = 7, /* seL4_AArch64IdRegs */
+     /* Add more IDs here, the two elements below must always be at the end. */
+     SEL4_BOOTINFO_HEADER_NUM,
+     SEL4_FORCE_LONG_ENUM(seL4_BootInfoID)
+@@ -117,6 +118,16 @@ typedef struct seL4_BootInfoHeader {
+     seL4_Word len; /* length of the chunk, including this header */
+ } seL4_BootInfoHeader;
+ 
++/* SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS: the boot CPU's feature ID
++ * registers, which EL0 cannot read.  Unallocated registers read as zero. */
++typedef struct seL4_AArch64IdRegs {
++    seL4_Word id_aa64isar0;
++    seL4_Word id_aa64isar1;
++    seL4_Word id_aa64isar2;
++    seL4_Word id_aa64pfr0;
++    seL4_Word id_aa64pfr1;
++} seL4_AArch64IdRegs;
++
+ SEL4_COMPILE_ASSERT(
+     invalid_seL4_BootInfoHeader,
+     sizeof(seL4_BootInfoHeader) == 2 * sizeof(seL4_Word));
+diff --git a/src/arch/arm/kernel/boot.c b/src/arch/arm/kernel/boot.c
+index 139f620b3..eb6db7c9b 100644
+--- a/src/arch/arm/kernel/boot.c
++++ b/src/arch/arm/kernel/boot.c
+@@ -412,6 +412,11 @@ static BOOT_CODE bool_t try_init_kernel(
+         };
+     }
+ 
++#ifdef CONFIG_ARCH_AARCH64
++    /* Pass the CPU feature ID registers on, for the root task's guests. */
++    extra_bi_size += sizeof(seL4_BootInfoHeader) + sizeof(seL4_AArch64IdRegs);
++#endif
++
+     /* The region of the initial thread is the user image + ipcbuf and boot info */
+     word_t extra_bi_size_bits = calculate_extra_bi_size_bits(extra_bi_size);
+     v_region_t it_v_reg = {
+@@ -470,6 +475,23 @@ static BOOT_CODE bool_t try_init_kernel(
+         extra_bi_offset += dtb_size;
+     }
+ 
++#ifdef CONFIG_ARCH_AARCH64
++    {
++        seL4_AArch64IdRegs id_regs;
++        MRS("id_aa64isar0_el1", id_regs.id_aa64isar0);
++        MRS("id_aa64isar1_el1", id_regs.id_aa64isar1);
++        MRS("S3_0_C0_C6_2", id_regs.id_aa64isar2);
++        MRS("id_aa64pfr0_el1", id_regs.id_aa64pfr0);
++        MRS("id_aa64pfr1_el1", id_regs.id_aa64pfr1);
++        header.id = SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS;
++        header.len = sizeof(header) + sizeof(id_regs);
++        *(seL4_BootInfoHeader *)(rootserver.extra_bi + extra_bi_offset) = header;
++        extra_bi_offset += sizeof(header);
++        memcpy((void *)(rootserver.extra_bi + extra_bi_offset), &id_regs, sizeof(id_regs));
++        extra_bi_offset += sizeof(id_regs);
++    }
++#endif
++
+     assert(extra_bi_size == extra_bi_offset);
+ 
+     if (config_set(CONFIG_TK1_SMMU)) {
+-- 
+2.47.3
+
