@@ -393,11 +393,14 @@ impl Ctl {
     }
 }
 
-/// A physical controller and its native disk capacity (512-byte sectors).
+/// A host disk (a unit of a physical controller) and its native capacity
+/// (512-byte sectors).
 #[derive(Clone, Copy, Debug)]
 pub struct DiskInfo {
     pub index: u64,
     pub bdf: u64,
+    /// virtio-scsi: target (bits 0-7) and LUN (from bit 8); else 0.
+    pub address: u64,
     pub owner: Option<u64>,
     pub failed: bool,
     pub kind: u64,
@@ -415,7 +418,7 @@ pub struct DiskAttachment {
 impl Ctl {
     pub fn disk_info(&self, index: u64) -> Result<DiskInfo> {
         let r = self.call(CTL_DISK_INFO, &[index], &[], &[])?;
-        Ok(DiskInfo { index, bdf: r.vals[0], owner: (r.vals[1] != u64::MAX).then_some(r.vals[1]),
+        Ok(DiskInfo { index, bdf: r.vals[0] & 0xffff, address: r.vals[0] >> 16, owner: (r.vals[1] != u64::MAX).then_some(r.vals[1]),
             failed: r.vals[2] != 0, kind: r.vals[3], sectors: r.vals[4], attachments: r.vals[5] })
     }
 

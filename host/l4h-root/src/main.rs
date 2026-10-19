@@ -33,7 +33,7 @@ use sel4_root_task::{Never, root_task};
 
 use l4h_host as host;
 
-use crate::blkd::Disk;
+use crate::blkd::{Controller, Disk};
 use crate::component::ROOT_BADGE_COMPONENT;
 use crate::guest::{Guest, GuestConfig, HYP_BADGE_FAULT, State, hyp_badge_guest, hyp_badge_vcpu};
 use crate::mem::{Alloc, Slots};
@@ -183,6 +183,8 @@ pub struct Host {
     pub asids: AsidPools,
     pub pci: pci::Pci,
     pub devmem: devmem::DevMem,
+    /// Disk controllers, and their units as host disks.
+    pub ctrls: Vec<Controller>,
     pub disks: Vec<Disk>,
     pub netd: netd::Netd,
     pub guests: Vec<Option<Guest>>,
@@ -259,13 +261,48 @@ impl Host {
     }
 
     /// Probe and start a controller once, independent of its clients.
-    pub fn ensure_disk(&mut self, disk: usize) -> Result<(), i64> {
-        let d = self.disks.get(disk).ok_or(ctl::ENOENT)?;
-        if d.failed { return Err(ctl::EIO); }
-        if d.capacity == 0 && !self.can_afford(16 << 20, 2) { return Err(ctl::ENOMEM); }
-        blkd::start(0x100 + disk as u32, &mut self.disks[disk], &self.pci,
+    fn ensure_ctrl(&mut self, c: usize) -> Result<(), i64> {
+        let ctrl = &self.ctrls[c];
+        if ctrl.failed { return Err(ctl::EIO); }
+        if ctrl.started() { return Ok(()); }
+        if !self.can_afford(16 << 20, 2) { return Err(ctl::ENOMEM); }
+        blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci,
             &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
         Ok(())
+    }
+
+    /// Start the controller of host disk `disk` and learn its geometry.
+    pub fn ensure_disk(&mut self, disk: usize) -> Result<(), i64> {
+        let (c, unit) = self.disks.get(disk).map(|d| (d.ctrl, d.unit)).ok_or(ctl::ENOENT)?;
+        self.ensure_ctrl(c)?;
+        if self.disks[disk].capacity == 0 {
+            let d = self.ctrls[c].info(unit).0.ok_or(ctl::EIO)?;
+            self.disks[disk] = Disk { ctrl: c, ..d };
+        }
+        Ok(())
+    }
+
+    /// Number the host disks: one per unit of each controller, in PCI
+    /// order.  virtio-scsi controllers start now, to find their logical
+    /// units; the others have one unit and start when first used.
+    fn scan_disks(&mut self) {
+        for c in 0..self.ctrls.len() {
+            if self.ctrls[c].kind != l4h_host::blk::BLKD_VIRTIO_SCSI {
+                self.disks.push(Disk::new(c, 0));
+                continue;
+            }
+            if let Err(e) = self.ensure_ctrl(c) {
+                let p = &self.ctrls[c].pci;
+                sel4::debug_println!("l4h-root: disk controller {:02x}:{:02x}.{} unusable: error {}", p.bus, p.dev, p.func, e);
+                continue;
+            }
+            let units = self.ctrls[c].info(0).1;
+            for u in 0..units {
+                if let Some(d) = self.ctrls[c].info(u).0 {
+                    self.disks.push(Disk { ctrl: c, ..d });
+                }
+            }
+        }
     }
 
     /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
@@ -275,25 +312,22 @@ impl Host {
         if lba_start % blkd::WINDOW_ALIGN != 0 || lba_count % blkd::WINDOW_ALIGN != 0 {
             return Err(ctl::EINVAL);
         }
-        let dk = self.disks.get(disk).ok_or(ctl::ENOENT)?;
-        if dk.failed {
-            return Err(ctl::EIO);
-        }
         self.ensure_disk(disk)?;
-        let dk = &self.disks[disk];
-        let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, dk.capacity).ok_or(ctl::EINVAL)?;
-        if dk.attachments.iter().flatten().any(|a| a.window.overlaps(window)) { return Err(ctl::EBUSY); }
-        if dk.attachments.iter().all(Option::is_some) { return Err(ctl::ENOSPC); }
+        let (c, unit) = (self.disks[disk].ctrl, self.disks[disk].unit);
+        let ctrl = &self.ctrls[c];
+        let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, self.disks[disk].capacity).ok_or(ctl::EINVAL)?;
+        if ctrl.attachments(disk).any(|(_, a)| a.window.overlaps(window)) { return Err(ctl::EBUSY); }
+        if ctrl.clients.iter().all(Option::is_some) { return Err(ctl::ENOSPC); }
         if !self.can_afford(1 << 20, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created {
                 return Err(ctl::EBUSY);
             }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
-            let (client, backend) = blkd::attach(&mut h.disks[disk], g, d, window, &mut h.alloc);
-            blkd::activate(&h.disks[disk], client, g, &backend, read_only, &mut h.wins.a);
+            let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, &mut h.alloc);
+            blkd::activate(&h.ctrls[c], unit, client, g, &backend, read_only, &mut h.wins.a);
             g.backends.push((d, backend));
-            g.disks.push((disk, client));
+            g.disks.push((c, client));
             Ok(())
         })
         .ok_or(ctl::ENOENT)?
@@ -345,8 +379,8 @@ impl Host {
         }
         // Disks are quiesced before any memory they were given is reused.
         let mut quiet = true;
-        for &(disk, client) in &g.disks {
-            quiet &= blkd::remove(&mut self.disks[disk], client, &self.pci);
+        for &(ctrl, client) in &g.disks {
+            quiet &= blkd::remove(&mut self.ctrls[ctrl], client, &self.pci);
         }
         let name = g.name.clone();
         self.asids.in_use -= g.asids;
@@ -386,9 +420,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     };
     let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
 
-    // PCI devices: virtio-blk disks can be passed through to guests.
+    // PCI devices: disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
-    let mut disks = Vec::new();
+    let mut ctrls = Vec::new();
     let mut nics = Vec::new();
     for d in pci.enumerate() {
         sel4::debug_println!(
@@ -404,19 +438,19 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             );
         }
         if blkd::is_disk(&d) {
-            if disks.len() == pci::MAX_DISKS {
-                sel4::debug_println!("l4h-root: more than {} disks, ignoring this one", pci::MAX_DISKS);
+            if ctrls.len() == pci::MAX_DISK_CTRLS {
+                sel4::debug_println!("l4h-root: more than {} disk controllers, ignoring this one", pci::MAX_DISK_CTRLS);
                 continue;
             }
             // Stop whatever the firmware left running: no DMA at all (the
             // memory it was given is not known), and a reset, since bus
             // mastering is enabled again on attach.
             pci.disable(&d);
-            let v = pci::VECTOR_DISK_BASE + disks.len() as u64;
-            let mut disk = Disk::new(d, v);
-            blkd::reset(&mut disk, &pci, &mut alloc, &mut devmem, &mut wins.a, info.tsc_hz / 1000);
-            pci.disable(&disk.pci);
-            disks.push(disk);
+            let v = pci::VECTOR_DISK_BASE + ctrls.len() as u64;
+            let mut ctrl = Controller::new(d, v);
+            blkd::reset(&mut ctrl, &pci, &mut alloc, &mut devmem, &mut wins.a, info.tsc_hz / 1000);
+            pci.disable(&ctrl.pci);
+            ctrls.push(ctrl);
         } else if netd::is_virtio_net(&d) {
             pci.disable(&d);
             nics.push(d);
@@ -432,13 +466,15 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         asids,
         pci,
         devmem,
-        disks,
+        ctrls,
+        disks: Vec::new(),
         netd,
         guests: Vec::new(),
         total_bytes,
         monitor: None,
         dashboard: None,
     };
+    h.scan_disks();
     h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem);
 

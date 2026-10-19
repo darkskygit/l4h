@@ -238,13 +238,19 @@ impl Dashboard {
             if r + 4 >= self.rows {
                 break;
             }
-            let kind = d.kind_name();
-            let owner = match d.owner {
+            let c = &h.ctrls[d.ctrl];
+            let owner = c.owner(i);
+            let owner_text = match owner {
                 Some(o) => format!("vm {}{}", o, if d.read_only { ", read-only" } else { "" }),
                 None => String::from("free"),
             };
-            let line = format!("disk {:<2} pci {:02x}:{:02x}.{}  {:<11}  {}", i, d.pci.bus, d.pci.dev, d.pci.func, kind, owner);
-            self.text(r, 3, &line, if d.owner.is_some() { FG } else { DIM }, BG);
+            let kind = if c.kind == crate::host::blk::BLKD_VIRTIO_SCSI {
+                format!("{} {}:{}", c.kind_name(), d.address & 0xff, d.address >> 8)
+            } else {
+                String::from(c.kind_name())
+            };
+            let line = format!("disk {:<2} pci {:02x}:{:02x}.{}  {:<15}  {}", i, c.pci.bus, c.pci.dev, c.pci.func, kind, owner_text);
+            self.text(r, 3, &line, if owner.is_some() { FG } else { DIM }, BG);
             r += 1;
         }
         r += 1;

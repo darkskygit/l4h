@@ -76,12 +76,17 @@ impl VirtioBlk {
 }
 
 impl Driver for VirtioBlk {
-    fn info(&self) -> DevInfo {
+    fn units(&self) -> usize {
+        1
+    }
+
+    fn info(&self, _unit: usize) -> DevInfo {
         DevInfo {
             capacity: self.capacity,
             block_size: self.block_size,
             read_only: self.features & VIRTIO_BLK_F_RO != 0,
             flush: self.features & VIRTIO_BLK_F_FLUSH != 0,
+            address: 0,
         }
     }
 
@@ -89,7 +94,7 @@ impl Driver for VirtioBlk {
         !self.free.is_empty()
     }
 
-    fn start(&mut self, tag: u64, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+    fn start(&mut self, tag: u64, _unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
         let s = self.free.pop().ok_or(blk::STATUS_IOERR)?;
         let slot = &mut self.slots[s as usize];
         let hdr = Mmio(slot.hdr_va);

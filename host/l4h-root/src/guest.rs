@@ -201,7 +201,7 @@ pub struct Guest {
     pub vmm: Option<Component>,
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,
-    /// Disks (host disk indices) attached to the guest.
+    /// Disk windows attached to the guest: (controller, blkd client).
     pub disks: Vec<(usize, usize)>,
     /// netd ports of its virtio-net devices.
     pub ports: Vec<usize>,

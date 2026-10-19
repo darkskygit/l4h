@@ -431,8 +431,9 @@ tools/run-qemu.sh host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
         \texttt{4G}) set the machine's cores and memory. Extra arguments go
         to QEMU.
   \item Disks may be \texttt{virtio-blk-pci}, \texttt{nvme} or a
-        \texttt{virtio-scsi-pci} controller; l4h uses the first
-        \texttt{scsi-hd} on a virtio-scsi controller. NICs must
+        \texttt{virtio-scsi-pci} controller, on which every
+        \texttt{scsi-hd} (up to 16) is a disk; \cmd{l4hctl disks} shows
+        its target and LUN. NICs must
         be \texttt{virtio-net-pci}. Use \texttt{disable-legacy=on} for
         virtio devices. A host supports up to 4 NICs.
   \item The serial port is the console. seL4 and the host components print
@@ -1194,7 +1195,8 @@ Op & Name & Arguments & Results \\
 8 & \texttt{CONSOLE\_READ} & VM, offset & next offset, bytes, bytes lost;
   output in data \\
 9 & \texttt{CONSOLE\_WRITE} & VM, length; input in data & bytes accepted \\
-10 & \texttt{DISK\_INFO} & disk & PCI address, owner (or $2^{64}-1$), failed
+10 & \texttt{DISK\_INFO} & disk & PCI address (with target and LUN of a
+  virtio-scsi disk from bit 16), owner (or $2^{64}-1$), failed
   flag (reset did not complete),
   kind (0 virtio-blk, 1 NVMe, 2 virtio-scsi) \\
 11 & \texttt{SWITCH\_CREATE} & -- & switch \\

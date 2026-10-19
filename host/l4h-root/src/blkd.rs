@@ -43,19 +43,18 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-/// A disk PCI device that can be passed through to a guest.
-pub struct Disk {
+/// A disk controller (PCI device) and its persistent blkd.  Its disks are
+/// the units blkd finds: one, or each logical unit of a virtio-scsi
+/// controller.
+pub struct Controller {
     pub pci: pci::Device,
     pub kind: u32,
     /// MSI vector (seL4 delivers vector n at CPU vector 0x30 + n).
     vector: u64,
     /// Frames of the BARs the driver uses, carved once.
     bars: Vec<(u8, Vec<cap::Granule>)>,
-    pub owner: Option<usize>,
-    pub capacity: u64,
-    pub block_size: u32,
-    pub attachments: Vec<Option<Attachment>>,
-    pub read_only: bool,
+    /// blkd's client channels, shared by the controller's disks.
+    pub clients: Vec<Option<Attachment>>,
     /// Reset, provisioning or drain failed: the device may still access
     /// its DMA targets, so it is quarantined until host reboot.
     pub failed: bool,
@@ -65,7 +64,25 @@ pub struct Disk {
     driver: Option<Blkd>,
 }
 
+/// A host disk: unit `unit` of controller `ctrl`.
+pub struct Disk {
+    pub ctrl: usize,
+    pub unit: u64,
+    /// Known once the controller's blkd runs (0 before).
+    pub capacity: u64,
+    pub block_size: u32,
+    pub read_only: bool,
+    /// Where the unit is on the controller (blk::BLKD_INFO).
+    pub address: u64,
+}
+
 impl Disk {
+    pub fn new(ctrl: usize, unit: u64) -> Self {
+        Disk { ctrl, unit, capacity: 0, block_size: 0, read_only: false, address: 0 }
+    }
+}
+
+impl Controller {
     pub fn new(pci: pci::Device, vector: u64) -> Self {
         let kind = if is_nvme(&pci) {
             blk::BLKD_NVME
@@ -74,9 +91,36 @@ impl Disk {
         } else {
             blk::BLKD_VIRTIO
         };
-        Disk { pci, kind, vector, bars: Vec::new(), owner: None, read_only: false,
-            capacity: 0, block_size: 0, attachments: (0..blk::MAX_CLIENTS).map(|_| None).collect(), failed: false,
-            io: None, driver: None }
+        Controller { pci, kind, vector, bars: Vec::new(), clients: (0..blk::MAX_CLIENTS).map(|_| None).collect(),
+            failed: false, io: None, driver: None }
+    }
+
+    pub fn started(&self) -> bool {
+        self.driver.is_some()
+    }
+
+    /// The attachments of disk `disk`, with their client indices.
+    pub fn attachments(&self, disk: usize) -> impl Iterator<Item = (usize, &Attachment)> {
+        self.clients.iter().enumerate().filter_map(move |(i, a)| a.as_ref().filter(|a| a.disk == disk).map(|a| (i, a)))
+    }
+
+    /// The first VM disk `disk` is attached to.
+    pub fn owner(&self, disk: usize) -> Option<usize> {
+        self.attachments(disk).next().map(|(_, a)| a.vm)
+    }
+
+    /// Ask blkd about `unit`: (disk geometry, number of units), None if
+    /// there is no such unit.
+    pub fn info(&self, unit: u64) -> (Option<Disk>, u64) {
+        let capacity = call(self.driver.as_ref().expect("started blkd").comp.service_ep, blk::BLKD_INFO, &[unit]);
+        let units = crate::mr(3);
+        let disk = (capacity != u64::MAX).then(|| Disk {
+            ctrl: 0, unit, capacity,
+            block_size: crate::mr(1) as u32,
+            read_only: crate::mr(2) != 0,
+            address: crate::mr(4),
+        });
+        (disk, units)
     }
 
     /// Base of the I/O BAR of a legacy virtio device.
@@ -134,6 +178,8 @@ pub fn is_disk(d: &pci::Device) -> bool {
 
 pub struct Attachment {
     pub vm: usize,
+    /// Host disk index.
+    pub disk: usize,
     pub window: blk::DiskWindow,
 }
 
@@ -151,7 +197,7 @@ fn bdf(d: &pci::Device) -> u32 {
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     id: u32,
-    disk: &mut Disk,
+    disk: &mut Controller,
     pci: &Pci,
     devmem: &mut DevMem,
     alloc: &mut Alloc,
@@ -264,10 +310,6 @@ pub fn start(
     let staging = (n_dma - blk::STAGING_SIZE / PAGE..n_dma)
         .map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap()).collect();
     disk.driver = Some(Blkd { comp, arena, staging });
-    let ep = disk.driver.as_ref().unwrap().comp.service_ep;
-    disk.capacity = call(ep, blk::BLKD_INFO, &[]);
-    disk.block_size = crate::mr(1) as u32;
-    disk.read_only = crate::mr(2) != 0;
 }
 
 fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
@@ -276,11 +318,12 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
     crate::mr(0)
 }
 
-/// Attach a checked window to one client of a running shared controller.
-pub fn attach(disk: &mut Disk, client: &mut Guest, dev_index: usize,
+/// Attach a checked window of host disk `disk` to one client of its
+/// running shared controller.
+pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index: usize,
     window: blk::DiskWindow, alloc: &mut Alloc) -> (usize, vmm::Backend) {
-    let i = disk.attachments.iter().position(Option::is_none).expect("free block client");
-    let driver = disk.driver.as_mut().expect("started blkd");
+    let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
+    let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: Vec<cap::Granule> = (0..blk::CHANNEL_PAGES)
         .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
     let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
@@ -295,16 +338,15 @@ pub fn attach(disk: &mut Disk, client: &mut Guest, dev_index: usize,
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
-    disk.attachments[i] = Some(Attachment { vm: client.id, window });
-    disk.owner = disk.attachments.iter().flatten().next().map(|a| a.vm);
+    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window });
     (i, vmm::Backend::Blk { chan, kick })
 }
 
 /// Publish root-owned client configuration, then activate the channel.
-pub fn activate(disk: &Disk, i: usize, client: &Guest, backend: &vmm::Backend,
+pub fn activate(ctrl: &Controller, unit: u64, i: usize, client: &Guest, backend: &vmm::Backend,
     read_only: bool, win: &mut Window) {
     let vmm::Backend::Blk { chan, .. } = backend else { unreachable!() };
-    let a = disk.attachments[i].as_ref().unwrap();
+    let a = ctrl.clients[i].as_ref().unwrap();
     win.with_frame(&abs_of(chan[0]), |p| unsafe {
         let c = p as *mut blk::Channel;
         core::ptr::addr_of_mut!((*c).capacity_sectors).write(a.window.sectors);
@@ -314,12 +356,12 @@ pub fn activate(disk: &Disk, i: usize, client: &Guest, backend: &vmm::Backend,
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });
     });
-    assert_eq!(call(disk.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64]), 0, "blkd add");
+    assert_eq!(call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit]), 0, "blkd add");
 }
 
 /// Drain this client before its memory is reused. A timeout quarantines
 /// the controller and all its DMA targets until host reboot.
-pub fn remove(disk: &mut Disk, i: usize, pci: &Pci) -> bool {
+pub fn remove(disk: &mut Controller, i: usize, pci: &Pci) -> bool {
     let driver = disk.driver.as_ref().unwrap();
     let quiet = !disk.failed && call(driver.comp.service_ep, blk::BLKD_REMOVE, &[i as u64]) == 0;
     if !quiet {
@@ -328,23 +370,25 @@ pub fn remove(disk: &mut Disk, i: usize, pci: &Pci) -> bool {
         pci.disable(&disk.pci);
     }
     let _ = driver.comp.slot(blk::BLKD_SLOT_CLIENT_DONE + i as u64).delete();
-    disk.attachments[i] = None;
-    disk.owner = disk.attachments.iter().flatten().next().map(|a| a.vm);
+    disk.clients[i] = None;
     quiet
 }
 
-/// Provision an unattached range. Data copies occur only during seeding.
-/// A zero-length request flushes the controller. Never trust discard to zero.
-pub fn write(disk: &mut Disk, sector: u64, len: usize, from: Option<*const u8>,
+/// Provision an unattached range of host disk `index`. Data copies occur
+/// only during seeding. A zero-length request flushes the disk. Never
+/// trust discard to zero.
+#[allow(clippy::too_many_arguments)]
+pub fn write(ctrl: &mut Controller, index: usize, dk: &Disk, sector: u64, len: usize, from: Option<*const u8>,
     pci: &Pci, win: &mut Window) -> Result<(), i64> {
-    if disk.failed { return Err(crate::ctl::EIO); }
-    if disk.read_only { return Err(crate::ctl::EPERM); }
+    if ctrl.failed { return Err(crate::ctl::EIO); }
+    if dk.read_only { return Err(crate::ctl::EPERM); }
     if len > blk::STAGING_SIZE { return Err(crate::ctl::EINVAL); }
     if len != 0 {
-        let w = blk::DiskWindow::new(sector, (len / 512) as u64, disk.capacity).ok_or(crate::ctl::EINVAL)?;
+        let w = blk::DiskWindow::new(sector, (len / 512) as u64, dk.capacity).ok_or(crate::ctl::EINVAL)?;
         if len % 4096 != 0 { return Err(crate::ctl::EINVAL); }
-        if disk.attachments.iter().flatten().any(|a| a.window.overlaps(w)) { return Err(crate::ctl::EBUSY); }
+        if ctrl.attachments(index).any(|(_, a)| a.window.overlaps(w)) { return Err(crate::ctl::EBUSY); }
     }
+    let disk = ctrl;
     let driver = disk.driver.as_ref().unwrap();
     for (i, f) in driver.staging.iter().take(len.div_ceil(PAGE)).enumerate() {
         win.with_frame(&abs_of(*f), |p| unsafe {
@@ -352,7 +396,11 @@ pub fn write(disk: &mut Disk, sector: u64, len: usize, from: Option<*const u8>,
             else { core::ptr::write_bytes(p, 0, PAGE); }
         });
     }
-    let status = call(driver.comp.service_ep, if len == 0 { blk::BLKD_FLUSH } else { blk::BLKD_WRITE }, &[sector, len as u64]);
+    let status = if len == 0 {
+        call(driver.comp.service_ep, blk::BLKD_FLUSH, &[dk.unit])
+    } else {
+        call(driver.comp.service_ep, blk::BLKD_WRITE, &[sector, len as u64, dk.unit])
+    };
     if status == 0 { return Ok(()); }
     if status == u64::MAX {
         disk.failed = true;
@@ -380,7 +428,7 @@ const VIRTIO_RESET_MS: u64 = 2000;
 /// for this; bus mastering is left as it is, so that DMA the device
 /// finishes while resetting lands in memory that is still the client's.
 /// On failure, marks the disk failed and returns false.
-pub fn reset(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
+pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
     if disk.failed {
         return false;
     }

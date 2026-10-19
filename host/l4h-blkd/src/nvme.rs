@@ -297,12 +297,17 @@ impl Nvme {
 }
 
 impl Driver for Nvme {
-    fn info(&self) -> DevInfo {
+    fn units(&self) -> usize {
+        1
+    }
+
+    fn info(&self, _unit: usize) -> DevInfo {
         DevInfo {
             capacity: self.nsze << (self.lba_shift - 9),
             block_size: 1 << self.lba_shift,
             read_only: false,
             flush: self.flush,
+            address: 0,
         }
     }
 
@@ -310,7 +315,7 @@ impl Driver for Nvme {
         !self.free_reqs.is_empty() && self.free_cids.len() >= MAX_PIECES
     }
 
-    fn start(&mut self, tag: u64, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+    fn start(&mut self, tag: u64, _unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
         let r = self.free_reqs.pop().ok_or(blk::STATUS_IOERR)?;
         self.reqs[r as usize] = Request { tag, pending: 0, status: blk::STATUS_OK };
         let result = (|| {

@@ -1,6 +1,7 @@
 //! virtio-scsi PCI driver, for modern (virtio 1.x) and legacy (0.9.5, as on
-//! GCE) devices.  blkd drives one logical unit: LUN 0 of the first target
-//! that reports a direct-access device, found at start.
+//! GCE) devices.  Every direct-access logical unit found at start is a unit
+//! of blkd: the LUNs of each target (REPORT LUNS, or LUN 0 alone), in
+//! target and LUN order, up to blk::MAX_UNITS.
 //!
 //! Each command is one descriptor chain (indirect if the device offers it):
 //! request header, data pieces, response; data the device reads comes
@@ -65,6 +66,7 @@ const ILLEGAL_REQUEST: u8 = 0x5;
 const UNIT_ATTENTION: u8 = 0x6;
 
 const INQUIRY: u8 = 0x12;
+const REPORT_LUNS: u8 = 0xa0;
 const TEST_UNIT_READY: u8 = 0x00;
 const MODE_SENSE_6: u8 = 0x1a;
 const READ_CAPACITY_10: u8 = 0x25;
@@ -134,6 +136,25 @@ struct Request {
     status: u32,
 }
 
+/// A direct-access logical unit.
+struct Unit {
+    /// virtio-scsi LUN field.
+    lun: [u8; 8],
+    target: u8,
+    number: u16,
+    blocks: u64,
+    block_size: u32,
+    /// Largest transfer of one command, a multiple of the block size.
+    max_bytes: u64,
+    read_only: bool,
+    flush: bool,
+}
+
+/// The virtio-scsi LUN field of a single-level LUN (flat addressing).
+fn lun_field(target: u8, lun: u16) -> [u8; 8] {
+    [1, target, 0x40 | (lun >> 8) as u8, lun as u8, 0, 0, 0, 0]
+}
+
 /// How a command ended.
 struct Outcome {
     response: u8,
@@ -151,14 +172,10 @@ pub struct VirtioScsi {
     free: Vec<u16>,
     reqs: Vec<Request>,
     free_reqs: Vec<u16>,
-    lun: [u8; 8],
+    units: Vec<Unit>,
     seg_max: usize,
-    max_bytes: u64,
+    max_sectors: u64,
     max_cmds: usize,
-    blocks: u64,
-    block_size: u32,
-    read_only: bool,
-    flush: bool,
 }
 
 fn spin_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -259,35 +276,85 @@ impl VirtioScsi {
             slots,
             reqs: alloc::vec![Request::default(); nslots],
             free_reqs: (0..nslots as u16).rev().collect(),
-            lun: [0; 8],
+            units: Vec::new(),
             seg_max,
-            max_bytes: 0,
-            max_cmds: 0,
-            blocks: 0,
-            block_size: 0,
-            read_only: false,
-            flush: true,
+            max_sectors,
+            max_cmds: MAX_PIECES.min(nslots),
         };
-        s.probe(max_target, max_sectors, (buf_va, buf_pa));
+        s.scan(max_target, (buf_va, buf_pa));
+        // Every piece may start a command, and every max_bytes.
+        for u in &s.units {
+            s.max_cmds = s.max_cmds.max(MAX_PIECES + MAX_REQUEST.div_ceil(u.max_bytes) as usize).min(nslots);
+        }
+        sel4::debug_println!(
+            "blkd {:#x}: virtio-scsi, {} disk(s) on targets 0-{}, {} slots{}",
+            id, s.units.len(), max_target, nslots,
+            if indirect { "" } else { " (direct descriptors)" },
+        );
         s
     }
 
-    /// Find the logical unit and read its geometry.
-    fn probe(&mut self, max_target: u8, max_sectors: u64, buf: (usize, u64)) {
-        let id = self.id;
+    /// Find the direct-access logical units.
+    fn scan(&mut self, max_target: u8, buf: (usize, u64)) {
         let byte = |i: usize| Mmio(buf.0).r8(i);
         let be = |off: usize, n: usize| (0..n).fold(0u64, |v, i| (v << 8) | byte(off + i) as u64);
-        let found = (0..=max_target).find(|&target| {
-            self.lun = [1, target, 0x40, 0, 0, 0, 0, 0];
-            let o = self.exec(&[INQUIRY, 0, 0, 0, 36, 0], Some((buf.1, 36)));
-            // Peripheral qualifier 0, direct-access device.
-            o.response == S_OK && o.status == GOOD && byte(0) == 0
-        });
-        let Some(target) = found else { panic!("blkd {:#x}: no virtio-scsi disk on targets 0-{}", id, max_target) };
+        for target in 0..=max_target {
+            // Absent targets fail at the transport (BAD_TARGET).
+            let o = self.exec(lun_field(target, 0), &[INQUIRY, 0, 0, 0, 36, 0], Some((buf.1, 36)));
+            if o.response != S_OK {
+                continue;
+            }
+            let mut luns = Vec::new();
+            let mut cdb = [0u8; 12];
+            cdb[0] = REPORT_LUNS;
+            cdb[6..10].copy_from_slice(&4096u32.to_be_bytes());
+            let o = self.exec(lun_field(target, 0), &cdb, Some((buf.1, 4096)));
+            if o.response == S_OK && o.status == GOOD {
+                let n = (be(0, 4) as usize / 8).min((4096 - 8) / 8);
+                for i in 0..n {
+                    let e = 8 + 8 * i;
+                    // Single-level LUNs: peripheral (bus 0) or flat addressing.
+                    if (2..8).any(|j| byte(e + j) != 0) {
+                        continue;
+                    }
+                    match byte(e) >> 6 {
+                        0 if byte(e) == 0 => luns.push(byte(e + 1) as u16),
+                        1 => luns.push(((byte(e) as u16 & 0x3f) << 8) | byte(e + 1) as u16),
+                        _ => {}
+                    }
+                }
+                luns.sort_unstable();
+                luns.dedup();
+            } else {
+                luns.push(0);
+            }
+            for lun in luns {
+                if self.units.len() == blk::MAX_UNITS {
+                    sel4::debug_println!("blkd {:#x}: more than {} disks, ignoring target {} LUN {}", self.id, blk::MAX_UNITS, target, lun);
+                    return;
+                }
+                if let Some(u) = self.probe(target, lun, buf) {
+                    self.units.push(u);
+                }
+            }
+        }
+    }
+
+    /// Read the geometry of a logical unit, if it is a disk.
+    fn probe(&mut self, target: u8, number: u16, buf: (usize, u64)) -> Option<Unit> {
+        let id = self.id;
+        let lun = lun_field(target, number);
+        let byte = |i: usize| Mmio(buf.0).r8(i);
+        let be = |off: usize, n: usize| (0..n).fold(0u64, |v, i| (v << 8) | byte(off + i) as u64);
+        let o = self.exec(lun, &[INQUIRY, 0, 0, 0, 36, 0], Some((buf.1, 36)));
+        // Peripheral qualifier 0, direct-access device.
+        if o.response != S_OK || o.status != GOOD || byte(0) != 0 {
+            return None;
+        }
 
         // Clear the unit attention of the reset, wait for the unit to be ready.
         for _ in 0..50 {
-            let o = self.exec(&[TEST_UNIT_READY, 0, 0, 0, 0, 0], None);
+            let o = self.exec(lun, &[TEST_UNIT_READY, 0, 0, 0, 0, 0], None);
             if o.response == S_OK && o.status == GOOD {
                 break;
             }
@@ -297,51 +364,56 @@ impl VirtioScsi {
         rc16[0] = READ_CAPACITY_16;
         rc16[1] = 0x10;
         rc16[13] = 32;
-        let o = self.exec(&[READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], Some((buf.1, 8)));
+        let o = self.exec(lun, &[READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], Some((buf.1, 8)));
         let (last, block_size) = if o.response == S_OK && o.status == GOOD && be(0, 4) != 0xffff_ffff {
             (be(0, 4), be(4, 4))
         } else {
-            let o = self.exec(&rc16, Some((buf.1, 32)));
+            let o = self.exec(lun, &rc16, Some((buf.1, 32)));
             if o.response != S_OK || o.status != GOOD {
-                panic!("blkd {:#x}: READ CAPACITY failed: response {} status {:#x}", id, o.response, o.status);
+                sel4::debug_println!("blkd {:#x}: target {} LUN {}: READ CAPACITY failed: response {} status {:#x}",
+                    id, target, number, o.response, o.status);
+                return None;
             }
             (be(0, 8), be(8, 4))
         };
         if !matches!(block_size, 512 | 4096) {
-            panic!("blkd {:#x}: unsupported block size {}", id, block_size);
+            sel4::debug_println!("blkd {:#x}: target {} LUN {}: unsupported block size {}", id, target, number, block_size);
+            return None;
         }
-        self.blocks = last + 1;
-        self.block_size = block_size as u32;
-        self.max_bytes = (max_sectors * 512 / block_size).max(1) * block_size;
-        // Every piece may start a command, and every max_bytes.
-        self.max_cmds = (MAX_PIECES + MAX_REQUEST.div_ceil(self.max_bytes) as usize).min(self.slots.len());
+        let mut u = Unit {
+            lun, target, number,
+            blocks: last + 1,
+            block_size: block_size as u32,
+            max_bytes: (self.max_sectors * 512 / block_size).max(1) * block_size,
+            read_only: false,
+            flush: true,
+        };
 
         // Write protection (mode parameter header) and the write cache
         // (caching page); without them, assume writable with a cache.
-        let o = self.exec(&[MODE_SENSE_6, 0x08, 0x08, 0, 255, 0], Some((buf.1, 255)));
+        let o = self.exec(lun, &[MODE_SENSE_6, 0x08, 0x08, 0, 255, 0], Some((buf.1, 255)));
         if o.response == S_OK && o.status == GOOD {
             let len = (byte(0) as usize + 1).min(255usize.saturating_sub(o.residual as usize));
-            self.read_only = byte(2) & 0x80 != 0;
+            u.read_only = byte(2) & 0x80 != 0;
             let page = 4 + byte(3) as usize;
             if page + 3 <= len && byte(page) & 0x3f == 0x08 {
-                self.flush = byte(page + 2) & 0x04 != 0;
+                u.flush = byte(page + 2) & 0x04 != 0;
             }
         }
         sel4::debug_println!(
-            "blkd {:#x}: virtio-scsi target {} LUN 0, {} {}-byte blocks{}{}, {} slots{}",
-            id, target, self.blocks, block_size,
-            if self.read_only { ", write-protected" } else { "" },
-            if self.flush { ", write cache" } else { "" },
-            self.slots.len(),
-            if self.indirect { "" } else { " (direct descriptors)" },
+            "blkd {:#x}: virtio-scsi unit {}: target {} LUN {}, {} {}-byte blocks{}{}",
+            id, self.units.len(), target, number, u.blocks, block_size,
+            if u.read_only { ", write-protected" } else { "" },
+            if u.flush { ", write cache" } else { "" },
         );
+        Some(u)
     }
 
     /// Run one command to completion by polling (during probing).
-    fn exec(&mut self, cdb: &[u8], data_in: Option<(u64, u32)>) -> Outcome {
+    fn exec(&mut self, lun: [u8; 8], cdb: &[u8], data_in: Option<(u64, u32)>) -> Outcome {
         let s = self.free.pop().expect("idle slot");
         let data = data_in.map(|(pa, len)| Seg { pa, len });
-        self.fill(s, cdb, data.as_slice(), data_in.is_some());
+        self.fill(s, lun, cdb, data.as_slice(), data_in.is_some());
         self.slots[s as usize].busy = true;
         self.vq.submit(self.slots[s as usize].head);
         self.t.notify(&self.vq);
@@ -354,14 +426,14 @@ impl VirtioScsi {
     }
 
     /// Write slot `s`'s command: header, descriptors.  Not yet submitted.
-    fn fill(&mut self, s: u16, cdb: &[u8], data: &[Seg], data_in: bool) {
+    fn fill(&mut self, s: u16, lun: [u8; 8], cdb: &[u8], data: &[Seg], data_in: bool) {
         let slot = &mut self.slots[s as usize];
         slot.retries = 0;
         let hdr = Mmio(slot.hdr_va);
         for i in 0..HDR_BYTES / 4 {
             hdr.w32(4 * i, 0);
         }
-        for (i, &b) in self.lun.iter().enumerate() {
+        for (i, &b) in lun.iter().enumerate() {
             hdr.w8(i, b);
         }
         hdr.w64(8, s as u64);
@@ -419,9 +491,9 @@ impl VirtioScsi {
         Outcome { response: r.r8(RESP_RESPONSE), status: r.r8(RESP_STATUS), residual: r.r32(RESP_RESIDUAL), sense_key }
     }
 
-    /// Fill a free slot with a READ or WRITE of `data` at `lba`.
-    fn rw(&mut self, r: u16, write: bool, lba: u64, data: &[Seg], bytes: u64) -> u16 {
-        let blocks = bytes / self.block_size as u64;
+    /// Fill a free slot with a READ or WRITE of `data` at `lba` of `unit`.
+    fn rw(&mut self, r: u16, unit: usize, write: bool, lba: u64, data: &[Seg], bytes: u64) -> u16 {
+        let blocks = bytes / self.units[unit].block_size as u64;
         let mut cdb = [0u8; 16];
         let len = if lba + blocks <= 1 << 32 && blocks <= 0xffff {
             cdb[0] = if write { WRITE_10 } else { READ_10 };
@@ -435,19 +507,25 @@ impl VirtioScsi {
             16
         };
         let s = self.free.pop().unwrap();
-        self.fill(s, &cdb[..len], data, !write);
+        self.fill(s, self.units[unit].lun, &cdb[..len], data, !write);
         self.slots[s as usize].req = r;
         s
     }
 }
 
 impl Driver for VirtioScsi {
-    fn info(&self) -> DevInfo {
+    fn units(&self) -> usize {
+        self.units.len()
+    }
+
+    fn info(&self, unit: usize) -> DevInfo {
+        let u = &self.units[unit];
         DevInfo {
-            capacity: self.blocks * (self.block_size as u64 / 512),
-            block_size: self.block_size,
-            read_only: self.read_only,
-            flush: self.flush,
+            capacity: u.blocks * (u.block_size as u64 / 512),
+            block_size: u.block_size,
+            read_only: u.read_only,
+            flush: u.flush,
+            address: blk::blkd_scsi_addr(u.target, u.number),
         }
     }
 
@@ -455,8 +533,8 @@ impl Driver for VirtioScsi {
         !self.free_reqs.is_empty() && self.free.len() >= self.max_cmds
     }
 
-    fn start(&mut self, tag: u64, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
-        if !self.can_start() {
+    fn start(&mut self, tag: u64, unit: usize, op: u32, sector: u64, data: &[Seg]) -> Result<(), u32> {
+        if !self.can_start() || unit >= self.units.len() {
             return Err(blk::STATUS_IOERR);
         }
         let r = self.free_reqs.pop().unwrap();
@@ -465,13 +543,13 @@ impl Driver for VirtioScsi {
         let result = (|| {
             if op == blk::OP_FLUSH {
                 let s = self.free.pop().unwrap();
-                self.fill(s, &[SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[], false);
+                self.fill(s, self.units[unit].lun, &[SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[], false);
                 self.slots[s as usize].req = r;
                 issued[0] = s;
                 n_issued = 1;
                 return Ok(());
             }
-            let bs = self.block_size as u64;
+            let (bs, max_bytes) = (self.units[unit].block_size as u64, self.units[unit].max_bytes);
             // Never round a sector down to the block holding it.
             if !(sector * 512).is_multiple_of(bs) {
                 return Err(blk::STATUS_IOERR);
@@ -484,7 +562,7 @@ impl Driver for VirtioScsi {
             let mut pieces = data.iter().copied();
             let mut cur = pieces.next();
             loop {
-                let full = n == self.seg_max || bytes == self.max_bytes;
+                let full = n == self.seg_max || bytes == max_bytes;
                 if cur.is_none() || full {
                     if n == 0 {
                         break;
@@ -496,7 +574,7 @@ impl Driver for VirtioScsi {
                     }
                     cmd[n - 1].len -= excess as u32;
                     let tail = Seg { pa: cmd[n - 1].pa + cmd[n - 1].len as u64, len: excess as u32 };
-                    issued[n_issued] = self.rw(r, write, lba, &cmd[..n], bytes - excess);
+                    issued[n_issued] = self.rw(r, unit, write, lba, &cmd[..n], bytes - excess);
                     n_issued += 1;
                     lba += (bytes - excess) / bs;
                     (n, bytes) = (0, 0);
@@ -506,7 +584,7 @@ impl Driver for VirtioScsi {
                     continue;
                 }
                 let p = cur.as_mut().unwrap();
-                let take = (p.len as u64).min(self.max_bytes - bytes);
+                let take = (p.len as u64).min(max_bytes - bytes);
                 cmd[n] = Seg { pa: p.pa, len: take as u32 };
                 n += 1;
                 bytes += take;

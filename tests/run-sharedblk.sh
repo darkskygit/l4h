@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Native block windows: concurrent clients, isolation, provisioning, reuse
 # and destroy during I/O. SHARED_BLK_DEV=nvme or scsi, SHARED_BLK_LBA=4096
-# also tested.
+# also tested; scsi-luns puts both disks on one virtio-scsi controller, as
+# LUNs 0 and 5 of target 1 behind a CD-ROM at target 0.
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,6 +33,11 @@ scsi) lba=${SHARED_BLK_LBA:-512}
                -device "scsi-hd,drive=d1,bus=s1.0,logical_block_size=$lba,physical_block_size=$lba")
       dev=(-device virtio-scsi-pci,id=s0,disable-legacy=on
            -device "scsi-hd,drive=d0,bus=s0.0,logical_block_size=$lba,physical_block_size=$lba") ;;
+scsi-luns)
+      lba=${SHARED_BLK_LBA:-512}
+      dev=(-device virtio-scsi-pci,id=s0,disable-legacy=on -device scsi-cd,bus=s0.0,scsi-id=0
+           -device "scsi-hd,drive=d0,bus=s0.0,scsi-id=1,lun=0,logical_block_size=$lba,physical_block_size=$lba")
+      slowdev=(-device "scsi-hd,drive=d1,bus=s0.0,scsi-id=1,lun=5,logical_block_size=$lba,physical_block_size=$lba") ;;
 *) slowdev=(-device virtio-blk-pci,drive=d1,disable-legacy=on)
    dev=(-device virtio-blk-pci,drive=d0,disable-legacy=on) ;;
 esac
@@ -49,3 +55,8 @@ sed -n '/l4h-root:/,$p' "$out/qemu.log"
 grep -q 'SHAREDBLK: PASS' "$out/qemu.log"
 grep -q '4 MiB of I/O pool kept out of use' "$out/qemu.log"
 ! grep -qE 'SHAREDVM: FAIL|SHAREDBLK: FAIL' "$out/qemu.log"
+if [ "${SHARED_BLK_DEV:-}" = scsi-luns ]; then
+    grep -aq '^disk 0: pci .* virtio-scsi 1:0,' "$out/qemu.log"
+    grep -aq '^disk 1: pci .* virtio-scsi 1:5,' "$out/qemu.log"
+    ! grep -aq '^disk 2:' "$out/qemu.log"
+fi

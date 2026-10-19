@@ -68,11 +68,11 @@ pub const VECTOR_NIC_BASE: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 pub const VECTOR_MONITOR: u64 = 8;
 pub const VECTOR_DISK_BASE: u64 = 16;
-/// Disks beyond this many are left alone.
+/// Disk controllers beyond this many are left alone.
 #[cfg(target_arch = "x86_64")]
-pub const MAX_DISKS: usize = 64;
+pub const MAX_DISK_CTRLS: usize = 64;
 #[cfg(target_arch = "aarch64")]
-pub const MAX_DISKS: usize = 48;
+pub const MAX_DISK_CTRLS: usize = 48;
 
 /// A capability for I/O ports [base, base + len), in a new root slot.
 #[cfg(target_arch = "x86_64")]

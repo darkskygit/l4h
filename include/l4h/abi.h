@@ -352,7 +352,8 @@ enum l4h_ctl_op {
 	L4H_CTL_CONSOLE_READ = 8,
 	/* args: vm, len; data: console input */
 	L4H_CTL_CONSOLE_WRITE = 9,
-	/* args: disk index -> vals: bdf, owner vm (or -1), failed (quarantined:
+	/* args: disk index -> vals: bdf (bits 0-15; a virtio-scsi disk adds
+	 * its target in bits 16-23 and LUN from bit 24), owner vm (or -1), failed (quarantined:
 	 * attaching it fails with EIO), kind (0 virtio-blk, 1 NVMe, 2 virtio-scsi),
      * capacity (512-byte sectors), number of attachments. owner is the
      * first attached VM; use BLK_INFO to enumerate all windows. */

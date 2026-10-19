@@ -789,8 +789,13 @@ thin provisioning or copy-on-write.
   the controller. Provisioning uses a private 1 MiB DMA scratch area and
   never permits writes overlapping a client, including read-only clients.
 - A virtio-scsi controller, modern or legacy (0.9.5 in I/O BAR 0, as on
-  GCE), is one disk: blkd scans LUN 0 of each target and drives the first
-  direct-access unit, as NVMe drives namespace 1. Requests become
+  GCE), has a host disk per direct-access logical unit (up to 16): blkd
+  lists each target's LUNs with REPORT LUNS (LUN 0 alone if that fails)
+  and skips other device types. Host disks are numbered by controller in
+  PCI order, then target and LUN, so root starts virtio-scsi controllers
+  at boot to learn their units; other controllers have one disk and start
+  on first use. blkd clients and quarantine are per controller: a drain
+  timeout fails every disk of it. Requests become
   READ/WRITE(10 or 16) and SYNCHRONIZE CACHE commands, split when they
   exceed the device's `seg_max` or `max_sectors`. Write protection and the
   write cache come from MODE SENSE; unit attentions and busy statuses are
@@ -802,8 +807,9 @@ thin provisioning or copy-on-write.
 
 `tests/run-sharedblk.sh` checks concurrent clients, overlap and bounds
 rejection, provisioning exclusion, destroy during I/O, read-only windows,
-flush/readback and repeated reuse. Run it with virtio-blk, virtio-scsi and
-NVMe (512 and 4096 byte logical blocks). `tests/blk-windows.rs` exercises the production
+flush/readback and repeated reuse. Run it with virtio-blk, virtio-scsi (also
+with both disks as LUNs of one controller) and NVMe (512 and 4096 byte
+logical blocks). `tests/blk-windows.rs` exercises the production
 validator on malformed requests and window/pool boundaries.
 
 ### 8.3 Network: L2 virtual switches only

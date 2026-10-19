@@ -41,5 +41,19 @@ for i in 1 2 3 4 5 6 7 8; do
 done
 echo "BLKTEST: parallel direct I/O through the I/O pool: ok"
 umount /mnt
+# A second disk on the same controller (BLKTEST_DEV=scsi-luns): its
+# writes stay on it.
+if [ -b /dev/vdb ]; then
+    echo "BLKTEST: vdb $(cat /sys/block/vdb/size) sectors"
+    dd if=/tmp/pat4 of=/dev/vdb bs=1M oflag=direct 2>/dev/null || fail "vdb write"
+    dd if=/dev/vdb of=/tmp/rb bs=1M count=4 iflag=direct 2>/dev/null || fail "vdb read"
+    cmp /tmp/pat4 /tmp/rb || fail "vdb readback mismatch"
+    echo 3 > /proc/sys/vm/drop_caches
+    mount -t ext4 /dev/vda /mnt || fail "vda after vdb writes"
+    grep -q "hello from the host" /mnt/hello.txt || fail "vda changed by vdb writes"
+    cmp /tmp/pat /mnt/pat || fail "vda data changed by vdb writes"
+    umount /mnt
+    echo "BLKTEST: second disk independent: ok"
+fi
 echo "BLKTEST: PASS"
 poweroff -f

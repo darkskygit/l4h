@@ -91,11 +91,25 @@ pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
 pub const MAX_CLIENTS: usize = 64;
 pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
 pub const STAGING_SIZE: usize = 1 << 20;
+/// Service calls of blkd (message registers; the result is in MR 0).
+/// unit -> capacity (u64::MAX if no such unit), block size, read-only,
+/// number of units, unit address (blkd_scsi_addr for virtio-scsi, else 0).
 pub const BLKD_INFO: u64 = 1;
+/// client, unit -> 0
 pub const BLKD_ADD: u64 = 2;
+/// client -> 0, or u64::MAX if it did not drain
 pub const BLKD_REMOVE: u64 = 3;
+/// sector, length, unit -> blk::STATUS_*, or u64::MAX
 pub const BLKD_WRITE: u64 = 4;
+/// unit -> blk::STATUS_*, or u64::MAX
 pub const BLKD_FLUSH: u64 = 5;
+/// Units per controller, at most.
+pub const MAX_UNITS: usize = 16;
+
+/// A virtio-scsi unit address: target and LUN.
+pub const fn blkd_scsi_addr(target: u8, lun: u16) -> u64 {
+    target as u64 | (lun as u64) << 8
+}
 
 pub const fn channel_va(client: usize) -> usize {
     0x2000_0000_0000 + client * 0x20000
