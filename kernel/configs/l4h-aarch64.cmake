@@ -21,3 +21,6 @@ set(KernelDebugBuild ON CACHE BOOL "")
 # Debug syscalls only for host components (see l4h-x86_64.cmake).
 set(KernelDebugSyscallMinMCP "101" CACHE STRING "")
 set(KernelPrinting ON CACHE BOOL "")
+# Kernel prints stall the core; spurious interrupts are frequent under
+# QEMU/HVF (see l4h-x86_64.cmake).
+set(KernelIRQReporting OFF CACHE BOOL "")

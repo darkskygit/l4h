@@ -23,6 +23,38 @@ pub use sel4_runtime_common;
 
 pub mod ioport;
 
+/// Limits a recurring critical error (such as failed I/O) to its first few
+/// prints: each one is a synchronous kernel print (see `host::VERBOSE`).
+pub struct ErrorLimit(u32);
+
+impl ErrorLimit {
+    const MAX: u32 = 8;
+
+    pub const fn new() -> Self {
+        ErrorLimit(0)
+    }
+
+    /// Whether to print this occurrence; the last one printed says so.
+    pub fn allow(&mut self) -> bool {
+        self.0 = self.0.saturating_add(1);
+        if self.0 == Self::MAX {
+            sel4::debug_println!("(further errors of this kind are not printed)");
+        }
+        self.0 <= Self::MAX
+    }
+}
+
+/// An informational message: printed only when `host::VERBOSE` (not in
+/// release builds).  Use `sel4::debug_println!` for critical errors only.
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {
+        if $crate::host::VERBOSE {
+            $crate::sel4::debug_println!($($arg)*);
+        }
+    };
+}
+
 use l4h_host::{CONFIG_OFFSET, INFO_MAGIC, INFO_VA, IPCBUF_VA, InfoHeader};
 
 /// The component info page.

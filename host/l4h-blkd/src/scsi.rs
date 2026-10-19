@@ -165,6 +165,7 @@ struct Outcome {
 
 pub struct VirtioScsi {
     id: u32,
+    io_errors: l4h_rt::ErrorLimit,
     t: Transport,
     vq: Virtq,
     indirect: bool,
@@ -272,6 +273,7 @@ impl VirtioScsi {
         let (buf_va, buf_pa) = dma.alloc(4096, 4096);
         let mut s = VirtioScsi {
             id, t, vq, indirect,
+            io_errors: l4h_rt::ErrorLimit::new(),
             free: (0..nslots as u16).rev().collect(),
             slots,
             reqs: alloc::vec![Request::default(); nslots],
@@ -286,7 +288,7 @@ impl VirtioScsi {
         for u in &s.units {
             s.max_cmds = s.max_cmds.max(MAX_PIECES + MAX_REQUEST.div_ceil(u.max_bytes) as usize).min(nslots);
         }
-        sel4::debug_println!(
+        l4h_rt::info!(
             "blkd {:#x}: virtio-scsi, {} disk(s) on targets 0-{}, {} slots{}",
             id, s.units.len(), max_target, nslots,
             if indirect { "" } else { " (direct descriptors)" },
@@ -400,7 +402,7 @@ impl VirtioScsi {
                 u.flush = byte(page + 2) & 0x04 != 0;
             }
         }
-        sel4::debug_println!(
+        l4h_rt::info!(
             "blkd {:#x}: virtio-scsi unit {}: target {} LUN {}, {} {}-byte blocks{}{}",
             id, self.units.len(), target, number, u.blocks, block_size,
             if u.read_only { ", write-protected" } else { "" },
@@ -644,7 +646,10 @@ impl Driver for VirtioScsi {
                 (S_OK, CHECK_CONDITION) if o.sense_key == Some(ILLEGAL_REQUEST) => blk::STATUS_UNSUPP,
                 _ => blk::STATUS_IOERR,
             };
-            if status != blk::STATUS_OK {
+            // Unsupported commands come from guests: not an error of the host.
+            if status == blk::STATUS_UNSUPP {
+                l4h_rt::info!("blkd {:#x}: virtio-scsi command unsupported by the device", self.id);
+            } else if status != blk::STATUS_OK && self.io_errors.allow() {
                 sel4::debug_println!(
                     "blkd {:#x}: virtio-scsi command failed: response {} status {:#x} sense key {:?} residual {}",
                     self.id, o.response, o.status, o.sense_key, o.residual

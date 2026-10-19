@@ -532,7 +532,7 @@ impl Guest {
         *regs.c_param_mut(0) = abi::BOOTINFO_VA;
         self.vcpus[0].ktcb.tcb_write_all_registers(true, &mut regs).expect("start vCPU 0");
         self.state = State::Running;
-        sel4::debug_println!("l4h-root: guest {} '{}' started", self.id, self.name);
+        info!("l4h-root: guest {} '{}' started", self.id, self.name);
     }
 
     /// Stop all threads of the guest and its VMM.
@@ -556,7 +556,7 @@ impl Guest {
         let pool = self.pool.paddr;
         let pinned = alloc.reclaim_pinning(self.arena, |p| pin_pool && p == pool);
         if pinned != 0 {
-            sel4::debug_println!("l4h-root: guest {}: {} MiB of I/O pool kept out of use", self.id, pinned >> 20);
+            info!("l4h-root: guest {}: {} MiB of I/O pool kept out of use", self.id, pinned >> 20);
         }
         // Capabilities that do not derive from the arena (badged endpoints,
         // copies of global objects) are left in their slots.
@@ -831,7 +831,7 @@ pub fn create(
         g.add_device(alloc, DevKind::Ctl).unwrap();
     }
 
-    sel4::debug_println!(
+    info!(
         "l4h-root: guest {} '{}' created: {} MiB RAM in {} blocks, {} vCPU(s), {} MiB I/O pool, {} KiB host objects",
         id, g.name, ram >> 20, nr_blocks, cfg.vcpus, g.pool.size >> 20, g.arena.bytes() >> 10
     );

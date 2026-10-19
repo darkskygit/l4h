@@ -7,6 +7,16 @@
 
 extern crate alloc;
 
+/// An informational message: printed only when `host::VERBOSE` (not in
+/// release builds).  Use `sel4::debug_println!` for critical errors only.
+macro_rules! info {
+    ($($arg:tt)*) => {
+        if l4h_host::VERBOSE {
+            sel4::debug_println!($($arg)*);
+        }
+    };
+}
+
 mod blkd;
 mod component;
 mod ctl;
@@ -287,7 +297,7 @@ impl Host {
                         }
                     }
                 }
-                sel4::debug_println!("l4h-root: cannot create guest '{}': out of memory", cfg.name);
+                info!("l4h-root: cannot create guest '{}': out of memory", cfg.name);
                 None
             }
         }
@@ -421,7 +431,7 @@ impl Host {
         let name = g.name.clone();
         self.asids.in_use -= g.asids;
         g.destroy(&mut self.alloc, !quiet);
-        sel4::debug_println!(
+        info!(
             "l4h-root: guest {} '{}' destroyed, {} MiB free",
             id, name, self.alloc.free_bytes() >> 20
         );
@@ -434,7 +444,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let cores = bootinfo.inner().numNodes as usize;
     let mut alloc = Alloc::new(Slots::new(bootinfo.empty().range()), bootinfo);
     let total_bytes = alloc.free_bytes();
-    sel4::debug_println!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
+    info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
 
     let hyp_ep = alloc.object_cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
     // The watchdog timer signals a notification bound to the root TCB, which
@@ -462,14 +472,14 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let mut ctrls = Vec::new();
     let mut nics = Vec::new();
     for d in pci.enumerate() {
-        sel4::debug_println!(
+        info!(
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
             d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
         );
         if d.vendor == 0x1af4 || d.vendor == 0x1ae0 {
             let caps: Vec<u8> = d.virtio_caps.iter().map(|c| c.cfg_type).collect();
             let bars: Vec<_> = d.bars.iter().filter(|b| b.size != 0).map(|b| (b.addr, b.size, b.is_io)).collect();
-            sel4::debug_println!(
+            info!(
                 "l4h-root:   virtio caps {:?}, msix {:?}, bars {:x?}",
                 caps, d.msix.map(|m| (m.table_bar, m.table_size)), bars
             );
@@ -516,7 +526,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem);
 
     if DOM0_KERNEL.is_empty() {
-        sel4::debug_println!("l4h-root: no dom0 kernel embedded, nothing to do");
+        info!("l4h-root: no dom0 kernel embedded, nothing to do");
     } else {
         boot_dom0(&mut h);
     }
@@ -697,7 +707,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
         }
         host::ROOT_CALL_GUEST_POWER if is_vmm => {
             let how = mr(1);
-            sel4::debug_println!("l4h-root: guest {} power request {}", id, how);
+            info!("l4h-root: guest {} power request {}", id, how);
             if how != l4h_abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
                 // The caller (dom0's VMM) is destroyed: no reply.
                 restart_dom0(h, id);
@@ -710,7 +720,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
                 g.state = State::Stopped;
             }
             if h.guests.iter().flatten().all(|g| g.state != State::Running) {
-                sel4::debug_println!("l4h-root: all guests stopped");
+                info!("l4h-root: all guests stopped");
             }
             Some(0)
         }

@@ -247,7 +247,7 @@ fn main(info: &'static Info) -> ! {
     };
     let dev: Vec<DevInfo> = (0..drv.units()).map(|u| drv.info(u)).collect();
     for (u, d) in dev.iter().enumerate() {
-        sel4::debug_println!("blkd {:#x}: shared controller, unit {}: {} sectors, {}-byte blocks", id, u, d.capacity, d.block_size);
+        l4h_rt::info!("blkd {:#x}: shared controller, unit {}: {} sectors, {}-byte blocks", id, u, d.capacity, d.block_size);
     }
     let mut b = Blkd {
         clients: (0..blk::MAX_CLIENTS).map(|_| None).collect(),

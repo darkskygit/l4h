@@ -46,7 +46,7 @@ impl Monitor {
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
         m.out(1, 0x01);
         m.out(4, m.inb(4) | 0x08);
-        sel4::debug_println!("l4h-root: serial monitor on COM1 (type 'help')");
+        info!("l4h-root: serial monitor on COM1 (type 'help')");
         Some(m)
     }
 
@@ -72,7 +72,7 @@ impl Monitor {
             ((UART_VA + 0x38) as *mut u32).write_volatile((1 << 4) | (1 << 6)); // RX, RX timeout
         }
         irq.irq_handler_ack().ok()?;
-        sel4::debug_println!("l4h-root: serial monitor on PL011 (type 'help')");
+        info!("l4h-root: serial monitor on PL011 (type 'help')");
         Some(Self { port: UART_VA as u64, irq, line: String::new() })
     }
 

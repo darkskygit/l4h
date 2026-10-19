@@ -35,6 +35,11 @@ set(KernelTimerTickMS "2" CACHE STRING "")
 # host components log to the serial port through the kernel.
 set(KernelDebugBuild ON CACHE BOOL "")
 set(KernelPrinting ON CACHE BOOL "")
+# Every kernel print is a synchronous serial write with interrupts off, which
+# stalls the core for the whole message.  Spurious interrupts are harmless and
+# frequent under some hypervisors (QEMU/HVF): never report them.  Host
+# components print only critical errors in release builds (host::VERBOSE).
+set(KernelIRQReporting OFF CACHE BOOL "")
 # Debug syscalls (some halt the machine) only for host components: guest
 # threads have an MCP of at most L4H_PRIO_KERNEL (100).
 set(KernelDebugSyscallMinMCP "101" CACHE STRING "")

@@ -980,7 +980,19 @@ the host keeps that dynamic plumbing simple.
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
 protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
 Serial output uses seL4's printing syscall; root drives COM1 input for the
-monitor. There is no separate serial virtualiser.
+monitor. There is no separate serial virtualiser. A kernel print is a
+synchronous serial write with interrupts off, which stalls its core for the
+whole message and breaks timing, so prints are kept rare:
+
+- The kernel never reports spurious interrupts (`KernelIRQReporting` off);
+  QEMU/HVF raises tens of thousands of them.
+- Host informational messages (device discovery, guest lifecycle, balancer
+  moves) use `info!`, which prints only when `host::VERBOSE`: not in builds
+  made with `L4H_RELEASE=1`. Release builds print critical errors only, and
+  repeated ones (failed I/O) only the first few times (`l4h_rt::ErrorLimit`).
+- Guest consoles, dom0's included, are copied to the serial port only when
+  verbose. They always go to the console rings that `console_read` serves.
+- The serial monitor's replies and the opt-in watchdog dumps always print.
 
 **Guest boot protocol.** The guest boots without firmware or a bootloader.
 Root parses dom0's embedded ELF. For runtime guests, the dom0 `l4hctl`

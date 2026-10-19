@@ -116,6 +116,7 @@ struct Request {
 
 pub struct Nvme {
     id: u32,
+    io_errors: l4h_rt::ErrorLimit,
     asq: Sq,
     acq: Cq,
     sq: Sq,
@@ -180,6 +181,7 @@ impl Nvme {
         let prp: Vec<_> = (0..depth).map(|_| dma.alloc(4096, 4096)).collect();
         let mut n = Nvme {
             id,
+            io_errors: l4h_rt::ErrorLimit::new(),
             asq: Sq { va: asq_va, depth: ADMIN_DEPTH, tail: 0, doorbell: db(0) },
             acq: Cq { va: acq_va, depth: ADMIN_DEPTH, head: 0, phase: 1, doorbell: db(1) },
             sq: Sq { va: sq_va, depth, tail: 0, doorbell: db(2) },
@@ -388,7 +390,9 @@ impl Driver for Nvme {
             let r = self.cmd_req[cid as usize] as usize;
             let req = &mut self.reqs[r];
             if status != 0 {
-                sel4::debug_println!("nvme {:#x}: command {} failed: status {:#x}", self.id, cid, status);
+                if self.io_errors.allow() {
+                    sel4::debug_println!("nvme {:#x}: command {} failed: status {:#x}", self.id, cid, status);
+                }
                 req.status = blk::STATUS_IOERR;
             }
             req.pending -= 1;

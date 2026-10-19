@@ -153,7 +153,7 @@ impl VirtioNet {
         // virtualization.
         nic.txq.set_interrupts(false);
         nic.kick(&nic.rxq);
-        l4h_rt::sel4::debug_println!(
+        l4h_rt::info!(
             "netd: NIC {}: {:02x}:{:02x}.{} virtio-net {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, offloads tx{}{} rx{}{}{}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7,
             if nic.ports.is_some() { "legacy" } else { "modern" },

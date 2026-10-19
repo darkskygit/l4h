@@ -431,7 +431,7 @@ fn main(info: &'static Info) -> ! {
     }
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
-    sel4::debug_println!("netd: {} uplink NIC(s)", d.nics.len());
+    l4h_rt::info!("netd: {} uplink NIC(s)", d.nics.len());
 
     let (mut msg, mut badge) = ep.recv(reply);
     loop {

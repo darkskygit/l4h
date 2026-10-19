@@ -7,6 +7,15 @@
 pub mod blk;
 pub mod net;
 
+/// Whether host components print informational messages.  Every print is a
+/// synchronous serial write by the seL4 kernel, which stalls the core for
+/// the whole message, so release builds (`L4H_RELEASE=1` when the host is
+/// built) print critical errors only; informational messages use `info!`.
+pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
+    Some(v) => !matches!(v.as_bytes(), [b'1']),
+    None => true,
+};
+
 /// Component address-space layout.
 pub const INFO_VA: usize = 0x1000_0000;
 pub const INFO_SIZE: usize = 0x4000;

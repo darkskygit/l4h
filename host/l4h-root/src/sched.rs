@@ -209,7 +209,7 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
         .min_by_key(|&&(gid, _, _, used)| (sibling_on(gid, dst), u64::MAX - used));
     let Some(&(gid, v, _, _)) = pick else { return };
     if configure(h, gid, v, dst) {
-        sel4::debug_println!(
+        info!(
             "l4h-root: balancer: guest {} vCPU {}: core {} -> {} (busy {:?})",
             gid, v, src, dst, busy
         );

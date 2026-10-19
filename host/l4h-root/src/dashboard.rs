@@ -79,7 +79,7 @@ impl Dashboard {
         let extra = bootinfo.extra().find(|e| e.id == sel4::BootInfoExtraId::X86FrameBuffer)?;
         let (addr, pitch, width, height, bpp, ty) = parse_fb(extra.content())?;
         if addr == 0 || bpp != 32 || ty != 1 || width < 640 || height < 400 {
-            sel4::debug_println!("l4h-root: framebuffer {}x{}@{} type {} not supported", width, height, bpp, ty);
+            info!("l4h-root: framebuffer {}x{}@{} type {} not supported", width, height, bpp, ty);
             return None;
         }
         // Device frames come in aligned power-of-two blocks.
@@ -119,7 +119,7 @@ impl Dashboard {
                 d.put(x, y, BG);
             }
         }
-        sel4::debug_println!("l4h-root: dashboard on {}x{} framebuffer ({} columns)", width, height, cols);
+        info!("l4h-root: dashboard on {}x{} framebuffer ({} columns)", width, height, cols);
         Some(d)
     }
 

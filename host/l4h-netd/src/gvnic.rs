@@ -414,7 +414,7 @@ impl Gvnic {
 
         let mac = g.mac;
         let link = g.r32(REG_DEVICE_STATUS) & DEVICE_STATUS_LINK != 0;
-        sel4::debug_println!(
+        l4h_rt::info!(
             "netd: NIC {}: {:02x}:{:02x}.{} gVNIC rev {} dqo-rda, {} blocks, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, mtu {}, rings tx {} rx {}, link {}",
             n, c.pci_bdf >> 8, (c.pci_bdf >> 3) & 0x1f, c.pci_bdf & 7, c.revision, blocks,
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
