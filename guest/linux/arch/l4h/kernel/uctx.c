@@ -184,31 +184,49 @@ void l4h_uctx_destroy(struct task_struct *t)
 	u->fault_ep_vcpu = -1;
 }
 
-/* Account `t` as possibly executing user code of `mm`. */
+/*
+ * Account `t` as possibly executing user code of `mm`.  The count is kept
+ * on the mm it was taken on: exec and exit change t->mm while `t` is
+ * counted, and an mm whose count is off is evicted from its VSpace while
+ * its threads run, which then share that VSpace with the next owner.
+ */
 static void mm_running_enter(struct task_struct *t, struct mm_struct *mm)
 {
-	if (t->thread.mm_running)
+	if (t->thread.running_mm == mm)
 		return;
+	WARN_ON_ONCE(t->thread.running_mm);
 	atomic_inc(&mm->context.l4h.running);
-	t->thread.mm_running = 1;
+	t->thread.running_mm = mm;
 }
 
-/* Called when `t` stops being current on its vCPU. */
-void l4h_uctx_switch_out(struct task_struct *t)
+static void mm_running_leave(struct task_struct *t)
 {
-	struct l4h_uctx *u = &t->thread.uctx;
-
-	if (!t->thread.mm_running)
-		return;
 	/* Release even a faulted context before the task can migrate.  Leaving
 	 * it bound lets the old vCPU's bind_sc() race with its new vCPU over
 	 * sc_owner/sc_vcpu, and retain a pointer to a task that can exit there.
 	 * A preempted context must also lose SC_U so it cannot run behind the
 	 * kernel's back.  Ownership is consequently local to the current vCPU. */
-	l4h_user_deschedule(u);
-	if (t->mm)
-		atomic_dec(&t->mm->context.l4h.running);
-	t->thread.mm_running = 0;
+	l4h_user_deschedule(&t->thread.uctx);
+	atomic_dec(&t->thread.running_mm->context.l4h.running);
+	t->thread.running_mm = NULL;
+}
+
+/* Called when `t` stops being current on its vCPU. */
+void l4h_uctx_switch_out(struct task_struct *t)
+{
+	if (t->thread.running_mm)
+		mm_running_leave(t);
+}
+
+/* `t` no longer uses `mm` (exec, exit_mm()), which may be freed next. */
+void l4h_uctx_mm_gone(struct task_struct *t, struct mm_struct *mm)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	if (t->thread.running_mm == mm)
+		mm_running_leave(t);
+	local_irq_restore(flags);
 }
 
 static void prepare_user(struct task_struct *t)

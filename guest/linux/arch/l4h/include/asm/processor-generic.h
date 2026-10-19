@@ -39,7 +39,7 @@ struct thread_struct {
 	/* seL4 user context of this thread (see os-sel4/user.c) */
 	struct l4h_uctx uctx;
 	struct l4h_obj utcb_obj, reply_obj;
-	int mm_running;			/* counted in mm->context.l4h.running */
+	struct mm_struct *running_mm;	/* counted in its context.l4h.running */
 	u64 vs_gen;			/* VSpace generation the TCB is bound to */
 
 	/* Contains variable sized FP registers */
