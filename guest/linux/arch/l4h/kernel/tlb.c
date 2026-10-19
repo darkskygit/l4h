@@ -14,6 +14,7 @@
 #include <os.h>
 #include <skas.h>
 #include <kern_util.h>
+#include <l4h_vspace.h>
 
 struct vm_ops {
 	struct mm_id *mm_idp;
@@ -229,6 +230,8 @@ int um_tlb_sync(struct mm_struct *mm)
 		} else
 			ret = update_p4d_range(pgd, addr, next, &ops);
 	} while (pgd++, addr = next, ((addr < end) && !ret));
+	if (mm != &init_mm)
+		l4h_mm_flush_deferred(mm);
 
 out:
 	if (mm == &init_mm)

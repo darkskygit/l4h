@@ -76,6 +76,7 @@ struct l4h_as {
 	unsigned long root;
 	struct list_head tables;
 	struct xarray pages;
+	bool flush_pending;	/* rights lowered with L4H_PROT_DEFER_FLUSH */
 };
 
 static void as_init(struct l4h_as *as, unsigned long root)
@@ -83,6 +84,7 @@ static void as_init(struct l4h_as *as, unsigned long root)
 	as->root = root;
 	INIT_LIST_HEAD(&as->tables);
 	xa_init(&as->pages);
+	as->flush_pending = false;
 }
 
 static int as_add_table(struct l4h_as *as, int level, unsigned long va)
@@ -117,7 +119,14 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 	return 0;
 }
 
-static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, int prot)
+/*
+ * Map `phys` at `va`.  With `defer`, a remap that lowers the rights of the
+ * frame leaves the TLBs to as_flush_deferred(): a TLB sync lowers many in a
+ * row (fork write-protects every private page), and each flush is an IPI
+ * round trip to every core the address space ran on.
+ */
+static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, int prot,
+		       bool defer)
 {
 	unsigned long vpn = va >> PAGE_SHIFT, pfn = phys >> PAGE_SHIFT;
 	void *e = xa_load(&as->pages, vpn);
@@ -129,11 +138,16 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 		 * same rights is already there (the sync and the fault path
 		 * both install it after a fault).  Every seL4 map flushes the
 		 * address space on all the cores it ran on, so skip it. */
+		unsigned long lowered = entry_prot(e) & ~eff_prot(prot);
+
 		if (entry_prot(e) == eff_prot(prot))
 			return 0;
-		err = l4h_page_map(entry_slot(e), as->root, va, prot);
+		err = l4h_page_map(entry_slot(e), as->root, va,
+				   prot | (defer && lowered ? L4H_PROT_DEFER_FLUSH : 0));
 		if (err)
 			return -EFAULT;
+		if (defer && lowered)
+			as->flush_pending = true;
 		xa_store(&as->pages, vpn, mk_entry(entry_slot(e), pfn, prot), GFP_ATOMIC);
 		return 0;
 	}
@@ -181,7 +195,9 @@ static void as_reset(struct l4h_as *as)
 {
 	struct table *t, *n;
 
+	/* Unmapping invalidates each translation, deferred or not. */
 	as_unmap_range(as, 0, ~0ul);
+	as->flush_pending = false;
 	list_for_each_entry_safe(t, n, &as->tables, link) {
 		list_del(&t->link);
 		l4h_obj_free(&t->obj);
@@ -202,7 +218,7 @@ int os_map_memory(void *virt, unsigned long phys, unsigned long len, int r, int 
 
 	raw_spin_lock_irqsave(&kernel_as_lock, flags);
 	for (off = 0; off < len && !err; off += PAGE_SIZE)
-		err = as_map_page(&kernel_as, va + off, phys + off, prot);
+		err = as_map_page(&kernel_as, va + off, phys + off, prot, false);
 	raw_spin_unlock_irqrestore(&kernel_as_lock, flags);
 	return err;
 }
@@ -355,13 +371,15 @@ static struct mm_struct *idp_mm(struct mm_id *mm_idp)
 }
 
 /*
- * Map [virt, virt+len) to physical `phys` with UM_PROT_* `prot`.  With
- * `skip_enomem`, a page that cannot be mapped for lack of seL4 objects is
- * left unmapped (any old mapping of it is gone) and the others are still
- * done: its next access faults, and the fault path waits for memory.
+ * Map [virt, virt+len) to physical `phys` with UM_PROT_* `prot`.  For a TLB
+ * sync (`from_sync`), a page that cannot be mapped for lack of seL4 objects
+ * is left unmapped (any old mapping of it is gone) and the others are still
+ * done: its next access faults, and the fault path waits for memory.  The
+ * sync also defers the TLB flush of lowered rights to its end
+ * (l4h_mm_flush_deferred()).
  */
 static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot,
-		     unsigned long phys, bool skip_enomem)
+		     unsigned long phys, bool from_sync)
 {
 	struct l4h_mm *m = mm_l4h(idp_mm(mm_idp));
 	unsigned long flags, off;
@@ -375,8 +393,8 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 			as_unmap_range(as, virt, virt + len);
 		} else {
 			for (off = 0; off < len && !err; off += PAGE_SIZE) {
-				err = as_map_page(as, virt + off, phys + off, prot);
-				if (err == -ENOMEM && skip_enomem)
+				err = as_map_page(as, virt + off, phys + off, prot, from_sync);
+				if (err == -ENOMEM && from_sync)
 					err = 0;
 			}
 		}
@@ -390,6 +408,22 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 int map(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot, unsigned long phys)
 {
 	return map_pages(mm_idp, virt, len, prot, phys, true);
+}
+
+/* tlb.c: at the end of a sync of `mm`, before anyone relies on it. */
+void l4h_mm_flush_deferred(struct mm_struct *mm)
+{
+	struct l4h_mm *m = mm_l4h(mm);
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&m->lock, flags);
+	if (m->vs >= 0 && vs_pool[m->vs].as.flush_pending) {
+		struct l4h_as *as = &vs_pool[m->vs].as;
+
+		WARN_ON(l4h_vspace_flush(as->root));
+		as->flush_pending = false;
+	}
+	raw_spin_unlock_irqrestore(&m->lock, flags);
 }
 
 int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)

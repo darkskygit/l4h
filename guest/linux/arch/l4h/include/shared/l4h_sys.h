@@ -59,8 +59,12 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 #define L4H_PROT_READ		1
 #define L4H_PROT_WRITE		2
 #define L4H_PROT_EXEC		4
+/* With lowered rights for a frame already mapped there: leave the TLBs to
+ * l4h_vspace_flush() (x86_64; elsewhere the map flushes them itself). */
+#define L4H_PROT_DEFER_FLUSH	8
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
 int l4h_page_unmap(unsigned long frame);
+int l4h_vspace_flush(unsigned long vspace);
 int l4h_pt_map(int type, unsigned long table, unsigned long vspace, unsigned long va);
 
 /* ---- threads */

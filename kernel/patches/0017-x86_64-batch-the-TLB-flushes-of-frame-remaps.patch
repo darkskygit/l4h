@@ -1,0 +1,191 @@
+From 376204b60e630343d0efcff2b225467ef9addca2 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Mon, 19 Oct 2026 03:30:42 -0700
+Subject: [PATCH] x86_64: batch the TLB flushes of frame remaps
+
+Every 4 KiB frame map invalidated the whole address space on each core it
+had run on, one IPI round trip per core.  A guest kernel that mirrors
+page tables into a VSpace pays that for every page whose rights change:
+a fork write-protects every private page.
+
+- Mapping into a not-present entry invalidates nothing: x86 never caches
+  not-present translations, and the page table above it is in place.
+- A remap that keeps the frame and memory type and only raises rights
+  invalidates the address on the current core only; a stale entry
+  elsewhere can only cause a spurious page fault, which removes it.
+- With the new VM attribute seL4_X86_DeferFlush (bit 4), a remap that
+  lowers the rights of the frame leaves the TLBs alone, and the caller
+  completes a batch of them with seL4_X64_PML4_Flush, which invalidates
+  the ASID on every core of its TLB bitmap.  The stale entries only grant
+  rights the same frame capability had at the same address; unmapping
+  the frame, the only way to reuse it, still invalidates its translation
+  everywhere.
+
+Overwriting a present entry with another frame, and every other change,
+still invalidates as before.
+---
+ libsel4/arch_include/x86/sel4/arch/types.h    |  4 ++
+ .../interfaces/object-api-sel4-arch.xml       | 21 +++++++++
+ src/arch/x86/64/kernel/vspace.c               | 15 ++++++
+ src/arch/x86/kernel/vspace.c                  | 47 +++++++++++++++++--
+ 4 files changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/libsel4/arch_include/x86/sel4/arch/types.h b/libsel4/arch_include/x86/sel4/arch/types.h
+index 8fb8635eb..30a04f3c6 100644
+--- a/libsel4/arch_include/x86/sel4/arch/types.h
++++ b/libsel4/arch_include/x86/sel4/arch/types.h
+@@ -37,6 +37,10 @@ typedef enum {
+     /* x86_64: the mapping is not executable (XD), where the CPU supports
+      * it. May be combined with the cache attributes. */
+     seL4_X86_ExecuteNever = 8,
++    /* Not a memory attribute: when a map only lowers the rights of a frame
++     * already mapped at that address, leave the TLBs to a later
++     * seL4_X64_PML4_Flush of the address space. */
++    seL4_X86_DeferFlush = 16,
+     SEL4_FORCE_LONG_ENUM(seL4_X86_VMAttributes),
+ } seL4_X86_VMAttributes;
+ 
+diff --git a/libsel4/sel4_arch_include/x86_64/interfaces/object-api-sel4-arch.xml b/libsel4/sel4_arch_include/x86_64/interfaces/object-api-sel4-arch.xml
+index 080ee5b9d..fa89973b7 100644
+--- a/libsel4/sel4_arch_include/x86_64/interfaces/object-api-sel4-arch.xml
++++ b/libsel4/sel4_arch_include/x86_64/interfaces/object-api-sel4-arch.xml
+@@ -29,6 +29,27 @@
+         <member name="gs_base"/>
+     </struct>
+ 
++    <interface name="seL4_X64_PML4" manual_name="PML4" cap_description="Capability to the VSpace root (PML4) being operated on.">
++        <method id="X86PML4Flush" name="Flush" manual_name="Flush">
++            <brief>
++                Invalidate the translations of the address space on every core.
++            </brief>
++            <description>
++                Completes the frame maps made with <texttt text="seL4_X86_DeferFlush"/>.
++                <docref>See <autoref label="ch:vspace"/></docref>
++            </description>
++            <error name="seL4_IllegalOperation">
++                <description>
++                    The <texttt text="_service"/> is a CPtr to a capability of the wrong type.
++                </description>
++            </error>
++            <error name="seL4_InvalidCapability">
++                <description>
++                    The <texttt text="_service"/> has not been assigned an ASID.
++                </description>
++            </error>
++        </method>
++    </interface>
+     <interface name="seL4_X86_PDPT" manual_name="PDPT" cap_description="Capability to the PDPT being operated on.">
+         <method id="X86PDPTMap" name="Map">
+             <brief>
+diff --git a/src/arch/x86/64/kernel/vspace.c b/src/arch/x86/64/kernel/vspace.c
+index 96d60209c..843dfa1c9 100644
+--- a/src/arch/x86/64/kernel/vspace.c
++++ b/src/arch/x86/64/kernel/vspace.c
+@@ -1425,6 +1425,21 @@ exception_t decodeX86ModeMMUInvocation(
+     switch (cap_get_capType(cap)) {
+ 
+     case cap_pml4_cap:
++        if (label == X86PML4Flush) {
++            vspace_root_t *vspace;
++
++            if (!cap_pml4_cap_get_capPML4IsMapped(cap)) {
++                userError("X86PML4Flush: the VSpace has no ASID.");
++                current_syscall_error.type = seL4_InvalidCapability;
++                current_syscall_error.invalidCapNumber = 0;
++                return EXCEPTION_SYSCALL_ERROR;
++            }
++            vspace = (vspace_root_t *)cap_pml4_cap_get_capPML4BasePtr(cap);
++            setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
++            invalidateASID(vspace, cap_pml4_cap_get_capPML4MappedASID(cap),
++                           SMP_TERNARY(tlb_bitmap_get(vspace), 0));
++            return EXCEPTION_NONE;
++        }
+         current_syscall_error.type = seL4_IllegalOperation;
+         return EXCEPTION_SYSCALL_ERROR;
+ 
+diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
+index 8ca477b79..58b474b87 100644
+--- a/src/arch/x86/kernel/vspace.c
++++ b/src/arch/x86/kernel/vspace.c
+@@ -794,12 +794,48 @@ void unmapPageTable(asid_t asid, vptr_t vaddr, pte_t *pt)
+                                      SMP_TERNARY(tlb_bitmap_get(find_ret.vspace_root), 0));
+ }
+ 
++/* seL4_X86_DeferFlush: a map that lowers the rights of a frame already
++ * mapped at that address leaves stale entries in the TLBs, which the caller
++ * removes later with seL4_X64_PML4_Flush.  They can only grant rights the
++ * same frame capability had at that address, and unmapping the frame (the
++ * only way to reuse it) still invalidates its translation everywhere. */
++#define X86_ATTR_DEFER_FLUSH BIT(4)
++
++/* True if `pte` maps the frame of the present entry `old` with at least its
++ * rights and the same memory type.  A TLB entry left from `old` can then
++ * only cause a spurious page fault, which invalidates it. */
++static bool_t pteRightsRaised(pte_t old, pte_t pte)
++{
++    return pte_get_page_base_address(old) == pte_get_page_base_address(pte) &&
++           pte_get_pat(old) == pte_get_pat(pte) &&
++           pte_get_cache_disabled(old) == pte_get_cache_disabled(pte) &&
++           pte_get_write_through(old) == pte_get_write_through(pte) &&
++           pte_get_read_write(pte) >= pte_get_read_write(old) &&
++           pte_get_super_user(pte) >= pte_get_super_user(old) &&
++           pte_get_xd(pte) <= pte_get_xd(old);
++}
++
+ static exception_t performX86PageInvocationMapPTE(cap_t cap, cte_t *ctSlot, pte_t *ptSlot, pte_t pte,
+-                                                  vspace_root_t *vspace)
++                                                  vspace_root_t *vspace, bool_t deferFlush)
+ {
++    pte_t old = *ptSlot;
++    asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
++
+     ctSlot->cap = cap;
+     *ptSlot = pte;
+-    invalidatePageStructureCacheASID(pptr_to_paddr(vspace), cap_frame_cap_get_capFMappedASID(cap),
++    /* Not-present entries are never cached: a new mapping needs no
++     * invalidation (the page table above it is already in place). */
++    if (!pte_get_present(old)) {
++        return EXCEPTION_NONE;
++    }
++    if (pteRightsRaised(old, pte)) {
++        invalidateLocalTranslationSingleASID(cap_frame_cap_get_capFMappedAddress(cap), asid);
++        return EXCEPTION_NONE;
++    }
++    if (deferFlush && pte_get_page_base_address(old) == pte_get_page_base_address(pte)) {
++        return EXCEPTION_NONE;
++    }
++    invalidatePageStructureCacheASID(pptr_to_paddr(vspace), asid,
+                                      SMP_TERNARY(tlb_bitmap_get(vspace), 0));
+     return EXCEPTION_NONE;
+ }
+@@ -951,6 +987,7 @@ exception_t decodeX86FrameInvocation(
+         vm_attributes_t vmAttr;
+         vm_page_size_t  frameSize;
+         asid_t          asid;
++        bool_t          deferFlush;
+ 
+         if (length < 3 || current_extra_caps.excaprefs[0] == NULL) {
+             current_syscall_error.type = seL4_TruncatedMessage;
+@@ -961,7 +998,8 @@ exception_t decodeX86FrameInvocation(
+         frameSize = cap_frame_cap_get_capFSize(cap);
+         vaddr = getSyscallArg(0, buffer);
+         w_rightsMask = getSyscallArg(1, buffer);
+-        vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer));
++        deferFlush = !!(getSyscallArg(2, buffer) & X86_ATTR_DEFER_FLUSH);
++        vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer) & ~X86_ATTR_DEFER_FLUSH);
+ #ifdef CONFIG_ARCH_X86_64
+         /* Without execute-disable the XD bit is reserved: ignore it. */
+         if (vm_attributes_get_x86XDBit(vmAttr) && !x86_64_nxEnabled()) {
+@@ -1061,7 +1099,8 @@ exception_t decodeX86FrameInvocation(
+             }
+ 
+             setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
+-            return performX86PageInvocationMapPTE(cap, cte, map_ret.ptSlot, map_ret.pte, vspace);
++            return performX86PageInvocationMapPTE(cap, cte, map_ret.ptSlot, map_ret.pte, vspace,
++                                                   deferFlush);
+         }
+ 
+         /* PDE mappings */
+-- 
+2.47.3
+

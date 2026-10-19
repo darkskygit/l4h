@@ -280,6 +280,20 @@ We need no IOMMU, since no device is passed into a guest.
   the wrong order. A following remote call (TLB shootdown, remote TCB stall)
   could then lose arrivals, leaving every core spinning in `ipi_wait()`.
   This is an upstream bug that SMP l4h guests hit within seconds.
+- **0017 (performance), batched TLB flushes for x86_64 frame remaps.**
+  Every 4 KiB `seL4_X86_Page_Map` invalidated the address space on each
+  core in its TLB bitmap, an IPI round trip per core. A fork write-protects
+  every private page, so a 16 MiB fork with three busy threads took 140 ms.
+  - Maps into a not-present entry invalidate nothing. Remaps that only
+    raise rights invalidate the address on the current core only.
+  - A remap with `seL4_X86_DeferFlush` that lowers rights leaves the TLBs
+    alone. `seL4_X64_PML4_Flush` then flushes the ASID once. The guest
+    uses this for the downgrades of one TLB sync (§5).
+  - Stale entries only grant rights the same frame cap had at the same
+    address. Unmapping, the only way to reuse the frame, still invalidates
+    at once.
+  - The 16 MiB fork now takes 6 ms, and the copy-on-write fault after it
+    7.7 µs/page instead of 47.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4

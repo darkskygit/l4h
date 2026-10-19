@@ -132,6 +132,8 @@ int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, in
 	seL4_X86_VMAttributes attr = (prot & L4H_PROT_EXEC) ? seL4_X86_Default_VMAttributes :
 				     seL4_X86_ExecuteNever;
 
+	if (prot & L4H_PROT_DEFER_FLUSH)
+		attr |= seL4_X86_DeferFlush;
 	return seL4_X86_Page_Map(frame, vspace, va, r, attr);
 #endif
 }
@@ -142,6 +144,16 @@ int l4h_page_unmap(unsigned long frame)
 	return seL4_ARM_Page_Unmap(frame);
 #else
 	return seL4_X86_Page_Unmap(frame);
+#endif
+}
+
+/* Complete the maps made with L4H_PROT_DEFER_FLUSH in `vspace`. */
+int l4h_vspace_flush(unsigned long vspace)
+{
+#ifdef __aarch64__
+	return 0;
+#else
+	return seL4_X64_PML4_Flush(vspace);
 #endif
 }
 
