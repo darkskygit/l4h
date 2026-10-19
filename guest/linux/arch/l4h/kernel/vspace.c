@@ -13,8 +13,8 @@
  * its pages when it runs again.
  *
  * Every mapping needs its own frame capability: the slot is recorded in a
- * per-address-space xarray (virtual page -> slot | pfn) so that it can be
- * deleted again on unmap.
+ * per-address-space xarray (virtual page -> slot | rights | pfn) so that it
+ * can be deleted again on unmap, and a remap with unchanged rights skipped.
  */
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -35,10 +35,20 @@
 
 #define SLOT_BITS	30
 #define SLOT_MASK	((1ul << SLOT_BITS) - 1)
+#define PROT_SHIFT	SLOT_BITS
+#define PROT_MASK	7ul
+#define PFN_SHIFT	(SLOT_BITS + 3)
 
-static inline void *mk_entry(unsigned long slot, unsigned long pfn)
+/* The rights a mapping with L4H_PROT_* `prot` gets (seL4 has no
+ * write-only mappings). */
+static inline unsigned long eff_prot(int prot)
 {
-	return xa_mk_value((pfn << SLOT_BITS) | slot);
+	return (prot & L4H_PROT_WRITE) ? prot | L4H_PROT_READ : prot;
+}
+
+static inline void *mk_entry(unsigned long slot, unsigned long pfn, int prot)
+{
+	return xa_mk_value((pfn << PFN_SHIFT) | (eff_prot(prot) << PROT_SHIFT) | slot);
 }
 
 static inline unsigned long entry_slot(void *e)
@@ -48,7 +58,12 @@ static inline unsigned long entry_slot(void *e)
 
 static inline unsigned long entry_pfn(void *e)
 {
-	return xa_to_value(e) >> SLOT_BITS;
+	return xa_to_value(e) >> PFN_SHIFT;
+}
+
+static inline unsigned long entry_prot(void *e)
+{
+	return (xa_to_value(e) >> PROT_SHIFT) & PROT_MASK;
 }
 
 struct table {
@@ -110,9 +125,17 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 	int err;
 
 	if (e && entry_pfn(e) == pfn) {
-		/* Same frame: remap with the new rights. */
+		/* Same frame.  The entry mirrors the VSpace: a mapping with the
+		 * same rights is already there (the sync and the fault path
+		 * both install it after a fault).  Every seL4 map flushes the
+		 * address space on all the cores it ran on, so skip it. */
+		if (entry_prot(e) == eff_prot(prot))
+			return 0;
 		err = l4h_page_map(entry_slot(e), as->root, va, prot);
-		return err ? -EFAULT : 0;
+		if (err)
+			return -EFAULT;
+		xa_store(&as->pages, vpn, mk_entry(entry_slot(e), pfn, prot), GFP_ATOMIC);
+		return 0;
 	}
 	if (e) {
 		xa_erase(&as->pages, vpn);
@@ -133,7 +156,7 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 		l4h_slot_delete(slot);
 		return err < 0 ? err : -EFAULT;
 	}
-	err = xa_err(xa_store(&as->pages, vpn, mk_entry(slot, pfn), GFP_ATOMIC));
+	err = xa_err(xa_store(&as->pages, vpn, mk_entry(slot, pfn, prot), GFP_ATOMIC));
 	if (err) {
 		l4h_slot_delete(slot);
 		return err;

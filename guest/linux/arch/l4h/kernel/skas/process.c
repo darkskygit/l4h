@@ -46,6 +46,11 @@ void current_mm_sync(void)
 {
 	if (current->mm == NULL)
 		return;
+	/* Nothing pending: do not queue behind another thread's sync, which
+	 * only a flush has to wait for.  A mapping it has yet to install
+	 * just faults. */
+	if (!READ_ONCE(current->mm->context.sync_tlb_range_to))
+		return;
 
 	um_tlb_sync(current->mm);
 }
