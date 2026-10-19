@@ -33,6 +33,8 @@ pub const CTL_VM_SET_SCHED: u32 = 16;
 pub const CTL_VM_INFO: u32 = 17;
 pub const CTL_VM_STATS: u32 = 18;
 pub const CTL_VM_SHUTDOWN: u32 = 19;
+pub const CTL_BLK_WRITE: u32 = 20;
+pub const CTL_BLK_INFO: u32 = 21;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -388,5 +390,72 @@ impl Ctl {
             })
             .collect();
         Ok((ports, (r.vals[1] != u64::MAX).then_some(r.vals[1])))
+    }
+}
+
+/// A physical controller and its native disk capacity (512-byte sectors).
+#[derive(Clone, Copy, Debug)]
+pub struct DiskInfo {
+    pub index: u64,
+    pub bdf: u64,
+    pub owner: Option<u64>,
+    pub failed: bool,
+    pub kind: u64,
+    pub sectors: u64,
+    pub attachments: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DiskAttachment {
+    pub vm: u64,
+    pub start: u64,
+    pub sectors: u64,
+}
+
+impl Ctl {
+    pub fn disk_info(&self, index: u64) -> Result<DiskInfo> {
+        let r = self.call(CTL_DISK_INFO, &[index], &[], &[])?;
+        Ok(DiskInfo { index, bdf: r.vals[0], owner: (r.vals[1] != u64::MAX).then_some(r.vals[1]),
+            failed: r.vals[2] != 0, kind: r.vals[3], sectors: r.vals[4], attachments: r.vals[5] })
+    }
+
+    pub fn disk_attachments(&self, disk: u64) -> Result<Vec<DiskAttachment>> {
+        let mut out = Vec::new();
+        let mut first = 0;
+        loop {
+            let r = self.call(CTL_BLK_INFO, &[disk, first], &[], &[])?;
+            if r.vals[0] == 0 { return Ok(out); }
+            if r.vals[0] <= first { return err("invalid attachment cursor"); }
+            first = r.vals[0];
+            out.push(DiskAttachment { vm: r.vals[1], start: r.vals[2], sectors: r.vals[3] });
+        }
+    }
+
+    /// Seed an unattached, 4 KiB aligned region; at most CTL_LOAD_MAX bytes.
+    pub fn disk_write(&self, disk: u64, sector: u64, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() || bytes.len() > CTL_LOAD_MAX || bytes.len() % 4096 != 0 || sector % 8 != 0 {
+            return err("disk write must be 4 KiB aligned and 1..=CTL_LOAD_MAX bytes");
+        }
+        self.call(CTL_BLK_WRITE, &[disk, sector, bytes.len() as u64, 0], &[], bytes)?;
+        Ok(())
+    }
+
+    /// Explicit zero writes, including sparse image holes and recycled space.
+    pub fn disk_zero(&self, disk: u64, sector: u64, sectors: u64) -> Result<()> {
+        if sector % 8 != 0 || sectors == 0 || sectors % 8 != 0 || sector.checked_add(sectors).is_none() {
+            return err("disk zero must be a finite 4 KiB aligned range");
+        }
+        let mut offset = 0;
+        while offset < sectors {
+            let count = (sectors - offset).min((CTL_LOAD_MAX / 512) as u64);
+            self.call(CTL_BLK_WRITE, &[disk, sector + offset, count * 512, 1], &[], &[])?;
+            offset += count;
+        }
+        Ok(())
+    }
+
+    pub fn disk_flush(&self, disk: u64) -> Result<()> {
+        self.call(CTL_BLK_WRITE, &[disk, 0, 0, 0], &[], &[])?;
+        Ok(())
     }
 }

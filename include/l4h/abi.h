@@ -352,8 +352,10 @@ enum l4h_ctl_op {
 	L4H_CTL_CONSOLE_READ = 8,
 	/* args: vm, len; data: console input */
 	L4H_CTL_CONSOLE_WRITE = 9,
-	/* args: disk index -> vals: bdf, owner vm (or -1), failed (did not
-	 * reset: attaching it fails with EIO), kind (0 virtio-blk, 1 NVMe) */
+	/* args: disk index -> vals: bdf, owner vm (or -1), failed (quarantined:
+	 * attaching it fails with EIO), kind (0 virtio-blk, 1 NVMe),
+     * capacity (512-byte sectors), number of attachments. owner is the
+     * first attached VM; use BLK_INFO to enumerate all windows. */
 	L4H_CTL_DISK_INFO = 10,
 	/* -> vals[0] = switch */
 	L4H_CTL_SWITCH_CREATE = 11,
@@ -378,6 +380,12 @@ enum l4h_ctl_op {
 	/* args: vm -> vals[0] = CPU used in the last 100 ms (permille of a core,
 	 * all vCPUs), vals[1] = CPU cap (percent per vCPU, 0 = none) */
 	L4H_CTL_VM_STATS = 18,
+    /* disk, sector, bytes (0 = flush, max L4H_CTL_LOAD_MAX), zero (0/1).
+     * Writes the control data buffer or zeros to an UNATTACHED range.
+     * Sector and length must be 4 KiB aligned. */
+    L4H_CTL_BLK_WRITE = 20,
+    /* disk, first attachment -> vals: next (0 = end), vm, start, sectors */
+    L4H_CTL_BLK_INFO = 21,
 };
 
 #define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */

@@ -1,4 +1,4 @@
-//! blkd: drives one disk (virtio-blk or NVMe PCI device) for one client (a
+//! blkd: drives one disk (virtio-blk or NVMe PCI device) for multiple clients (a
 //! guest's l4h-vmm).  Requests carry guest-physical segments, which are
 //! validated against the client's I/O pool and its LBA window and handed to
 //! the device by physical address: the device reads and writes the pool
@@ -58,119 +58,169 @@ pub trait Driver {
     fn reap(&mut self, done: &mut dyn FnMut(u64, u32));
 }
 
-struct Blkd {
+struct Client {
     chan: *mut Channel,
-    /// The client's I/O pool, the only memory requests may point to.
     pool: Pool,
-    drv: Box<dyn Driver>,
-    lba_start: u64,
-    /// Size of the client's window in sectors.
-    sectors: u64,
-    block_size: u32,
+    window: blk::DiskWindow,
     read_only: bool,
-    flush: bool,
     done: sel4::cap::Notification,
+    outstanding: usize,
 }
 
-impl Blkd {
-    /// Translate guest-physical segments into physical pieces.  Every
-    /// segment must lie in the client's I/O pool.
-    fn translate(&self, req: &blk::Req, out: &mut Vec<Seg>) -> bool {
-        out.clear();
-        for s in &req.segs[..req.nr_segs as usize] {
-            let Some(pa) = self.pool.translate(s.gpa, s.len as u64) else {
-                return false;
-            };
-            out.push(Seg { pa, len: s.len });
-        }
-        true
-    }
+#[derive(Clone, Copy)]
+struct Pending {
+    client: usize,
+    id: u64,
+}
 
+struct Blkd {
+    clients: Vec<Option<Client>>,
+    // Tags are allocated here, never taken from a client. Slots are not
+    // reusable until the hardware has completed every command of a request.
+    pending: Vec<Option<Pending>>,
+    drv: Box<dyn Driver>,
+    dev: DevInfo,
+    next: usize,
+    ticks_per_sec: u64,
+}
+
+impl Client {
     fn respond(&self, id: u64, status: u32) {
         unsafe {
             let h = addr_of!((*self.chan).cq.head).read_volatile();
-            addr_of_mut!((*self.chan).resps[h as usize % blk::RING_SIZE]).write_volatile(blk::Resp { id, status, reserved: 0 });
+            addr_of_mut!((*self.chan).resps[h as usize % blk::RING_SIZE])
+                .write_volatile(blk::Resp { id, status, reserved: 0 });
             fence(Ordering::Release);
             addr_of_mut!((*self.chan).cq.head).write_volatile(h.wrapping_add(1));
         }
+        self.done.signal();
     }
 
-    /// Validate and start one request.
-    fn start(&mut self, req: &blk::Req, pieces: &mut Vec<Seg>) -> Result<(), u32> {
-        if req.nr_segs as usize > blk::MAX_SEGS {
-            return Err(blk::STATUS_IOERR);
-        }
-        let device_writes = match req.op {
-            blk::OP_READ => true,
-            blk::OP_WRITE if self.read_only => return Err(blk::STATUS_IOERR),
-            blk::OP_WRITE => false,
-            blk::OP_FLUSH if !self.flush => return Err(blk::STATUS_OK),
-            blk::OP_FLUSH => return self.drv.start(req.id, blk::OP_FLUSH, 0, &[]),
-            _ => return Err(blk::STATUS_UNSUPP),
-        };
-        let segs = &req.segs[..req.nr_segs as usize];
-        // Data direction must match the operation.
-        if segs.iter().any(|s| (s.flags & blk::SEG_WRITE != 0) != device_writes) {
-            return Err(blk::STATUS_IOERR);
-        }
-        let bytes: u64 = segs.iter().map(|s| s.len as u64).sum();
-        let bs = self.block_size as u64;
-        // The sector comes from the client: check its range first.
-        if req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
-            return Err(blk::STATUS_IOERR);
-        }
-        // The sector on the disk must be block aligned too: drivers that
-        // address blocks would round it down, outside the window.
-        let sector = self.lba_start + req.sector;
-        if bytes == 0 || bytes % bs != 0 || (sector * 512) % bs != 0 {
-            return Err(blk::STATUS_IOERR);
-        }
-        if !self.translate(req, pieces) {
-            return Err(blk::STATUS_IOERR);
-        }
-        self.drv.start(req.id, req.op, sector, pieces)
-    }
-
-    /// Take requests from the channel while the device has room.
-    fn submit(&mut self) -> bool {
-        let mut started = false;
-        let mut responded = false;
-        let mut pieces = Vec::with_capacity(MAX_PIECES);
-        while self.drv.can_start() {
-            let req = unsafe {
-                let tail = addr_of!((*self.chan).sq.tail).read_volatile();
-                if tail == addr_of!((*self.chan).sq.head).read_volatile() {
-                    break;
-                }
-                fence(Ordering::Acquire);
-                let r = addr_of!((*self.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile();
-                addr_of_mut!((*self.chan).sq.tail).write_volatile(tail.wrapping_add(1));
-                r
-            };
-            match self.start(&req, &mut pieces) {
-                Ok(()) => started = true,
-                Err(status) => {
-                    self.respond(req.id, status);
-                    responded = true;
-                }
+    fn prepare(&self, req: &blk::Req, block_size: u32, pieces: &mut Vec<Seg>) -> Result<u64, u32> {
+        let sector = self.window.check_request(req, self.pool, block_size, self.read_only)?;
+        pieces.clear();
+        if req.op != blk::OP_FLUSH {
+            for s in &req.segs[..req.nr_segs as usize] {
+                pieces.push(Seg { pa: self.pool.translate(s.gpa, s.len as u64).unwrap(), len: s.len });
             }
         }
-        if started {
-            self.drv.kick();
-        }
-        responded
+        Ok(sector)
     }
+}
 
-    /// Reap completed requests.
+impl Blkd {
     fn reap(&mut self) -> bool {
         let mut done = Vec::new();
         self.drv.reap(&mut |tag, status| done.push((tag, status)));
-        for &(tag, status) in &done {
-            self.respond(tag, status);
+        let mut provision = false;
+        for (tag, status) in done {
+            if tag == u64::MAX {
+                provision = true;
+                // Provisioning is serialized by l4h-root.
+                set_mr(1, status as u64);
+                continue;
+            }
+            if let Some(p) = self.pending.get_mut(tag as usize).and_then(|p| p.take()) {
+                if let Some(c) = self.clients[p.client].as_mut() {
+                    c.outstanding -= 1;
+                    c.respond(p.id, status);
+                }
+            }
         }
-        !done.is_empty()
+        provision
+    }
+
+    fn submit(&mut self) {
+        let mut pieces = Vec::with_capacity(MAX_PIECES);
+        let mut started = false;
+        // Bounded work per client and round-robin starting point. A busy
+        // ring cannot occupy every hardware slot before others get a turn.
+        for _round in 0..blk::RING_SIZE / 4 {
+            for off in 0..blk::MAX_CLIENTS {
+                let i = (self.next + off) % blk::MAX_CLIENTS;
+                let Some(c) = self.clients[i].as_mut() else { continue };
+                for _ in 0..4 {
+                    if !self.drv.can_start() { break; }
+                    let Some(tag) = self.pending.iter().position(Option::is_none) else { break };
+                    let req = unsafe {
+                        let tail = addr_of!((*c.chan).sq.tail).read_volatile();
+                        let head = addr_of!((*c.chan).sq.head).read_volatile();
+                        let cq_used = addr_of!((*c.chan).cq.head).read_volatile()
+                            .wrapping_sub(addr_of!((*c.chan).cq.tail).read_volatile()) as usize;
+                        // Reserve completion space for every in-flight request.
+                        if head == tail || head.wrapping_sub(tail) as usize > blk::RING_SIZE
+                            || cq_used.saturating_add(c.outstanding) >= blk::RING_SIZE { break; }
+                        fence(Ordering::Acquire);
+                        let req = addr_of!((*c.chan).reqs[tail as usize % blk::RING_SIZE]).read_volatile();
+                        addr_of_mut!((*c.chan).sq.tail).write_volatile(tail.wrapping_add(1));
+                        req
+                    };
+                    let result = c.prepare(&req, self.dev.block_size, &mut pieces).and_then(|sector| {
+                        if req.op == blk::OP_FLUSH {
+                            pieces.clear();
+                            if !self.dev.flush { return Err(blk::STATUS_OK); }
+                        }
+                        self.drv.start(tag as u64, req.op, sector, &pieces)
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.pending[tag] = Some(Pending { client: i, id: req.id });
+                            c.outstanding += 1;
+                            started = true;
+                        }
+                        Err(status) => c.respond(req.id, status),
+                    }
+                }
+            }
+        }
+        self.next = (self.next + 1) % blk::MAX_CLIENTS;
+        if started { self.drv.kick(); }
+    }
+
+    fn deadline(&self) -> u64 { host::ticks::now().saturating_add(5 * self.ticks_per_sec) }
+
+    fn remove(&mut self, i: usize) -> u64 {
+        if i >= self.clients.len() { return u64::MAX; }
+        // Stop consuming this channel first. Polling the hardware drains
+        // only submitted work; no controller reset disrupts other clients.
+        let end = self.deadline();
+        while self.clients[i].as_ref().is_some_and(|c| c.outstanding != 0) {
+            self.reap();
+            if host::ticks::now() > end { return u64::MAX; }
+            core::hint::spin_loop();
+        }
+        self.clients[i] = None;
+        0
+    }
+
+    fn provision(&mut self, cfg: &BlkdConfig, sector: u64, len: usize, flush: bool) -> u64 {
+        if self.dev.read_only { return blk::STATUS_IOERR as u64; }
+        if !flush {
+            let Some(w) = blk::DiskWindow::new(sector, (len / 512) as u64, self.dev.capacity) else { return u64::MAX };
+            if len == 0 || len > blk::STAGING_SIZE || len % self.dev.block_size as usize != 0
+                || self.clients.iter().flatten().any(|c| c.window.overlaps(w)) { return u64::MAX; }
+        }
+        if flush && !self.dev.flush { return blk::STATUS_OK as u64; }
+        let end = self.deadline();
+        while !self.drv.can_start() {
+            self.reap();
+            if host::ticks::now() > end { return u64::MAX; }
+        }
+        let data = [Seg { pa: cfg.dma_paddr + cfg.dma_size, len: len as u32 }];
+        let result = self.drv.start(u64::MAX, if flush { blk::OP_FLUSH } else { blk::OP_WRITE },
+            sector, if flush { &[] } else { &data });
+        if let Err(status) = result { return status as u64; }
+        self.drv.kick();
+        loop {
+            if self.reap() { return mr(1); }
+            if host::ticks::now() > end { return u64::MAX; }
+            core::hint::spin_loop();
+        }
     }
 }
+
+fn mr(i: usize) -> u64 { sel4::with_ipc_buffer(|b| b.msg_regs()[i]) }
+fn set_mr(i: usize, v: u64) { sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v); }
 
 fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
@@ -180,69 +230,64 @@ fn main(info: &'static Info) -> ! {
         _ => Box::new(virtio::VirtioBlk::new(id, cfg)),
     };
     let dev = drv.info();
-    let lba_start = cfg.lba_start.min(dev.capacity);
-    let mut sectors = dev.capacity - lba_start;
-    if cfg.lba_count != 0 {
-        sectors = sectors.min(cfg.lba_count);
-    }
-    // The device addresses whole blocks: the window must start on one
-    // (l4h-root checks this too) and is cut to whole blocks.
-    let block_sectors = (dev.block_size as u64 / 512).max(1);
-    if lba_start % block_sectors != 0 {
-        sel4::debug_println!(
-            "blkd {:#x}: window start {} is not aligned to {}-byte blocks; disk disabled",
-            id, lba_start, dev.block_size
-        );
-        sectors = 0;
-    }
-    sectors -= sectors % block_sectors;
-    let read_only = dev.read_only || cfg.read_only != 0;
-    let chan = cfg.chan_va as *mut Channel;
-    unsafe {
-        addr_of_mut!((*chan).capacity_sectors).write_volatile(sectors);
-        addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
-        addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
-        fence(Ordering::Release);
-        addr_of_mut!((*chan).ready).write_volatile(1);
-    }
-    sel4::debug_println!(
-        "blkd {:#x}: {:02x}:{:02x}.{} {}: {} MiB from sector {}, {}-byte blocks{}",
-        id,
-        cfg.pci_bdf >> 8,
-        (cfg.pci_bdf >> 3) & 0x1f,
-        cfg.pci_bdf & 7,
-        if cfg.kind == blk::BLKD_NVME { "nvme" } else { "virtio-blk" },
-        sectors >> 11,
-        lba_start,
-        dev.block_size,
-        if read_only { ", read-only" } else { "" }
-    );
+    sel4::debug_println!("blkd {:#x}: shared controller, {} sectors, {}-byte blocks", id, dev.capacity, dev.block_size);
     let mut b = Blkd {
-        chan,
-        pool: Pool { gpa: cfg.pool_gpa, paddr: cfg.pool_paddr, size: cfg.pool_size },
-        drv,
-        lba_start,
-        sectors,
-        block_size: dev.block_size,
-        read_only,
-        flush: dev.flush,
-        done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE),
+        clients: (0..blk::MAX_CLIENTS).map(|_| None).collect(),
+        pending: alloc::vec![None; 256],
+        drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
     };
-
-    let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
+    let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
+    let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
     let irq = cap::<cap_type::IrqHandler>(blk::BLKD_SLOT_IRQ);
-    // The client is waiting for the channel to be ready.
-    b.done.signal();
+    let (mut msg, mut badge) = ep.recv(reply);
     loop {
-        let (_, badge) = ntfn.wait();
-        let mut signal = b.reap();
-        signal |= b.submit();
-        if badge & blk::BLKD_BADGE_IRQ != 0 {
-            irq.irq_handler_ack().expect("blkd: IRQ ack");
+        if badge != 0 {
+            b.reap();
+            b.submit();
+            if badge & blk::BLKD_BADGE_IRQ != 0 { irq.irq_handler_ack().expect("blkd IRQ ack"); }
+            (msg, badge) = ep.recv(reply);
+            continue;
         }
-        if signal {
-            b.done.signal();
-        }
+        let result = match msg.label() {
+            blk::BLKD_INFO => {
+                set_mr(1, b.dev.block_size as u64);
+                set_mr(2, b.dev.read_only as u64);
+                b.dev.capacity
+            }
+            blk::BLKD_ADD => {
+                let i = mr(0) as usize;
+                if i >= blk::MAX_CLIENTS || b.clients[i].is_some() { u64::MAX } else {
+                    let chan = blk::channel_va(i) as *mut Channel;
+                    let (start, count, ro, pool) = unsafe {
+                        (addr_of!((*chan).lba_start).read_volatile(), addr_of!((*chan).capacity_sectors).read_volatile(),
+                         addr_of!((*chan).read_only).read_volatile(), addr_of!((*chan).pool).read_volatile())
+                    };
+                    match blk::DiskWindow::new(start, count, b.dev.capacity) {
+                        Some(window) if !b.clients.iter().flatten().any(|c| c.window.overlaps(window)) => {
+                            b.clients[i] = Some(Client { chan, pool, window, read_only: ro != 0 || b.dev.read_only,
+                                done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0 });
+                            unsafe {
+                                addr_of_mut!((*chan).read_only).write_volatile((ro != 0 || b.dev.read_only) as u32);
+                                addr_of_mut!((*chan).block_size).write_volatile(b.dev.block_size);
+                                fence(Ordering::Release);
+                                addr_of_mut!((*chan).ready).write_volatile(1);
+                            }
+                            0
+                        }
+                        _ => u64::MAX,
+                    }
+                }
+            }
+            blk::BLKD_REMOVE => b.remove(mr(0) as usize),
+            blk::BLKD_WRITE => b.provision(cfg, mr(0), mr(1) as usize, false),
+            blk::BLKD_FLUSH => b.provision(cfg, 0, 0, true),
+            _ => u64::MAX,
+        };
+        set_mr(0, result);
+        // Service calls can have reaped completions while polling. A kick
+        // may have been coalesced, so always revisit all pending channels.
+        b.submit();
+        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 3), reply);
     }
 }
 

@@ -234,6 +234,8 @@ pub const CTL_VM_SET_SCHED: u32 = 16;
 pub const CTL_VM_INFO: u32 = 17;
 pub const CTL_VM_STATS: u32 = 18;
 pub const CTL_VM_SHUTDOWN: u32 = 19;
+pub const CTL_BLK_WRITE: u32 = 20;
+pub const CTL_BLK_INFO: u32 = 21;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 pub const NIC_ISOLATED: u64 = 1 << 1;
 

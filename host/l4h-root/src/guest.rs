@@ -202,7 +202,7 @@ pub struct Guest {
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,
     /// Disks (host disk indices) attached to the guest.
-    pub disks: Vec<usize>,
+    pub disks: Vec<(usize, usize)>,
     /// netd ports of its virtio-net devices.
     pub ports: Vec<usize>,
     /// ASIDs held by its VSpaces (its own, its processes', its components').

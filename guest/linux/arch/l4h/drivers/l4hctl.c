@@ -3,10 +3,10 @@
  * /dev/l4hctl: dom0's access to the l4h control API (DESIGN.md §9.1).
  *
  * ioctl(L4HCTL_IOC_CALL) passes a struct l4h_ctl_req to l4h-root and
- * returns the struct l4h_ctl_resp.  For L4H_CTL_VM_LOAD, the bytes to load
+ * returns the struct l4h_ctl_resp. For VM_LOAD and BLK_WRITE, source bytes
  * come from a user buffer: they are staged in the device's data area, a
- * host-owned region (l4h-root never reads guest RAM), and args[2] becomes
- * their offset there (0).
+ * host-owned region (l4h-root never reads guest RAM). VM_LOAD uses offset
+ * zero; BLK_WRITE uses the staged bytes only when its zero flag is clear.
  */
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -22,7 +22,7 @@
 struct l4hctl_call {
 	__u64 req;      /* struct l4h_ctl_req * */
 	__u64 resp;     /* struct l4h_ctl_resp * */
-	__u64 buf;      /* VM_LOAD: source bytes */
+	__u64 buf;      /* VM_LOAD / BLK_WRITE: source bytes */
 	__u64 len;
 };
 
@@ -59,6 +59,15 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		}
 		req->args[2] = 0;
 		req->args[3] = call.len;
+	} else if (req->op == L4H_CTL_BLK_WRITE && !req->args[3]) {
+		if (call.len > stage_size || call.len != req->args[2]) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (copy_from_user(stage, u64_to_user_ptr(call.buf), call.len)) {
+			ret = -EFAULT;
+			goto out;
+		}
 	}
 	memset(resp, 0, sizeof(*resp));
 	l4h_hypercall(L4H_HC_CTL, &mr, 0, 1);

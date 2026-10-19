@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "SHAREDBLK: FAIL: $*"; poweroff -f; }
+create() { l4hctl create "$1" --kernel /bin/vmlinux --initrd /bin/sharedvm.cpio.gz --mem 128 --disk "$2" --cmdline "console=hvc0 quiet pattern=${3:-A}"; }
+waitfor() {
+    l4hctl console "$1" --until "$2" --timeout 90 > /tmp/console || { cat /tmp/console; fail "$2"; }
+    if grep -q 'SHAREDVM: FAIL' /tmp/console; then cat /tmp/console; fail guest; fi
+}
+echo "SHAREDBLK: start"
+l4hctl disks
+head -c 4096 /dev/zero | tr '\000' A > /tmp/a
+head -c 4096 /dev/zero | tr '\000' B > /tmp/b
+l4hctl disk-zero 0 2048 32768 || fail zero
+l4hctl disk-write 0 2048 /tmp/a || fail seed-a
+l4hctl disk-write 0 18432 /tmp/b || fail seed-b
+a=$(create a 0,start=2048,sectors=16384 A) || fail create-a
+b=$(create b 0,start=18432,sectors=16384 B) || fail create-b
+waitfor "$a" 'SHAREDVM: ready'
+waitfor "$b" 'SHAREDVM: ready'
+echo "SHAREDBLK: concurrent windows booted"
+if create overlap 0,start=4096,sectors=16384 A > /tmp/id 2>/tmp/err; then fail overlap; fi
+grep -q busy /tmp/err || { cat /tmp/err; fail overlap-error; }
+if l4hctl disk-write 0 2048 /tmp/b 2>/tmp/err; then fail live-provision; fi
+grep -q busy /tmp/err || fail live-provision-error
+for w in start=2049,sectors=16384 start=2048,sectors=7 start=18446744073709551608,sectors=16 start=131072,sectors=8; do
+    if create invalid "0,$w" A > /tmp/id 2>/tmp/err; then fail "invalid $w"; fi
+done
+echo "SHAREDBLK: overlap, alignment, overflow, capacity and live provisioning refused"
+l4hctl destroy "$a" || fail destroy-a
+l4hctl send "$b" check
+waitfor "$b" 'SHAREDVM: survivor ok'
+echo "SHAREDBLK: survivor kept doing I/O after peer destroy"
+# Zero a recycled region, then seed and attach read-only without stopping b.
+l4hctl disk-zero 0 2048 16384 || fail recycle-zero
+l4hctl disk-write 0 2048 /tmp/a || fail recycle-seed
+c=$(create readonly 0,ro,start=2048,sectors=16384 A) || fail create-readonly
+waitfor "$c" 'SHAREDVM: readonly ok'
+l4hctl destroy "$c" || fail destroy-readonly
+l4hctl destroy "$b" || fail destroy-b
+# Repeated reuse exercises mapping revocation, notification slots and tags.
+for i in 1 2 3; do
+    c=$(create reuse 0,ro,start=2048,sectors=16384 A) || fail reuse
+    waitfor "$c" 'SHAREDVM: readonly ok'
+    l4hctl destroy "$c" || fail destroy-reuse
+done
+# Slow hardware retains more than five seconds of DMA work at destroy.
+# The controller must be quarantined and its I/O pool kept out of use.
+q=$(l4hctl create quarantine --kernel /bin/vmlinux --initrd /bin/sharedvm.cpio.gz --mem 128 \
+    --disk 1,start=2048,sectors=16384 --cmdline "console=hvc0 quiet quarantine=1") || fail create-quarantine
+waitfor "$q" 'SHAREDVM: quarantine busy'
+l4hctl destroy "$q" || fail destroy-quarantine
+l4hctl disks > /tmp/disks
+grep -q '^disk 1:.*failed (quarantined)' /tmp/disks || { cat /tmp/disks; fail quarantine; }
+if create quarantined 1,start=2048,sectors=16384 A > /tmp/id 2>/tmp/err; then fail quarantine-attach; fi
+if l4hctl disk-zero 1 2048 8 2>/tmp/err; then fail quarantine-provision; fi
+echo "SHAREDBLK: timeout quarantines controller and refuses reuse"
+cat /tmp/disks
+echo "SHAREDBLK: PASS"
+poweroff -f

@@ -258,6 +258,16 @@ impl Host {
         }
     }
 
+    /// Probe and start a controller once, independent of its clients.
+    pub fn ensure_disk(&mut self, disk: usize) -> Result<(), i64> {
+        let d = self.disks.get(disk).ok_or(ctl::ENOENT)?;
+        if d.failed { return Err(ctl::EIO); }
+        if d.capacity == 0 && !self.can_afford(16 << 20, 2) { return Err(ctl::ENOMEM); }
+        blkd::start(0x100 + disk as u32, &mut self.disks[disk], &self.pci,
+            &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+        Ok(())
+    }
+
     /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
     /// of it; 0 = to the end) through to guest `id` before it starts.
     /// The window must be aligned to blkd::WINDOW_ALIGN sectors.
@@ -269,33 +279,21 @@ impl Host {
         if dk.failed {
             return Err(ctl::EIO);
         }
-        if dk.owner.is_some() {
-            return Err(ctl::EBUSY);
-        }
-        if !self.can_afford(16 << 20, 2) {
-            return Err(ctl::ENOMEM);
-        }
+        self.ensure_disk(disk)?;
+        let dk = &self.disks[disk];
+        let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, dk.capacity).ok_or(ctl::EINVAL)?;
+        if dk.attachments.iter().flatten().any(|a| a.window.overlaps(window)) { return Err(ctl::EBUSY); }
+        if dk.attachments.iter().all(Option::is_some) { return Err(ctl::ENOSPC); }
+        if !self.can_afford(1 << 20, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created {
                 return Err(ctl::EBUSY);
             }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
-            let backend = blkd::attach(
-                0x100 + disk as u32,
-                &mut h.disks[disk],
-                &h.pci,
-                g,
-                d,
-                (read_only, lba_start, lba_count),
-                &mut h.devmem,
-                &mut h.alloc,
-                &mut h.wins.a,
-                &mut h.asids,
-                &h.info,
-            );
-            h.disks[disk].read_only = read_only;
+            let (client, backend) = blkd::attach(&mut h.disks[disk], g, d, window, &mut h.alloc);
+            blkd::activate(&h.disks[disk], client, g, &backend, read_only, &mut h.wins.a);
             g.backends.push((d, backend));
-            g.disks.push(disk);
+            g.disks.push((disk, client));
             Ok(())
         })
         .ok_or(ctl::ENOENT)?
@@ -347,9 +345,8 @@ impl Host {
         }
         // Disks are quiesced before any memory they were given is reused.
         let mut quiet = true;
-        for &d in &g.disks {
-            let ticks_per_ms = self.info.tsc_hz / 1000;
-            quiet &= blkd::detach(&mut self.disks[d], &self.pci, &mut self.alloc, &mut self.devmem, &mut self.wins.a, ticks_per_ms);
+        for &(disk, client) in &g.disks {
+            quiet &= blkd::remove(&mut self.disks[disk], client, &self.pci);
         }
         let name = g.name.clone();
         self.asids.in_use -= g.asids;

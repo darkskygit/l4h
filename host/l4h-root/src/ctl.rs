@@ -60,12 +60,32 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             Ok(())
         }
         abi::CTL_DISK_INFO => {
+            if !h.disks.get(a[0] as usize).ok_or(ENOENT)?.failed { h.ensure_disk(a[0] as usize)?; }
             let d = h.disks.get(a[0] as usize).ok_or(ENOENT)?;
             let p = &d.pci;
             resp.vals[0] = ((p.bus as u64) << 8) | ((p.dev as u64) << 3) | p.func as u64;
             resp.vals[1] = d.owner.map_or(u64::MAX, |o| o as u64);
             resp.vals[2] = d.failed as u64;
             resp.vals[3] = d.kind as u64;
+            resp.vals[4] = d.capacity;
+            resp.vals[5] = d.attachments.iter().flatten().count() as u64;
+            Ok(())
+        }
+        abi::CTL_BLK_WRITE => {
+            let (disk, sector, len, zero) = (a[0] as usize, a[1], a[2] as usize, a[3]);
+            if a[2] > abi::CTL_LOAD_MAX || zero > 1 { return Err(EINVAL); }
+            h.ensure_disk(disk)?;
+            let from = if zero != 0 { None } else {
+                Some(h.guest(caller).and_then(|g| g.ctl_data()).ok_or(EINVAL)? as *const u8)
+            };
+            crate::blkd::write(&mut h.disks[disk], sector, len, from, &h.pci, &mut h.wins.a)
+        }
+        abi::CTL_BLK_INFO => {
+            let disk = h.disks.get(a[0] as usize).ok_or(ENOENT)?;
+            let first = usize::try_from(a[1]).map_err(|_| EINVAL)?;
+            if let Some((i, att)) = disk.attachments.iter().enumerate().skip(first).find_map(|(i,a)| a.as_ref().map(|a| (i,a))) {
+                resp.vals = [i as u64 + 1, att.vm as u64, att.window.start, att.window.sectors, 0, 0];
+            }
             Ok(())
         }
         abi::CTL_VM_CREATE => {

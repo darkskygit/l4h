@@ -70,6 +70,9 @@ pub struct Channel {
     /// Logical block size in bytes (512 or 4096); requests must be aligned.
     pub block_size: u32,
     pub reserved: [u32; 11],
+    /// Written by l4h-root before BLKD_ADD; copied into private driver state.
+    pub lba_start: u64,
+    pub pool: Pool,
     pub reqs: [Req; RING_SIZE],
     pub resps: [Resp; RING_SIZE],
 }
@@ -82,7 +85,19 @@ pub const BLKD_BADGE_IRQ: u64 = 1 << 1;
 /// blkd CSpace slots (beyond the common ones).
 pub const BLKD_SLOT_IRQ: u64 = 16;
 /// Notification of the client, badged with its "done" bit.
-pub const BLKD_SLOT_CLIENT_DONE: u64 = 17;
+pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
+pub const MAX_CLIENTS: usize = 64;
+pub const CHANNEL_PAGES: usize = core::mem::size_of::<Channel>().div_ceil(4096);
+pub const STAGING_SIZE: usize = 1 << 20;
+pub const BLKD_INFO: u64 = 1;
+pub const BLKD_ADD: u64 = 2;
+pub const BLKD_REMOVE: u64 = 3;
+pub const BLKD_WRITE: u64 = 4;
+pub const BLKD_FLUSH: u64 = 5;
+
+pub const fn channel_va(client: usize) -> usize {
+    0x2000_0000_0000 + client * 0x20000
+}
 
 /// A virtio-pci structure: BAR-relative location, mapped by l4h-root.
 #[repr(C)]
@@ -95,17 +110,11 @@ pub struct PciRegion {
 pub const BLKD_VIRTIO: u32 = 0;
 pub const BLKD_NVME: u32 = 1;
 
-/// Configuration of a blkd driving one disk (virtio-blk or NVMe PCI
-/// device) for one client.
+/// Configuration of one persistent physical-controller driver.
 #[repr(C)]
 pub struct BlkdConfig {
     pub kind: u32,
-    /// Refuse writes (in addition to a read-only device).
-    pub read_only: u32,
-    /// The client sees sectors [lba_start, lba_start + lba_count) of the
-    /// disk (512-byte units); lba_count 0 means up to the end.
-    pub lba_start: u64,
-    pub lba_count: u64,
+    pub reserved: u32,
     /// NVMe: BAR0 (controller registers and doorbells).
     pub bar0: PciRegion,
     pub pci_bdf: u32,
@@ -123,18 +132,12 @@ pub struct BlkdConfig {
     pub dma_va: u64,
     pub dma_paddr: u64,
     pub dma_size: u64,
-    /// The client's channel.
-    pub chan_va: u64,
-    /// The client's data region, its I/O pool: guest-physical
-    /// [pool_gpa, pool_gpa + pool_size) is physically contiguous at
-    /// pool_paddr.  Every segment must lie in it.
-    pub pool_gpa: u64,
-    pub pool_paddr: u64,
-    pub pool_size: u64,
+
 }
 
 /// The data region of a client: segments must lie in its I/O pool, and are
 /// translated with one offset.  Shared with tests/fuzz-virtq.
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Pool {
     pub gpa: u64,
@@ -148,6 +151,55 @@ impl Pool {
     pub fn translate(&self, gpa: u64, len: u64) -> Option<u64> {
         let off = gpa.checked_sub(self.gpa)?;
         let end = off.checked_add(len)?;
-        (len > 0 && end <= self.size).then(|| self.paddr + off)
+        if len > 0 && end <= self.size { self.paddr.checked_add(off) } else { None }
+    }
+}
+
+/// A checked, finite, 4 KiB aligned window in 512-byte sectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskWindow {
+    pub start: u64,
+    pub sectors: u64,
+}
+
+impl DiskWindow {
+    pub fn new(start: u64, sectors: u64, capacity: u64) -> Option<Self> {
+        let sectors = if sectors == 0 { capacity.checked_sub(start)? } else { sectors };
+        (start % 8 == 0 && sectors > 0 && sectors % 8 == 0
+            && start.checked_add(sectors)? <= capacity).then_some(Self { start, sectors })
+    }
+
+    pub fn overlaps(self, other: Self) -> bool {
+        self.start < other.start + other.sectors && other.start < self.start + self.sectors
+    }
+}
+
+impl DiskWindow {
+    /// Validate a snapshotted request before it reaches a hardware driver.
+    /// Both the window and pool come from l4h-root, never from the guest.
+    pub fn check_request(self, req: &Req, pool: Pool, block_size: u32, read_only: bool) -> Result<u64, u32> {
+        if req.nr_segs as usize > MAX_SEGS || !matches!(block_size, 512 | 4096) {
+            return Err(STATUS_IOERR);
+        }
+        let device_writes = match req.op {
+            OP_READ => true,
+            OP_WRITE if !read_only => false,
+            OP_FLUSH if req.nr_segs == 0 => return Ok(0),
+            _ => return Err(STATUS_IOERR),
+        };
+        let segs = &req.segs[..req.nr_segs as usize];
+        let bytes: u64 = segs.iter().map(|s| s.len as u64).sum();
+        let sector = self.start.checked_add(req.sector).ok_or(STATUS_IOERR)?;
+        if bytes == 0 || bytes % block_size as u64 != 0 || sector % (block_size as u64 / 512) != 0
+            || req.sector.checked_add(bytes / 512).is_none_or(|end| end > self.sectors) {
+            return Err(STATUS_IOERR);
+        }
+        for seg in segs {
+            if seg.flags & !SEG_WRITE != 0 || (seg.flags & SEG_WRITE != 0) != device_writes
+                || pool.translate(seg.gpa, seg.len as u64).is_none() {
+                return Err(STATUS_IOERR);
+            }
+        }
+        Ok(sector)
     }
 }

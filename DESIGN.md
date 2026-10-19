@@ -758,45 +758,45 @@ for each device, with no trapped accesses:
   pool and are addressed by GPA (§15.1). `VIRTIO_F_ACCESS_PLATFORM` is
   required.
 
-### 8.2 Block, passthrough through the I/O pool
+### 8.2 Block, shared controllers and exclusive raw windows
 
-"Passthrough" means that **a guest's virtio-blk disk is a raw physical
-backing**: a whole disk, an NVMe namespace or an LBA window, assigned to
-exactly one guest. There is no image format or host filesystem.
+A physical virtio-blk or NVMe PCI controller has one persistent blkd.
+`BLK_ATTACH` attaches a finite, 4 KiB aligned, non-overlapping LBA window
+to a guest before boot. Every window appears as a separate virtio-blk
+volume starting at sector zero. There is no image format, host filesystem,
+thin provisioning or copy-on-write.
 
-- **Path.** Guest `virtio_blk` → `l4h-vmm` (parses descriptor chains) →
-  shared block queue → `l4h-blkd` → NVMe or virtio-blk PCI device. One blkd
-  component serves each attached disk; there is no blk-mux.
-- **DMA.** All rings and buffers live in the guest's host-owned I/O pool
-  (§15.1). The guest kernel copies data between its RAM and the pool using
-  restricted DMA/swiotlb. The VMM forwards pool GPAs; blkd validates and
-  translates them to physical addresses with one offset. The device DMAs
-  directly into the pool, and host components add no data copy.
-- **Drivers.** blkd has two Rust drivers behind one trait:
-  - virtio-blk PCI, with an indirect descriptor table per request;
-  - NVMe, with one I/O queue pair and namespace 1. Its 4 KiB pages and
-    PRP lists are sized to the controller's MDTS. A request is split into
-    several commands when its pieces cannot share one PRP list.
-- **Validation.** Every segment must lie in the I/O pool, its direction
-  must match the operation, and the request must be aligned to the logical
-  block size and stay within the LBA window and the disk. The logical
-  block size is passed to the guest as virtio `blk_size`. Writes are
-  refused on read-only attachments. Windows must start and end on 4 KiB,
-  the largest block size blkd supports: root refuses others with EINVAL.
-- **Semantics.** Flushes reach the device. There is one queue per disk;
-  multi-queue, discard, write-zeroes and I/O rate limits are future work.
-- **Reset.** A device or queue reset waits until blkd has completed every
-  request from the old queue before the hypercall returns. The VMM counts
-  outstanding requests and ignores a chain whose head is already in
-  flight. Destroy resets the physical device before reusing its buffers
-  (§9.1).
-- **No IOMMU.** Isolation depends on the trusted driver validating every
-  address; the untrusted guest has no device registers. IOMMU confinement
-  of a device would be a future defence in depth.
-- **Tests.** QEMU NVMe at 512-byte and 4 KiB LBAs
-  (`BLKTEST_DEV=nvme tests/run-blktest.sh`), read-only windows and destroy
-  during disk I/O (`tests/run-ctltest.sh`), and hostile descriptors aimed
-  outside the pool (`tests/testguest` and `tests/fuzz-virtq`).
+- Guest `virtio_blk` → l4h-vmm → per-client shared queue → blkd → device.
+- Each client has its own immutable pool/window/permission configuration,
+  channel and completion notification. The controller supports 64 clients.
+- Descriptor buffers must lie in that client's host-owned I/O pool. The
+  driver translates pool GPAs to physical addresses; the device never sees
+  guest RAM. Guest swiotlb performs the remaining payload copy.
+- l4h-root and blkd both enforce window exclusivity. Request validation uses
+  checked arithmetic and verifies block alignment, direction, permissions,
+  operation and pool bounds. Hardware request tags are allocated by blkd,
+  so identical IDs from different clients cannot collide.
+- Submission runs round-robin, with bounded work per client and reserved
+  completion capacity for outstanding requests.
+- Destroy stops the client's VMM, drains that client's submitted work, then
+  releases its mapping and pool. It does not reset a shared controller.
+  On a five-second timeout, root suspends the driver and quarantines the
+  controller. Its DMA memory remains allocated, and every affected guest
+  pool is pinned when destroyed. No new attachment or provisioning write
+  is accepted until host reboot.
+- dom0 can seed or explicitly zero UNATTACHED ranges using `BLK_WRITE` and
+  its ioctl staging buffer (up to 1 MiB per call). A zero-length call flushes
+  the controller. Provisioning uses a private 1 MiB DMA scratch area and
+  never permits writes overlapping a client, including read-only clients.
+- `DISK_INFO` additionally returns capacity and attachment count;
+  `BLK_INFO` enumerates `(vm, start, sectors)` with a cursor. The legacy
+  owner field identifies the first attachment, or -1 when none exist.
+
+`tests/run-sharedblk.sh` checks concurrent clients, overlap and bounds
+rejection, provisioning exclusion, destroy during I/O, read-only windows,
+flush/readback and repeated reuse. Run it with virtio-blk and NVMe (512 and
+4096 byte logical blocks). `tests/blk-windows.rs` exercises the production
+validator on malformed requests and window/pool boundaries.
 
 ### 8.3 Network: L2 virtual switches only
 
@@ -962,7 +962,7 @@ external orchestration can run in dom0.
   pool and deletes the tracked slots. ASIDs are released by the kernel
   when VSpaces die. Repeated create/destroy leaves free memory unchanged
   (`tests/run-ctltest.sh`).
-- **Disk detach.** A disk is detached only when its guest is destroyed.
+- **Disk detach.** A disk window is detached only when its guest is destroyed; the shared controller remains running.
   The device may hold commands that address the guest's I/O pool and
   blkd's DMA memory (queues, PRP lists, request headers), so `l4h-root`:
   1. suspends blkd, so that nothing more is submitted;

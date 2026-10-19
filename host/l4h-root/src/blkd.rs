@@ -32,7 +32,7 @@ pub const WINDOW_ALIGN: u64 = 8;
 const DEVICE_ATTRS: VmAttributes = VmAttributes::CACHE_DISABLED;
 #[cfg(target_arch = "aarch64")]
 const DEVICE_ATTRS: VmAttributes = VmAttributes::EXECUTE_NEVER;
-const DMA_BITS: usize = 21;
+const DMA_BITS: usize = 22;
 /// Each BAR is mapped at MMIO_VA + bar * BAR_STRIDE.
 const BAR_STRIDE: usize = 0x100_0000;
 
@@ -51,9 +51,12 @@ pub struct Disk {
     /// Frames of the BARs the driver uses, carved once.
     bars: Vec<(u8, Vec<cap::Granule>)>,
     pub owner: Option<usize>,
+    pub capacity: u64,
+    pub block_size: u32,
+    pub attachments: Vec<Option<Attachment>>,
     pub read_only: bool,
-    /// The device did not confirm a reset: it may still access memory it
-    /// was given, so it is never enabled again.
+    /// Reset, provisioning or drain failed: the device may still access
+    /// its DMA targets, so it is quarantined until host reboot.
     pub failed: bool,
     driver: Option<Blkd>,
 }
@@ -61,7 +64,8 @@ pub struct Disk {
 impl Disk {
     pub fn new(pci: pci::Device, vector: u64) -> Self {
         let kind = if is_nvme(&pci) { blk::BLKD_NVME } else { blk::BLKD_VIRTIO };
-        Disk { pci, kind, vector, bars: Vec::new(), owner: None, read_only: false, failed: false, driver: None }
+        Disk { pci, kind, vector, bars: Vec::new(), owner: None, read_only: false,
+            capacity: 0, block_size: 0, attachments: (0..blk::MAX_CLIENTS).map(|_| None).collect(), failed: false, driver: None }
     }
 }
 
@@ -81,35 +85,34 @@ pub fn is_disk(d: &pci::Device) -> bool {
     is_virtio_blk(d) || is_nvme(d)
 }
 
+pub struct Attachment {
+    pub vm: usize,
+    pub window: blk::DiskWindow,
+}
+
 struct Blkd {
     comp: Component,
     arena: Arena,
-    irq_slot: usize,
-    /// Physical address of its DMA memory (queues, PRP lists, headers).
-    dma_paddr: usize,
+    staging: Vec<cap::Granule>,
 }
 
 fn bdf(d: &pci::Device) -> u32 {
     ((d.bus as u32) << 8) | ((d.dev as u32) << 3) | d.func as u32
 }
 
-/// Start a blkd for `disk` serving guest device `dev_index` of `client`,
-/// and return the backend for the client's l4h-vmm.
+/// Start one persistent driver for the physical controller.
 #[allow(clippy::too_many_arguments)]
-pub fn attach(
+pub fn start(
     id: u32,
     disk: &mut Disk,
     pci: &Pci,
-    client: &mut Guest,
-    dev_index: usize,
-    window: (bool, u64, u64),
     devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
     asids: &mut AsidPools,
     host_info: &HostInfo,
-) -> vmm::Backend {
-    assert!(disk.driver.is_none());
+) {
+    if disk.driver.is_some() { return; }
     let d = &disk.pci;
     let bar_va = |b: u8| host::MMIO_VA + b as usize * BAR_STRIDE;
     let msix = d.msix.unwrap();
@@ -137,17 +140,8 @@ pub fn attach(
         .expect("blkd DMA frames");
     arena.own(dma_slot, dma_paddr, DMA_BITS);
 
-    // ---- Channel to the client's l4h-vmm, in the client's arena.
-    let chan_pages = core::mem::size_of::<blk::Channel>().div_ceil(PAGE);
-    let chan: Vec<cap::Granule> = (0..chan_pages)
-        .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP))
-        .collect();
-
     let mut cfg: alloc::boxed::Box<blk::BlkdConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
     cfg.kind = disk.kind;
-    cfg.read_only = window.0 as u32;
-    cfg.lba_start = window.1;
-    cfg.lba_count = window.2;
     cfg.bar0 = blk::PciRegion { va: bar_va(0) as u64, len: d.bars[0].size };
     cfg.pci_bdf = bdf(d);
     let vector = disk.vector;
@@ -163,13 +157,8 @@ pub fn attach(
     cfg.msix_table = msix_table;
     cfg.dma_va = host::DMA_VA as u64;
     cfg.dma_paddr = dma_paddr as u64;
-    cfg.dma_size = 1 << DMA_BITS;
-    cfg.chan_va = host::blkd_chan_va() as u64;
-    // The client's data region is its I/O pool: guest RAM is never given
-    // to a device.
-    cfg.pool_gpa = client.pool.gpa as u64;
-    cfg.pool_paddr = client.pool.paddr as u64;
-    cfg.pool_size = client.pool.size as u64;
+    // Keep a 1 MiB scratch buffer beyond the driver's queue allocator.
+    cfg.dma_size = (1 << DMA_BITS) - blk::STAGING_SIZE as u64;
     let cfg_bytes = unsafe {
         core::slice::from_raw_parts(&*cfg as *const blk::BlkdConfig as *const u8, core::mem::size_of::<blk::BlkdConfig>())
     };
@@ -189,10 +178,10 @@ pub fn attach(
     let comp = component::create(&args, alloc, &mut arena, win, asids, host_info);
 
     // Mapping caps are kept in a CNode of the arena.
-    let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 12 });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
-        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, 10);
+        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, 12);
         keep_next += 1;
         s
     };
@@ -203,10 +192,6 @@ pub fn attach(
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
         comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
     }
-    for (i, f) in chan.iter().enumerate() {
-        comp.map_copy(alloc, &mut arena, &abs_of(*f), host::blkd_chan_va() + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
-    }
-
     // ---- Interrupt, notifications.
     let irq_slot = alloc.slots.global(|s| s.alloc());
     pci::msi_irq(d, vector, &abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap()));
@@ -216,59 +201,109 @@ pub fn attach(
     abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), blk::BLKD_BADGE_IRQ).expect("IRQ notification");
     irq.irq_handler_set_notification(irq_ntfn).expect("IRQ set notification");
     comp.give(blk::BLKD_SLOT_IRQ, irq, CapRights::all());
-    comp.give_badged(
-        blk::BLKD_SLOT_CLIENT_DONE,
-        client.vmm_ntfn,
-        CapRights::write_only(),
-        1 << (host::VMM_BADGE_DONE_SHIFT as usize + dev_index),
-    );
-    let kick_slot = alloc.slots.alloc();
-    let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
-    abs_of(kick).mint(&abs_of(comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
-
     pci.enable(d);
     pci.enable_msix(d);
     component::start(&comp);
 
-    disk.owner = Some(client.id);
-    disk.driver = Some(Blkd { comp, arena, irq_slot, dma_paddr });
-    vmm::Backend::Blk { chan, kick }
+    let staging = (n_dma - blk::STAGING_SIZE / PAGE..n_dma)
+        .map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap()).collect();
+    disk.driver = Some(Blkd { comp, arena, staging });
+    let ep = disk.driver.as_ref().unwrap().comp.service_ep;
+    disk.capacity = call(ep, blk::BLKD_INFO, &[]);
+    disk.block_size = crate::mr(1) as u32;
+    disk.read_only = crate::mr(2) != 0;
 }
 
-/// Stop the driver of `disk`, quiesce the device and free the driver.
-///
-/// The driver is suspended first (no more submissions), then the device is
-/// reset, which ends or aborts every command it holds; only then are bus
-/// mastering and MSI-X turned off.  Clearing bus mastering alone is not
-/// enough: a device may finish a command it already started, and it keeps
-/// its queues to resume on the next enable.  Returns false if the device
-/// did not confirm the reset: it may still write to the client's I/O pool
-/// (the only client memory a device is given), which the caller must then
-/// not reuse.  The driver's DMA memory is kept out of use in that case,
-/// and the disk is never enabled again.
-pub fn detach(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
-    let b = disk.driver.take();
-    if let Some(b) = &b {
-        let _ = b.comp.tcb.tcb_suspend();
+fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
+    for (i, &v) in args.iter().enumerate() { crate::set_mr(i, v); }
+    ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
+    crate::mr(0)
+}
+
+/// Attach a checked window to one client of a running shared controller.
+pub fn attach(disk: &mut Disk, client: &mut Guest, dev_index: usize,
+    window: blk::DiskWindow, alloc: &mut Alloc) -> (usize, vmm::Backend) {
+    let i = disk.attachments.iter().position(Option::is_none).expect("free block client");
+    let driver = disk.driver.as_mut().expect("started blkd");
+    let chan: Vec<cap::Granule> = (0..blk::CHANNEL_PAGES)
+        .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
+    let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
+    // Initial values are delivered via the service call, not guest-chosen IDs.
+    for (page, f) in chan.iter().enumerate() {
+        alloc.global(|alloc| driver.comp.map_copy(alloc, &mut driver.arena, &abs_of(*f), blk::channel_va(i) + page * PAGE,
+            CapRights::read_write(), VmAttributes::DEFAULT,
+            keep.absolute_cptr_from_bits_with_depth(page as u64, 10)));
     }
-    let quiet = reset(disk, pci, alloc, devmem, win, ticks_per_ms);
-    pci.disable(&disk.pci);
-    if let Some(b) = b {
-        let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(b.irq_slot).cap();
-        let _ = irq.irq_handler_clear();
-        abs_of(irq).delete().expect("delete IRQ handler");
-        alloc.slots.free(b.irq_slot);
-        let pinned = alloc.reclaim_pinning(b.arena, |p| !quiet && p == b.dma_paddr);
-        if pinned != 0 {
-            let p = &disk.pci;
-            sel4::debug_println!(
-                "l4h-root: disk {:02x}:{:02x}.{}: {} MiB of DMA memory kept out of use",
-                p.bus, p.dev, p.func, pinned >> 20
-            );
-        }
+    driver.comp.give_badged(blk::BLKD_SLOT_CLIENT_DONE + i as u64, client.vmm_ntfn,
+        CapRights::write_only(), 1 << (host::VMM_BADGE_DONE_SHIFT as usize + dev_index));
+    let kick_slot = alloc.slots.alloc();
+    let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
+    abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
+    disk.attachments[i] = Some(Attachment { vm: client.id, window });
+    disk.owner = disk.attachments.iter().flatten().next().map(|a| a.vm);
+    (i, vmm::Backend::Blk { chan, kick })
+}
+
+/// Publish root-owned client configuration, then activate the channel.
+pub fn activate(disk: &Disk, i: usize, client: &Guest, backend: &vmm::Backend,
+    read_only: bool, win: &mut Window) {
+    let vmm::Backend::Blk { chan, .. } = backend else { unreachable!() };
+    let a = disk.attachments[i].as_ref().unwrap();
+    win.with_frame(&abs_of(chan[0]), |p| unsafe {
+        let c = p as *mut blk::Channel;
+        core::ptr::addr_of_mut!((*c).capacity_sectors).write(a.window.sectors);
+        core::ptr::addr_of_mut!((*c).lba_start).write(a.window.start);
+        core::ptr::addr_of_mut!((*c).read_only).write(read_only as u32);
+        core::ptr::addr_of_mut!((*c).pool).write(blk::Pool {
+            gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
+        });
+    });
+    assert_eq!(call(disk.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64]), 0, "blkd add");
+}
+
+/// Drain this client before its memory is reused. A timeout quarantines
+/// the controller and all its DMA targets until host reboot.
+pub fn remove(disk: &mut Disk, i: usize, pci: &Pci) -> bool {
+    let driver = disk.driver.as_ref().unwrap();
+    let quiet = !disk.failed && call(driver.comp.service_ep, blk::BLKD_REMOVE, &[i as u64]) == 0;
+    if !quiet {
+        disk.failed = true;
+        let _ = driver.comp.tcb.tcb_suspend();
+        pci.disable(&disk.pci);
     }
-    disk.owner = None;
+    let _ = driver.comp.slot(blk::BLKD_SLOT_CLIENT_DONE + i as u64).delete();
+    disk.attachments[i] = None;
+    disk.owner = disk.attachments.iter().flatten().next().map(|a| a.vm);
     quiet
+}
+
+/// Provision an unattached range. Data copies occur only during seeding.
+/// A zero-length request flushes the controller. Never trust discard to zero.
+pub fn write(disk: &mut Disk, sector: u64, len: usize, from: Option<*const u8>,
+    pci: &Pci, win: &mut Window) -> Result<(), i64> {
+    if disk.failed { return Err(crate::ctl::EIO); }
+    if disk.read_only { return Err(crate::ctl::EPERM); }
+    if len > blk::STAGING_SIZE { return Err(crate::ctl::EINVAL); }
+    if len != 0 {
+        let w = blk::DiskWindow::new(sector, (len / 512) as u64, disk.capacity).ok_or(crate::ctl::EINVAL)?;
+        if len % 4096 != 0 { return Err(crate::ctl::EINVAL); }
+        if disk.attachments.iter().flatten().any(|a| a.window.overlaps(w)) { return Err(crate::ctl::EBUSY); }
+    }
+    let driver = disk.driver.as_ref().unwrap();
+    for (i, f) in driver.staging.iter().take(len.div_ceil(PAGE)).enumerate() {
+        win.with_frame(&abs_of(*f), |p| unsafe {
+            if let Some(from) = from { core::ptr::copy_nonoverlapping(from.add(i * PAGE), p, PAGE); }
+            else { core::ptr::write_bytes(p, 0, PAGE); }
+        });
+    }
+    let status = call(driver.comp.service_ep, if len == 0 { blk::BLKD_FLUSH } else { blk::BLKD_WRITE }, &[sector, len as u64]);
+    if status == 0 { return Ok(()); }
+    if status == u64::MAX {
+        disk.failed = true;
+        let _ = driver.comp.tcb.tcb_suspend();
+        pci.disable(&disk.pci);
+    }
+    Err(crate::ctl::EIO)
 }
 
 /// NVMe controller registers (in BAR 0).

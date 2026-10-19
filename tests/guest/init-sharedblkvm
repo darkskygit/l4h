@@ -1,0 +1,45 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "SHAREDVM: FAIL: $*"; poweroff -f; }
+case " $(cat /proc/cmdline) " in
+*" quarantine=1 "*)
+    for i in $(seq 1 32); do
+        dd if=/dev/vda of=/dev/null bs=1M count=8 iflag=direct 2>/dev/null &
+    done
+    sleep 1
+    echo "SHAREDVM: quarantine busy"
+    while :; do sleep 10; done ;;
+esac
+pattern=A
+case " $(cat /proc/cmdline) " in *" pattern=B "*) pattern=B ;; esac
+head -c 4096 /dev/zero | tr '\000' "$pattern" > /tmp/pattern
+[ "$(cat /sys/block/vda/size)" = 16384 ] || fail capacity
+dd if=/dev/vda of=/tmp/read bs=4096 count=1 iflag=direct 2>/dev/null || fail read
+cmp /tmp/pattern /tmp/read || fail seed
+if [ "$(cat /sys/block/vda/ro)" = 1 ]; then
+    if dd if=/tmp/pattern of=/dev/vda bs=4096 count=1 oflag=direct 2>/dev/null; then fail readonly; fi
+    dd if=/dev/zero of=/tmp/zero bs=4096 count=1 2>/dev/null
+    dd if=/dev/vda of=/tmp/read bs=4096 skip=32 count=1 iflag=direct 2>/dev/null || fail recycled-read
+    cmp /tmp/zero /tmp/read || fail recycled-data
+    echo "SHAREDVM: readonly ok"
+else
+    if dd if=/tmp/pattern of=/dev/vda bs=4096 seek=2048 count=1 oflag=direct 2>/dev/null; then fail boundary; fi
+    # Keep requests in flight while the other client is destroyed.
+    (while :; do dd if=/tmp/pattern of=/dev/vda bs=4096 seek=32 count=1 oflag=direct conv=notrunc 2>/dev/null || exit; done) &
+    writer=$!
+    echo "SHAREDVM: ready"
+    read -r line
+    kill "$writer" 2>/dev/null || true
+    wait "$writer" 2>/dev/null || true
+    sync
+    dd if=/dev/vda of=/tmp/read bs=4096 count=1 iflag=direct 2>/dev/null || fail reread
+    cmp /tmp/pattern /tmp/read || fail isolation
+    dd if=/dev/vda of=/tmp/read bs=4096 skip=32 count=1 iflag=direct 2>/dev/null || fail writecheck
+    cmp /tmp/pattern /tmp/read || fail persistence
+    echo "SHAREDVM: survivor ok"
+fi
+while :; do sleep 10; done

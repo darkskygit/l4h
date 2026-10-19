@@ -79,7 +79,9 @@ fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: O
 
 const USAGE: &str = "usage: l4hctl <command>
   info                         host resources
-  disks                        host disks and their owners
+  disks                        host disks, owners, capacities and attachments
+  disk-zero DISK START SECTORS zero an unattached region
+  disk-write DISK START FILE   seed an unattached region, then flush
   list                         VMs
   create NAME --kernel F [--initrd F] [--mem MB] [--vcpus N]
          [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
@@ -123,9 +125,35 @@ fn run(args: &[String]) -> Result<i32> {
                 let bdf = r.vals[0];
                 let owner = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("vm {}", r.vals[1]) };
                 let kind = if r.vals[3] == 1 { "nvme" } else { "virtio-blk" };
-                let failed = if r.vals[2] != 0 { ", failed (did not reset)" } else { "" };
-                println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+                let failed = if r.vals[2] != 0 { ", failed (quarantined)" } else { "" };
+                println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}, sectors {}, attachments {}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, r.vals[4], r.vals[5]);
             }
+        }
+        "disk-zero" => {
+            if args.len() != 4 { return err("disk-zero DISK START SECTORS"); }
+            let disk = parse_num(&args[1])?;
+            ctl.disk_zero(disk, parse_num(&args[2])?, parse_num(&args[3])?)?;
+            ctl.disk_flush(disk)?;
+        }
+        "disk-write" => {
+            use std::io::Read;
+            if args.len() != 4 { return err("disk-write DISK START FILE"); }
+            let disk = parse_num(&args[1])?;
+            let mut sector = parse_num(&args[2])?;
+            let mut f = std::fs::File::open(&args[3]).map_err(|e| Error(e.to_string()))?;
+            let mut data = vec![0; CTL_LOAD_MAX];
+            loop {
+                let mut len = 0;
+                while len < data.len() {
+                    let n = f.read(&mut data[len..]).map_err(|e| Error(e.to_string()))?;
+                    if n == 0 { break; }
+                    len += n;
+                }
+                if len == 0 { break; }
+                ctl.disk_write(disk, sector, &data[..len])?;
+                sector = sector.checked_add((len / 512) as u64).ok_or_else(|| Error("sector overflow".into()))?;
+            }
+            ctl.disk_flush(disk)?;
         }
         "list" => {
             println!("{:>3} {:<16} {:>5} {:>8} {}", "ID", "NAME", "VCPUS", "MEM", "STATE");
