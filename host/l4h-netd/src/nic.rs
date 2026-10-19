@@ -2,6 +2,7 @@
 //! (0.9.5, as on GCE) devices.  Frames are copied between the switch and
 //! DMA buffers owned by this driver.
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use l4h_rt::host::net::{self, NicConfig};
@@ -25,6 +26,9 @@ const RX_BUF: usize = 2048;
 const TX_BUF: usize = HDR + net::MAX_FRAME;
 const RX_QUEUE: u16 = 128;
 const TX_BUFS: u16 = 24;
+/// Frames waiting for a TX buffer (rather than dropped), and their bytes.
+const TX_BACKLOG_FRAMES: usize = 512;
+const TX_BACKLOG_BYTES: usize = 4 << 20;
 
 pub struct Nic {
     pub switch: Option<u32>,
@@ -41,6 +45,9 @@ pub struct Nic {
     rx_bufs: Vec<(usize, u64)>,
     tx_bufs: Vec<(usize, u64)>,
     tx_free: Vec<u16>,
+    tx_backlog: VecDeque<(Vec<u8>, [u8; HDR])>,
+    tx_backlog_bytes: usize,
+    pub tx_drops: u64,
 }
 
 /// Features this driver uses, of those the device offers.
@@ -127,11 +134,17 @@ impl Nic {
             rx_bufs,
             tx_free: (0..tx_bufs.len() as u16).rev().collect(),
             tx_bufs,
+            tx_backlog: VecDeque::new(),
+            tx_backlog_bytes: 0,
+            tx_drops: 0,
         };
         match &nic.ports {
             Some(p) => p.out8(legacy::STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK),
             None => modern_device(c).driver_ok(),
         }
+        // Interrupts per sent buffer only while frames wait for one
+        // (flush_tx); each costs a VM exit, dear under nested virtualization.
+        nic.txq.set_interrupts(false);
         nic.kick(&nic.rxq);
         sel4::debug_println!(
             "netd: NIC {}: {:02x}:{:02x}.{} {}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -147,6 +160,22 @@ impl Nic {
         if let Some(p) = &self.ports {
             p.out16(legacy::QUEUE_NOTIFY, q.idx);
         }
+    }
+
+    /// RX interrupts off while netd drains the queue.
+    pub fn rx_begin(&self) {
+        self.rxq.set_interrupts(false);
+    }
+
+    /// RX interrupts on again; false if frames arrived meanwhile, which the
+    /// caller drains (interrupts off again).
+    pub fn rx_done(&self) -> bool {
+        self.rxq.set_interrupts(true);
+        if self.rxq.has_used() {
+            self.rxq.set_interrupts(false);
+            return false;
+        }
+        true
     }
 
     /// Next received frame, copied to `out`; returns its length.
@@ -173,15 +202,52 @@ impl Nic {
         }
     }
 
-    pub fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) {
-        let hl = self.hdr_len;
-        if frame.len() + hl > TX_BUF {
+    /// Send a frame, or hold it until a TX buffer is free: a dropped frame
+    /// costs TCP a retransmission timeout.
+    pub fn send(&mut self, frame: &[u8], hdr: &[u8; HDR]) {
+        if frame.len() + self.hdr_len > TX_BUF {
+            self.tx_drops += 1;
             return;
         }
+        if self.tx_backlog.is_empty() && self.transmit(frame, hdr) {
+            return;
+        }
+        if self.tx_backlog.len() >= TX_BACKLOG_FRAMES || self.tx_backlog_bytes + frame.len() > TX_BACKLOG_BYTES {
+            self.tx_drops += 1;
+            return;
+        }
+        self.tx_backlog.push_back((frame.to_vec(), *hdr));
+        self.tx_backlog_bytes += frame.len();
+        self.flush_tx();
+    }
+
+    /// Send held frames while TX buffers are free.  While some remain,
+    /// the device interrupts when it returns buffers.
+    pub fn flush_tx(&mut self) {
+        loop {
+            while let Some((frame, hdr)) = self.tx_backlog.pop_front() {
+                if !self.transmit(&frame, &hdr) {
+                    self.tx_backlog.push_front((frame, hdr));
+                    break;
+                }
+                self.tx_backlog_bytes -= frame.len();
+            }
+            let waiting = !self.tx_backlog.is_empty();
+            self.txq.set_interrupts(waiting);
+            // Buffers returned before the interrupt was on: send again.
+            if !waiting || !self.txq.has_used() {
+                return;
+            }
+        }
+    }
+
+    /// Put a frame into a free TX buffer; false if there is none.
+    fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+        let hl = self.hdr_len;
         if self.tx_free.is_empty() {
             self.reap_tx();
         }
-        let Some(i) = self.tx_free.pop() else { return };
+        let Some(i) = self.tx_free.pop() else { return false };
         let (va, pa) = self.tx_bufs[i as usize];
         unsafe {
             core::ptr::copy_nonoverlapping(hdr.as_ptr(), va as *mut u8, hl);
@@ -194,5 +260,6 @@ impl Nic {
         self.txq.set_desc(i, pa, (hl + frame.len()) as u32, 0, 0);
         self.txq.submit(i);
         self.kick(&self.txq);
+        true
     }
 }

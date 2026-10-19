@@ -875,6 +875,20 @@ NAT, DHCP and firewalling belong in a VM.
   that a GSO frame is TCP over IPv4/IPv6. Incoherent headers are dropped.
   A frame for a port that cannot take its offload is segmented and
   checksummed in software. Guest vNICs have one RX/TX queue pair.
+- **Full rings hold, not drop.** A guest's RX ring has 24 slots, fewer
+  than one TCP burst. Frames for a full ring wait in a per-port backlog
+  (at most 512 frames and 2 MiB per port, 16 MiB in all) and are
+  delivered in order; netd sets `rx_wanted` in the port and the VMM kicks
+  netd when it frees RX slots. Likewise frames for an uplink NIC without a
+  free TX buffer wait in a per-NIC backlog (512 frames, 4 MiB). Only
+  beyond those bounds is a frame dropped, so a guest that stops reading
+  costs nobody else. Dropping instead cost a TCP retransmission timeout
+  per burst: downloads over the QEMU uplink ran at about 3.5 MB/s, now
+  about 40 MB/s on the nested dev box.
+- **NIC interrupts.** netd turns RX interrupts off while it drains the
+  NIC's queue (re-checking after turning them on) and takes TX
+  interrupts only while frames wait for a TX buffer. Each interrupt is a
+  VM exit, which is costly when nested.
 - **Learning and security.** MAC entries age after 300 s, with at most
   1024 per switch and 8192 in all. A full table drops expired entries and
   then stops learning; unknown unicast, broadcast and multicast are
@@ -1241,6 +1255,7 @@ Figures dominated by exits are therefore pessimistic here.
 | disk, 4 KiB read latency | ~200 µs | Two cross-core wakeups: guest → VMM → blkd and back. |
 | guest↔guest ping | 1.4 ms | Four component hops per direction, with cross-core wakeups. |
 | guest↔guest TCP | ~30 MB/s | Limited per frame (~140 µs, i.e. wakeups), not by copying. Checksum offload and TSO pass through the switch. |
+| uplink download (QEMU user net) | ~40 MB/s | 64 MiB in 1.6 s; a plain Linux VM on the same QEMU does ~470 MB/s. Was ~3.5 MB/s while full RX rings dropped frames (§8.3). |
 
 Next steps for I/O latency:
 - place each guest's VMM, blkd and netd work on the guest's core, or use

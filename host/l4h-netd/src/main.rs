@@ -14,7 +14,7 @@ extern crate alloc;
 mod nic;
 mod offload;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
@@ -34,6 +34,13 @@ const FDB_AGE_SECS: u64 = 300;
 /// still switched, by flooding).
 const FDB_MAX: usize = 1024;
 const FDB_MAX_TOTAL: usize = 8192;
+/// Frames held for a guest whose RX ring is full, per port and in all.
+/// Dropping them instead costs TCP a retransmission timeout whenever a
+/// burst outruns the ring (24 slots); a guest that stops reading costs
+/// only its own backlog.
+const BACKLOG_FRAMES: usize = 512;
+const BACKLOG_BYTES: usize = 2 << 20;
+const BACKLOG_BYTES_TOTAL: usize = 16 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PortId {
@@ -55,6 +62,9 @@ struct GuestPort {
     rx_frames: u64,
     tx_frames: u64,
     drops: u64,
+    /// Frames for a full RX ring, oldest first, and their bytes.
+    backlog: VecDeque<(Vec<u8>, [u8; net::HDR_SIZE])>,
+    backlog_bytes: usize,
 }
 
 #[derive(Default)]
@@ -73,6 +83,8 @@ struct Netd {
     seg_buf: Vec<u8>,
     /// Entries in all forwarding tables.
     fdb_total: usize,
+    /// Bytes in all ports' backlogs.
+    backlog_total: usize,
 }
 
 fn rdtsc() -> u64 {
@@ -134,29 +146,30 @@ impl Netd {
                 if !rx_csum {
                     complete_csum(frame, hdr);
                 }
-                unsafe {
-                    let head = addr_of!((*p.chan).rx.head).read_volatile();
-                    let tail = addr_of!((*p.chan).rx.tail).read_volatile();
-                    if head.wrapping_sub(tail) as usize >= net::RING_SIZE {
+                // Behind a backlog, or no room: hold the frame (in order).
+                if p.backlog.is_empty() && rx_put(p.chan, frame, hdr) {
+                    p.rx_frames += 1;
+                    p.signal = true;
+                } else {
+                    if p.backlog.len() >= BACKLOG_FRAMES
+                        || p.backlog_bytes + frame.len() > BACKLOG_BYTES
+                        || self.backlog_total + frame.len() > BACKLOG_BYTES_TOTAL
+                    {
                         p.drops += 1;
                         return;
                     }
-                    let slot = addr_of_mut!((*p.chan).rx_slots[head as usize % net::RING_SIZE]);
-                    core::ptr::copy_nonoverlapping(frame.as_ptr(), addr_of_mut!((*slot).data) as *mut u8, frame.len());
-                    addr_of_mut!((*slot).hdr).write_volatile(*hdr);
-                    addr_of_mut!((*slot).len).write_volatile(frame.len() as u32);
-                    fence(Ordering::Release);
-                    addr_of_mut!((*p.chan).rx.head).write_volatile(head.wrapping_add(1));
+                    p.backlog.push_back((frame.to_vec(), *hdr));
+                    p.backlog_bytes += frame.len();
+                    self.backlog_total += frame.len();
+                    self.rx_backlog(i);
                 }
-                p.rx_frames += 1;
-                p.signal = true;
             }
             PortId::Uplink(n) => {
                 let nic = &mut self.nics[n];
                 if !nic.csum {
                     complete_csum(frame, hdr);
                 }
-                nic.transmit(frame, hdr);
+                nic.send(frame, hdr);
             }
         }
     }
@@ -230,6 +243,35 @@ impl Netd {
         }
     }
 
+    /// Move port `i`'s backlog into its RX ring while there is room.  While
+    /// frames remain, the client is asked to kick netd when it frees slots.
+    fn rx_backlog(&mut self, i: usize) {
+        let Some(p) = self.ports[i].as_mut() else { return };
+        loop {
+            while let Some((frame, hdr)) = p.backlog.front() {
+                if !rx_put(p.chan, frame, hdr) {
+                    break;
+                }
+                let n = frame.len();
+                p.backlog.pop_front();
+                p.backlog_bytes -= n;
+                self.backlog_total -= n;
+                p.rx_frames += 1;
+                p.signal = true;
+            }
+            let wanted = !p.backlog.is_empty();
+            unsafe { addr_of_mut!((*p.chan).rx_wanted).write_volatile(wanted as u32) };
+            if !wanted {
+                return;
+            }
+            // The client may have freed slots before it saw rx_wanted.
+            fence(Ordering::SeqCst);
+            if rx_full(p.chan) {
+                return;
+            }
+        }
+    }
+
     /// Take the frames a guest port has queued for transmission.
     fn port_tx(&mut self, i: usize) {
         let Some(p) = self.ports[i].as_ref() else { return };
@@ -270,14 +312,20 @@ impl Netd {
 
     fn nic_rx(&mut self, n: usize) {
         let mut frame = core::mem::take(&mut self.buf);
-        while let Some(len) = self.nics[n].receive(&mut frame) {
-            if self.nics[n].switch.is_some() {
-                let mut hdr = [0u8; net::HDR_SIZE];
-                self.forward(PortId::Uplink(n), &mut frame[..len], &mut hdr);
+        self.nics[n].rx_begin();
+        loop {
+            while let Some(len) = self.nics[n].receive(&mut frame) {
+                if self.nics[n].switch.is_some() {
+                    let mut hdr = [0u8; net::HDR_SIZE];
+                    self.forward(PortId::Uplink(n), &mut frame[..len], &mut hdr);
+                }
+            }
+            if self.nics[n].rx_done() {
+                break;
             }
         }
         self.buf = frame;
-        self.nics[n].reap_tx();
+        self.nics[n].flush_tx();
     }
 
     fn signal_clients(&mut self) {
@@ -290,7 +338,8 @@ impl Netd {
     }
 
     fn remove_port(&mut self, i: usize) {
-        if self.ports.get_mut(i).and_then(|p| p.take()).is_some() {
+        if let Some(p) = self.ports.get_mut(i).and_then(|p| p.take()) {
+            self.backlog_total -= p.backlog_bytes;
             for sw in self.switches.values_mut() {
                 let before = sw.fdb.len();
                 sw.fdb.retain(|_, (p, _)| *p != PortId::Guest(i));
@@ -298,6 +347,31 @@ impl Netd {
             }
         }
     }
+}
+
+fn rx_full(chan: *mut net::Port) -> bool {
+    unsafe {
+        let head = addr_of!((*chan).rx.head).read_volatile();
+        let tail = addr_of!((*chan).rx.tail).read_volatile();
+        head.wrapping_sub(tail) as usize >= net::RING_SIZE
+    }
+}
+
+/// Put a frame into a port's RX ring; false if it is full.
+fn rx_put(chan: *mut net::Port, frame: &[u8], hdr: &[u8; net::HDR_SIZE]) -> bool {
+    if rx_full(chan) {
+        return false;
+    }
+    unsafe {
+        let head = addr_of!((*chan).rx.head).read_volatile();
+        let slot = addr_of_mut!((*chan).rx_slots[head as usize % net::RING_SIZE]);
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), addr_of_mut!((*slot).data) as *mut u8, frame.len());
+        addr_of_mut!((*slot).hdr).write_volatile(*hdr);
+        addr_of_mut!((*slot).len).write_volatile(frame.len() as u32);
+        fence(Ordering::Release);
+        addr_of_mut!((*chan).rx.head).write_volatile(head.wrapping_add(1));
+    }
+    true
 }
 
 fn mr(i: usize) -> u64 {
@@ -318,6 +392,7 @@ fn main(info: &'static Info) -> ! {
         buf: alloc::vec![0u8; net::MAX_FRAME],
         seg_buf: alloc::vec![0u8; net::MAX_FRAME],
         fdb_total: 0,
+        backlog_total: 0,
     };
     for (n, c) in cfg.nics[..cfg.nr_nics as usize].iter().enumerate() {
         d.nics.push(Nic::new(n, c));
@@ -333,6 +408,7 @@ fn main(info: &'static Info) -> ! {
             for i in 0..net::MAX_PORTS {
                 if badge & (1 << i) != 0 {
                     d.port_tx(i);
+                    d.rx_backlog(i);
                 }
             }
             for n in 0..d.nics.len() {
@@ -358,6 +434,7 @@ fn main(info: &'static Info) -> ! {
                     unsafe {
                         addr_of_mut!((*chan).mac).write_volatile([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0]);
                         addr_of_mut!((*chan).link_up).write_volatile(1);
+                        addr_of_mut!((*chan).rx_wanted).write_volatile(0);
                     }
                     d.ports[i] = Some(GuestPort {
                         chan,
@@ -370,6 +447,8 @@ fn main(info: &'static Info) -> ! {
                         rx_frames: 0,
                         tx_frames: 0,
                         drops: 0,
+                        backlog: VecDeque::new(),
+                        backlog_bytes: 0,
                     });
                     0
                 } else {
@@ -409,4 +488,5 @@ fn main(info: &'static Info) -> ! {
     }
 }
 
-l4h_rt::component!(main, heap_size = 4 * 1024 * 1024);
+// Room for the forwarding tables and BACKLOG_BYTES_TOTAL of held frames.
+l4h_rt::component!(main, heap_size = 24 * 1024 * 1024);

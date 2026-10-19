@@ -272,6 +272,20 @@ impl Virtq {
         }
     }
 
+    /// Ask the device for an interrupt per used buffer, or not
+    /// (VIRTQ_AVAIL_F_NO_INTERRUPT).  A driver draining the queue anyway
+    /// turns them off; after turning them on again it must re-check
+    /// `has_used` for buffers used in between.
+    pub fn set_interrupts(&self, on: bool) {
+        Mmio(self.avail).w16(0, if on { 0 } else { 1 });
+        dma_fence(Ordering::SeqCst);
+    }
+
+    pub fn has_used(&self) -> bool {
+        dma_fence(Ordering::SeqCst);
+        Mmio(self.used).r16(2) != self.last_used
+    }
+
     /// Next used element: (id, written length).
     pub fn pop_used(&mut self) -> Option<(u32, u32)> {
         let u = Mmio(self.used);

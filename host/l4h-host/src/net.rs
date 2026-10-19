@@ -47,7 +47,10 @@ pub struct Port {
     /// checksum and drops TSO frames for it.
     pub rx_csum: u32,
     pub rx_gso: u32,
-    pub reserved: [u32; 11],
+    /// Set by netd while it holds frames for a full RX ring: the client
+    /// kicks netd after freeing RX slots.
+    pub rx_wanted: u32,
+    pub reserved: [u32; 10],
     pub tx_slots: [Slot; RING_SIZE],
     pub rx_slots: [Slot; RING_SIZE],
 }

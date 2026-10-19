@@ -154,6 +154,13 @@ impl Net {
             q.push(mem, chain, written as u32);
             returned = true;
         }
+        // netd holds frames for this port until we free slots: tell it.
+        if returned {
+            fence(Ordering::SeqCst);
+            if unsafe { addr_of!((*self.chan).rx_wanted).read_volatile() } != 0 {
+                self.kick.signal();
+            }
+        }
         returned
     }
 }
