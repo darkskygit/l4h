@@ -560,7 +560,11 @@ the vDSO. On x86_64 the vDSO is Linux's generic one (`lib/vdso`): the
 kernel keeps a time page current (`update_vsyscall()`), mapped read-only
 four pages below the vDSO text in every process, so `clock_gettime`,
 `gettimeofday`, `time` and `clock_getres` do not trap (~40 ns instead of a
-~1.4 µs syscall on the nested dev box). Time namespaces are off: they
+~1.4 µs syscall on the nested dev box). The vDSO and its data pages live
+in the top 64 KiB of user space (`L4H_VDSO_AREA`), and `STACK_TOP` is a
+guard page below that area: a stack randomized to within the data pages
+made installing them fail exec past its point of no return, killing
+~0.2 % of execs with SIGSEGV. Time namespaces are off: they
 would need that page remapped per namespace. The aarch64 vDSO has no time
 functions yet; glibc falls back to the syscall there. `l4h-root` passes the TSC frequency, taken from seL4 bootinfo.
 The clockevent is a per-vCPU one-shot deadline armed with

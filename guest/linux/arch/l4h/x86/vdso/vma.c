@@ -30,6 +30,13 @@ static int __init init_vdso(void)
 	int i;
 
 	vdso_pages = DIV_ROUND_UP(vdso_end - vdso_start, PAGE_SIZE);
+	/* The stack starts below L4H_VDSO_AREA (asm/processor-generic.h). */
+	if ((vdso_pages + __VDSO_PAGES) * PAGE_SIZE > L4H_VDSO_AREA) {
+		printk(KERN_ERR "vdso: %u pages do not fit below the top of user space\n",
+		       vdso_pages + __VDSO_PAGES);
+		vdso_enabled = 0;
+		return -ENOMEM;
+	}
 	um_vdso_addr = task_size - vdso_pages * PAGE_SIZE;
 
 	vdso_text = kcalloc(vdso_pages + 1, sizeof(*vdso_text), GFP_KERNEL);

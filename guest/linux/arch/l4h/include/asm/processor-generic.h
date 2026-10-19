@@ -68,7 +68,13 @@ extern unsigned long task_size;
 extern unsigned long stacksizelim;
 
 #define STACK_ROOM	(stacksizelim)
-#define STACK_TOP	(TASK_SIZE - 2 * PAGE_SIZE)
+/* The top of user space holds the vDSO and, on x86_64, its data pages
+ * below it (arch_setup_additional_pages()).  The stack starts below that
+ * area and a guard page; randomize_stack_top() only moves it further down.
+ * A stack overlapping the data pages made installing them fail the exec
+ * past its point of no return. */
+#define L4H_VDSO_AREA	(16 * PAGE_SIZE)
+#define STACK_TOP	(TASK_SIZE - L4H_VDSO_AREA - PAGE_SIZE)
 #define STACK_TOP_MAX	STACK_TOP
 
 /* This decides where the kernel will search for a free chunk of vm

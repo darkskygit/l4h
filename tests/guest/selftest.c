@@ -335,6 +335,19 @@ static void test_fork(void)
 	}
 	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
 	      "exec /bin/true: status %x", status);
+
+	/* Without stack randomization the stack starts at STACK_TOP itself.
+	 * It must be clear of the vDSO and its data pages: installing them
+	 * over the stack failed exec past its point of no return (SIGSEGV),
+	 * which randomization made happen for ~0.2 % of execs. */
+	pid = fork();
+	if (pid == 0) {
+		personality(ADDR_NO_RANDOMIZE);
+		execl("/bin/true", "true", NULL);
+		_exit(99);
+	}
+	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "exec /bin/true without randomization: status %x", status);
 }
 
 /* ---- ptrace */
