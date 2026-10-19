@@ -38,7 +38,13 @@ s1=$(steal)
 echo "M6TEST: guest steal ticks while capped: $((s1 - s0)) in 2 s"
 [ $((s1 - s0)) -ge 80 ] || fail "steal time not reported ($s0 -> $s1)"
 echo "M6TEST: capped at 25%: ${after}%"
-[ "$after" -ge 15 ] && [ "$after" -le 35 ] || fail "cap not applied (${after}%)"
+# The cap's budget covers the guest kernel too.  Under emulation (aarch64
+# on TCG, slow > 1) the guest kernel's own work costs 10-15% of a core in
+# wall-clock time, capped or not, and a capped vCPU read 13-20% there
+# (21% on x86/KVM).  The upper bound is what shows the cap holds.
+lo=15
+[ "$slow" -gt 1 ] && lo=10
+[ "$after" -ge "$lo" ] && [ "$after" -le 35 ] || fail "cap not applied (${after}%)"
 l4hctl sched "$id" 0
 sleep 2
 echo "M6TEST: uncapped again: $(cpu hog)%"
