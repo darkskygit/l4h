@@ -1,77 +1,46 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2011 Richard Weinberger <richrd@nod.at>
+ * vDSO time functions for l4h x86_64: the generic implementation over the
+ * time page the kernel keeps current (update_vsyscall()) and the TSC, so
+ * clock_gettime, gettimeofday, time and clock_getres do not trap.
  *
- * This vDSO turns all calls into a syscall so that UML can trap them.
+ * Copyright 2006 Andi Kleen, SUSE Labs.
+ * Copyright 2019 ARM Limited
  */
-
-
-/* Disable profiling for userspace code */
-#define DISABLE_BRANCH_PROFILING
-
 #include <linux/time.h>
-#include <linux/getcpu.h>
-#include <asm/unistd.h>
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <vdso/gettime.h>
 
-/* workaround for -Wmissing-prototypes warnings */
-int __vdso_clock_gettime(clockid_t clock, struct __kernel_old_timespec *ts);
-int __vdso_gettimeofday(struct __kernel_old_timeval *tv, struct timezone *tz);
-__kernel_old_time_t __vdso_time(__kernel_old_time_t *t);
-long __vdso_getcpu(unsigned int *cpu, unsigned int *node, struct getcpu_cache *unused);
-
-int __vdso_clock_gettime(clockid_t clock, struct __kernel_old_timespec *ts)
-{
-	long ret;
-
-	asm("syscall"
-		: "=a" (ret)
-		: "0" (__NR_clock_gettime), "D" (clock), "S" (ts)
-		: "rcx", "r11", "memory");
-
-	return ret;
-}
-int clock_gettime(clockid_t, struct __kernel_old_timespec *)
-	__attribute__((weak, alias("__vdso_clock_gettime")));
+#include "lib/vdso/gettimeofday.c"
 
 int __vdso_gettimeofday(struct __kernel_old_timeval *tv, struct timezone *tz)
 {
-	long ret;
-
-	asm("syscall"
-		: "=a" (ret)
-		: "0" (__NR_gettimeofday), "D" (tv), "S" (tz)
-		: "rcx", "r11", "memory");
-
-	return ret;
+	return __cvdso_gettimeofday(tv, tz);
 }
+
 int gettimeofday(struct __kernel_old_timeval *, struct timezone *)
 	__attribute__((weak, alias("__vdso_gettimeofday")));
 
 __kernel_old_time_t __vdso_time(__kernel_old_time_t *t)
 {
-	long secs;
-
-	asm volatile("syscall"
-		: "=a" (secs)
-		: "0" (__NR_time), "D" (t) : "cc", "r11", "cx", "memory");
-
-	return secs;
+	return __cvdso_time(t);
 }
+
 __kernel_old_time_t time(__kernel_old_time_t *t) __attribute__((weak, alias("__vdso_time")));
 
-long
-__vdso_getcpu(unsigned int *cpu, unsigned int *node, struct getcpu_cache *unused)
+int __vdso_clock_gettime(clockid_t clock, struct __kernel_timespec *ts)
 {
-	long ret;
-
-	/* l4h guests are SMP: ask the kernel. */
-	asm("syscall"
-		: "=a" (ret)
-		: "0" (__NR_getcpu), "D" (cpu), "S" (node), "d" (unused)
-		: "rcx", "r11", "memory");
-
-	return ret;
+	return __cvdso_clock_gettime(clock, ts);
 }
 
-long getcpu(unsigned int *cpu, unsigned int *node, struct getcpu_cache *tcache)
-	__attribute__((weak, alias("__vdso_getcpu")));
+int clock_gettime(clockid_t, struct __kernel_timespec *)
+	__attribute__((weak, alias("__vdso_clock_gettime")));
+
+int __vdso_clock_getres(clockid_t clock, struct __kernel_timespec *res)
+{
+	return __cvdso_clock_getres(clock, res);
+}
+
+int clock_getres(clockid_t, struct __kernel_timespec *)
+	__attribute__((weak, alias("__vdso_clock_getres")));

@@ -556,8 +556,13 @@ WriteRegisters `fs_base`. With `KernelFSGSBase=inst`, userspace
 `wrfsbase` works natively, and we advertise HWCAP2_FSGSBASE.
 
 **Time.** The clocksource is the TSC, read with `rdtsc` in the kernel and in
-the vDSO. The vvar page is mapped into every process, and `clock_gettime`
-never traps. `l4h-root` passes the TSC frequency, taken from seL4 bootinfo.
+the vDSO. On x86_64 the vDSO is Linux's generic one (`lib/vdso`): the
+kernel keeps a time page current (`update_vsyscall()`), mapped read-only
+four pages below the vDSO text in every process, so `clock_gettime`,
+`gettimeofday`, `time` and `clock_getres` do not trap (~40 ns instead of a
+~1.4 µs syscall on the nested dev box). Time namespaces are off: they
+would need that page remapped per namespace. The aarch64 vDSO has no time
+functions yet; glibc falls back to the syscall there. `l4h-root` passes the TSC frequency, taken from seL4 bootinfo.
 The clockevent is a per-vCPU one-shot deadline armed with
 `seL4_TCB_SetTimer(kTCB, deadline, L4H_BADGE_TIMER)`, which signals `N_v`.
 
@@ -1273,10 +1278,10 @@ Rules that keep the port cheap:
 
 | Operation | Native KVM guest | l4h, estimate | Notes |
 |-----------|------------------|---------------|-------|
-| null syscall | ~50 ns | ~0.4–1 µs | Fault IPC slowpath plus ReplyRecv. An optional seL4 patch can fastpath UnknownSyscall replies. Comparable to Xen PV x86_64 or gVisor systrap. |
+| null syscall | ~50 ns | ~0.4–1 µs | Fault IPC slowpath plus ReplyRecv. Comparable to Xen PV x86_64 or gVisor systrap. |
 | page fault (anon) | ~1 µs | ~2–4 µs | Fault IPC, `handle_mm_fault` and `Page_Map`. |
 | context switch | ~1–2 µs | ~2–3 µs | Two `SetSchedParams` and a reply. No FPU copying. |
-| `clock_gettime` | vDSO | vDSO (rdtsc) | No trap. |
+| `clock_gettime` | vDSO | vDSO (rdtsc) | No trap on x86_64 (~40 ns); a syscall on aarch64. |
 | fork+exec | baseline | 1.5–3× | Lazy refault. |
 | disk I/O | | near native | One copy by the guest kernel through its I/O pool, plus two host queue hops. |
 | network | | copies through pool and port slots | The guest bounces through its I/O pool; VMM and netd copy between pool, port and NIC buffers (§8.3). |
@@ -1307,7 +1312,8 @@ Figures dominated by exits are therefore pessimistic here.
 
 | Operation | l4h, nested KVM | Notes |
 |-----------|-----------------|-------|
-| getpid | 1.3–1.5 µs | Was 20 µs before kernel patch 0006. MCS reprogrammed the TSC deadline, a VM exit, on every scheduling-context switch. It now keeps an earlier armed deadline. |
+| getpid | 1.2–1.3 µs | Was 20 µs before kernel patch 0006. MCS reprogrammed the TSC deadline, a VM exit, on every scheduling-context switch. It now keeps an earlier armed deadline. Of the ~3,200-cycle seL4 round trip, most is the two thread switches (an address-space switch and an eager FPU swap each, ~640 cycles) and four kernel entries and exits; Linux itself takes ~440 cycles. A fastpath for the trapped syscall and its reply was tried and saved only ~6 %. |
+| `clock_gettime` | ~40 ns | vDSO; was a ~1.4 µs syscall before it had time functions. |
 | page fault (first touch) | 5–6.5 µs | |
 | pipe round trip | 10 µs (same vCPU) | 37 µs between 2 vCPUs, which needs cross-core IPIs. |
 | fork+exit+wait | 340–450 µs | |

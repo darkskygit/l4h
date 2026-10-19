@@ -63,6 +63,10 @@ static struct clocksource l4h_tsc_clocksource = {
 	.read		= l4h_tsc_read,
 	.mask		= CLOCKSOURCE_MASK(64),
 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS | CLOCK_SOURCE_VALID_FOR_HRES,
+#ifdef CONFIG_GENERIC_GETTIMEOFDAY
+	/* User code reads the same counter: the vDSO's clock_gettime(). */
+	.vdso_clock_mode = VDSO_CLOCKMODE_L4H,
+#endif
 };
 
 static u64 notrace l4h_sched_clock(void)

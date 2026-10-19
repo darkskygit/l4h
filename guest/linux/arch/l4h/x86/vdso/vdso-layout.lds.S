@@ -5,8 +5,16 @@
  * This script controls its layout.
  */
 
+#include <vdso/page.h>
+#include <asm/vdso/vsyscall.h>
+#include <vdso/datapage.h>
+
 SECTIONS
 {
+	/* The data pages (vdso_u_time_data, ...) sit just below the text. */
+	. = VDSO_PRELINK;
+	VDSO_VVAR_SYMS
+
 	. = VDSO_PRELINK + SIZEOF_HEADERS;
 
 	.hash		: { *(.hash) }			:text

@@ -35,7 +35,8 @@ $(obj)/%.so: $(obj)/%.so.dbg FORCE
 #
 CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
        $(filter -g%,$(KBUILD_CFLAGS)) -fno-stack-protector \
-       -fno-omit-frame-pointer -foptimize-sibling-calls
+       -fno-omit-frame-pointer -foptimize-sibling-calls \
+       -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO -I$(srctree)
 
 $(vobjs): KBUILD_CFLAGS += $(CFL)
 

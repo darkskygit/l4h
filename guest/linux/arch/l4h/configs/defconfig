@@ -53,6 +53,9 @@ CONFIG_IPC_NS=y
 CONFIG_PID_NS=y
 CONFIG_NET_NS=y
 CONFIG_USER_NS=y
+# Time namespaces would need the vDSO data pages remapped per namespace;
+# x86/vdso/vma.c maps one time page for all.
+# CONFIG_TIME_NS is not set
 CONFIG_MEMCG=y
 CONFIG_CGROUP_SCHED=y
 CONFIG_CGROUP_PIDS=y
