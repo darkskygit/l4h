@@ -23,12 +23,12 @@
  * Blocks change mode as the demand for objects changes (§15.3).  Free
  * object blocks beyond a watermark go back to frame mode.  When an object
  * block is taken, a worker keeps a reserve of free ones: it takes a
- * 2 MiB-aligned range from the page allocator (which compacts memory for
- * it), revokes its frames and makes it an object block.  Allocations run
- * in atomic context (under page-table locks) and never wait for that: the
- * reserve covers them while the worker converts more.  Callers that may
- * sleep wait for the worker when even the reserve is gone
- * (l4h_objmem_wait()), and call the OOM killer if no 2 MiB range can be
+ * 2 MiB-aligned range from the page allocator, falling back to isolation
+ * and synchronous migration, revokes its frames and makes it an object
+ * block.  Allocations run in atomic context (under page-table locks) and
+ * never wait for that: the reserve covers them while the worker converts
+ * more.  Callers that may sleep wait for the worker when even the reserve
+ * is gone (l4h_objmem_wait()), and call the OOM killer if no 2 MiB range can be
  * found (l4h_objmem_oom()).
  *
  * Slots live in second-level CNodes (radix 12, guard 6) that we create in
@@ -112,6 +112,7 @@ enum block_state {
 enum block_origin {
 	ORIG_RESERVED,	/* memblock-reserved at boot */
 	ORIG_ALLOC,	/* allocated by us (order 9), to be freed again */
+	ORIG_CONTIG,	/* alloc_contig_range: each page has its own reference */
 };
 
 struct block {
@@ -156,6 +157,7 @@ static int open_block[NR_CLASSES] = { -1, -1, -1, -1 };
 static unsigned int nr_object_blocks, nr_reserve, nr_spare;
 static unsigned int reserve_target, spare_watermark;
 static unsigned long conversions_to_objects, conversions_to_frames, conversion_failures;
+static unsigned long contig_attempts, contig_successes;
 
 static void objmem_kick(void);
 
@@ -672,16 +674,14 @@ static void block_to_objects(unsigned int b, int origin)
 	nr_reserve++;
 	nr_object_blocks++;
 	conversions_to_objects++;
+	if (origin == ORIG_CONTIG)
+		contig_successes++;
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 }
 
-/*
- * Frame -> object: a 2 MiB-aligned range from the page allocator, which
- * reclaims and compacts memory for it if needed (an order-9 page is block
- * aligned).  Boot blocks have no Untyped: then take another range, and
- * give those back afterwards.
- */
-static int frames_to_objects(void)
+/* Fast path: an order-9 page is block aligned.  Boot blocks cannot be
+ * converted: hold those allocations while trying for another block. */
+static int frames_to_objects_buddy(void)
 {
 	struct page *held[8];
 	int nr_held = 0, ret = -ENOMEM, i;
@@ -713,9 +713,57 @@ static int frames_to_objects(void)
 	}
 	for (i = 0; i < nr_held; i++)
 		__free_pages(held[i], RAM_BLOCK_ORDER);
-	if (ret)
-		conversion_failures++;
 	return ret;
+}
+
+/*
+ * An order-9 allocation can fail while plenty of RAM is reclaimable:
+ * direct compaction uses MIGRATE_SYNC_LIGHT and may skip busy/dirty pages
+ * or defer further attempts.  Before declaring OOM, isolate each eligible
+ * block and try synchronous migration, including waiting for writeback.
+ * objmem_mutex keeps block modes stable while we sleep; caps_lock must
+ * stay unlocked because migration flushes process mappings.
+ */
+static int frames_to_objects(void)
+{
+	unsigned int b;
+	unsigned long flags;
+	int ret;
+
+	if (!frames_to_objects_buddy())
+		return 0;
+	for (b = boot_blocks; b < nr_blocks; b++) {
+		unsigned long pfn = (unsigned long)b << RAM_BLOCK_ORDER;
+		bool eligible;
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
+		raw_spin_lock_irqsave(&caps_lock, flags);
+		eligible = blocks[b].state == BLK_FRAMES;
+		if (eligible)
+			contig_attempts++;
+		raw_spin_unlock_irqrestore(&caps_lock, flags);
+		if (!eligible)
+			continue;
+		/* Do not pass __GFP_NOMEMALLOC: alloc_contig_range accepts
+		 * only reclaim flags and a restricted set of action flags. */
+		ret = alloc_contig_range(pfn, pfn + RAM_BLOCK_PAGES, ACR_FLAGS_NONE,
+					GFP_KERNEL | __GFP_NOWARN);
+		if (!ret) {
+			raw_spin_lock_irqsave(&caps_lock, flags);
+			blocks[b].state = BLK_BUSY;
+			raw_spin_unlock_irqrestore(&caps_lock, flags);
+			block_to_objects(b, ORIG_CONTIG);
+			return 0;
+		}
+		if (ret == -EINTR)
+			return ret;
+		cond_resched();
+	}
+	raw_spin_lock_irqsave(&caps_lock, flags);
+	conversion_failures++;
+	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	return -ENOMEM;
 }
 
 /* Object -> frame, for the highest spare block (objects low in RAM). */
@@ -757,6 +805,8 @@ static void objects_to_frames(void)
 	pfn = (unsigned long)b << RAM_BLOCK_ORDER;
 	if (blocks[b].origin == ORIG_ALLOC) {
 		__free_pages(pfn_to_page(pfn), RAM_BLOCK_ORDER);
+	} else if (blocks[b].origin == ORIG_CONTIG) {
+		free_contig_range(pfn, RAM_BLOCK_PAGES);
 	} else {
 		for (i = 0; i < RAM_BLOCK_PAGES; i++)
 			free_reserved_page(pfn_to_page(pfn + i));
@@ -996,6 +1046,8 @@ static int objmem_stats_show(struct seq_file *m, void *v)
 		   nr_spare, spare_watermark);
 	seq_printf(m, "to_objects %lu to_frames %lu failures %lu\n", conversions_to_objects,
 		   conversions_to_frames, conversion_failures);
+	seq_printf(m, "contig_attempts %lu contig_successes %lu\n", contig_attempts,
+		   contig_successes);
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	return 0;
 }

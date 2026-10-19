@@ -1511,16 +1511,22 @@ memory the guest can retype.
 - **Frame -> object** (`frames_to_objects`): an order-9 allocation from the
   page allocator (`GFP_KERNEL | __GFP_RETRY_MAYFAIL`, so it reclaims and
   compacts; an order-9 page is a whole aligned block), retrying past boot
-  blocks, which have no Untyped. Revoking the block's Untyped copy then
-  deletes its 512 frames with every mapping and copy of them; the pages
-  stay allocated, so they are out of the page allocator. Deviation: no
-  `alloc_contig_range` fallback; the order-9 allocation with compaction
-  was enough in the tests.
+  blocks, which have no Untyped. If this fails, the guest scans frame
+  blocks with `alloc_contig_range`, isolating the selected range and
+  migrating its pages synchronously. Direct compaction only uses
+  `MIGRATE_SYNC_LIGHT` and can defer or skip busy and dirty pages; an
+  order-9 failure alone does not establish OOM. Revoking the block's
+  Untyped copy then deletes its 512 frames with every mapping and copy of
+  them; the pages stay allocated, so they are out of the page allocator.
+  Boot blocks and blocks already holding objects are excluded from the
+  fallback scan.
 - **Object -> frame** (`objects_to_frames`): the highest spare block is
   revoked (it has no children), gets its 512 frames back in its RAM CNode
   (which is kept), is mapped again, and its pages go back to the page
-  allocator (`__free_pages`, or `free_reserved_page` for blocks that were
-  object blocks since boot).
+  allocator (`__free_pages` for buddy allocations, `free_contig_range`
+  for isolated ranges, or `free_reserved_page` for blocks that were
+  object blocks since boot). Isolated ranges hold one reference per page
+  and must not be freed as a single order-9 allocation.
 - **When there is no memory for objects.** Atomic callers get `-ENOMEM`:
   a TLB sync that cannot map a page leaves it unmapped and goes on (its
   unmaps must all happen; before, an error ended the sync early), so the
@@ -1531,18 +1537,31 @@ memory the guest can retype.
   Creating a user context no longer panics on a failure.
 - **Accounting.** `/proc/meminfo` has `L4hObjects` (RAM in object blocks,
   out of the page allocator) and `L4hObjectsUsed`; `/proc/l4h_objmem`
-  shows block counts, targets and conversions.
-- **Test** (`tests/run-objtest.sh`, 4 vCPUs, 256 MiB): 8 processes each
+  shows block counts, targets and conversions, plus `contig_attempts`
+  and `contig_successes` for the synchronous migration fallback.
+- **Test** (`tests/run-objtest.sh`): a fragmentation regression fills most
+  free RAM, retains one movable anonymous page per physical 2 MiB block,
+  and discards the rest. With direct compaction's fragmentation threshold
+  set to 1000 and proactive compaction disabled, a child touches a page
+  every 2 MiB of a 16 GiB mapping.
+  This must grow object memory through synchronous migration and preserve
+  the retained pages' contents. Before the fallback, this reproduced an
+  objmem OOM with 162 MiB free in a 256 MiB guest.
+  The stress phases use 8 processes that each
   touch a page every 2 MiB of a 1 GiB mapping (4096 page tables, 16 MiB):
-  object blocks grow from 14 to 32 MiB by converting frame blocks, and go
-  back when they exit. The same three times while `selftest`'s
+  object blocks grow by converting frame blocks, and go back when they
+  exit. The same three times while `selftest`'s
   `smp_mm_stress`, `smp_unmap_vis` and `smp_fork_storm` run, five times.
-  Then a process maps sparse memory without end: page tables take 64 MiB,
-  a conversion fails for lack of a 2 MiB range, the OOM killer kills the
-  process, and the guest carries on; conversions work afterwards.
-- **Fragmentation** (§9 of the design) is visible: after the OOM round,
-  12 MiB stay in chunks that long-lived objects pin, against 3.5 MiB
-  before it. Compaction (rebuilding VSpace mirrors into fresh blocks)
-  remains future work.
+  Then a process maps sparse memory until RAM is exhausted: the OOM
+  killer kills it, the guest carries on, and conversions work afterwards.
+  With the fallback, a 1-vCPU 256 MiB run made nine synchronous
+  conversions in the fragmentation regression; the later exhaustion
+  phase reached 6 MiB free before OOM and recovered successfully.
+  The full suite also passed with 4 vCPUs, using ten synchronous
+  conversions in the fragmentation regression.
+- **Fragmentation** (§9 of the design): long-lived objects can still pin
+  partly empty chunks, and unmovable Linux pages can prevent a whole
+  frame block from being isolated. Compaction of object memory (rebuilding
+  VSpace mirrors into fresh blocks) remains future work.
 - Phase 3 is shared by x86_64 and AArch64; only the paging-structure
   operations differ. The measurements above are from x86_64.

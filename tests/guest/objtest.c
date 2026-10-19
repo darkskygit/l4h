@@ -10,7 +10,9 @@
 //     again afterwards.
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +30,8 @@ static int failures;
 struct stats {
 	unsigned long objects_kb, used_kb, free_kb;
 	unsigned long to_objects, to_frames, failures;
+	unsigned long contig_attempts, contig_successes;
+	unsigned long migrated;
 	unsigned blocks, object_blocks, reserve_target, spare_target;
 };
 
@@ -54,6 +58,15 @@ static void read_stats(struct stats *s)
 		if (fgets(line, sizeof(line), f))
 			sscanf(line, "to_objects %lu to_frames %lu failures %lu", &s->to_objects,
 			       &s->to_frames, &s->failures);
+		if (fgets(line, sizeof(line), f))
+			sscanf(line, "contig_attempts %lu contig_successes %lu", &s->contig_attempts,
+			       &s->contig_successes);
+		fclose(f);
+	}
+	f = fopen("/proc/vmstat", "r");
+	if (f) {
+		while (fgets(line, sizeof(line), f))
+			sscanf(line, "pgmigrate_success %lu", &s->migrated);
 		fclose(f);
 	}
 }
@@ -149,6 +162,117 @@ static int wait_objects_below(unsigned long kb, int ms)
 /* L4hObjects at boot: what object memory returns to when idle, give or
  * take the free blocks kept (reserve and watermark) and fragmentation. */
 static unsigned long boot_objects_kb;
+
+/* Leave one movable page in each physical 2 MiB block we touch, then
+ * grow object memory with proactive compaction disabled and direct
+ * compaction disabled by its fragmentation heuristic.  Synchronous
+ * migration must rescue the allocation while most of RAM is free.
+ * Check the retained pages after migration as well.
+ */
+static void test_fragmentation(void)
+{
+	const char *knobs[] = { "/proc/sys/vm/extfrag_threshold",
+				"/proc/sys/vm/compaction_proactiveness" };
+	const int values[] = { 1000, 0 };
+	struct stats s0, s1;
+	unsigned long bytes, pages, i, run, kept = 0;
+	unsigned char *seen, *p;
+	uint64_t *pfns;
+	FILE *f;
+	int fd, saved[2], nr_saved = 0, k, st, ret;
+	pid_t pid;
+
+	read_stats(&s0);
+	bytes = s0.free_kb > 32768 ? (s0.free_kb - 32768) * 1024 : 0;
+	pages = bytes / 4096;
+	CHECK(pages > 0, "not enough RAM for fragmentation test");
+	if (!pages)
+		return;
+	seen = calloc(s0.blocks, 1);
+	pfns = malloc(pages * sizeof(*pfns));
+	p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	CHECK(seen && pfns && p != MAP_FAILED, "fragmentation bookkeeping");
+	if (!seen || !pfns || p == MAP_FAILED)
+		goto out;
+	for (k = 0; k < 2; k++) {
+		f = fopen(knobs[k], "r");
+		ret = f ? fscanf(f, "%d", &saved[k]) : 0;
+		if (f)
+			fclose(f);
+		CHECK(ret == 1, "read %s", knobs[k]);
+		if (ret != 1)
+			goto restore;
+		f = fopen(knobs[k], "w");
+		ret = f ? fprintf(f, "%d\n", values[k]) : 0;
+		if (f)
+			fclose(f);
+		CHECK(ret > 0, "set %s", knobs[k]);
+		if (ret <= 0)
+			goto restore;
+		nr_saved++;
+	}
+	for (i = 0; i < pages; i++)
+		p[i * 4096] = 0x5a;
+	fd = open("/proc/self/pagemap", O_RDONLY);
+	ret = fd >= 0 && pread(fd, pfns, pages * sizeof(*pfns),
+			      (uintptr_t)p / 4096 * sizeof(*pfns)) == (ssize_t)(pages * sizeof(*pfns));
+	if (fd >= 0)
+		close(fd);
+	CHECK(ret, "read pagemap");
+	if (!ret)
+		goto restore;
+	/* Mark retained pages; release the rest in contiguous runs. */
+	for (i = 0; i < pages; i++) {
+		unsigned long b = (pfns[i] & ((1ull << 55) - 1)) / 512;
+
+		pfns[i] = b < s0.blocks && !seen[b];
+		if (pfns[i]) {
+			seen[b] = 1;
+			kept++;
+		}
+	}
+	for (i = 0; i < pages;) {
+		if (pfns[i]) {
+			i++;
+			continue;
+		}
+		run = i;
+		while (i < pages && !pfns[i])
+			i++;
+		CHECK(!madvise(p + run * 4096, (i - run) * 4096, MADV_DONTNEED),
+		      "discard fragmentation pages");
+	}
+	printf("OBJTEST: fragmented %lu physical blocks\n", kept);
+	show("before fragmented pressure:");
+	pid = fork();
+	if (pid == 0)
+		_exit(touch_sparse(16ul * 1024 * MIB) > 0 ? 0 : 1);
+	CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && !WEXITSTATUS(st),
+	      "object growth with fragmented free RAM failed");
+	read_stats(&s1);
+	CHECK(s1.contig_successes > s0.contig_successes, "synchronous migration was not exercised");
+	CHECK(s1.migrated > s0.migrated, "no pages migrated under fragmentation");
+	printf("OBJTEST: synchronous migrations %lu, attempts %lu\n",
+	       s1.contig_successes - s0.contig_successes, s1.contig_attempts - s0.contig_attempts);
+	for (i = 0; i < pages; i++)
+		if (pfns[i])
+			CHECK(p[i * 4096] == 0x5a, "migrated page contents at %lu", i);
+restore:
+	while (nr_saved) {
+		k = --nr_saved;
+		f = fopen(knobs[k], "w");
+		CHECK(f != NULL, "restore %s", knobs[k]);
+		if (f) {
+			fprintf(f, "%d\n", saved[k]);
+			fclose(f);
+		}
+	}
+out:
+	if (p != MAP_FAILED)
+		munmap(p, bytes);
+	free(pfns);
+	free(seen);
+}
 
 static void test_pressure(unsigned long span, const char *label)
 {
@@ -248,6 +372,7 @@ int main(int argc, char **argv)
 		read_stats(&s);
 		boot_objects_kb = s.objects_kb;
 	}
+	test_fragmentation();
 	test_pressure(span, "page-table pressure");
 	test_mm_stress_during_conversions(span);
 	test_oom();

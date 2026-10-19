@@ -45,6 +45,9 @@ config UML
 
 config L4H
 	def_bool y
+	# Object memory grows by isolating and migrating whole RAM blocks.
+	select COMPACTION
+	select MEMORY_ISOLATION
 
 config MMU
 	bool
