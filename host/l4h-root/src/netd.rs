@@ -266,8 +266,14 @@ impl Netd {
             frames.map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(i).cap()).collect();
         for (i, f) in chan.iter().enumerate() {
             let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
-            // Paging structures for the port come from netd's own pool.
-            self.comp.map_copy(alloc, &mut self.arena, &abs_of(*f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst);
+            // Paging structures for the port come from netd's own pool, and
+            // outlive the guest: their root slots must not be tracked into
+            // it, or destroying it deletes them (and the arena regions they
+            // grew into) while other ports still use them.
+            let (comp, arena) = (&self.comp, &mut self.arena);
+            alloc.global(|alloc| {
+                comp.map_copy(alloc, arena, &abs_of(*f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
+            });
         }
         self.comp.give_badged(
             net::NETD_SLOT_CLIENT_BASE + p as u64,

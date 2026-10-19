@@ -17,7 +17,6 @@ ping -c 3 -W 2 10.0.2.2 >/dev/null || fail "ping the uplink gateway"
 echo "NETTEST: uplink ok"
 
 K="--kernel /bin/vmlinux --initrd /bin/netvm.cpio.gz --mem 96"
-sw1=$(l4hctl switch-create) && sw2=$(l4hctl switch-create) || fail "switch-create"
 run() { # name expect-pattern create-args...
     name=$1; pat=$2; shift 2
     id=$(l4hctl create "$name" $K "$@") || fail "create $name"
@@ -28,6 +27,25 @@ run() { # name expect-pattern create-args...
     echo "NETTEST: $name ok"
     eval "vm_$name=$id"
 }
+# Second boot: A outlived a dom0 restart, so the ports dom0 did not make
+# must still be served.  netd's paging structures for them once came from
+# dom0's slots and were deleted with it.
+vm_a=$(l4hctl list | awk '$2 == "a" { print $1 }')
+if [ -n "$vm_a" ]; then
+    echo "NETTEST: dom0 restarted, a is vm $vm_a"
+    sw1=
+    for n in 1 2 3 4; do
+        l4hctl switch "$n" 2>/dev/null | awk -v vm="$vm_a" '$2 == vm { f = 1 } END { exit !f }' && { sw1=$n; break; }
+    done
+    [ -n "$sw1" ] || fail "a's switch"
+    run h "" --nic "$sw1" --cmdline "console=hvc0 IP0=192.168.1.8/24 PING=192.168.1.1"
+    grep -q "ping 192.168.1.1 ok" /tmp/h || fail "h -> a after a dom0 restart"
+    echo "NETTEST: ports survive a dom0 restart"
+    for v in $vm_a $vm_h; do l4hctl destroy "$v" || fail "destroy $v"; done
+    echo "NETTEST: PASS"
+    poweroff -f
+fi
+sw1=$(l4hctl switch-create) && sw2=$(l4hctl switch-create) || fail "switch-create"
 # A: two NICs, one per switch.
 run a "" --nic "$sw1" --nic "$sw2" --cmdline "console=hvc0 IP0=192.168.1.1/24 IP1=192.168.2.1/24"
 run b "" --nic "$sw1" --cmdline "console=hvc0 IP0=192.168.1.2/24 PING=192.168.1.1" 2>/dev/null
@@ -52,6 +70,6 @@ echo "NETTEST: isolated ports ok"
 l4hctl switch "$sw1"
 l4hctl switch "$sw2"
 l4hctl list
-for v in $vm_a $vm_b $vm_c $vm_d $vm_e $vm_f $vm_g; do l4hctl destroy "$v" || fail "destroy $v"; done
-echo "NETTEST: PASS"
-poweroff -f
+for v in $vm_b $vm_c $vm_d $vm_e $vm_f $vm_g; do l4hctl destroy "$v" || fail "destroy $v"; done
+echo "NETTEST: rebooting dom0"
+reboot -f

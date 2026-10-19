@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # M5 gate: L2 switches with an uplink, guest-to-guest traffic, multiple
-# vNICs, switch isolation, isolated ports and MAC lock.
+# vNICs, switch isolation, isolated ports, MAC lock, and ports that outlive
+# a dom0 restart.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
