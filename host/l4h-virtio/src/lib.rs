@@ -39,7 +39,21 @@ pub const DESC_F_NEXT: u16 = 1;
 pub const DESC_F_WRITE: u16 = 2;
 pub const DESC_F_INDIRECT: u16 = 4;
 
-const NO_VECTOR: u16 = 0xffff;
+pub const NO_VECTOR: u16 = 0xffff;
+
+/// Registers of a legacy virtio PCI device (I/O BAR 0), with MSI-X on.
+pub mod legacy {
+    pub const DEVICE_FEATURES: u16 = 0x00;
+    pub const GUEST_FEATURES: u16 = 0x04;
+    pub const QUEUE_PFN: u16 = 0x08;
+    pub const QUEUE_SIZE: u16 = 0x0c;
+    pub const QUEUE_SELECT: u16 = 0x0e;
+    pub const QUEUE_NOTIFY: u16 = 0x10;
+    pub const STATUS: u16 = 0x12;
+    pub const CONFIG_VECTOR: u16 = 0x14;
+    pub const QUEUE_VECTOR: u16 = 0x16;
+    pub const DEVICE_CONFIG: u16 = 0x18;
+}
 
 // Common configuration structure offsets.
 const DEVICE_FEATURE_SELECT: usize = 0x00;

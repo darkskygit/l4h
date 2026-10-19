@@ -238,12 +238,12 @@ impl Dashboard {
             if r + 4 >= self.rows {
                 break;
             }
-            let kind = if d.kind == crate::host::blk::BLKD_NVME { "nvme" } else { "virtio-blk" };
+            let kind = d.kind_name();
             let owner = match d.owner {
                 Some(o) => format!("vm {}{}", o, if d.read_only { ", read-only" } else { "" }),
                 None => String::from("free"),
             };
-            let line = format!("disk {:<2} pci {:02x}:{:02x}.{}  {:<10}  {}", i, d.pci.bus, d.pci.dev, d.pci.func, kind, owner);
+            let line = format!("disk {:<2} pci {:02x}:{:02x}.{}  {:<11}  {}", i, d.pci.bus, d.pci.dev, d.pci.func, kind, owner);
             self.text(r, 3, &line, if d.owner.is_some() { FG } else { DIM }, BG);
             r += 1;
         }

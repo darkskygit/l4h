@@ -1,4 +1,4 @@
-//! blkd: drives one disk (virtio-blk or NVMe PCI device) for multiple clients (a
+//! blkd: drives one disk (virtio-blk, virtio-scsi or NVMe PCI device) for multiple clients (a
 //! guest's l4h-vmm).  Requests carry guest-physical segments, which are
 //! validated against the client's I/O pool and its LBA window and handed to
 //! the device by physical address: the device reads and writes the pool
@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod nvme;
+mod scsi;
 mod virtio;
 
 use alloc::boxed::Box;
@@ -227,6 +228,7 @@ fn main(info: &'static Info) -> ! {
     let id = info.header().id;
     let drv: Box<dyn Driver> = match cfg.kind {
         blk::BLKD_NVME => Box::new(nvme::Nvme::new(id, cfg)),
+        blk::BLKD_VIRTIO_SCSI => Box::new(scsi::VirtioScsi::new(id, cfg)),
         _ => Box::new(virtio::VirtioBlk::new(id, cfg)),
     };
     let dev = drv.info();

@@ -77,7 +77,7 @@ tree, which also records the status of every part.
 
 \begin{description}
   \item[Host.] The machine l4h runs on: a physical machine, a QEMU VM or a
-    cloud VM. It provides CPU cores, memory, PCI disks (virtio-blk or NVMe)
+    cloud VM. It provides CPU cores, memory, PCI disks (virtio-blk, virtio-scsi or NVMe)
     and PCI NICs (virtio-net).
   \item[Guest, or VM.] A Linux system running on l4h. Every guest has a
     name, a numeric id, a number of vCPUs, a fixed amount of RAM, and up to
@@ -126,7 +126,7 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \node[host, below=0.9cm of va, minimum width=3.2cm] (netd) {l4h-netd\\\footnotesize switches, NIC drivers};
   \node[host, below=0.9cm of vb, minimum width=3.2cm] (blkd) {l4h-blkd\\\footnotesize one per attached disk};
   \node[box, below=0.6cm of netd, minimum width=10.8cm, fill=gray!15] (k) {seL4 microkernel (MCS, SMP) with l4h patches};
-  \node[box, below=0.3cm of k, minimum width=10.8cm] (hw) {host hardware: cores, memory, NVMe/virtio-blk disks, virtio-net NICs, COM1};
+  \node[box, below=0.3cm of k, minimum width=10.8cm] (hw) {host hardware: cores, memory, NVMe/virtio-blk/virtio-scsi disks, virtio-net NICs, COM1};
   \foreach \g/\v in {dom0/v0, ga/va, gb/vb} \draw[<->] (\g) -- (\v);
   \draw[->, dashed] (v0) -- node[left, font=\scriptsize] {control API} (root);
   \draw[<->] (v0) -- (netd); \draw[<->] (va) -- (netd); \draw[<->] (vb) -- (netd);
@@ -146,8 +146,8 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \item[l4h-vmm] runs once per guest. It serves the guest's hypercalls and
     virtio devices. It maps only its own guest's I/O pool (below), never its
     RAM, so a compromised VMM can harm only that guest.
-  \item[l4h-blkd] runs once per attached disk. It drives the disk (virtio-blk
-    or NVMe), checks every request against the guest's I/O pool and its
+  \item[l4h-blkd] runs once per attached disk. It drives the disk (virtio-blk,
+    virtio-scsi or NVMe), checks every request against the guest's I/O pool and its
     sector window, and lets the device DMA straight into the pool.
   \item[l4h-netd] holds every switch and drives the uplink NICs.
 \end{description}
@@ -430,7 +430,9 @@ tools/run-qemu.sh host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
   \item \texttt{L4H\_SMP} (default 4) and \texttt{L4H\_MEM} (default
         \texttt{4G}) set the machine's cores and memory. Extra arguments go
         to QEMU.
-  \item Disks may be \texttt{virtio-blk-pci} or \texttt{nvme}. NICs must
+  \item Disks may be \texttt{virtio-blk-pci}, \texttt{nvme} or a
+        \texttt{virtio-scsi-pci} controller; l4h uses the first
+        \texttt{scsi-hd} on a virtio-scsi controller. NICs must
         be \texttt{virtio-net-pci}. Use \texttt{disable-legacy=on} for
         virtio devices. A host supports up to 4 NICs.
   \item The serial port is the console. seL4 and the host components print
@@ -657,7 +659,7 @@ everything it held: memory, disks and vNICs. Destroying a running VM is like
 pulling its power cord: disk requests in flight are aborted, and writes the
 guest had not flushed may be lost or torn. Before any of the VM's memory is
 reused, \texttt{l4h-root} resets each of its disks (NVMe controller reset,
-virtio-blk device reset) so that no request still in a device can write to
+virtio device reset) so that no request still in a device can write to
 it. A disk that does not complete the reset is disabled until the host
 reboots, and the memory it may still write to is not reused
 (Section~\ref{sec:disk-failed}). To stop a VM cleanly:
@@ -713,7 +715,7 @@ disks available for other guests, build the host with
 \paragraph{Failed disks.}\label{sec:disk-failed} When its owner is
 destroyed, a disk is reset before it becomes free. If the device does not
 complete the reset (an NVMe controller that stays ready past its timeout,
-up to two minutes, or a virtio-blk device that does not reset within two
+up to two minutes, or a virtio device that does not reset within two
 seconds), the serial log shows \texttt{device did not reset}, \cmd{l4hctl
 disks} marks it \texttt{failed}, and attaching it fails with \texttt{I/O
 error}. The destroyed VM's I/O pool and the driver's DMA memory stay out of
@@ -1098,7 +1100,8 @@ Test & What it checks \\
 \cmd{run-objtest.sh} & guest RAM blocks becoming seL4 objects and back
   under page-table pressure and SMP stress; guest OOM \\
 \cmd{run-blktest.sh} & disk pass-through and data integrity
-  (\texttt{BLKTEST\_DEV=nvme} for NVMe) \\
+  (\texttt{BLKTEST\_DEV=nvme} for NVMe, \texttt{scsi} or
+  \texttt{scsi-legacy} for virtio-scsi) \\
 \cmd{run-ctltest.sh} & VM lifecycle, console, clean shutdown, disk windows,
   memory reclaim, destroying VMs during disk I/O (virtio-blk and NVMe) \\
 \cmd{run-nettest.sh} & DHCP over the uplink, switches, several vNICs,
@@ -1193,7 +1196,7 @@ Op & Name & Arguments & Results \\
 9 & \texttt{CONSOLE\_WRITE} & VM, length; input in data & bytes accepted \\
 10 & \texttt{DISK\_INFO} & disk & PCI address, owner (or $2^{64}-1$), failed
   flag (reset did not complete),
-  kind (0 virtio-blk, 1 NVMe) \\
+  kind (0 virtio-blk, 1 NVMe, 2 virtio-scsi) \\
 11 & \texttt{SWITCH\_CREATE} & -- & switch \\
 12 & \texttt{SWITCH\_ATTACH\_\allowbreak UPLINK} & switch, NIC & -- \\
 13 & \texttt{NIC\_CREATE} & VM, switch, MAC (0: default), flags (bit 0:

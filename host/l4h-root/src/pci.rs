@@ -89,6 +89,27 @@ pub fn io_ports(alloc: &mut Alloc, base: u16, len: u16) -> Option<sel4::cap::Nul
     }
 }
 
+/// Port I/O through an IOPort capability from io_ports.
+#[cfg(target_arch = "x86_64")]
+pub fn in8(io: sel4::cap::Null, port: u16) -> u8 {
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_In8(io.bits(), port).result)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn out8(io: sel4::cap::Null, port: u16, v: u8) {
+    sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(io.bits(), port as u64, v as u64));
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn in8(_io: sel4::cap::Null, _port: u16) -> u8 {
+    unreachable!("I/O ports")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn out8(_io: sel4::cap::Null, _port: u16, _v: u8) {
+    unreachable!("I/O ports")
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub fn io_ports(_alloc: &mut Alloc, _base: u16, _len: u16) -> Option<sel4::cap::Null> {
     None
@@ -295,6 +316,12 @@ impl Pci {
     pub fn enable(&self, d: &Device) {
         let cmd = self.read16(d.bus, d.dev, d.func, 4);
         self.write16(d.bus, d.dev, d.func, 4, cmd | 0x2 | 0x4 | 0x400);
+    }
+
+    /// Enable I/O space decoding (registers of a legacy virtio device).
+    pub fn enable_io(&self, d: &Device) {
+        let cmd = self.read16(d.bus, d.dev, d.func, 4);
+        self.write16(d.bus, d.dev, d.func, 4, cmd | 0x1);
     }
 
     /// Enable memory decoding only (to reach the registers), disable INTx.

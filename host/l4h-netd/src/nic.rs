@@ -5,9 +5,10 @@
 use alloc::vec::Vec;
 
 use l4h_rt::host::net::{self, NicConfig};
+use l4h_rt::ioport::Ports;
 use l4h_rt::sel4;
 use l4h_virtio::{
-    DESC_F_WRITE, Device, Dma, F_VERSION_1, Mmio, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq,
+    DESC_F_WRITE, Device, Dma, F_VERSION_1, Mmio, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy,
 };
 
 const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
@@ -24,71 +25,6 @@ const RX_BUF: usize = 2048;
 const TX_BUF: usize = HDR + net::MAX_FRAME;
 const RX_QUEUE: u16 = 128;
 const TX_BUFS: u16 = 24;
-
-/// Registers of a legacy virtio PCI device (I/O BAR 0), with MSI-X on.
-mod legacy {
-    pub const DEVICE_FEATURES: u16 = 0x00;
-    pub const GUEST_FEATURES: u16 = 0x04;
-    pub const QUEUE_PFN: u16 = 0x08;
-    pub const QUEUE_SIZE: u16 = 0x0c;
-    pub const QUEUE_SELECT: u16 = 0x0e;
-    pub const QUEUE_NOTIFY: u16 = 0x10;
-    pub const STATUS: u16 = 0x12;
-    pub const CONFIG_VECTOR: u16 = 0x14;
-    pub const QUEUE_VECTOR: u16 = 0x16;
-    pub const DEVICE_CONFIG: u16 = 0x18;
-}
-
-/// A legacy device's I/O ports.
-struct Ports {
-    cap: u64,
-    base: u16,
-}
-
-#[cfg(target_arch = "x86_64")]
-impl Ports {
-    fn in8(&self, r: u16) -> u8 {
-        sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_IOPort_In8(self.cap, self.base + r).result)
-    }
-    fn in16(&self, r: u16) -> u16 {
-        sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_IOPort_In16(self.cap, self.base + r).result)
-    }
-    fn in32(&self, r: u16) -> u32 {
-        sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_IOPort_In32(self.cap, self.base + r).result)
-    }
-    fn out8(&self, r: u16, v: u8) {
-        sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_IOPort_Out8(self.cap, (self.base + r) as u64, v as u64));
-    }
-    fn out16(&self, r: u16, v: u16) {
-        sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_IOPort_Out16(self.cap, (self.base + r) as u64, v as u64));
-    }
-    fn out32(&self, r: u16, v: u32) {
-        sel4::with_ipc_buffer_mut(|b| b.inner_mut().seL4_X86_IOPort_Out32(self.cap, (self.base + r) as u64, v as u64));
-    }
-}
-
-/// Legacy (I/O port) virtio-net devices exist only on x86 (GCE N2).
-#[cfg(not(target_arch = "x86_64"))]
-impl Ports {
-    fn in8(&self, _r: u16) -> u8 {
-        unreachable!("I/O ports at {:#x} (cap {})", self.base, self.cap)
-    }
-    fn in16(&self, _r: u16) -> u16 {
-        unreachable!("I/O ports")
-    }
-    fn in32(&self, _r: u16) -> u32 {
-        unreachable!("I/O ports")
-    }
-    fn out8(&self, _r: u16, _v: u8) {
-        unreachable!("I/O ports")
-    }
-    fn out16(&self, _r: u16, _v: u16) {
-        unreachable!("I/O ports")
-    }
-    fn out32(&self, _r: u16, _v: u32) {
-        unreachable!("I/O ports")
-    }
-}
 
 pub struct Nic {
     pub switch: Option<u32>,

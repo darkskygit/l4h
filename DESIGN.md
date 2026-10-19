@@ -24,7 +24,7 @@ review decisions are recorded in §14. Future work is identified below;
 | R2 | x86_64 first, but friendly to aarch64. | Each layer is split into ISA-independent and ISA-specific parts (§11). seL4, rust-sel4 and sDDF already support aarch64. Nothing in the design relies on an x86-only mechanism such as segmentation, rings 1/2 or Xen-style page-table validation. |
 | R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a new paravirtual transport, `virtio-l4h`, with no trapped MMIO (§8). All device buffers use a host-owned I/O pool; the guest copies block data between its RAM and the pool, and the device DMAs into the pool (§15.1). For networking, the hypervisor provides **only L2 virtual switches**. A VM can have several vNICs, each on a switch, and a physical NIC is just an uplink port on a switch. Routing and NAT, when wanted, are done by a VM. |
 | R6 | A runtime management API, available to "dom0", the first guest started at boot. | `l4h-root` exposes a control API through a `l4hctl` paravirtual device that only dom0 receives (§9.1). dom0 has no device-driver duties. |
-| R7 | Targets: QEMU with virtio devices first, then GCP. | QEMU uses virtio-net-pci, virtio-blk-pci and nvme. GCE N2 is tested with virtio-net and NVMe local SSDs; gen-3+ types (C3, N4, C4) need a future gVNIC driver (§10). |
+| R7 | Targets: QEMU with virtio devices first, then GCP. | QEMU uses virtio-net-pci, virtio-blk-pci, virtio-scsi-pci and nvme. GCE N2 is tested with virtio-net and NVMe local SSDs; gen-3+ types (C3, N4, C4) need a future gVNIC driver (§10). |
 | R4 | SMP guests. | Each guest vCPU is an seL4 kernel-context thread with its own scheduling context. IPIs are seL4 notifications (§6). |
 | R5 | Many guests per host, e.g. 30 guests on 4 CPUs. | seL4 MCS scheduling contexts give each vCPU a budget. Idle guests consume no CPU because the guest kernel is tickless and idle means blocked in `seL4_Recv`. A host balancer moves vCPUs between cores (§7). Each guest makes its kernel objects from its own RAM (§15). |
 
@@ -760,7 +760,7 @@ for each device, with no trapped accesses:
 
 ### 8.2 Block, shared controllers and exclusive raw windows
 
-A physical virtio-blk or NVMe PCI controller has one persistent blkd.
+A physical virtio-blk, virtio-scsi or NVMe PCI controller has one persistent blkd.
 `BLK_ATTACH` attaches a finite, 4 KiB aligned, non-overlapping LBA window
 to a guest before boot. Every window appears as a separate virtio-blk
 volume starting at sector zero. There is no image format, host filesystem,
@@ -788,14 +788,22 @@ thin provisioning or copy-on-write.
   its ioctl staging buffer (up to 1 MiB per call). A zero-length call flushes
   the controller. Provisioning uses a private 1 MiB DMA scratch area and
   never permits writes overlapping a client, including read-only clients.
+- A virtio-scsi controller, modern or legacy (0.9.5 in I/O BAR 0, as on
+  GCE), is one disk: blkd scans LUN 0 of each target and drives the first
+  direct-access unit, as NVMe drives namespace 1. Requests become
+  READ/WRITE(10 or 16) and SYNCHRONIZE CACHE commands, split when they
+  exceed the device's `seg_max` or `max_sectors`. Write protection and the
+  write cache come from MODE SENSE; unit attentions and busy statuses are
+  retried. Indirect descriptors are used when offered; otherwise each
+  command slot owns a fixed run of ring descriptors.
 - `DISK_INFO` additionally returns capacity and attachment count;
   `BLK_INFO` enumerates `(vm, start, sectors)` with a cursor. The legacy
   owner field identifies the first attachment, or -1 when none exist.
 
 `tests/run-sharedblk.sh` checks concurrent clients, overlap and bounds
 rejection, provisioning exclusion, destroy during I/O, read-only windows,
-flush/readback and repeated reuse. Run it with virtio-blk and NVMe (512 and
-4096 byte logical blocks). `tests/blk-windows.rs` exercises the production
+flush/readback and repeated reuse. Run it with virtio-blk, virtio-scsi and
+NVMe (512 and 4096 byte logical blocks). `tests/blk-windows.rs` exercises the production
 validator on malformed requests and window/pool boundaries.
 
 ### 8.3 Network: L2 virtual switches only
@@ -870,7 +878,7 @@ the host keeps that dynamic plumbing simple.
 |-----------|-----------|------|
 | `l4h-root` | 1 | Allocates guest RAM blocks, I/O pools, host objects and vCPU scheduling contexts. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's embedded images and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
-| `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk PCI or NVMe disk. |
+| `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
 | `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and virtio-net PCI uplink drivers. |
 
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
@@ -968,8 +976,9 @@ external orchestration can run in dom0.
   1. suspends blkd, so that nothing more is submitted;
   2. resets the device itself, through a mapping of its registers: NVMe
      clears CC.EN and waits up to CAP.TO for CSTS.RDY to clear, which
-     aborts every command and deletes the queues; virtio-blk writes 0 to
-     `device_status` and waits until it reads back 0. Bus mastering stays
+     aborts every command and deletes the queues; virtio writes 0 to
+     `device_status` (an I/O port on a legacy device) and waits until it
+     reads back 0. Bus mastering stays
      on meanwhile, so DMA the device finishes while resetting lands in
      memory that still belongs to the guest;
   3. clears bus mastering, memory decoding and MSI-X, and deletes the IRQ
@@ -1028,8 +1037,8 @@ external orchestration can run in dom0.
    l4h drives these with its Rust blkd/netd drivers and serial monitor.
 2. **GCP.**
    - **Current target:** N2 with virtio-net and NVMe local SSDs. N2 boot
-     disks use virtio-scsi, read only by firmware and GRUB; l4h does not
-     drive that interface.
+     disks use virtio-scsi, which blkd drives as a legacy device (tested
+     under QEMU with `disable-modern=on`, not yet on GCE).
    - **Future target:** third-generation and later types (C3, C3D, N4,
      C4), which require gVNIC. A gVNIC driver, potentially ported from
      Linux `gve`, is not implemented. NVMe already has a Rust driver.
@@ -1069,8 +1078,8 @@ external orchestration can run in dom0.
     port capability.
   - dom0's first vNIC takes the uplink NIC's MAC address, since the VPC
     only delivers frames for it.
-  - N2 boot disks are virtio-scsi, which l4h does not drive; the firmware
-    and GRUB only need them.
+  - N2 boot disks are virtio-scsi. Before blkd supported it, only the
+    firmware and GRUB read them.
   - gVNIC, which C3 and later need, is not implemented.
 
 ---
@@ -1086,7 +1095,7 @@ external orchestration can run in dom0.
 | TLS | `fs_base` | `TPIDR_EL0` (`seL4_TCB_SetTLSBase`) |
 | Timer (E3) | LAPIC TSC-deadline or countdown | ARM generic timer |
 | vDSO clock | `rdtsc` | `cntvct_el0` |
-| Drivers | Rust virtio-net/blk PCI, NVMe | Same drivers; ECAM, BAR assignment and GICv2m MSI-X |
+| Drivers | Rust virtio-net/blk/scsi PCI, NVMe | Same drivers; ECAM, BAR assignment and GICv2m MSI-X |
 | Boot | multiboot2 / UEFI | rust-sel4 loader, entry at EL1 or EL2 |
 
 Rules that keep the port cheap:

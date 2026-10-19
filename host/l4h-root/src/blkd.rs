@@ -1,5 +1,6 @@
-//! Passing a virtio-blk PCI device through to a guest: a blkd component
-//! drives the device, and the guest's l4h-vmm presents it as virtio-l4h.
+//! Passing a disk (virtio-blk, virtio-scsi or NVMe PCI device) through to
+//! a guest: a blkd component drives the device, and the guest's l4h-vmm
+//! presents it as virtio-l4h.
 
 use alloc::vec::Vec;
 
@@ -42,7 +43,7 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
-/// A virtio-blk PCI device that can be passed through to a guest.
+/// A disk PCI device that can be passed through to a guest.
 pub struct Disk {
     pub pci: pci::Device,
     pub kind: u32,
@@ -58,14 +59,46 @@ pub struct Disk {
     /// Reset, provisioning or drain failed: the device may still access
     /// its DMA targets, so it is quarantined until host reboot.
     pub failed: bool,
+    /// IOPort capability for the registers of a legacy virtio device,
+    /// issued once.
+    io: Option<cap::Null>,
     driver: Option<Blkd>,
 }
 
 impl Disk {
     pub fn new(pci: pci::Device, vector: u64) -> Self {
-        let kind = if is_nvme(&pci) { blk::BLKD_NVME } else { blk::BLKD_VIRTIO };
+        let kind = if is_nvme(&pci) {
+            blk::BLKD_NVME
+        } else if is_virtio_scsi(&pci) {
+            blk::BLKD_VIRTIO_SCSI
+        } else {
+            blk::BLKD_VIRTIO
+        };
         Disk { pci, kind, vector, bars: Vec::new(), owner: None, read_only: false,
-            capacity: 0, block_size: 0, attachments: (0..blk::MAX_CLIENTS).map(|_| None).collect(), failed: false, driver: None }
+            capacity: 0, block_size: 0, attachments: (0..blk::MAX_CLIENTS).map(|_| None).collect(), failed: false,
+            io: None, driver: None }
+    }
+
+    /// Base of the I/O BAR of a legacy virtio device.
+    fn legacy_io(&self) -> Option<u16> {
+        is_legacy_virtio(&self.pci).then_some(self.pci.bars[0].addr as u16)
+    }
+
+    /// The IOPort capability of a legacy device, issued on first use.
+    fn io_cap(&mut self, alloc: &mut Alloc) -> Option<cap::Null> {
+        if self.io.is_none() {
+            let base = self.legacy_io()?;
+            self.io = pci::io_ports(alloc, base, self.pci.bars[0].size as u16);
+        }
+        self.io
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            blk::BLKD_NVME => "nvme",
+            blk::BLKD_VIRTIO_SCSI => "virtio-scsi",
+            _ => "virtio-blk",
+        }
     }
 }
 
@@ -76,13 +109,27 @@ pub fn is_virtio_blk(d: &pci::Device) -> bool {
         && d.msix.is_some()
 }
 
+/// A virtio 0.9.5 ("legacy") device: registers in I/O BAR 0, no virtio
+/// capabilities.  GCE's virtio-net and virtio-scsi are legacy devices.
+pub fn is_legacy_virtio(d: &pci::Device) -> bool {
+    cfg!(target_arch = "x86_64") && d.virtio_caps.is_empty() && d.bars[0].is_io && d.bars[0].size >= 0x20
+}
+
+/// A virtio-scsi controller, modern or legacy (as on GCE).
+pub fn is_virtio_scsi(d: &pci::Device) -> bool {
+    d.vendor == VIRTIO_VENDOR
+        && (d.device == 0x1048 || d.device == 0x1004)
+        && (d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG) || (d.device == 0x1004 && is_legacy_virtio(d)))
+        && d.msix.is_some()
+}
+
 pub fn is_nvme(d: &pci::Device) -> bool {
     d.class == 0x01 && d.subclass == 0x08 && d.prog_if == 0x02 && d.msix.is_some() && d.bars[0].size >= 0x2000
 }
 
 /// Disks l4h can pass through.
 pub fn is_disk(d: &pci::Device) -> bool {
-    is_virtio_blk(d) || is_nvme(d)
+    is_virtio_blk(d) || is_virtio_scsi(d) || is_nvme(d)
 }
 
 pub struct Attachment {
@@ -113,6 +160,8 @@ pub fn start(
     host_info: &HostInfo,
 ) {
     if disk.driver.is_some() { return; }
+    let io = disk.io_cap(alloc);
+    let legacy_io = disk.legacy_io();
     let d = &disk.pci;
     let bar_va = |b: u8| host::MMIO_VA + b as usize * BAR_STRIDE;
     let msix = d.msix.unwrap();
@@ -122,6 +171,8 @@ pub fn start(
     };
     let (regions, mut bar_list) = if disk.kind == blk::BLKD_NVME {
         (None, alloc::vec![0u8])
+    } else if legacy_io.is_some() {
+        (None, Vec::new())
     } else {
         (Some(virtio_regions(d, bar_va)), virtio_bars(d))
     };
@@ -142,6 +193,7 @@ pub fn start(
 
     let mut cfg: alloc::boxed::Box<blk::BlkdConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
     cfg.kind = disk.kind;
+    cfg.legacy_io = legacy_io.unwrap_or(0) as u32;
     cfg.bar0 = blk::PciRegion { va: bar_va(0) as u64, len: d.bars[0].size };
     cfg.pci_bdf = bdf(d);
     let vector = disk.vector;
@@ -201,6 +253,10 @@ pub fn start(
     abs_of(irq_ntfn).mint(&abs_of(comp.ntfn), CapRights::all(), blk::BLKD_BADGE_IRQ).expect("IRQ notification");
     irq.irq_handler_set_notification(irq_ntfn).expect("IRQ set notification");
     comp.give(blk::BLKD_SLOT_IRQ, irq, CapRights::all());
+    if legacy_io.is_some() {
+        comp.give(blk::BLKD_SLOT_IOPORT, io.expect("legacy virtio I/O ports"), CapRights::all());
+        pci.enable_io(d);
+    }
     pci.enable(d);
     pci.enable_msix(d);
     component::start(&comp);
@@ -312,19 +368,42 @@ const NVME_CC: usize = 0x14;
 const NVME_CSTS: usize = 0x1c;
 /// Offset of `device_status` in the virtio-pci common configuration.
 const VIRTIO_DEVICE_STATUS: usize = 20;
+/// Device status register of a legacy virtio device (I/O BAR 0).
+const VIRTIO_LEGACY_STATUS: u16 = 0x12;
 /// The virtio spec sets no bound on a reset.
 const VIRTIO_RESET_MS: u64 = 2000;
 
 /// Reset `disk` so that it can no longer access memory: NVMe clears
 /// CC.EN and waits for CSTS.RDY to clear (within CAP.TO), which aborts all
-/// commands and deletes the queues; virtio-blk writes 0 to the device
-/// status and waits until it reads back 0.  Memory decoding is turned on
+/// commands and deletes the queues; virtio writes 0 to the device status
+/// and waits until it reads back 0.  Memory (or I/O) decoding is turned on
 /// for this; bus mastering is left as it is, so that DMA the device
 /// finishes while resetting lands in memory that is still the client's.
 /// On failure, marks the disk failed and returns false.
 pub fn reset(disk: &mut Disk, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem, win: &mut Window, ticks_per_ms: u64) -> bool {
     if disk.failed {
         return false;
+    }
+    if let Some(base) = disk.legacy_io() {
+        let ok = match disk.io_cap(alloc) {
+            Some(io) => {
+                pci.enable_io(&disk.pci);
+                pci::out8(io, base + VIRTIO_LEGACY_STATUS, 0);
+                let end = host::ticks::now() + VIRTIO_RESET_MS * ticks_per_ms;
+                loop {
+                    if pci::in8(io, base + VIRTIO_LEGACY_STATUS) == 0 { break true; }
+                    if host::ticks::now() > end { break false; }
+                    core::hint::spin_loop();
+                }
+            }
+            None => false,
+        };
+        if !ok {
+            let p = &disk.pci;
+            sel4::debug_println!("l4h-root: disk {:02x}:{:02x}.{}: device did not reset; it stays disabled", p.bus, p.dev, p.func);
+            disk.failed = true;
+        }
+        return ok;
     }
     let nvme = disk.kind == blk::BLKD_NVME;
     let (bar, off) = if nvme {

@@ -8,7 +8,7 @@ use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 use l4h_abi as abi;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{VirtioRegions, map_bars, virtio_regions};
+use crate::blkd::{VirtioRegions, is_legacy_virtio, map_bars, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
@@ -37,10 +37,9 @@ pub fn is_virtio_net(d: &pci::Device) -> bool {
         && d.msix.is_some()
 }
 
-/// A virtio 0.9.5 ("legacy") device: registers in I/O BAR 0, no virtio
-/// capabilities.  GCE's virtio-net is one.
+/// A legacy virtio-net device, as on GCE.
 fn is_legacy(d: &pci::Device) -> bool {
-    d.device == 0x1000 && d.virtio_caps.is_empty() && d.bars[0].is_io && d.bars[0].size >= 0x20
+    d.device == 0x1000 && is_legacy_virtio(d)
 }
 
 pub struct Nic {

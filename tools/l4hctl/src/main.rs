@@ -124,7 +124,7 @@ fn run(args: &[String]) -> Result<i32> {
                 let r = ctl.call(CTL_DISK_INFO, &[d], &[], &[])?;
                 let bdf = r.vals[0];
                 let owner = if r.vals[1] == u64::MAX { "-".to_string() } else { format!("vm {}", r.vals[1]) };
-                let kind = if r.vals[3] == 1 { "nvme" } else { "virtio-blk" };
+                let kind = match r.vals[3] { 1 => "nvme", 2 => "virtio-scsi", _ => "virtio-blk" };
                 let failed = if r.vals[2] != 0 { ", failed (quarantined)" } else { "" };
                 println!("disk {d}: pci {:02x}:{:02x}.{} {kind}, owner {owner}{failed}, sectors {}, attachments {}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7, r.vals[4], r.vals[5]);
             }

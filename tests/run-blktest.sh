@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Pass a virtio-blk PCI disk through to dom0 and check reads and writes.
 # Usage: run-blktest.sh [vcpus]
-# BLKTEST_DEV=nvme uses an NVMe controller (BLKTEST_LBA=4096 for 4 KiB
-# blocks) instead of virtio-blk.
+# BLKTEST_DEV=nvme uses an NVMe controller, BLKTEST_DEV=scsi a virtio-scsi
+# controller (scsi-legacy: a legacy-only one, as on GCE), instead of
+# virtio-blk; BLKTEST_LBA=4096 gives either 4 KiB blocks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/guest
@@ -13,6 +14,11 @@ mkfs.ext4 -q -F -b 4096 -d "$out/blkroot" "$out/blk.img" 64M
 case "${BLKTEST_DEV:-virtio}" in
 nvme) lba=${BLKTEST_LBA:-512}
       dev="-device nvme,drive=d0,serial=l4h0,logical_block_size=$lba,physical_block_size=$lba" ;;
+scsi|scsi-legacy)
+      lba=${BLKTEST_LBA:-512}
+      # Target 1, as GCE places its boot disk.
+      if [ "$BLKTEST_DEV" = scsi ]; then mode=disable-legacy=on; else mode=disable-modern=on; fi
+      dev="-device virtio-scsi-pci,id=s0,$mode -device scsi-hd,drive=d0,bus=s0.0,scsi-id=1,logical_block_size=$lba,physical_block_size=$lba" ;;
 *)    dev="-device virtio-blk-pci,drive=d0,disable-legacy=on" ;;
 esac
 "$root/tools/mkinitramfs.sh" "$out/blktest.cpio.gz" "$root/tests/guest/init-blktest" >/dev/null

@@ -21,6 +21,8 @@ pub use sel4_panicking_env;
 #[doc(hidden)]
 pub use sel4_runtime_common;
 
+pub mod ioport;
+
 use l4h_host::{CONFIG_OFFSET, INFO_MAGIC, INFO_VA, IPCBUF_VA, InfoHeader};
 
 /// The component info page.

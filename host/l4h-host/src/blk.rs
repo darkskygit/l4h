@@ -84,6 +84,8 @@ pub const BLKD_BADGE_IRQ: u64 = 1 << 1;
 
 /// blkd CSpace slots (beyond the common ones).
 pub const BLKD_SLOT_IRQ: u64 = 16;
+/// I/O port capability of a legacy virtio device (BlkdConfig::legacy_io).
+pub const BLKD_SLOT_IOPORT: u64 = 17;
 /// Notification of the client, badged with its "done" bit.
 pub const BLKD_SLOT_CLIENT_DONE: u64 = 32;
 pub const MAX_CLIENTS: usize = 64;
@@ -109,12 +111,15 @@ pub struct PciRegion {
 
 pub const BLKD_VIRTIO: u32 = 0;
 pub const BLKD_NVME: u32 = 1;
+pub const BLKD_VIRTIO_SCSI: u32 = 2;
 
 /// Configuration of one persistent physical-controller driver.
 #[repr(C)]
 pub struct BlkdConfig {
     pub kind: u32,
-    pub reserved: u32,
+    /// Legacy virtio device: base of its I/O BAR 0, reached with the
+    /// capability in BLKD_SLOT_IOPORT; 0 for a modern device.
+    pub legacy_io: u32,
     /// NVMe: BAR0 (controller registers and doorbells).
     pub bar0: PciRegion,
     pub pci_bdf: u32,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Native block windows: concurrent clients, isolation, provisioning, reuse
-# and destroy during I/O. SHARED_BLK_DEV=nvme, SHARED_BLK_LBA=4096 also tested.
+# and destroy during I/O. SHARED_BLK_DEV=nvme or scsi, SHARED_BLK_LBA=4096
+# also tested.
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,6 +27,11 @@ truncate -s 64M "$out/slow.raw"
 case "${SHARED_BLK_DEV:-virtio}" in
 nvme) slowdev=(-device "nvme,drive=d1,serial=slow,logical_block_size=${SHARED_BLK_LBA:-512},physical_block_size=${SHARED_BLK_LBA:-512}")
       dev=(-device "nvme,drive=d0,serial=shared,logical_block_size=${SHARED_BLK_LBA:-512},physical_block_size=${SHARED_BLK_LBA:-512}") ;;
+scsi) lba=${SHARED_BLK_LBA:-512}
+      slowdev=(-device virtio-scsi-pci,id=s1,disable-legacy=on
+               -device "scsi-hd,drive=d1,bus=s1.0,logical_block_size=$lba,physical_block_size=$lba")
+      dev=(-device virtio-scsi-pci,id=s0,disable-legacy=on
+           -device "scsi-hd,drive=d0,bus=s0.0,logical_block_size=$lba,physical_block_size=$lba") ;;
 *) slowdev=(-device virtio-blk-pci,drive=d1,disable-legacy=on)
    dev=(-device virtio-blk-pci,drive=d0,disable-legacy=on) ;;
 esac
