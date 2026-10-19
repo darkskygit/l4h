@@ -399,23 +399,34 @@ int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	spinlock_t *ptl;
 	int prot, err = 0;
 
+	/* handle_page_fault() releases mmap_lock before returning to segv(),
+	 * so a concurrent munmap() may be freeing the page tables of `va`.
+	 * It frees them under a read lock (after downgrading mmap_lock), but
+	 * only once their VMAs are detached, and never the tables a remaining
+	 * VMA spans: holding the read lock and finding `va`'s VMA still there
+	 * keeps the hierarchy stable while we walk it.  (The PTE lock below
+	 * protects only the leaf entry.)
+	 */
+	mmap_read_lock(mm);
+	if (!vma_lookup(mm, va))
+		goto out_unlock;
 	pgd = pgd_offset(mm, va);
 	if (!pgd_present(*pgd))
-		return 0;
+		goto out_unlock;
 	p4d = p4d_offset(pgd, va);
 	if (!p4d_present(*p4d))
-		return 0;
+		goto out_unlock;
 	pud = pud_offset(p4d, va);
 	if (!pud_present(*pud))
-		return 0;
+		goto out_unlock;
 	pmd = pmd_offset(pud, va);
 	if (!pmd_present(*pmd))
-		return 0;
+		goto out_unlock;
 	/* Hold the PTE lock so that a concurrent unmap on another vCPU cannot
 	 * complete (and sync) between reading the PTE and installing it. */
 	pte = pte_offset_map_lock(mm, pmd, va, &ptl);
 	if (!pte)
-		return 0;
+		goto out_unlock;
 	entry = *pte;
 	if (pte_present(entry) && pte_young(entry) && pte_read(entry)) {
 		prot = UM_PROT_READ;
@@ -426,6 +437,8 @@ int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 		err = map_pages(&mm->context.id, va, PAGE_SIZE, prot, pte_val(entry) & PAGE_MASK, false);
 	}
 	pte_unmap_unlock(pte, ptl);
+out_unlock:
+	mmap_read_unlock(mm);
 	return err == -ENOMEM ? err : 0;
 }
 
