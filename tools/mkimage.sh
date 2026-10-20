@@ -4,7 +4,15 @@
 # This is the image format GCE imports (tar -Sczf image.tar.gz disk.raw;
 # gcloud compute images create ... --guest-os-features=UEFI_COMPATIBLE).
 # Usage: mkimage.sh <out.raw> [l4h-root.elf]
+# L4H_SERIAL_PORT (default 0x3f8, COM1) is the console port of GRUB and
+# seL4, e.g. 0x2f8 (COM2) for Supermicro serial-over-LAN.
+# L4H_FB_CONSOLE=1 also shows GRUB and the seL4 console on the screen
+# (kernel option fb_console), for machines whose serial port is out of
+# reach but whose graphical console is not.
 set -euo pipefail
+serial=${L4H_SERIAL_PORT:-0x3f8}
+terminal=serial fbcon=
+if [ "${L4H_FB_CONSOLE:-0}" = 1 ]; then terminal="serial console" fbcon=" fb_console"; fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$1
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
@@ -12,14 +20,14 @@ kernel=$root/build/sel4/bin/kernel.elf
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-cat > "$work/grub.cfg" <<'CFG'
+cat > "$work/grub.cfg" <<CFG
 set timeout=0
-serial --unit=0 --speed=115200
+serial --port=$serial --speed=115200
 terminal_input serial
-terminal_output serial
+terminal_output $terminal
 search --no-floppy --set=root --file /boot/l4h-root.elf
 menuentry "l4h" {
-    multiboot2 /boot/kernel.elf console_port=0x3f8 debug_port=0x3f8
+    multiboot2 /boot/kernel.elf console_port=$serial debug_port=$serial$fbcon
     module2 /boot/l4h-root.elf
     boot
 }

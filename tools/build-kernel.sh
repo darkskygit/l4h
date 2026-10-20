@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Build the patched seL4 kernel and install libsel4 + kernel into build/sel4.
 # L4H_RELEASE=1 builds without kernel assertions and debug syscalls.
+# L4H_LAPIC_MODE=XAPIC builds for machines whose firmware leaves x2APIC off
+# (default X2APIC, faster under virtualization).  L4H_PCID=OFF builds for
+# CPUs without process-context identifiers (CPUID.1:ECX.PCID), such as the
+# AMD EPYC 4004 series; seL4 otherwise stops in its first boot checks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/build/seL4-src
@@ -18,6 +22,8 @@ config=$root/kernel/configs/l4h-x86_64.cmake
 cmake -G Ninja -S "$src" -B "$out" \
     -C "$config" \
     -DKernelDebugBuild=$debug \
+    -DKernelLAPICMode="${L4H_LAPIC_MODE:-X2APIC}" \
+    -DKernelSupportPCID="${L4H_PCID:-ON}" \
     -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DCROSS_COMPILER_PREFIX= >/dev/null
 ninja -C "$out" all

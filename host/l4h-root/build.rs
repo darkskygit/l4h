@@ -33,4 +33,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=L4H_DOM0_DISKS");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_NICS");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_INTERNAL_SWITCHES");
+    println!("cargo:rerun-if-env-changed=L4H_UPLINK_NIC");
+    println!("cargo:rerun-if-env-changed=L4H_BOOT_DISK");
+    println!("cargo:rerun-if-env-changed=L4H_SERIAL_PORT");
+    println!("cargo:rerun-if-env-changed=L4H_SERIAL_IRQ");
+    println!("cargo:rerun-if-env-changed=L4H_FB_CONSOLE");
 }

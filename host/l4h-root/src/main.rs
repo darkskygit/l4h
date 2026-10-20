@@ -62,20 +62,52 @@ static DOM0_KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-kerne
 static DOM0_INITRD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-initrd"));
 static DOM0_CMDLINE: &str = include_str!(concat!(env!("OUT_DIR"), "/dom0-cmdline"));
 
+/// A decimal number, or hexadecimal after "0x".
 const fn parse_usize(s: Option<&str>, default: usize) -> usize {
     match s {
         None => default,
         Some(s) => {
             let b = s.as_bytes();
-            let mut i = 0;
+            let (mut i, radix) = if b.len() > 2 && b[0] == b'0' && b[1] == b'x' { (2, 16) } else { (0, 10) };
             let mut v = 0;
             while i < b.len() {
-                v = v * 10 + (b[i] - b'0') as usize;
+                let d = match b[i] {
+                    b'0'..=b'9' => b[i] - b'0',
+                    b'a'..=b'f' => b[i] - b'a' + 10,
+                    b'A'..=b'F' => b[i] - b'A' + 10,
+                    _ => panic!("not a number"),
+                };
+                v = v * radix + d as usize;
                 i += 1;
             }
             v
         }
     }
+}
+
+/// A PCI address "bus:device.function" (hexadecimal) as bus << 8 |
+/// device << 3 | function, or None.
+const fn parse_bdf(s: Option<&str>) -> Option<u32> {
+    let Some(s) = s else { return None };
+    let b = s.as_bytes();
+    let mut v = [0u32; 3];
+    let (mut i, mut f) = (0, 0);
+    while i < b.len() {
+        match b[i] {
+            b':' | b'.' => f += 1,
+            c => {
+                let d = match c {
+                    b'0'..=b'9' => c - b'0',
+                    b'a'..=b'f' => c - b'a' + 10,
+                    b'A'..=b'F' => c - b'A' + 10,
+                    _ => panic!("not a PCI address"),
+                };
+                v[f] = v[f] * 16 + d as u32;
+            }
+        }
+        i += 1;
+    }
+    Some(v[0] << 8 | v[1] << 3 | v[2])
 }
 const DOM0_MEM_MB: usize = parse_usize(option_env!("L4H_DOM0_MEM_MB"), 256);
 const DOM0_VCPUS: usize = parse_usize(option_env!("L4H_DOM0_VCPUS"), 1);
@@ -86,6 +118,12 @@ const DOM0_IO_POOL_MB: usize = parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), g
 const DOM0_DISKS: usize = parse_usize(option_env!("L4H_DOM0_DISKS"), 64);
 /* vNICs of dom0 on switch 0, which has the first NIC as its uplink. */
 const DOM0_NICS: usize = parse_usize(option_env!("L4H_DOM0_NICS"), 1);
+/* The PCI address (bus:dev.fn) of the uplink NIC, when it is not the first
+ * NIC: e.g. the public port of a two-port card. */
+const UPLINK_NIC: Option<u32> = parse_bdf(option_env!("L4H_UPLINK_NIC"));
+/* The PCI address of the boot disk's controller, when it is not the first
+ * disk controller: it becomes host disk 0. */
+const BOOT_DISK: Option<u32> = parse_bdf(option_env!("L4H_BOOT_DISK"));
 /* Internal switches 1..=n, created at first boot, each with one more vNIC
  * of dom0 (a normal port, for routing between it and isolated guests). */
 const DOM0_INTERNAL_SWITCHES: usize = parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0);
@@ -507,6 +545,16 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             balloon = Some(d);
         }
     }
+    // The boot disk first: dom0 takes the first DOM0_DISKS host disks.
+    if let Some(bdf) = BOOT_DISK {
+        match ctrls.iter().position(|c: &Controller| netd::bdf(&c.pci) == bdf) {
+            Some(i) => {
+                let c = ctrls.remove(i);
+                ctrls.insert(0, c);
+            }
+            None => sel4::debug_println!("l4h-root: no boot disk at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7),
+        }
+    }
     if let Some(d) = balloon {
         alloc.balloon = balloon::Balloon::new(&d, &pci, &mut alloc, &mut devmem, info.tsc_hz / 1000);
     }
@@ -557,12 +605,23 @@ pub fn boot_dom0(h: &mut Host) {
             sel4::debug_println!("l4h-root: cannot give disk {} to dom0: error {}", d, e);
         }
     }
-    // Switch 0, with the first NIC (if any) as its uplink (on first boot).
+    // Switch 0, with the uplink NIC (if any; by default the first) as its
+    // uplink (on first boot).
     let sw = 0;
     if h.netd.switches == 0 {
         h.netd.create_switch();
-        if !h.netd.nics.is_empty() {
-            h.netd.attach_uplink(sw, 0).expect("uplink");
+        let nic = match UPLINK_NIC {
+            None => (!h.netd.nics.is_empty()).then_some(0),
+            Some(bdf) => {
+                let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
+                if n.is_none() {
+                    sel4::debug_println!("l4h-root: no uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+                }
+                n
+            }
+        };
+        if let Some(nic) = nic {
+            h.netd.attach_uplink(sw, nic).expect("uplink");
         }
     }
     // dom0's first vNIC takes the uplink NIC's MAC address: networks

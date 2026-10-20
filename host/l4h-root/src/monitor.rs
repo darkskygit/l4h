@@ -1,4 +1,6 @@
-//! A minimal monitor on the serial console (COM1, the GCE serial port),
+//! A minimal monitor on the serial console (COM1, the GCE serial port, or
+//! $L4H_SERIAL_PORT and $L4H_SERIAL_IRQ at build time, e.g. COM2 for
+//! Supermicro serial-over-LAN),
 //! for when dom0 is not usable (DESIGN.md §9.1): list, destroy,
 //! restart-dom0.  The kernel keeps printing to the same port; we only take
 //! its receive side.
@@ -14,10 +16,10 @@ use crate::mem::Alloc;
 pub const MONITOR_BADGE: u64 = 1 << 41;
 
 #[cfg(target_arch = "x86_64")]
-const COM1: u16 = 0x3f8;
+const SERIAL_PORT: u16 = crate::parse_usize(option_env!("L4H_SERIAL_PORT"), 0x3f8) as u16;
 #[cfg(target_arch = "x86_64")]
-const IRQ_COM1: u64 = 4;
-/// seL4 user IRQ vector for COM1.
+const SERIAL_IRQ: u64 = crate::parse_usize(option_env!("L4H_SERIAL_IRQ"), 4) as u64;
+/// seL4 user IRQ vector for the serial port.
 #[cfg(target_arch = "x86_64")]
 const VECTOR: u64 = crate::pci::VECTOR_MONITOR;
 
@@ -33,9 +35,9 @@ impl Monitor {
         use sel4::init_thread::slot;
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         let port = alloc.slots.alloc();
-        slot::IO_PORT_CONTROL.cap().ioport_control_issue(COM1 as u64, COM1 as u64 + 7, &abs(port)).ok()?;
+        slot::IO_PORT_CONTROL.cap().ioport_control_issue(SERIAL_PORT as u64, SERIAL_PORT as u64 + 7, &abs(port)).ok()?;
         let irq_slot = alloc.slots.alloc();
-        slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, IRQ_COM1, 0, 0, VECTOR, &abs(irq_slot)).ok()?;
+        slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, SERIAL_IRQ, 0, 0, VECTOR, &abs(irq_slot)).ok()?;
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let badged = alloc.slots.alloc();
         abs(badged)
@@ -46,7 +48,7 @@ impl Monitor {
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
         m.out(1, 0x01);
         m.out(4, m.inb(4) | 0x08);
-        info!("l4h-root: serial monitor on COM1 (type 'help')");
+        info!("l4h-root: serial monitor on port {:#x} (type 'help')", SERIAL_PORT);
         Some(m)
     }
 
@@ -78,12 +80,12 @@ impl Monitor {
 
     #[cfg(target_arch = "x86_64")]
     fn inb(&self, off: u16) -> u8 {
-        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_In8(self.port, COM1 + off).result as u8)
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_In8(self.port, SERIAL_PORT + off).result as u8)
     }
 
     #[cfg(target_arch = "x86_64")]
     fn out(&self, off: u16, v: u8) {
-        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(self.port, (COM1 + off) as u64, v as u64));
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(self.port, (SERIAL_PORT + off) as u64, v as u64));
     }
 
     #[cfg(target_arch = "aarch64")]

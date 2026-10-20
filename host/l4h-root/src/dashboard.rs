@@ -22,6 +22,9 @@ use crate::vspace::map_frame;
 const FB_VA: usize = 0x0000_7200_0000_0000;
 /// Refresh period in timer ticks of the balancer (100 ms).
 const REFRESH_TICKS: u32 = 10;
+/// Built for an image whose kernel copies the console to the screen
+/// (mkimage.sh L4H_FB_CONSOLE=1): the dashboard keeps to the upper half.
+const FB_CONSOLE: bool = crate::parse_usize(option_env!("L4H_FB_CONSOLE"), 0) != 0;
 
 const BG: u32 = 0x10141c;
 const FG: u32 = 0xd0d4d8;
@@ -99,6 +102,8 @@ impl Dashboard {
             }
         });
         let fb = (FB_VA + (addr & 4095)) as *mut u8;
+        // The kernel's copy of the console (fb_console) has the lower half.
+        let height = if FB_CONSOLE { height / 2 } else { height };
         let sx = if width >= 1280 { 2 } else { 1 };
         let sy = 2;
         let (cols, rows) = (width / (8 * sx), height / (8 * sy));
