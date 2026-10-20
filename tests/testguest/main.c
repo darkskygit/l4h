@@ -253,9 +253,14 @@ static void untyped_copy_test(seL4_CPtr quota)
 	err = seL4_Untyped_Retype(copy, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, f0, UT_FRAMES);
 	CHECK(err == 0, "frames from the copy err=", err);
 	volatile uint64_t *p = (volatile uint64_t *)UT_TEST_VA;
+	volatile uint64_t *q = (volatile uint64_t *)(UT_TEST_VA + 0x1000);
 	ut_map(L4H_CPTR(f0 + UT_FRAMES - 1), UT_TEST_VA);
 	p[0] = 0x1234567890abcdefull;
 	CHECK(p[0] == 0x1234567890abcdefull, "frame write", p[0]);
+	/* A page whose only non-zero word is its last: a reset clears only
+	 * pages that are not zero already, and must find it. */
+	ut_map(L4H_CPTR(f0 + UT_FRAMES - 2), UT_TEST_VA + 0x1000);
+	q[511] = 0x5a5a5a5a5a5a5a5aull;
 
 	/* The original is full while the copy exists: it cannot be retyped. */
 	err = seL4_Untyped_Retype(orig, UT_FRAME, 0, L4H_CNODE_CPTR, 0, 0, next_slot, 1);
@@ -283,6 +288,8 @@ static void untyped_copy_test(seL4_CPtr quota)
 	CHECK(err == 0, "frames again err=", err);
 	ut_map(L4H_CPTR(f0 + UT_FRAMES - 1), UT_TEST_VA);
 	CHECK(p[0] == 0, "reset memory not zeroed: ", p[0]);
+	ut_map(L4H_CPTR(f0 + UT_FRAMES - 2), UT_TEST_VA + 0x1000);
+	CHECK(q[511] == 0, "reset memory not zeroed at the end of a page: ", q[511]);
 
 	/* Revoking the original (teardown by l4h-root) deletes the copy and
 	 * everything retyped from it. */
