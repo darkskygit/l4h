@@ -159,6 +159,7 @@ version = "0.1.0"
 dependencies = [
  "l4h-abi",
  "l4h-host",
+ "l4h-virtio",
  "sel4",
  "sel4-root-task",
 ]

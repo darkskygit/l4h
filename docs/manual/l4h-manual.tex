@@ -436,6 +436,12 @@ tools/run-qemu.sh host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
         its target and LUN. NICs must
         be \texttt{virtio-net-pci}. Use \texttt{disable-legacy=on} for
         virtio devices. A host supports up to 4 NICs.
+  \item The script adds a \texttt{virtio-balloon-pci} device with
+        \texttt{free-page-reporting=on}. \texttt{l4h-root} reports the
+        memory it has not given to guests to QEMU, which then drops it,
+        so QEMU uses about as much host memory as the guests do, not all
+        of \texttt{L4H\_MEM}. \texttt{L4H\_BALLOON=0} leaves the device
+        out. Memory a guest holds stays in use, even if the guest frees it.
   \item The serial port is the console. seL4 and the host components print
         there, and so do the guests' consoles, each line prefixed with
         \texttt{[vm$N$]}. The serial monitor (Chapter~\ref{ch:recovery})
@@ -1118,6 +1124,8 @@ Test & What it checks \\
   under each cap (use a release seL4; timings are reported, not checked) \\
 \cmd{run-limits.sh} & the host refuses what it cannot afford and recovers,
   and runs a large guest on a fragmented host \\
+\cmd{run-balloontest.sh} & memory the host does not use is given back to
+  QEMU through virtio-balloon free page reporting \\
 \cmd{run-vmbench.sh} & per-guest host memory overhead; create, boot,
   shutdown and destroy latency (reported, not checked) \\
 \cmd{run-monitor.sh} & the serial monitor \\

@@ -138,8 +138,9 @@ fn run(h: &mut Host, line: &str) {
             }
         }
         "info" => sel4::debug_println!(
-            "monitor: {} cores, {} MiB free of {} MiB, {} disk(s), {} NIC(s)",
-            h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.disks.len(), h.netd.nics.len()
+            "monitor: {} cores, {} MiB free of {} MiB ({} MiB reported to the hypervisor), {} disk(s), {} NIC(s)",
+            h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.alloc.reported_bytes() >> 20,
+            h.disks.len(), h.netd.nics.len()
         ),
         "destroy" => match words.next().and_then(|w| w.parse::<usize>().ok()) {
             Some(id) if h.guest(id).is_some_and(|g| !g.dom0) => {

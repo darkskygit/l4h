@@ -1,0 +1,25 @@
+#!/bin/sh
+# dom0 init for tests/run-balloontest.sh: phases in which the host measures
+# how much memory QEMU really uses.  Each phase is announced, then held
+# for BT_HOLD seconds while the host takes its measurement.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "BALLOONTEST: FAIL: $*"; poweroff -f; }
+hold=$(sed -n 's/.*BT_HOLD=\([0-9]*\).*/\1/p' /proc/cmdline)
+phase() { echo "BALLOONTEST: phase $1"; sleep "$hold"; }
+phase idle
+# Twice: memory reported free once must work as guest RAM again.
+for round in 1 2; do
+    id=$(l4hctl create fill$round --kernel /bin/vmlinux --initrd /bin/balloonvm.cpio.gz --mem 1024) \
+        || fail "create $round"
+    l4hctl console "$id" --until "BALLOONVM: " --timeout 120 > /tmp/out || fail "vm $round did not finish"
+    grep -q "BALLOONVM: ok" /tmp/out || { cat /tmp/out; fail "vm $round data"; }
+    phase filled$round
+    l4hctl destroy "$id" || fail "destroy $round"
+    phase destroyed$round
+done
+l4hctl info
+echo "BALLOONTEST: done"
+poweroff -f

@@ -6,9 +6,13 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 rootserver=$1; shift
 objcopy -O elf32-i386 "$root/build/sel4/bin/kernel.elf" "$root/build/kernel32.elf"
+# l4h reports its free memory to QEMU, which then drops it
+# (L4H_BALLOON=0 leaves the device out).
+balloon=()
+[ "${L4H_BALLOON:-1}" = 1 ] && balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-legacy=on)
 exec qemu-system-x86_64 \
     -enable-kvm -cpu host,-vmx,+invtsc \
     -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-4G}" \
     -nographic -serial mon:stdio -no-reboot \
     -kernel "$root/build/kernel32.elf" \
-    -initrd "$rootserver" "$@"
+    -initrd "$rootserver" "${balloon[@]}" "$@"

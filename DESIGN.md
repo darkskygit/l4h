@@ -294,6 +294,12 @@ We need no IOMMU, since no device is passed into a guest.
     at once.
   - The 16 MiB fork now takes 6 ms, and the copy-on-write fault after it
     7.7 µs/page instead of 47.
+- **0019, Untyped resets skip memory that is already zero.** Resetting an
+  Untyped wrote zeros over all the memory it had handed out. Under a
+  hypervisor that backs memory on demand, that backs memory nobody uses,
+  including memory l4h reported free (§15.4). The reset now reads each
+  page (or reset chunk) and clears it only if a word is non-zero; reading
+  unbacked memory maps the host's zero page.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -667,8 +673,9 @@ including pool addresses, device indices and lifecycle state.
 - **Memory sizing for 30 guests.** Guest RAM is reserved in full at creation.
   Guest-created CNode slots, page tables and TCBs come from that RAM. Host
   overhead is the I/O pool plus about 6 MiB of objects per guest (§15.2).
-  Ballooning (virtio-balloon to revoke frames) and free-page reporting come
-  later.
+  When l4h itself runs in a VM, the host's free memory is reported to the
+  hypervisor (§15.4). Ballooning guests and passing on their free page
+  reports come later.
 
 **Revised during implementation (v1).**
 
@@ -1704,3 +1711,50 @@ memory the guest can retype.
   VSpace mirrors into fresh blocks) remains future work.
 - Phase 3 is shared by x86_64 and AArch64; only the paging-structure
   operations differ. The measurements above are from x86_64.
+
+### 15.4 Free page reporting to the hypervisor
+
+When l4h runs in a VM (QEMU/KVM for development and tests), memory it has
+not given to a guest should not occupy the hypervisor's RAM.
+
+- **Device.** `l4h-root` drives a virtio-balloon PCI device that offers
+  free page reporting (`VIRTIO_BALLOON_F_REPORTING`; QEMU
+  `-device virtio-balloon-pci,free-page-reporting=on`, which
+  `tools/run-qemu.sh`, `run-uefi.sh` and `run-image-aarch64.sh` add unless
+  `L4H_BALLOON=0`). Only the reporting queue is used: no inflation or
+  deflation, no statistics. QEMU numbers its queues by the features it
+  offers, so the reporting queue is 2, plus one for the statistics queue
+  and one for free page hinting if offered. The device has no interrupt:
+  the root task's 100 ms timer polls it (`balloon.rs`).
+- **What is reported.** The allocator's free blocks (§15.2) of 2 MiB or
+  more, once free for 2 s (as Linux does), so that memory freed and
+  allocated again soon is not reported. A report is one chain of
+  device-writable buffers, one per block or per 2 GiB of one, at most 32;
+  one report is in flight at a time. Each free block is *free* (since a
+  time), *reporting* or *reported*. Splitting a block passes its state to
+  the halves, and merging two reported halves gives a reported parent.
+- **Reuse.** A block being reported must not be used until the device
+  returns it. Allocation skips such blocks, and waits (up to 2 s) for the
+  report when nothing else fits. Reported blocks are used like others: the
+  hypervisor has dropped their contents, which read as zero, as seL4 would
+  make them anyway. Touching them backs them again.
+- **Zeroing.** Clearing memory that reads as zero would back it again, so
+  kernel patch 0019 makes Untyped resets write only pages that are not
+  zero. This matters for guest RAM too: a guest's RAM block is reset when
+  the guest first retypes it, and pages the guest never writes stay
+  unbacked.
+- **Measured** (`tests/run-balloontest.sh`: QEMU with 4 GiB and KVM,
+  256 MiB dom0, a 1 GiB guest that fills 768 MiB of tmpfs, destroyed, all
+  twice; QEMU's resident memory):
+
+  | | idle | guest filled | guest destroyed |
+  |---|---|---|---|
+  | before | 618 MiB | 1642 MiB | 1642 MiB |
+  | patch 0019 only | 292 MiB | 1128–1260 MiB | 1128–1260 MiB |
+  | patch 0019 and reporting | 293 MiB | 1133 MiB | 307–310 MiB |
+
+- **Not covered.** Memory a guest holds but does not use stays backed
+  once the guest has written it: guests have no balloon, and their free
+  pages are not reported. A guest's `page_reporting` device passing GPAs
+  through the VMM to `l4h-root`, which would translate them to physical
+  addresses and report them, is the natural next step.

@@ -30,9 +30,9 @@ pub const WINDOW_ALIGN: u64 = 8;
 
 /// Mapping attributes for device registers.
 #[cfg(target_arch = "x86_64")]
-const DEVICE_ATTRS: VmAttributes = VmAttributes::CACHE_DISABLED;
+pub const DEVICE_ATTRS: VmAttributes = VmAttributes::CACHE_DISABLED;
 #[cfg(target_arch = "aarch64")]
-const DEVICE_ATTRS: VmAttributes = VmAttributes::EXECUTE_NEVER;
+pub const DEVICE_ATTRS: VmAttributes = VmAttributes::EXECUTE_NEVER;
 const DMA_BITS: usize = 22;
 /// Each BAR is mapped at MMIO_VA + bar * BAR_STRIDE.
 const BAR_STRIDE: usize = 0x100_0000;

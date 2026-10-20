@@ -14,6 +14,8 @@ use core::ops::Range;
 use sel4::init_thread::slot;
 use sel4::{ObjectBlueprint, cap};
 
+use crate::balloon::{self, Balloon};
+
 pub type Slot = usize;
 
 /// Allocator for slots in the root task's own CNode.
@@ -247,6 +249,22 @@ impl UtPool {
     }
 }
 
+/// What the hypervisor l4h runs in knows of a free block (balloon.rs).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hint {
+    /// Not reported; free since this tick count.
+    Free(u64),
+    /// In the report in flight: not to be used until the device returns it.
+    Reporting,
+    /// Reported: the hypervisor may have dropped the memory.
+    Reported,
+}
+
+struct FreeBlock {
+    r: UtRegion,
+    hint: Hint,
+}
+
 /// Global allocation state of the root task.
 ///
 /// Free memory is kept as untouched power-of-two Untyped *blocks*, buddy
@@ -258,13 +276,17 @@ impl UtPool {
 /// both halves makes it whole.  Guest RAM comes in 2 MiB blocks, so
 /// without merging the free memory would end up in 2 MiB pieces.  Small
 /// global objects come from `pool`, which is refilled with blocks.
+///
+/// Blocks that stay free are reported to the hypervisor, if it takes free
+/// page reports (`balloon`), so that it can drop their memory.
 pub struct Alloc {
     pub slots: Slots,
     /// Small objects of the root task itself.
     pub pool: UtPool,
-    blocks: Vec<UtRegion>,
+    blocks: Vec<FreeBlock>,
     /// Split blocks, (paddr, size bits) -> slot of their Untyped.
     parents: BTreeMap<(usize, usize), Slot>,
+    pub balloon: Option<Balloon>,
 }
 
 const SMALL_POOL_BITS: usize = 24;
@@ -275,7 +297,8 @@ fn untyped_at(s: Slot) -> cap::Untyped {
 
 impl Alloc {
     pub fn new(slots: Slots, bootinfo: &sel4::BootInfo) -> Self {
-        let mut a = Alloc { slots, pool: UtPool::empty(), blocks: UtPool::from_bootinfo(bootinfo).regions, parents: BTreeMap::new() };
+        let blocks = UtPool::from_bootinfo(bootinfo).regions.into_iter().map(|r| FreeBlock { r, hint: Hint::Free(0) }).collect();
+        let mut a = Alloc { slots, pool: UtPool::empty(), blocks, parents: BTreeMap::new(), balloon: None };
         a.refill();
         a
     }
@@ -293,26 +316,35 @@ impl Alloc {
     }
 
     pub fn free_bytes(&self) -> usize {
-        self.blocks.iter().map(|b| 1usize << b.size_bits).sum::<usize>() + self.pool.free_bytes()
+        self.blocks.iter().map(|b| 1usize << b.r.size_bits).sum::<usize>() + self.pool.free_bytes()
     }
 
     /// Largest block available.
     pub fn largest_block_bits(&self) -> Option<usize> {
-        self.blocks.iter().map(|b| b.size_bits).max()
+        self.blocks.iter().map(|b| b.r.size_bits).max()
+    }
+
+    /// Whether a block of 2^bits bytes can be split off now, without
+    /// merging or waiting for a report.
+    fn has_block(&self, bits: usize) -> bool {
+        self.blocks.iter().any(|b| b.r.size_bits >= bits && b.hint != Hint::Reporting)
     }
 
     /// An untouched Untyped of exactly 2^bits bytes, in root slot `slot`.
     pub fn split(&mut self, bits: usize, slot: Slot) -> Option<UtRegion> {
-        if !self.blocks.iter().any(|b| b.size_bits >= bits) {
+        if !self.has_block(bits) {
+            self.finish_report(true);
+        }
+        if !self.has_block(bits) {
             self.merge_up_to(bits);
         }
         let (i, _) = self
             .blocks
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.size_bits >= bits)
-            .min_by_key(|(_, b)| (b.size_bits, b.paddr))?;
-        let mut b = self.blocks.swap_remove(i);
+            .filter(|(_, b)| b.r.size_bits >= bits && b.hint != Hint::Reporting)
+            .min_by_key(|(_, b)| (b.r.size_bits, b.r.paddr))?;
+        let FreeBlock { r: mut b, hint } = self.blocks.swap_remove(i);
         while b.size_bits > bits {
             let half = b.size_bits - 1;
             let s = self.slots.global(|s| s.alloc_range(2));
@@ -322,7 +354,7 @@ impl Alloc {
             // The parent is kept, to merge the halves again when both
             // are free.
             self.parents.insert((b.paddr, b.size_bits), b.cap.bits() as Slot);
-            self.blocks.push(UtRegion::fresh(untyped_at(s.start + 1), b.paddr + (1 << half), half));
+            self.blocks.push(FreeBlock { r: UtRegion::fresh(untyped_at(s.start + 1), b.paddr + (1 << half), half), hint });
             b = UtRegion::fresh(untyped_at(s.start), b.paddr, half);
         }
         let dst = slot::CNODE.cap().absolute_cptr(untyped_at(slot));
@@ -378,7 +410,7 @@ impl Alloc {
     /// seL4 clear all the memory its children used, which for a large
     /// parent costs far more than the request that split it.
     fn free_block(&mut self, r: UtRegion) {
-        self.blocks.push(r);
+        self.blocks.push(FreeBlock { r, hint: Hint::Free(l4h_host::ticks::now()) });
     }
 
     /// Merge free buddies, smallest first, into blocks of up to 2^bits
@@ -388,29 +420,38 @@ impl Alloc {
             let mut merged = false;
             let mut i = 0;
             while i < self.blocks.len() {
-                let (paddr, b) = (self.blocks[i].paddr, self.blocks[i].size_bits);
+                let (paddr, b) = (self.blocks[i].r.paddr, self.blocks[i].r.size_bits);
                 let parent = (paddr & !(1 << b), b + 1);
                 let buddy = paddr ^ (1 << b);
                 let pslot = self.parents.get(&parent).copied();
-                let j = self.blocks.iter().position(|x| x.paddr == buddy && x.size_bits == b);
+                let j = self.blocks.iter().position(|x| x.r.paddr == buddy && x.r.size_bits == b);
                 let (Some(pslot), Some(j), true) = (pslot, j, b < bits) else {
                     i += 1;
                     continue;
                 };
+                if self.blocks[i].hint == Hint::Reporting || self.blocks[j].hint == Hint::Reporting {
+                    i += 1;
+                    continue;
+                }
                 // Neither half has children: deleting both leaves the
                 // parent without children, so its next retype starts
                 // afresh (and clears what the halves used).
                 let (x, y) = (self.blocks.swap_remove(i.max(j)), self.blocks.swap_remove(i.min(j)));
-                for half in [x.cap, y.cap] {
+                let hint = if x.hint == Hint::Reported && y.hint == Hint::Reported {
+                    Hint::Reported
+                } else {
+                    Hint::Free(l4h_host::ticks::now())
+                };
+                for half in [x.r.cap, y.r.cap] {
                     let s = half.bits() as Slot;
                     slot::CNODE.cap().absolute_cptr(half).delete().expect("delete merged half");
                     self.slots.global(|sl| sl.free(s));
                 }
                 self.parents.remove(&parent);
-                self.blocks.push(UtRegion::fresh(untyped_at(pslot), parent.0, parent.1));
+                self.blocks.push(FreeBlock { r: UtRegion::fresh(untyped_at(pslot), parent.0, parent.1), hint });
                 merged = true;
             }
-            if !merged || self.blocks.iter().any(|b| b.size_bits >= bits) {
+            if !merged || self.has_block(bits) {
                 return;
             }
         }
@@ -420,6 +461,65 @@ impl Alloc {
     /// Free blocks: (count, bytes of the largest), for diagnostics.
     pub fn block_stats(&self) -> (usize, usize) {
         (self.blocks.len(), self.largest_block_bits().map_or(0, |b| 1 << b))
+    }
+
+    /// Free memory reported to the hypervisor, in bytes.
+    pub fn reported_bytes(&self) -> usize {
+        self.blocks.iter().filter(|b| b.hint == Hint::Reported).map(|b| 1usize << b.r.size_bits).sum()
+    }
+
+    /// Report the blocks that have been free for `delay` ticks to the
+    /// hypervisor, as many as one report holds, unless a report is in
+    /// flight.  Called periodically.
+    pub fn report_free(&mut self, now: u64, delay: u64) {
+        self.finish_report(false);
+        let Some(dev) = &mut self.balloon else { return };
+        if dev.busy() {
+            return;
+        }
+        let mut ranges = Vec::new();
+        for b in &mut self.blocks {
+            let Hint::Free(since) = b.hint else { continue };
+            if b.r.size_bits < balloon::MIN_BITS || now.saturating_sub(since) < delay {
+                continue;
+            }
+            let piece = 1usize << b.r.size_bits.min(balloon::MAX_DESC_BITS);
+            let n = (1usize << b.r.size_bits) / piece;
+            if ranges.len() + n > dev.capacity() {
+                continue;
+            }
+            ranges.extend((0..n).map(|k| (b.r.paddr + k * piece, piece)));
+            b.hint = Hint::Reporting;
+        }
+        if !ranges.is_empty() {
+            dev.report(&ranges);
+        }
+    }
+
+    /// Take back the blocks of the report in flight once the device is
+    /// done with it; `wait` waits for that.
+    fn finish_report(&mut self, wait: bool) {
+        let Some(dev) = &mut self.balloon else { return };
+        if !dev.busy() {
+            return;
+        }
+        if !dev.done(wait) {
+            if wait {
+                sel4::debug_println!("l4h-root: balloon: the device holds a free page report too long");
+            }
+            return;
+        }
+        let mut bytes = 0;
+        for b in &mut self.blocks {
+            if b.hint == Hint::Reporting {
+                b.hint = Hint::Reported;
+                bytes += 1usize << b.r.size_bits;
+            }
+        }
+        info!(
+            "l4h-root: balloon: reported {} MiB, {} of {} MiB free reported",
+            bytes >> 20, self.reported_bytes() >> 20, self.free_bytes() >> 20
+        );
     }
 
 

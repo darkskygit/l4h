@@ -13,7 +13,11 @@ if [ "$accel" = hvf ]; then
     cpu=host
     machine+=,kernel-irqchip=off
 fi
+# l4h reports its free memory to QEMU, which then drops it
+# (L4H_BALLOON=0 leaves the device out).
+balloon=()
+[ "${L4H_BALLOON:-1}" = 1 ] && balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-legacy=on)
 exec qemu-system-aarch64 \
     -machine "$machine" -accel "$accel" -cpu "${L4H_QEMU_CPU:-$cpu}" \
     -smp "${L4H_SMP:-4}" -m "$l4h_memory_mb" \
-    -nographic -serial mon:stdio -no-reboot -kernel "$image" "$@"
+    -nographic -serial mon:stdio -no-reboot -kernel "$image" "${balloon[@]}" "$@"

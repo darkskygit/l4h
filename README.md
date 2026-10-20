@@ -31,6 +31,8 @@ current status of each part.
   `/dev/l4hctl` and the `l4hctl` CLI: create, load, start, shutdown and
   destroy VMs; console access; disks; switches; NICs; CPU caps. Destroying
   a VM returns all its memory.
+- **Memory under QEMU/KVM.** Memory not given to guests is reported
+  free through virtio-balloon free page reporting, so QEMU drops it.
 - **Boot.** Multiboot under QEMU, or a UEFI disk image for GCE
   (`tools/mkimage.sh`, `tools/gce-image.sh`; tested on N2 and C3 with
   `tests/gce-test.sh`). On a host with a display
@@ -138,6 +140,7 @@ l4hctl console 1 --follow
 | `tests/run-captest.sh [cap%] [rounds]` | self-test and fork loops in a guest capped from boot |
 | `tests/run-capperf.sh [caps]` | fork/exec and CPU-bound timings, uncapped and under each cap (use a release seL4) |
 | `tests/run-limits.sh` | the root task refuses what it cannot afford and recovers |
+| `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon) is dropped: QEMU's memory use idle, with a guest and after destroying it |
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`) |
 | `tests/run-uefitest.sh` | UEFI/GRUB boot image with NVMe and virtio-net, as on GCE |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Guest of tests/guest/init-balloontest: fill most of RAM with data and
+# read it back.
+mount -t proc proc /proc
+mount -t tmpfs -o size=800m tmp /tmp
+want=$(yes l4h-balloon | head -c $((768 << 20)) | md5sum)
+yes l4h-balloon | head -c $((768 << 20)) > /tmp/fill || { echo "BALLOONVM: fill failed"; while :; do sleep 10; done; }
+got=$(md5sum < /tmp/fill)
+if [ "$got" = "$want" ]; then echo "BALLOONVM: ok"; else echo "BALLOONVM: data differs"; fi
+while :; do sleep 10; done

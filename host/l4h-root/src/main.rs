@@ -17,6 +17,7 @@ macro_rules! info {
     };
 }
 
+mod balloon;
 mod blkd;
 mod component;
 mod ctl;
@@ -471,6 +472,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
     let mut ctrls = Vec::new();
     let mut nics = Vec::new();
+    let mut balloon = None;
     for d in pci.enumerate() {
         info!(
             "l4h-root: pci {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x}",
@@ -501,7 +503,12 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         } else if netd::is_uplink(&d) {
             pci.disable(&d);
             nics.push(d);
+        } else if balloon::is_balloon(&d) && balloon.is_none() {
+            balloon = Some(d);
         }
+    }
+    if let Some(d) = balloon {
+        alloc.balloon = balloon::Balloon::new(&d, &pci, &mut alloc, &mut devmem, info.tsc_hz / 1000);
     }
     let mut asids = asids;
     let netd = netd::spawn(nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
@@ -648,6 +655,7 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             let now = rdtsc();
             sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
             last_balance = now;
+            h.alloc.report_free(now, h.info.tsc_hz * balloon::REPORT_DELAY_MS / 1000);
             dashboard::Dashboard::tick(h);
             if WATCHDOG_SECS != 0 && rdtsc() >= next_watchdog {
                 watchdog_dump(h);
