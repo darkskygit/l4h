@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod gvnic;
+mod ixgbe;
 mod nic;
 mod offload;
 mod virtio_net;

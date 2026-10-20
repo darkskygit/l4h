@@ -99,6 +99,7 @@ pub const NETD_NIC_MAC: u64 = 5;
 /// NicConfig::kind.
 pub const NIC_VIRTIO: u32 = 0;
 pub const NIC_GVNIC: u32 = 1;
+pub const NIC_IXGBE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -119,7 +120,7 @@ pub struct NicConfig {
     pub isr: crate::blk::PciRegion,
     pub device: crate::blk::PciRegion,
     pub msix_table: crate::blk::PciRegion,
-    /// gVNIC: register BAR 0 and doorbell BAR 2.
+    /// gVNIC: register BAR 0 and doorbell BAR 2; X550: register BAR 0.
     pub regs: crate::blk::PciRegion,
     pub doorbells: crate::blk::PciRegion,
     pub dma_paddr: u64,

@@ -1,4 +1,4 @@
-//! Uplink NICs: a virtio-net or gVNIC device, and the frames waiting for
+//! Uplink NICs: a virtio-net, gVNIC or Intel X550 device, and the frames waiting for
 //! one of its TX buffers.
 
 use alloc::collections::VecDeque;
@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use l4h_rt::host::net::{self, NicConfig};
 
 use crate::gvnic::Gvnic;
+use crate::ixgbe::Ixgbe;
 use crate::virtio_net::VirtioNet;
 
 const HDR: usize = net::HDR_SIZE;
@@ -17,6 +18,7 @@ const TX_BACKLOG_BYTES: usize = 4 << 20;
 enum Dev {
     Virtio(VirtioNet),
     Gvnic(Gvnic),
+    Ixgbe(Ixgbe),
 }
 
 /// Calls the same method on whichever device this is.
@@ -25,6 +27,7 @@ macro_rules! dev {
         match &mut $self.dev {
             Dev::Virtio($d) => $e,
             Dev::Gvnic($d) => $e,
+            Dev::Ixgbe($d) => $e,
         }
     };
 }
@@ -49,6 +52,11 @@ impl Nic {
                 let (mac, csum, tso) = (g.mac, g.csum, g.tso);
                 (Dev::Gvnic(g), mac, csum, tso)
             }
+            net::NIC_IXGBE => {
+                let x = Ixgbe::new(n, c, tsc_hz);
+                let (mac, csum, tso) = (x.mac, x.csum, x.tso);
+                (Dev::Ixgbe(x), mac, csum, tso)
+            }
             _ => {
                 let v = VirtioNet::new(n, c);
                 let (mac, csum, tso) = (v.mac, v.csum, v.tso);
@@ -63,6 +71,7 @@ impl Nic {
         match &self.dev {
             Dev::Virtio(_) => self.tso,
             Dev::Gvnic(g) => g.takes_gso(hdr),
+            Dev::Ixgbe(x) => x.takes_gso(hdr),
         }
     }
 

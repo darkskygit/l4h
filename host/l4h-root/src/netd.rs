@@ -50,9 +50,20 @@ pub fn is_gvnic(d: &pci::Device) -> bool {
     d.vendor == 0x1ae0 && d.device == 0x0042 && mem(0) && mem(2) && d.msix.is_some_and(|m| m.table_size >= 3)
 }
 
+/// Intel X550 (Linux ixgbe), as on Latitude.sh m4.metal servers:
+/// registers in BAR 0, MSI-X with an entry each for RX and TX.
+pub fn is_ixgbe(d: &pci::Device) -> bool {
+    // X550T, X550T1.
+    d.vendor == 0x8086
+        && matches!(d.device, 0x1563 | 0x15d1)
+        && !d.bars[0].is_io
+        && d.bars[0].size != 0
+        && d.msix.is_some_and(|m| m.table_size >= 2)
+}
+
 /// NICs netd can drive as an uplink.
 pub fn is_uplink(d: &pci::Device) -> bool {
-    is_virtio_net(d) || is_gvnic(d)
+    is_virtio_net(d) || is_gvnic(d) || is_ixgbe(d)
 }
 
 pub struct Nic {
@@ -75,7 +86,7 @@ pub struct Netd {
     pub switches: u32,
 }
 
-fn bdf(d: &pci::Device) -> u32 {
+pub fn bdf(d: &pci::Device) -> u32 {
     ((d.bus as u32) << 8) | ((d.dev as u32) << 3) | d.func as u32
 }
 
@@ -107,7 +118,8 @@ pub fn spawn(
         let bar_region = |b: u8| l4h_host::blk::PciRegion { va: bar_va(b) as u64, len: d.bars[b as usize].size };
         let none = l4h_host::blk::PciRegion { va: 0, len: 0 };
         let gvnic = is_gvnic(d);
-        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) || gvnic {
+        let ixgbe = is_ixgbe(d);
+        let VirtioRegions { common, notify, notify_mult, isr, device, msix_table } = if is_legacy(d) || gvnic || ixgbe {
             let msix = d.msix.unwrap();
             VirtioRegions {
                 common: none,
@@ -132,7 +144,13 @@ pub fn spawn(
             .expect("NIC DMA frames");
         dma.push(frames);
         cfg.nics[n] = net::NicConfig {
-            kind: if gvnic { net::NIC_GVNIC } else { net::NIC_VIRTIO },
+            kind: if gvnic {
+                net::NIC_GVNIC
+            } else if ixgbe {
+                net::NIC_IXGBE
+            } else {
+                net::NIC_VIRTIO
+            },
             revision: d.revision as u32,
             pci_bdf: bdf(d),
             msi_data: pci::msi_data(NIC_MSI_BASE + n as u64),
@@ -144,7 +162,7 @@ pub fn spawn(
             isr,
             device,
             msix_table,
-            regs: if gvnic { bar_region(0) } else { none },
+            regs: if gvnic || ixgbe { bar_region(0) } else { none },
             doorbells: if gvnic { bar_region(2) } else { none },
             dma_paddr: paddr as u64,
             dma_size: 1 << NIC_DMA_BITS,
@@ -181,7 +199,13 @@ pub fn spawn(
     let mut nic_list = Vec::new();
     for (n, d) in nics.into_iter().enumerate() {
         let mut bars = Vec::new();
-        let used = if is_gvnic(&d) { alloc::vec![0, 2, d.msix.unwrap().table_bar] } else { crate::blkd::virtio_bars(&d) };
+        let used = if is_gvnic(&d) {
+            alloc::vec![0, 2, d.msix.unwrap().table_bar]
+        } else if is_ixgbe(&d) {
+            alloc::vec![0, d.msix.unwrap().table_bar]
+        } else {
+            crate::blkd::virtio_bars(&d)
+        };
         map_bars(&comp, alloc, &mut arena, devmem, &d, &mut bars, &used, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
