@@ -539,10 +539,20 @@ attaches that object to the faulting task, and refills the pool.
   interrupt a running thread asynchronously. Interrupt sources therefore
   **set a bit in the vCPU's event page** (a shared frame, as with Xen's
   `evtchn_pending`) and then signal `N_v`. The guest checks the event word, a
-  cheap memory load, in `local_irq_enable`, `preempt_enable` and
-  `cond_resched`, and before blocking. The E3 timer only signals `N_v`, so
-  the same check also compares `rdtsc` against the vCPU's armed deadline.
-  The default guest configuration uses `CONFIG_PREEMPT_VOLUNTARY`.
+  cheap memory load, when it re-enables interrupts, in `cond_resched`
+  (patch 0005, so also in every `might_sleep` under
+  `CONFIG_PREEMPT_VOLUNTARY`), and before blocking. The E3 timer only
+  signals `N_v`, so the same check also compares `rdtsc` against the
+  vCPU's armed deadline. The default guest configuration uses
+  `CONFIG_PREEMPT_VOLUNTARY`.
+
+  *Revised:* `cond_resched` did not poll at first. A loop that waits for
+  another task with `cond_resched` and plain spinlocks then never sees
+  the timer, so `need_resched` is never set and the task it waits for
+  never runs. On a 1-vCPU guest this froze the whole guest, timers and
+  console included, with no lockup report: `shrink_dcache_parent` spun
+  in `d_walk` on dentries that another task had on its shrink list, which
+  Docker's container setup and teardown hit within seconds.
 - **Future backstop.** The proposed upcall injection for a kTCB that runs
   too long without polling is not implemented. It would require suspending
   the kTCB and changing its registers to enter an interrupt handler, with

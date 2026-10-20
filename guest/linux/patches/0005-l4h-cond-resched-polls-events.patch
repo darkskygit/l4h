@@ -1,0 +1,25 @@
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7467,8 +7467,22 @@
+ #endif /* CONFIG_RT_MUTEXES */
+ 
+ #if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)
++#ifdef CONFIG_L4H
++/* arch/l4h/os-sel4/events.c: deliver pending events if interrupts are on. */
++void l4h_poll_events(void);
++#endif
++
+ int __sched __cond_resched(void)
+ {
++#ifdef CONFIG_L4H
++	/*
++	 * An l4h vCPU sees its timer and other interrupts only where it polls
++	 * for them, so a loop that waits here for another task and never
++	 * re-enables interrupts (shrink_dcache_parent()) would never be
++	 * told to reschedule.
++	 */
++	l4h_poll_events();
++#endif
+ 	if (should_resched(0) && !irqs_disabled()) {
+ 		preempt_schedule_common();
+ 		return 1;

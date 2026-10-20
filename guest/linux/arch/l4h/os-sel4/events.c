@@ -200,3 +200,14 @@ void l4h_dispatch_pending(void)
 	}
 	v->in_irq = 0;
 }
+
+/* Deliver pending events if interrupts are enabled, as re-enabling them
+ * would.  Called from cond_resched(), whose callers may loop waiting for
+ * another task without ever re-enabling interrupts. */
+void l4h_poll_events(void)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+
+	if (v->irqs_enabled && !v->in_irq && l4h_events_pending())
+		l4h_dispatch_pending();
+}
