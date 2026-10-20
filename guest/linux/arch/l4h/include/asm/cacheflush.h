@@ -2,7 +2,7 @@
 #define __UM_ASM_CACHEFLUSH_H
 
 #include <asm/tlbflush.h>
-#define flush_cache_vmap flush_tlb_kernel_range
+#define flush_cache_vmap l4h_kernel_map_sync
 #define flush_cache_vunmap flush_tlb_kernel_range
 
 #ifdef CONFIG_UML_ARM64

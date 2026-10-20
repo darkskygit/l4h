@@ -15,6 +15,7 @@
 #include <skas.h>
 #include <kern_util.h>
 #include <l4h_vspace.h>
+#include <l4h_caps.h>
 
 struct vm_ops {
 	struct mm_id *mm_idp;
@@ -24,6 +25,8 @@ struct vm_ops {
 		    unsigned long phys);
 	int (*unmap)(struct mm_id *mm_idp,
 		     unsigned long virt, unsigned long len);
+	/* Kernel syncs: a map ran out of seL4 objects (see um_tlb_sync()). */
+	bool enomem;
 };
 
 static int kern_map(struct mm_id *mm_idp,
@@ -38,13 +41,6 @@ static int kern_unmap(struct mm_id *mm_idp,
 		      unsigned long virt, unsigned long len)
 {
 	return os_unmap_memory((void *)virt, len);
-}
-
-void report_enomem(void)
-{
-	printk(KERN_ERR "UML ran out of memory on the host side! "
-			"This can happen due to a memory limitation or "
-			"vm.max_map_count has been reached.\n");
 }
 
 static int sync_one_pte(pte_t *pte, unsigned long addr, struct vm_ops *ops)
@@ -77,6 +73,12 @@ static int sync_one_pte(pte_t *pte, unsigned long addr, struct vm_ops *ops)
 			       (x ? UM_PROT_EXEC : 0);
 
 			ret = ops->mmap(ops->mm_idp, addr, PAGE_SIZE, prot, phys);
+			if (ret == -ENOMEM && ops->mmap == kern_map) {
+				/* Left to sync again; the walk goes on, since
+				 * its unmaps must all happen. */
+				ops->enomem = true;
+				return 0;
+			}
 		} else
 			ret = ops->unmap(ops->mm_idp, addr, PAGE_SIZE);
 		if (ret)
@@ -186,12 +188,17 @@ static inline int update_p4d_range(pgd_t *pgd, unsigned long addr,
  * Callers include flushes under a PTE lock, so this must not sleep.  Kernel
  * syncs are rare and short and also keep interrupts off; user syncs may be
  * long and leave them on (no interrupt handler syncs a user mm).
+ *
+ * User maps that find no memory for seL4 objects are dropped: the page
+ * faults again.  Kernel maps cannot be: a fault of the guest kernel stops
+ * the guest.  Their PTEs stay unsynced, the range is marked again, and the
+ * sync returns -ENOMEM for l4h_kernel_map_sync() to retry.
  */
 int um_tlb_sync(struct mm_struct *mm)
 {
 	pgd_t *pgd;
-	struct vm_ops ops;
-	unsigned long addr, end, next, flags, wflags = 0;
+	struct vm_ops ops = {};
+	unsigned long start, addr, end, next, flags, wflags = 0;
 	int ret = 0;
 
 	if (mm == &init_mm)
@@ -208,6 +215,7 @@ int um_tlb_sync(struct mm_struct *mm)
 	raw_spin_unlock_irqrestore(&mm->context.sync_lock, flags);
 	if (end == 0)
 		goto out;
+	start = addr;
 
 	ops.mm_idp = &mm->context.id;
 	if (mm == &init_mm) {
@@ -232,6 +240,11 @@ int um_tlb_sync(struct mm_struct *mm)
 	} while (pgd++, addr = next, ((addr < end) && !ret));
 	if (mm != &init_mm)
 		l4h_mm_flush_deferred(mm);
+	if (ops.enomem) {
+		um_tlb_mark_sync(mm, start, end);
+		if (!ret)
+			ret = -ENOMEM;
+	}
 
 out:
 	if (mm == &init_mm)
@@ -239,10 +252,23 @@ out:
 	else
 		raw_spin_unlock(&mm->context.sync_walk_lock);
 
-	if (ret == -ENOMEM)
-		report_enomem();
-
 	return ret;
+}
+
+/*
+ * Make new kernel mappings (vmap, vmalloc, percpu) reachable before the
+ * caller uses them.  Every caller may sleep: wait for object memory and
+ * retry, as the page fault path does.
+ */
+void l4h_kernel_map_sync(unsigned long start, unsigned long end)
+{
+	um_tlb_mark_sync(&init_mm, start, end);
+	while (um_tlb_sync(&init_mm) == -ENOMEM) {
+		if (!l4h_objmem_wait()) {
+			l4h_objmem_oom();
+			schedule_timeout_uninterruptible(1);
+		}
+	}
 }
 
 void flush_tlb_all(void)

@@ -31,6 +31,7 @@
  */
 
 extern int um_tlb_sync(struct mm_struct *mm);
+extern void l4h_kernel_map_sync(unsigned long start, unsigned long end);
 
 /*
  * With several vCPUs, threads of `mm` may be running elsewhere: removed or

@@ -41,7 +41,6 @@ extern void reboot_skas(void);
 extern int os_map_memory(void *virt, unsigned long phys, unsigned long len, int r, int w, int x);
 extern int os_protect_memory(void *addr, unsigned long len, int r, int w, int x);
 extern int os_unmap_memory(void *addr, int len);
-extern void report_enomem(void);
 int map(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot,
 	unsigned long phys);
 int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len);
