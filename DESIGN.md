@@ -300,6 +300,14 @@ We need no IOMMU, since no device is passed into a guest.
   including memory l4h reported free (§15.4). The reset now reads each
   page (or reset chunk) and clears it only if a word is non-zero; reading
   unbacked memory maps the host's zero page.
+- **0020, framebuffer console (x86).** With the command-line option
+  `fb_console`, everything the kernel prints (its own messages and host
+  components' debug output) is also drawn on the lower half of the
+  multiboot2 framebuffer, if it is 32 bpp and below 4 GiB: 8x8 glyphs
+  doubled vertically, wrapping instead of scrolling so the framebuffer is
+  never read. For machines whose serial port is out of reach but whose
+  screen is not, such as Latitude.sh servers behind their BMC's web proxy
+  (§10.1); `tools/mkimage.sh` adds it with `L4H_FB_CONSOLE=1`.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -891,7 +899,7 @@ NAT, DHCP and firewalling belong in a VM.
 - **Path.** Guest `virtio_net` → `l4h-vmm` → shared net port rings →
   `l4h-netd` → destination port or uplink NIC. netd combines all switches
   and the uplink NIC drivers in one Rust component: modern and legacy
-  virtio-net, and gVNIC (below).
+  virtio-net, gVNIC and the Intel X550 (below).
 - **Multiple vNICs.** Each vNIC is on one switch and appears as a separate
   `ethN`. It shares the guest's limit of 16 devices with the console,
   disks and, in dom0, control device. There are 48 guest ports in all.
@@ -962,6 +970,25 @@ NAT, DHCP and firewalling belong in a VM.
   frames per kick and ignores rings whose indices claim more. MAC lock
   is on by default. Isolated ports exchange no frames with each other,
   but can reach normal ports and the uplink (`--nic ...,isolated`).
+- **Intel X550.** `l4h-netd/src/ixgbe.rs` follows Linux `ixgbe` for the
+  X550 (8086:1563, 15d1), as on Latitude.sh m4.metal servers. It resets
+  the MAC under the SW/FW PHY semaphore but not the PHY, which
+  renegotiates the link with the firmware's settings (about 7 s on
+  10GBASE-T), then sets up one RX and one TX queue of advanced
+  descriptors: 512 RX buffers of 2 KiB (a larger frame spans buffers),
+  CRC stripping, no RSC or RSS, promiscuous like the other uplinks. RX
+  raises MSI-X entry 0 and TX entry 1, both programmed with netd's one
+  vector, so EIMS/EIMC mask them separately; causes clear themselves
+  (EIAC) and are moderated to about 20,000 per second. Receive: an L4
+  checksum the device verified (L4CS without TCPE, and no IPv4 header
+  error) becomes `DATA_VALID`. Transmit: a context descriptor carries
+  checksum offload for TCP and UDP over IPv4/IPv6 and TSO (MSS 64–9216);
+  as Linux, the TCP checksum field loses the length and the IPv4 length
+  and checksum are left to the device; data descriptors take at most
+  16 KiB each. `tests/ixgbe-vfio` compiles the driver unchanged into a
+  Linux program that drives a real port through VFIO (ARP, ICMP, DNS, UDP
+  checksum offload, 4 KB and 60 KB TSO, both interrupt causes); it was
+  run on the Latitude.sh hardware before the first boot.
 - **Router VMs.** On GCE, the router's uplink vNIC uses the instance's MAC
   address. dom0's first vNIC takes the uplink NIC's MAC by default. The
   router's other vNICs join internal switches and Linux provides NAT or
@@ -1001,7 +1028,7 @@ the host keeps that dynamic plumbing simple.
 | `l4h-root` | 1 | Allocates guest RAM blocks, I/O pools, host objects and vCPU scheduling contexts. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's embedded images and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
-| `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net and gVNIC uplink drivers. |
+| `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC and X550 uplink drivers. |
 
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
 protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
@@ -1183,7 +1210,23 @@ external orchestration can run in dom0.
      stabilizes TSC/APIC calibration on N2 (§4).
    - **Networking:** virtio-net or gVNIC is the uplink of a switch, and a
      router VM (often dom0) owns the instance MAC (§8.3).
-3. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
+3. **Bare metal: Latitude.sh m4.metal.small** (Supermicro H13SRE-F, AMD
+   EPYC 4244P, Intel X550, Micron 7500 NVMe; UEFI). Deployed with
+   l4h-sandbox (its `deployments/latitude-sh-l4es`). Build options for
+   such machines, all off by default:
+   - `L4H_LAPIC_MODE=XAPIC` (`tools/build-kernel.sh`): the firmware leaves
+     x2APIC off. `L4H_PCID=OFF`: the CPU has no PCID, and seL4 otherwise
+     stops in its first boot check. There is no TSC-deadline timer; the
+     APIC countdown serves, as on N2.
+   - `L4H_SERIAL_PORT`/`L4H_SERIAL_IRQ` (GRUB, seL4, the l4h-root monitor):
+     serial-over-LAN is COM2 (0x2f8, IRQ 3), per the ACPI SPCR table.
+   - `L4H_UPLINK_NIC=bus:dev.fn` (l4h-root): the uplink when it is not
+     the first NIC, here the X550's second port. `L4H_BOOT_DISK`: the
+     controller that becomes host disk 0, so dom0 gets it.
+   - `L4H_FB_CONSOLE=1` (`tools/mkimage.sh`, l4h-root): GRUB and the seL4
+     console (patch 0020) on the screen; the dashboard keeps to the upper
+     half.
+4. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
    adding one NIC driver.
 
 **Status (v1).**
