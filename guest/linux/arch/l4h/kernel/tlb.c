@@ -256,19 +256,34 @@ out:
 }
 
 /*
+ * A kernel map found no memory.  It may have lacked seL4 objects or an
+ * atomic allocation (a slot CNode, the mapping's xarray node): make room
+ * for both, and sleep, so that the retry neither spins with the vCPU taken
+ * nor waits for memory nobody frees.
+ */
+static void kernel_map_wait(void)
+{
+	unsigned long page;
+
+	if (!l4h_objmem_wait())
+		l4h_objmem_oom();
+	/* Reclaims, or calls the OOM killer, below the watermarks. */
+	page = __get_free_page(GFP_KERNEL | __GFP_NOWARN);
+	if (page)
+		free_page(page);
+	schedule_timeout_uninterruptible(1);
+}
+
+/*
  * Make new kernel mappings (vmap, vmalloc, percpu) reachable before the
- * caller uses them.  Every caller may sleep: wait for object memory and
- * retry, as the page fault path does.
+ * caller uses them.  Every caller may sleep: wait for memory and retry, as
+ * the page fault path does.
  */
 void l4h_kernel_map_sync(unsigned long start, unsigned long end)
 {
 	um_tlb_mark_sync(&init_mm, start, end);
-	while (um_tlb_sync(&init_mm) == -ENOMEM) {
-		if (!l4h_objmem_wait()) {
-			l4h_objmem_oom();
-			schedule_timeout_uninterruptible(1);
-		}
-	}
+	while (um_tlb_sync(&init_mm) == -ENOMEM)
+		kernel_map_wait();
 }
 
 void flush_tlb_all(void)

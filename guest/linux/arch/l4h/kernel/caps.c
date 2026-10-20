@@ -48,6 +48,7 @@
 #include <linux/gfp.h>
 #include <linux/oom.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/mm.h>
 #include <linux/workqueue.h>
 #include <linux/proc_fs.h>
 #include <linux/errno.h>
@@ -723,10 +724,16 @@ static int frames_to_objects_buddy(void)
  * block and try synchronous migration, including waiting for writeback.
  * objmem_mutex keeps block modes stable while we sleep; caps_lock must
  * stay unlocked because migration flushes process mappings.
+ *
+ * Migration runs with PF_MEMALLOC, as direct compaction does, so that it
+ * skips locked folios instead of waiting for them: a kernel mapping waits
+ * for object memory with folios locked (EROFS decompresses into locked
+ * page cache folios through vm_map_ram), and every waiter needs
+ * objmem_mutex.
  */
 static int frames_to_objects(void)
 {
-	unsigned int b;
+	unsigned int b, noreclaim;
 	unsigned long flags;
 	int ret;
 
@@ -747,8 +754,10 @@ static int frames_to_objects(void)
 			continue;
 		/* Do not pass __GFP_NOMEMALLOC: alloc_contig_range accepts
 		 * only reclaim flags and a restricted set of action flags. */
+		noreclaim = memalloc_noreclaim_save();
 		ret = alloc_contig_range(pfn, pfn + RAM_BLOCK_PAGES, ACR_FLAGS_NONE,
 					GFP_KERNEL | __GFP_NOWARN);
+		memalloc_noreclaim_restore(noreclaim);
 		if (!ret) {
 			raw_spin_lock_irqsave(&caps_lock, flags);
 			blocks[b].state = BLK_BUSY;

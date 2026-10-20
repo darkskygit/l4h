@@ -1665,7 +1665,18 @@ memory the guest can retype.
   Untyped copy then deletes its 512 frames with every mapping and copy of
   them; the pages stay allocated, so they are out of the page allocator.
   Boot blocks and blocks already holding objects are excluded from the
-  fallback scan.
+  fallback scan. The migration runs with `PF_MEMALLOC`, as direct
+  compaction does, so it skips locked folios instead of waiting for them:
+  a kernel mapping can wait for object memory while holding folio locks
+  (EROFS decompresses into locked page cache folios through
+  `vm_map_ram`), and waiting for one of them under `objmem_mutex`
+  deadlocked the guest.
+- **Kernel mappings** (vmap, vmalloc, percpu) cannot be left to fault
+  again: a guest-kernel fault stops the guest. A kernel TLB sync that
+  finds no memory leaves those PTEs unsynced and marks the range again,
+  and `flush_cache_vmap` retries until it succeeds, sleeping between
+  tries, waiting for object memory and allocating a page so that reclaim
+  or the OOM killer runs when an atomic allocation failed.
 - **Object -> frame** (`objects_to_frames`): the highest spare block is
   revoked (it has no children), gets its 512 frames back in its RAM CNode
   (which is kept), is mapped again, and its pages go back to the page
