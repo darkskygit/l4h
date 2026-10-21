@@ -15,10 +15,15 @@
 //! for us.  We answer one request at a time, and each guest's
 //! ActivateCredential calls are rate limited, so that no guest keeps the
 //! TPM busy for the others.
+//!
+//! Nothing here allocates (DESIGN.md §9): requests are copied, and answers
+//! built, in fixed buffers, and the evidence is made once into one.  The
+//! heap is the AML interpreter's (aml::HEAP).
 
 #![no_std]
 #![no_main]
 
+// For the AML interpreter only (aml::HEAP).
 extern crate alloc;
 
 mod aml;
@@ -27,7 +32,6 @@ mod time;
 mod tpm;
 mod tpm2;
 
-use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
@@ -40,8 +44,9 @@ use l4h_rt::host::trust::{self, GuestRecord, TrustdConfig};
 use l4h_rt::{Info, cap, host, info, sel4};
 use sel4::cap_type;
 
-use crate::cbor::Enc;
+use crate::cbor::{Enc, Overflow};
 use crate::tpm::{Error, Tpm};
+use crate::tpm2::Template;
 
 const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
@@ -60,17 +65,49 @@ const QUOTE_PCRS: u32 = 0xffff;
 const KEY_PCR: u32 = 15;
 const KEY_DOMAIN: &[u8] = b"l4h-trustd-key-v1";
 
+/// The host evidence's room: the AK's public area, the key, 16 PCRs, the
+/// quote and its signature take about 1 KiB, the rest is for the EK
+/// certificate.
+const EVIDENCE_MAX: usize = 8192;
+/// The largest EK certificate we put in the evidence (a few hundred bytes
+/// to 2 KiB in practice).  A larger one is left out: the evidence is
+/// still usable, without the certificate a verifier can check the TPM by.
+const EK_CERT_MAX: usize = 4096;
+
+/// The largest report payload: each key, and the longest encoding of its
+/// value.
+const PAYLOAD_MAX: usize = 1
+    + (2 + 9)
+    + (4 + 9)
+    + (5 + 2 + abi::ATTEST_DATA_SIZE)
+    + (5 + 1)
+    + (5 + 2 + 32)
+    + (6 + 9)
+    + (6 + 9)
+    + (7 + 2 + 32)
+    + (9 + 9);
+/// The room for a report, and for each of its pieces: the COSE_Sign1 is
+/// the payload with 76 bytes around it (the Sig_structure, 20).
+const REPORT_MAX: usize = 512;
+const _: () = assert!(PAYLOAD_MAX + 76 <= REPORT_MAX);
+/// An answer we build: a report, or a credential (a TPM2B_DIGEST, at most
+/// 64 bytes).
+const ANSWER_MAX: usize = REPORT_MAX;
+
 struct State {
     tpm: Tpm,
     key: SigningKey,
     /// SHA-256 of the key's SEC1 point.
     key_id: [u8; 32],
-    ak: tpm2::Key,
+    /// The attestation key's handle.
+    ak: u32,
     /// The EK, created on first use (ActivateCredential), RSA unless the
     /// TPM has an ECC EK certificate.
     ek: Option<u32>,
     ek_ecc: bool,
-    evidence: Vec<u8>,
+    /// The host evidence: its first `evidence_len` bytes.
+    evidence: [u8; EVIDENCE_MAX],
+    evidence_len: usize,
 }
 
 /// The P-256 point of `key`, uncompressed (0x04, x, y).
@@ -98,32 +135,44 @@ fn init(cfg: &TrustdConfig, hz: u64) -> Result<State, (&'static str, Error)> {
     let key_id: [u8; 32] = Sha256::digest(p).into();
     let bound: [u8; 32] = Sha256::new().chain_update(KEY_DOMAIN).chain_update(p).finalize().into();
 
-    let ak = step("CreatePrimary (AK)", tpm2::create_primary(&mut tpm, tpm2::RH_ENDORSEMENT, &tpm2::ak_template()))?;
-    let pcrs = step("PCR_Read", tpm2::pcr_read(&mut tpm, QUOTE_PCRS))?;
-    let (quote, sig) = step("Quote", tpm2::quote(&mut tpm, ak.handle, &bound, QUOTE_PCRS))?;
-    step("PCR_Extend", tpm2::pcr_extend(&mut tpm, KEY_PCR, &bound))?;
     // The EK certificate, if the manufacturer stored one.
-    let (ek_cert, ek_ecc) = match step("NV_Read (EK certificate)", tpm2::nv_read(&mut tpm, tpm2::NV_EK_CERT_ECC))? {
-        Some(c) => (Some(c), true),
-        None => (step("NV_Read (EK certificate)", tpm2::nv_read(&mut tpm, tpm2::NV_EK_CERT_RSA))?, false),
+    let mut cert = [0u8; EK_CERT_MAX];
+    let read = |tpm: &mut Tpm, index, cert: &mut [u8]| step("NV_Read (EK certificate)", tpm2::nv_read(tpm, index, cert));
+    let (ek_cert, ek_ecc) = match read(&mut tpm, tpm2::NV_EK_CERT_ECC, &mut cert)? {
+        Some(n) => (Some(n), true),
+        None => (read(&mut tpm, tpm2::NV_EK_CERT_RSA, &mut cert)?, false),
+    };
+    let ek_cert = match ek_cert {
+        Some(n) if n > EK_CERT_MAX => {
+            info!("l4h-trustd: the EK certificate ({} bytes) is larger than {}: left out of the evidence", n, EK_CERT_MAX);
+            None
+        }
+        c => c.map(|n| &cert[..n]),
     };
 
-    // The evidence: keys in the order of their encodings (RFC 8949 §4.2.1).
-    let mut e = Enc::new();
+    // The evidence, as the TPM answers: keys in the order of their
+    // encodings (RFC 8949 §4.2.1).
+    let mut evidence = [0u8; EVIDENCE_MAX];
+    let mut e = Enc::new(&mut evidence);
     e.map(6 + ek_cert.is_some() as usize);
     e.text("v").uint(1);
-    e.text("ak").bytes(&ak.public);
+    let (ak, ak_public) = step("CreatePrimary (AK)", tpm2::create_primary(&mut tpm, tpm2::RH_ENDORSEMENT, Template::Ak))?;
+    e.text("ak").bytes(ak_public);
     // A COSE_Key (EC2, P-256).
     e.text("key").map(4).uint(1).uint(2).nint(0).uint(1).nint(1).bytes(&p[1..33]).nint(2).bytes(&p[33..]);
+    let pcrs = step("PCR_Read", tpm2::pcr_read(&mut tpm, QUOTE_PCRS))?;
     e.text("pcrs").map(pcrs.len());
     for (i, v) in &pcrs {
         e.uint(*i as u64).bytes(v);
     }
-    e.text("quote").bytes(&quote);
-    if let Some(c) = &ek_cert {
+    let (quote, sig) = step("Quote", tpm2::quote(&mut tpm, ak, &bound, QUOTE_PCRS))?;
+    e.text("quote").bytes(quote);
+    if let Some(c) = ek_cert {
         e.text("ekcert").bytes(c);
     }
-    e.text("quotesig").bytes(&sig);
+    e.text("quotesig").bytes(sig);
+    let evidence_len = e.done().map_err(|Overflow| ("evidence", Error::Bad("larger than EVIDENCE_MAX")))?.len();
+    step("PCR_Extend", tpm2::pcr_extend(&mut tpm, KEY_PCR, &bound))?;
     info!(
         "l4h-trustd: ready in {} ms: signing key {:02x}{:02x}{:02x}{:02x}..., {} EK certificate",
         (host::ticks::now() - t0) * 1000 / hz.max(1),
@@ -134,7 +183,7 @@ fn init(cfg: &TrustdConfig, hz: u64) -> Result<State, (&'static str, Error)> {
             (Some(_), false) => "an RSA",
         }
     );
-    Ok(State { tpm, key, key_id, ak, ek: None, ek_ecc, evidence: e.0 })
+    Ok(State { tpm, key, key_id, ak, ek: None, ek_ecc, evidence, evidence_len })
 }
 
 /// Guest `id`'s record, if it runs.
@@ -155,9 +204,10 @@ fn record(id: usize) -> Option<GuestRecord> {
 
 impl State {
     /// The COSE_Sign1 report on guest `id`, whose record is `r`, with the
-    /// guest's `data`.
-    fn report(&self, id: usize, r: &GuestRecord, data: &[u8; abi::ATTEST_DATA_SIZE]) -> Vec<u8> {
-        let mut c = Enc::new();
+    /// guest's `data`, in `out`: its length.
+    fn report(&self, id: usize, r: &GuestRecord, data: &[u8; abi::ATTEST_DATA_SIZE], out: &mut [u8]) -> Result<usize, Overflow> {
+        let mut payload = [0u8; REPORT_MAX];
+        let mut c = Enc::new(&mut payload);
         c.map(9);
         c.text("v").uint(1);
         c.text("ram").uint(r.ram);
@@ -168,27 +218,29 @@ impl State {
         c.text("vcpus").uint(r.vcpus as u64);
         c.text("launch").bytes(&r.launch);
         c.text("instance").uint(r.instance);
-        let payload = c.0;
+        let payload = c.done()?;
         // Protected header {1: -7}: alg ES256.
         let protected = [0xa1, 0x01, 0x26];
-        let mut s = Enc::new();
-        s.array(4).text("Signature1").bytes(&protected).bytes(&[]).bytes(&payload);
-        let sig: Signature = self.key.sign(&s.0);
-        let mut out = Enc::new();
-        out.tag(18).array(4).bytes(&protected).map(0).bytes(&payload).bytes(&sig.to_bytes());
-        out.0
+        let mut sig_structure = [0u8; REPORT_MAX];
+        let mut s = Enc::new(&mut sig_structure);
+        s.array(4).text("Signature1").bytes(&protected).bytes(&[]).bytes(payload);
+        let sig: Signature = self.key.sign(s.done()?);
+        let mut o = Enc::new(out);
+        o.tag(18).array(4).bytes(&protected).map(0).bytes(payload).bytes(&sig.to_bytes());
+        Ok(o.done()?.len())
     }
 
-    fn activate(&mut self, blob: &[u8], secret: &[u8]) -> Result<Vec<u8>, Error> {
+    /// The credential, in `out`: its length.
+    fn activate(&mut self, blob: &[u8], secret: &[u8], out: &mut [u8]) -> Result<usize, Error> {
         let ek = match self.ek {
             Some(h) => h,
             None => {
-                let k = tpm2::create_primary(&mut self.tpm, tpm2::RH_ENDORSEMENT, &tpm2::ek_template(self.ek_ecc))?;
-                self.ek = Some(k.handle);
-                k.handle
+                let (h, _) = tpm2::create_primary(&mut self.tpm, tpm2::RH_ENDORSEMENT, Template::Ek { ecc: self.ek_ecc })?;
+                self.ek = Some(h);
+                h
             }
         };
-        tpm2::activate_credential(&mut self.tpm, self.ak.handle, ek, blob, secret)
+        tpm2::activate_credential(&mut self.tpm, self.ak, ek, blob, secret, out)
     }
 }
 
@@ -223,39 +275,54 @@ fn page(id: usize) -> *mut abi::AttestPage {
     trust::page_va(id) as *mut abi::AttestPage
 }
 
-/// The result of guest `id`'s request in its page, or -errno.
-fn execute(state: &mut Option<State>, id: usize, r: &GuestRecord, last: &mut Answered, hz: u64) -> Result<Vec<u8>, i64> {
+/// The result of guest `id`'s request in its page (the evidence, or what
+/// we built in `out`), or -errno.
+fn execute<'a>(
+    state: &'a mut Option<State>,
+    id: usize,
+    r: &GuestRecord,
+    last: &mut Answered,
+    hz: u64,
+    out: &'a mut [u8; ANSWER_MAX],
+) -> Result<&'a [u8], i64> {
     let p = page(id);
     let (op, in_len, blob_len) = unsafe {
         (addr_of!((*p).op).read_volatile(), addr_of!((*p).in_len).read_volatile() as usize, addr_of!((*p).blob_len).read_volatile() as usize)
     };
     // Our own copy: the guest may change the page meanwhile.
-    let mut data = alloc::vec![0u8; in_len.min(abi::ATTEST_PAGE_DATA)];
+    let mut copy = [0u8; abi::ATTEST_PAGE_DATA];
+    let data = &mut copy[..in_len.min(abi::ATTEST_PAGE_DATA)];
     for (i, b) in data.iter_mut().enumerate() {
         *b = unsafe { addr_of!((*p).data[i]).read_volatile() };
     }
+    let data = &*data;
     let Some(s) = state else { return Err(EIO) };
     match op {
         abi::ATTEST_REPORT => {
             let mut d = [0u8; abi::ATTEST_DATA_SIZE];
             let n = data.len().min(d.len());
             d[..n].copy_from_slice(&data[..n]);
-            Ok(s.report(id, r, &d))
+            // REPORT_MAX bounds every report.
+            let n = s.report(id, r, &d, out).map_err(|Overflow| EIO)?;
+            Ok(&out[..n])
         }
-        abi::ATTEST_EVIDENCE => Ok(s.evidence.clone()),
+        abi::ATTEST_EVIDENCE => Ok(&s.evidence[..s.evidence_len]),
         abi::ATTEST_ACTIVATE if blob_len > data.len() => Err(EINVAL),
         abi::ATTEST_ACTIVATE if !last.may_activate(hz) => Err(EAGAIN),
-        abi::ATTEST_ACTIVATE => s.activate(&data[..blob_len], &data[blob_len..]).map_err(|e| {
-            info!("l4h-trustd: guest {}: ActivateCredential failed: {}", id, e);
-            EINVAL
-        }),
+        abi::ATTEST_ACTIVATE => {
+            let n = s.activate(&data[..blob_len], &data[blob_len..], out).map_err(|e| {
+                info!("l4h-trustd: guest {}: ActivateCredential failed: {}", id, e);
+                EINVAL
+            })?;
+            Ok(&out[..n])
+        }
         _ => Err(ENOSYS),
     }
 }
 
 /// Answer guest `id`'s request `seq`: the result's piece from the
 /// request's offset, then done = seq; root raises the device's event.
-fn answer(id: usize, seq: u32, result: Result<Vec<u8>, i64>) {
+fn answer(id: usize, seq: u32, result: Result<&[u8], i64>) {
     let p = page(id);
     unsafe {
         let off = addr_of!((*p).offset).read_volatile() as usize;
@@ -293,6 +360,7 @@ fn main(info: &'static Info) -> ! {
     // notification.
     let kick = cap::<cap_type::Notification>(trust::SLOT_KICK);
     let mut answered = [Answered::default(); trust::MAX_RECORDS];
+    let mut out = [0u8; ANSWER_MAX];
     loop {
         let (_, mut kicked) = kick.wait();
         while kicked != 0 {
@@ -308,7 +376,7 @@ fn main(info: &'static Info) -> ! {
             if seq == last.seq {
                 continue;
             }
-            let result = execute(&mut state, id, &r, last, hz);
+            let result = execute(&mut state, id, &r, last, hz, &mut out);
             // Destroyed meanwhile (or replaced by another guest): nobody
             // waits for this answer.
             if record(id).is_none_or(|now| now.instance != r.instance) {
@@ -320,4 +388,4 @@ fn main(info: &'static Info) -> ! {
     }
 }
 
-l4h_rt::component!(main);
+l4h_rt::component!(main, heap_size = aml::HEAP);

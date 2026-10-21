@@ -13,6 +13,7 @@ use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
 use l4h_host as host;
+use l4h_host::fixed::ArrayVec;
 use l4h_host::trust::{self, GuestRecord, TrustdConfig};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
@@ -41,7 +42,7 @@ pub struct Trustd {
     registry: *mut GuestRecord,
     next_instance: u64,
     /// The request page of each guest id, mapped in trustd.
-    pages: Vec<cap::Granule>,
+    pages: [cap::Granule; trust::MAX_RECORDS],
     /// Guests signal it, badged with trust::kick_badge(id).
     kick: cap::Notification,
     /// Device memory carved for trustd's ranges and its AML's accesses.
@@ -55,7 +56,7 @@ pub struct Trustd {
 struct Layout {
     iface: u32,
     start: u32,
-    ranges: Vec<(usize, usize)>,
+    ranges: ArrayVec<(usize, usize), { trust::MAX_RANGES }>,
     loc: Option<(usize, usize)>,
     ctrl: Option<(usize, usize)>,
     cmd: Option<(usize, usize, usize)>,
@@ -69,10 +70,10 @@ impl Layout {
     fn range(&mut self, paddr: usize, len: usize) -> Option<(usize, usize)> {
         let base = paddr & !(PAGE - 1);
         let size = (paddr + len).next_multiple_of(PAGE) - base;
-        if size > trust::RANGE_STRIDE || self.ranges.len() == trust::MAX_RANGES {
+        if size > trust::RANGE_STRIDE {
             return None;
         }
-        self.ranges.push((base, size));
+        self.ranges.push((base, size)).ok()?;
         Some((self.ranges.len() - 1, paddr - base))
     }
 
@@ -195,15 +196,11 @@ pub fn spawn(
         let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
         let l = find_tpm(bootinfo, &mut phys)?;
-        // The pages of each range.
-        let mut pages = Vec::new();
+        // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
-            match (0..size / PAGE).map(|p| phys.frame(base + p * PAGE)).collect::<Option<Vec<_>>>() {
-                Some(f) => pages.push(f),
-                None => {
-                    sel4::debug_println!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
-                    return None;
-                }
+            if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
+                sel4::debug_println!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
+                return None;
             }
         }
         let aml = match l.start {
@@ -234,10 +231,11 @@ pub fn spawn(
             keep.absolute_cptr_from_bits_with_depth(keep_next - 1, KEEP_BITS)
         };
         let mut arena = arena;
-        for (r, frames) in pages.iter().enumerate() {
-            for (p, f) in frames.iter().enumerate() {
+        for (r, &(base, size)) in l.ranges.iter().enumerate() {
+            for p in 0..size / PAGE {
+                let f = frames.get(&(base + p * PAGE)).copied().expect("TPM page carved above");
                 let va = trust::TPM_VA + r * trust::RANGE_STRIDE + p * PAGE;
-                comp.map_copy(alloc, &mut arena, &abs_of(*f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep_slot());
+                comp.map_copy(alloc, &mut arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep_slot());
             }
         }
         // The ACPI tables, in fresh frames.
@@ -309,12 +307,11 @@ fn finish(
         map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, REGISTRY_VA, CapRights::read_write(), VmAttributes::DEFAULT);
     });
     comp.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep());
-    let mut pages = Vec::new();
-    for g in 0..trust::MAX_RECORDS {
+    let pages = core::array::from_fn(|g| {
         let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         comp.map_copy(alloc, &mut arena, &abs_of(f), trust::page_va(g), CapRights::read_write(), VmAttributes::DEFAULT, keep());
-        pages.push(f);
-    }
+        f
+    });
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
     component::start(&comp);

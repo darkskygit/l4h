@@ -6,13 +6,11 @@
 //! own TPM ranges go to root (ROOT_CALL_HW), which refuses RAM and
 //! hardware in use.
 
-use alloc::string::ToString;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::Cell;
 use core::ptr::NonNull;
 use core::str::FromStr;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use acpi::aml::namespace::{AmlName, NamespaceLevelKind};
 use acpi::aml::object::{Object, WrappedObject};
@@ -21,6 +19,7 @@ use acpi::registers::FixedRegisters;
 use acpi::sdt::fadt::Fadt;
 use acpi::{Handle, PciAddress, RawPhysicalMapping};
 
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::trust::{self, TrustdConfig};
 use l4h_rt::{cap, host, sel4};
 use sel4::cap_type;
@@ -35,15 +34,32 @@ const START_UUID: [u8; 16] = [
 const START_REVISION: u64 = 1;
 const START_FUNCTION: u64 = 1;
 
+/// trustd's heap, which only the interpreter uses (DESIGN.md §9: the one
+/// allocator in trustd, as the `acpi` crate allocates and cannot do
+/// otherwise).  It holds the namespace the firmware's AML builds at start,
+/// where each method keeps a copy of its bytecode and each named object
+/// takes a node of about a hundred bytes, and, for each command, what the
+/// _DSM's evaluation takes and gives back.  What bounds it is the
+/// firmware, never a guest: the tables root gives us, which we take only
+/// up to AML_LIMIT, a quarter of the heap.  A typical DSDT and its SSDTs
+/// are 100-300 KiB.
+pub const HEAP: usize = 2 << 20;
+const AML_LIMIT: usize = HEAP / 4;
+/// The deepest TPM device whose parents' _INI we run.
+const MAX_DEPTH: usize = 16;
+
 /// Hardware for the interpreter: our TPM ranges directly, the rest through
 /// root.
 #[derive(Clone)]
 pub struct Hw {
     /// (physical address, size, VA) of each range we have mapped.
-    ranges: Vec<(usize, usize, usize)>,
+    ranges: ArrayVec<(usize, usize, usize), { trust::MAX_RANGES }>,
     hz: u64,
-    mutexes: Arc<Cell<u32>>,
 }
+
+/// The mutex handles the interpreter has made (one thread: they only
+/// need to differ).
+static MUTEXES: AtomicU32 = AtomicU32::new(0);
 
 /// What the interpreter maps that is none of our ranges (the PM1 blocks,
 /// in system memory on some machines): it only touches them for the
@@ -191,8 +207,7 @@ impl acpi::Handler for Hw {
     }
     // One thread: mutexes are always free.
     fn create_mutex(&self) -> Handle {
-        self.mutexes.set(self.mutexes.get() + 1);
-        Handle(self.mutexes.get())
+        Handle(MUTEXES.fetch_add(1, Ordering::Relaxed) + 1)
     }
     fn acquire(&self, _mutex: Handle, _timeout: u16) -> Result<(), AmlError> {
         Ok(())
@@ -224,15 +239,35 @@ static LOG: Log = Log;
 pub struct Start {
     interp: NoSendInterpreter<Hw>,
     dsm: AmlName,
+    /// The arguments of the start function, made once: each command
+    /// passes them again (a clone of the list is 4 counted references).
+    args: Vec<WrappedObject>,
 }
 
 fn dsm_args(function: u64) -> Vec<WrappedObject> {
-    vec![
-        Object::Buffer(START_UUID.to_vec()).wrap(),
-        Object::Integer(START_REVISION).wrap(),
-        Object::Integer(function).wrap(),
-        Object::Package(Vec::new()).wrap(),
-    ]
+    let mut args = Vec::with_capacity(4);
+    args.push(Object::Buffer(START_UUID.to_vec()).wrap());
+    args.push(Object::Integer(START_REVISION).wrap());
+    args.push(Object::Integer(function).wrap());
+    args.push(Object::Package(Vec::new()).wrap());
+    args
+}
+
+/// The ACPI tables in `all`, one after the other.
+fn tables(all: &[u8]) -> impl Iterator<Item = Result<&[u8], &'static str>> {
+    let mut at = 0;
+    core::iter::from_fn(move || {
+        if at + 36 > all.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(all[at + 4..at + 8].try_into().unwrap()) as usize;
+        if len < 36 || at + len > all.len() {
+            at = all.len();
+            return Some(Err("bad ACPI table"));
+        }
+        at += len;
+        Some(Ok(&all[at - len..at]))
+    })
 }
 
 fn aml_err(what: &'static str) -> impl FnOnce(AmlError) -> &'static str {
@@ -256,43 +291,39 @@ impl Start {
     /// has the start function.
     pub fn new(cfg: &TrustdConfig, hz: u64) -> Result<Start, &'static str> {
         let _ = log::set_logger(&LOG).map(|()| log::set_max_level(log::LevelFilter::Warn));
-        let all: &'static [u8] = unsafe { core::slice::from_raw_parts(trust::AML_VA as *const u8, cfg.aml_size as usize) };
-        let mut tables = Vec::new();
-        let mut at = 0;
-        while at + 36 <= all.len() {
-            let len = u32::from_le_bytes(all[at + 4..at + 8].try_into().unwrap()) as usize;
-            if len < 36 || at + len > all.len() {
-                return Err("bad ACPI table");
-            }
-            tables.push(&all[at..at + len]);
-            at += len;
+        if cfg.aml_size as usize > AML_LIMIT {
+            return Err("ACPI tables too large for the interpreter's heap");
         }
-        let [fadt, dsdt, ssdts @ ..] = tables.as_slice() else { return Err("no FADT or DSDT") };
+        let all: &'static [u8] = unsafe { core::slice::from_raw_parts(trust::AML_VA as *const u8, cfg.aml_size as usize) };
+        let mut tables = tables(all);
+        let (Some(Ok(fadt)), Some(Ok(dsdt))) = (tables.next(), tables.next()) else { return Err("no FADT or DSDT") };
         if &fadt[..4] != b"FACP" || &dsdt[..4] != b"DSDT" {
             return Err("no FADT or DSDT");
         }
-        let ranges = cfg
-            .ranges
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.size != 0)
-            .map(|(i, r)| (r.paddr as usize, r.size as usize, trust::TPM_VA + i * trust::RANGE_STRIDE))
-            .collect();
-        let hw = Hw { ranges, hz, mutexes: Arc::new(Cell::new(0)) };
+        let mut ranges = ArrayVec::new();
+        for (i, r) in cfg.ranges.iter().enumerate().filter(|(_, r)| r.size != 0) {
+            // No more than cfg.ranges has: always fits.
+            let _ = ranges.push((r.paddr as usize, r.size as usize, trust::TPM_VA + i * trust::RANGE_STRIDE));
+        }
+        let hw = Hw { ranges, hz };
         // The FADT as the crate reads it (a packed struct).
         let fadt: &Fadt = unsafe { &*(fadt.as_ptr() as *const Fadt) };
         let registers = FixedRegisters::new(fadt, hw.clone()).map_err(|_| "FADT PM1 registers")?;
         let interp = NoSendInterpreter::new(hw, dsdt[8], Arc::new(registers), None);
         interp.load_table(&dsdt[36..]).map_err(aml_err("loading the DSDT"))?;
-        for t in ssdts.iter().filter(|t| &t[..4] == b"SSDT") {
-            interp.load_table(&t[36..]).map_err(aml_err("loading an SSDT"))?;
+        for t in tables {
+            let t = t?;
+            if &t[..4] == b"SSDT" {
+                interp.load_table(&t[36..]).map_err(aml_err("loading an SSDT"))?;
+            }
         }
 
+        // The devices' paths (on the heap, as all the namespace is): their
+        // objects are evaluated with the namespace unlocked.
         let mut devices = Vec::new();
         interp
             .namespace
             .lock()
-            .clone()
             .traverse(|path, level| {
                 if matches!(level.kind, NamespaceLevelKind::Device) {
                     devices.push(path.clone());
@@ -302,7 +333,7 @@ impl Start {
             .map_err(aml_err("walking the namespace"))?;
         let name = |s: &str, dev: &AmlName| AmlName::from_str(s).and_then(|n| n.resolve(dev));
         for dev in devices {
-            let id = |s| name(s, &dev).and_then(|n| interp.evaluate_if_present(n, vec![]));
+            let id = |s| name(s, &dev).and_then(|n| interp.evaluate_if_present(n, Vec::new()));
             let tpm = |s| id(s).ok().flatten().is_some_and(|o| is_tpm(&o));
             if !tpm("_HID") && !tpm("_CID") {
                 continue;
@@ -310,17 +341,18 @@ impl Start {
             // Its _INI, and its parents' (only these: other devices' are
             // none of our business).
             let mut path = dev.clone();
-            let mut scopes = vec![dev.clone()];
+            let mut scopes = ArrayVec::<AmlName, MAX_DEPTH>::new();
+            let _ = scopes.push(dev.clone());
             while let Ok(p) = path.parent() {
-                if p.to_string() == "\\" || scopes.contains(&p) {
+                if p == AmlName::root() || scopes.contains(&p) {
                     break;
                 }
-                scopes.push(p.clone());
+                scopes.push(p.clone()).map_err(|_| "TPM device too deep in the namespace")?;
                 path = p;
             }
             for s in scopes.iter().rev() {
                 if let Ok(ini) = name("_INI", s) {
-                    interp.evaluate_if_present(ini, vec![]).map_err(aml_err("_INI"))?;
+                    interp.evaluate_if_present(ini, Vec::new()).map_err(aml_err("_INI"))?;
                 }
             }
             let dsm = name("_DSM", &dev).map_err(aml_err("_DSM name"))?;
@@ -328,7 +360,7 @@ impl Start {
             let supported = interp.evaluate_if_present(dsm.clone(), dsm_args(0)).ok().flatten();
             let has_start = supported.as_ref().and_then(|o| o.as_buffer().ok()).is_some_and(|b| b.first().is_some_and(|f| f & (1 << START_FUNCTION) != 0));
             if has_start {
-                return Ok(Start { interp, dsm });
+                return Ok(Start { interp, dsm, args: dsm_args(START_FUNCTION) });
             }
         }
         Err("no MSFT0101 device with the CRB start _DSM")
@@ -336,7 +368,7 @@ impl Start {
 
     /// Start the command in the CRB buffer.
     pub fn start(&self) -> Result<(), &'static str> {
-        let r = self.interp.evaluate(self.dsm.clone(), dsm_args(START_FUNCTION)).map_err(aml_err("_DSM start"))?;
+        let r = self.interp.evaluate(self.dsm.clone(), self.args.clone()).map_err(aml_err("_DSM start"))?;
         match r.as_integer() {
             Ok(0) => Ok(()),
             _ => Err("_DSM start failed"),

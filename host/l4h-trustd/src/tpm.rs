@@ -4,7 +4,6 @@
 //! (AMD fTPM) and Pluton's doorbells.  Commands are polled: trustd takes no
 //! interrupt.
 
-use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 use l4h_rt::host;
@@ -16,6 +15,10 @@ use crate::{aml, time};
 const TIMEOUT_SECS: u64 = 120;
 /// Largest response we accept.
 const MAX_RESPONSE: usize = 4096;
+/// Largest command we send: ActivateCredential with a guest's credential
+/// blob and secret, at most a request page's data, and about 100 bytes of
+/// handles and sessions around them.
+pub const CMD_MAX: usize = l4h_abi::ATTEST_PAGE_DATA + 256;
 /// Warnings that ask for the command again.
 const RC_YIELDED: u32 = 0x908;
 const RC_TESTING: u32 = 0x90a;
@@ -52,6 +55,9 @@ pub struct Tpm {
     bells: (usize, usize),
     acpi: Option<aml::Start>,
     hz: u64,
+    /// The command being sent and the response last received.
+    cbuf: [u8; CMD_MAX],
+    rbuf: [u8; MAX_RESPONSE],
 }
 
 // FIFO (TIS) registers.
@@ -113,6 +119,8 @@ impl Tpm {
             bells: (cfg.start_va as usize, cfg.reply_va as usize),
             acpi,
             hz,
+            cbuf: [0; CMD_MAX],
+            rbuf: [0; MAX_RESPONSE],
         })
     }
 
@@ -139,21 +147,22 @@ impl Tpm {
         self.wait_ms(what, 0, done)
     }
 
-    /// Send `cmd` and return the response, whose code is checked.  The
-    /// TPM may ask for a command again (busy, self-testing): we do, for a
-    /// while.
-    pub fn exec(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
+    /// Send the command `build` writes (returning its length) and return
+    /// the response, whose code is checked.  The TPM may ask for a command
+    /// again (busy, self-testing): we do, for a while.
+    pub fn exec(&mut self, build: impl FnOnce(&mut [u8]) -> Result<usize, Error>) -> Result<&[u8], Error> {
+        let cmd = build(&mut self.cbuf)?;
         let deadline = host::ticks::now() + self.hz * TIMEOUT_SECS;
         loop {
-            let rsp = match self.iface {
+            let n = match self.iface {
                 TPM_TIS => self.exec_tis(cmd),
                 _ => self.exec_crb(cmd),
             }?;
-            if rsp.len() < 10 {
+            if n < 10 {
                 return Err(Error::Bad("short response"));
             }
-            match u32::from_be_bytes(rsp[6..10].try_into().unwrap()) {
-                0 => return Ok(rsp),
+            match u32::from_be_bytes(self.rbuf[6..10].try_into().unwrap()) {
+                0 => return Ok(&self.rbuf[..n]),
                 RC_YIELDED | RC_TESTING | RC_RETRY if host::ticks::now() < deadline => {
                     time::sleep_ns(self.hz, 1_000_000);
                 }
@@ -162,7 +171,9 @@ impl Tpm {
         }
     }
 
-    fn exec_tis(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
+    /// The first `cmd` bytes of the command buffer, through the FIFO: the
+    /// response's length.
+    fn exec_tis(&mut self, cmd: usize) -> Result<usize, Error> {
         let regs = self.loc;
         w8(regs + TIS_ACCESS, ACCESS_REQUEST);
         self.wait("locality", |_| r8(regs + TIS_ACCESS) & (ACCESS_VALID | ACCESS_ACTIVE) == ACCESS_VALID | ACCESS_ACTIVE)?;
@@ -173,16 +184,16 @@ impl Tpm {
         r
     }
 
-    fn tis_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
+    fn tis_command(&mut self, cmd: usize) -> Result<usize, Error> {
         let regs = self.loc;
         let burst = || ((r32(regs + TIS_STS) >> 8) & 0xffff) as usize;
         w8(regs + TIS_STS, STS_READY as u8);
         self.wait("command ready", |_| r32(regs + TIS_STS) & STS_READY != 0)?;
         let mut sent = 0;
-        while sent < cmd.len() {
+        while sent < cmd {
             self.wait("burst count", |_| burst() != 0)?;
-            let n = burst().min(cmd.len() - sent);
-            for &b in &cmd[sent..sent + n] {
+            let n = burst().min(cmd - sent);
+            for &b in &self.cbuf[sent..sent + n] {
                 w8(regs + TIS_FIFO, b);
             }
             sent += n;
@@ -193,22 +204,23 @@ impl Tpm {
         }
         w8(regs + TIS_STS, STS_GO as u8);
         self.wait("response", |_| r32(regs + TIS_STS) & (STS_VALID | STS_DATA) == STS_VALID | STS_DATA)?;
-        let mut rsp = Vec::new();
+        let mut got = 0;
         let mut want = 10;
-        while rsp.len() < want {
+        while got < want {
             self.wait("response data", |_| burst() != 0)?;
-            let n = burst().min(want - rsp.len());
-            for _ in 0..n {
-                rsp.push(r8(regs + TIS_FIFO));
+            let n = burst().min(want - got);
+            for b in &mut self.rbuf[got..got + n] {
+                *b = r8(regs + TIS_FIFO);
             }
-            if want == 10 && rsp.len() >= 10 {
-                want = u32::from_be_bytes(rsp[2..6].try_into().unwrap()) as usize;
+            got += n;
+            if want == 10 && got >= 10 {
+                want = u32::from_be_bytes(self.rbuf[2..6].try_into().unwrap()) as usize;
                 if !(10..=MAX_RESPONSE).contains(&want) {
                     return Err(Error::Bad("response size"));
                 }
             }
         }
-        Ok(rsp)
+        Ok(got)
     }
 
     /// The ACPI start method has no idle state (as Linux tpm_crb).
@@ -242,8 +254,10 @@ impl Tpm {
         self.wait(what, |_| r32(ctrl + CRB_CTRL_REQ) & bit == 0)
     }
 
-    fn exec_crb(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
-        if cmd.len() > self.cmd.1 {
+    /// The first `cmd` bytes of the command buffer, through the CRB: the
+    /// response's length.
+    fn exec_crb(&mut self, cmd: usize) -> Result<usize, Error> {
+        if cmd > self.cmd.1 {
             return Err(Error::Bad("command larger than the CRB buffer"));
         }
         let loc = self.loc;
@@ -260,14 +274,14 @@ impl Tpm {
         idle.map(|()| r)
     }
 
-    fn crb_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
+    fn crb_command(&mut self, cmd: usize) -> Result<usize, Error> {
         let ctrl = self.ctrl;
         self.request(REQ_READY, "command ready")?;
         if r32(ctrl + CRB_CTRL_STS) & STS_FATAL != 0 {
             return Err(Error::Bad("TPM in failure mode"));
         }
         w32(ctrl + CRB_CTRL_CANCEL, 0);
-        for (i, &b) in cmd.iter().enumerate() {
+        for (i, &b) in self.cbuf[..cmd].iter().enumerate() {
             unsafe { write_volatile((self.cmd.0 + i) as *mut u8, b) };
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -279,13 +293,18 @@ impl Tpm {
         }
         self.doorbell(false)?;
         self.wait("response", |_| r32(ctrl + CRB_CTRL_START) & 1 == 0)?;
-        let byte = |i: usize| unsafe { read_volatile((self.rsp.0 + i) as *const u8) };
-        let mut rsp: Vec<u8> = (0..10).map(byte).collect();
-        let n = u32::from_be_bytes(rsp[2..6].try_into().unwrap()) as usize;
+        let base = self.rsp.0;
+        let byte = |i: usize| unsafe { read_volatile((base + i) as *const u8) };
+        for (i, b) in self.rbuf[..10].iter_mut().enumerate() {
+            *b = byte(i);
+        }
+        let n = u32::from_be_bytes(self.rbuf[2..6].try_into().unwrap()) as usize;
         if !(10..=MAX_RESPONSE.min(self.rsp.1)).contains(&n) {
             return Err(Error::Bad("response size"));
         }
-        rsp.extend((10..n).map(byte));
-        Ok(rsp)
+        for (i, b) in self.rbuf[..n].iter_mut().enumerate().skip(10) {
+            *b = byte(i);
+        }
+        Ok(n)
     }
 }
