@@ -1,6 +1,6 @@
 //! A minimal monitor on the serial console (COM1, the GCE serial port, or
-//! $L4H_SERIAL_PORT and $L4H_SERIAL_IRQ at build time, e.g. COM2 for
-//! Supermicro serial-over-LAN),
+//! the serial_port and serial_irq settings, e.g. COM2 for Supermicro
+//! serial-over-LAN),
 //! for when dom0 is not usable (DESIGN.md §9.1): list, destroy,
 //! restart-dom0.  The kernel keeps printing to the same port; we only take
 //! its receive side.
@@ -15,45 +15,44 @@ use crate::mem::Alloc;
 /// Badge of the monitor's interrupt on the root task's bound notification.
 pub const MONITOR_BADGE: u64 = 1 << 41;
 
-#[cfg(target_arch = "x86_64")]
-const SERIAL_PORT: u16 = crate::parse_usize(option_env!("L4H_SERIAL_PORT"), 0x3f8) as u16;
-#[cfg(target_arch = "x86_64")]
-const SERIAL_IRQ: u64 = crate::parse_usize(option_env!("L4H_SERIAL_IRQ"), 4) as u64;
 /// seL4 user IRQ vector for the serial port.
 #[cfg(target_arch = "x86_64")]
 const VECTOR: u64 = crate::pci::VECTOR_MONITOR;
 
 pub struct Monitor {
     port: u64,
+    /// The UART's first I/O port (x86).
+    #[cfg(target_arch = "x86_64")]
+    base: u16,
     irq: sel4::cap::IrqHandler,
     line: String,
 }
 
 impl Monitor {
     #[cfg(target_arch = "x86_64")]
-    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, base: u16, irq: u64) -> Option<Self> {
         use sel4::init_thread::slot;
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         let port = alloc.slots.alloc();
-        slot::IO_PORT_CONTROL.cap().ioport_control_issue(SERIAL_PORT as u64, SERIAL_PORT as u64 + 7, &abs(port)).ok()?;
+        slot::IO_PORT_CONTROL.cap().ioport_control_issue(base as u64, base as u64 + 7, &abs(port)).ok()?;
         let irq_slot = alloc.slots.alloc();
-        slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, SERIAL_IRQ, 0, 0, VECTOR, &abs(irq_slot)).ok()?;
+        slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, irq, 0, 0, VECTOR, &abs(irq_slot)).ok()?;
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let badged = alloc.slots.alloc();
         abs(badged)
             .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), MONITOR_BADGE)
             .ok()?;
         irq.irq_handler_set_notification(sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap()).ok()?;
-        let m = Monitor { port: port as u64, irq, line: String::new() };
+        let m = Monitor { port: port as u64, base, irq, line: String::new() };
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
         m.out(1, 0x01);
         m.out(4, m.inb(4) | 0x08);
-        info!("l4h-root: serial monitor on port {:#x} (type 'help')", SERIAL_PORT);
+        info!("l4h-root: serial monitor on port {:#x} (type 'help')", base);
         Some(m)
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _base: u16, _irq: u64) -> Option<Self> {
         use sel4::init_thread::slot;
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
@@ -80,12 +79,12 @@ impl Monitor {
 
     #[cfg(target_arch = "x86_64")]
     fn inb(&self, off: u16) -> u8 {
-        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_In8(self.port, SERIAL_PORT + off).result as u8)
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_In8(self.port, self.base + off).result as u8)
     }
 
     #[cfg(target_arch = "x86_64")]
     fn out(&self, off: u16, v: u8) {
-        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(self.port, (SERIAL_PORT + off) as u64, v as u64));
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(self.port, (self.base + off) as u64, v as u64));
     }
 
     #[cfg(target_arch = "aarch64")]

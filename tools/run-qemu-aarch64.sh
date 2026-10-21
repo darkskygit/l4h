@@ -3,9 +3,11 @@
 # Starts directly at EL1 with virtualization disabled. Set
 # L4H_QEMU_VIRTUALIZATION=on to test the loader's EL2-to-EL1 path.
 # Usage: run-qemu-aarch64.sh <l4h-root.elf> [extra qemu args...]
+# dom0 (L4H_DOM0_KERNEL, L4H_DOM0_INITRD) and an l4h.conf (L4H_CONFIG) are
+# appended to a copy of the root ELF (tools/dom0-modules.sh).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-rootserver=$1; shift
+rootserver=$("$root/tools/dom0-modules.sh" "$1"); shift
 source "$root/tools/aarch64-memory.sh"
 if [ "$(cat "$l4h_memory_stamp" 2>/dev/null || echo 2048)" != "$l4h_memory_mb" ]; then
     echo "Rebuild the AArch64 kernel and loader with L4H_MEM=$l4h_memory_mb before booting" >&2

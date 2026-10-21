@@ -33,9 +33,11 @@ current status of each part.
   a VM returns all its memory.
 - **Memory under QEMU/KVM.** Memory not given to guests is reported
   free through virtio-balloon free page reporting, so QEMU drops it.
-- **Boot.** Multiboot under QEMU, or a UEFI disk image for GCE
-  (`tools/mkimage.sh`, `tools/gce-image.sh`; tested on N2 and C3 with
-  `tests/gce-test.sh`). On a host with a display
+- **Boot.** Multiboot under QEMU, or l4h as one UEFI application
+  (`tools/mkefi.sh`, one per seL4 variant with `tools/build-efi.sh`) that
+  loads dom0 and its settings from the EFI system partition; a UEFI disk
+  image for GCE (`tools/mkimage.sh`, `tools/gce-image.sh`; tested on N2 and
+  C3 with `tests/gce-test.sh`). On a host with a display
   the UEFI image shows a read-only status dashboard.
 - **aarch64.** seL4, the host components and the ABI test guest run on
   QEMU `virt` at EL1. Native AArch64 Linux guests support SMP, signals, TLS,

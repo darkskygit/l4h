@@ -22,9 +22,6 @@ use crate::vspace::map_frame;
 const FB_VA: usize = 0x0000_7200_0000_0000;
 /// Refresh period in timer ticks of the balancer (100 ms).
 const REFRESH_TICKS: u32 = 10;
-/// Built for an image whose kernel copies the console to the screen
-/// (mkimage.sh L4H_FB_CONSOLE=1): the dashboard keeps to the upper half.
-const FB_CONSOLE: bool = crate::parse_usize(option_env!("L4H_FB_CONSOLE"), 0) != 0;
 
 const BG: u32 = 0x10141c;
 const FG: u32 = 0xd0d4d8;
@@ -71,14 +68,16 @@ fn parse_fb(c: &[u8]) -> Option<(u64, usize, usize, usize, u8, u8)> {
 
 impl Dashboard {
     #[cfg(not(target_arch = "x86_64"))]
-    pub fn new(_bootinfo: &sel4::BootInfoPtr, _alloc: &mut Alloc, _devmem: &mut DevMem) -> Option<Self> {
+    pub fn new(_bootinfo: &sel4::BootInfoPtr, _alloc: &mut Alloc, _devmem: &mut DevMem, _fb_console: bool) -> Option<Self> {
         let _ = (parse_fb, map_frame::<>, FB_VA);
         None
     }
 
     /// Map the boot framebuffer, if there is a usable one (32-bit RGB).
+    /// With `fb_console` (the fb_console setting), the kernel copies its
+    /// console to the screen and the dashboard keeps to the upper half.
     #[cfg(target_arch = "x86_64")]
-    pub fn new(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> Option<Self> {
+    pub fn new(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, fb_console: bool) -> Option<Self> {
         let extra = bootinfo.extra().find(|e| e.id == sel4::BootInfoExtraId::X86FrameBuffer)?;
         let (addr, pitch, width, height, bpp, ty) = parse_fb(extra.content())?;
         if addr == 0 || bpp != 32 || ty != 1 || width < 640 || height < 400 {
@@ -103,7 +102,7 @@ impl Dashboard {
         });
         let fb = (FB_VA + (addr & 4095)) as *mut u8;
         // The kernel's copy of the console (fb_console) has the lower half.
-        let height = if FB_CONSOLE { height / 2 } else { height };
+        let height = if fb_console { height / 2 } else { height };
         let sx = if width >= 1280 { 2 } else { 1 };
         let sy = 2;
         let (cols, rows) = (width / (8 * sx), height / (8 * sy));

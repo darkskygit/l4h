@@ -84,7 +84,8 @@ tree, which also records the status of every part.
     16 devices: a console, disks and network interfaces.
   \item[dom0.] The first guest, id 0. It is an ordinary guest with one
     extra device, \file{/dev/l4hctl}, through which it controls the host. Its
-    kernel, initramfs and settings are built into the host image. dom0 decides
+    kernel, initramfs and settings sit next to the host image, on its EFI
+    system partition (or, under QEMU, are appended to it). dom0 decides
     what runs, but it cannot read other guests' memory, and it runs no device
     drivers for host hardware.
   \item[Disk.] A host block device, numbered from 0 in PCI order. A disk is
@@ -289,9 +290,10 @@ tests/run-selftest.sh 4          # builds Linux and the host, boots a 4-vCPU gue
 
 \begin{caveat}
 The guest kernel needs the seL4 headers, so build the kernel before Linux.
-Rebuild the host (\cmd{tools/build-host.sh}) after changing dom0's
-kernel, initramfs or any \texttt{L4H\_DOM0\_*} variable, since they are
-embedded in \texttt{l4h-root}.
+Rebuild the host (\cmd{tools/build-host.sh}) after changing an
+\texttt{L4H\_*} setting default, since they are compiled in. dom0 itself is
+never built into \texttt{l4h-root}: changing it needs no rebuild
+(Chapter~\ref{ch:dom0}).
 \end{caveat}
 
 \section{Debug and release kernels}
@@ -321,9 +323,20 @@ share one \file{vmlinux}.
 \label{ch:dom0}
 
 An l4h host boots from two files: the seL4 kernel and \texttt{l4h-root}.
-dom0's kernel, initramfs and settings are built into \texttt{l4h-root}, from
-environment variables read by \cmd{tools/build-host.sh}
-(Table~\ref{tab:env}).
+dom0's kernel and initramfs, and \file{l4h.conf}, are separate files:
+\begin{itemize}
+  \item On a UEFI machine they sit on the EFI system partition, next to
+        l4h's UEFI application (Section~\ref{sec:esp}).
+  \item Otherwise, and under QEMU on both x86\_64 and aarch64,
+        \cmd{tools/add-modules.py IN.elf OUT.elf NAME=FILE...} appends
+        them to a built \file{l4h-root.elf}, under the names
+        \texttt{dom0-kernel}, \texttt{dom0-initrd} and \texttt{l4h-config}.
+        No Rust is rebuilt. \cmd{tools/run-qemu.sh} and
+        \cmd{tools/run-qemu-aarch64.sh} do this from the variables in
+        Table~\ref{tab:env}.
+\end{itemize}
+The host settings (Table~\ref{tab:settings}) default to the values
+\texttt{l4h-root} was built with; \file{l4h.conf} overrides them.
 
 \begin{table}[ht]
 \centering
@@ -332,8 +345,11 @@ environment variables read by \cmd{tools/build-host.sh}
 Variable & Meaning & Default \\
 \midrule
 \texttt{L4H\_DOM0\_KERNEL} & dom0's kernel (an \texttt{ARCH=l4h} ELF; strip it with
-  \cmd{objcopy --strip-debug} to keep the image small) & none \\
-\texttt{L4H\_DOM0\_INITRD} & dom0's initramfs; empty for none & none \\
+  \cmd{objcopy --strip-debug} to keep the image small), for the QEMU
+  scripts & none \\
+\texttt{L4H\_DOM0\_INITRD} & dom0's initramfs, for the QEMU scripts; empty
+  for none & none \\
+\texttt{L4H\_CONFIG} & an \file{l4h.conf}, for the QEMU scripts & none \\
 \texttt{L4H\_DOM0\_CMDLINE} & dom0's kernel command line & \texttt{console=hvc0} \\
 \texttt{L4H\_DOM0\_MEM\_MB} & dom0's RAM in MiB & 256 \\
 \texttt{L4H\_DOM0\_VCPUS} & dom0's vCPUs & 1 \\
@@ -344,9 +360,102 @@ Variable & Meaning & Default \\
   (debugging); 0 disables & 0 \\
 \bottomrule
 \end{tabularx}
-\caption{Build-time host settings.}
+\caption{Environment variables. The first three are read when QEMU
+  boots the host; the others, when \cmd{tools/build-host.sh} builds it, set
+  the defaults of the settings in Table~\ref{tab:settings}.}
 \label{tab:env}
 \end{table}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\linewidth}{@{}lXl@{}}
+\toprule
+\file{l4h.conf} key & Meaning & Default \\
+\midrule
+\texttt{dom0\_cmdline} & dom0's kernel command line & \texttt{L4H\_DOM0\_CMDLINE} \\
+\texttt{dom0\_mem\_mb} & dom0's RAM in MiB & 256 \\
+\texttt{dom0\_vcpus} & dom0's vCPUs & 1 \\
+\texttt{dom0\_io\_pool\_mb} & dom0's I/O pool in MiB, a power of two up to 256 & 4 \\
+\texttt{dom0\_disks} & attach the first $n$ host disks to dom0 & 64 (all) \\
+\texttt{dom0\_nics} & dom0's vNICs on switch 0 & 1 \\
+\texttt{dom0\_internal\_switches} & internal switches created at boot, each
+  with one dom0 vNIC & 0 \\
+\texttt{uplink\_nic} & PCI address (\texttt{bus:dev.fn}, hexadecimal) of
+  switch 0's uplink & the first NIC \\
+\texttt{uplink2\_nic} & PCI address of a second uplink, on switch 1, where
+  dom0 gets one more vNIC with its MAC & none \\
+\texttt{boot\_disk} & PCI address of the disk controller that becomes host
+  disk 0 & the first \\
+\texttt{serial\_port} & I/O port of the serial console (GRUB, seL4 and the
+  monitor) & \texttt{0x3f8} \\
+\texttt{serial\_irq} & its IRQ (the monitor) & 4 \\
+\texttt{fb\_console} & 1: GRUB and seL4 also print on the screen & 0 \\
+\texttt{watchdog\_secs} & print every guest's vCPU state every $n$ seconds
+  & 0 \\
+\bottomrule
+\end{tabularx}
+\caption{Host settings. Each defaults to its \texttt{L4H\_}-prefixed,
+  uppercase variable when \texttt{l4h-root} was built
+  (\texttt{L4H\_DOM0\_MEM\_MB}, \texttt{L4H\_UPLINK\_NIC}, \ldots), or else
+  to the value shown.}
+\label{tab:settings}
+\end{table}
+
+\section{dom0 on the EFI system partition}
+\label{sec:esp}
+
+l4h ships as one UEFI application, the same for every host: a standalone
+GRUB that carries the seL4 kernel and \texttt{l4h-root}
+(\cmd{tools/mkefi.sh OUT.efi}). It loads dom0 from the EFI system partition
+it was booted from:
+\begin{lstlisting}
+EFI/BOOT/BOOTX64.EFI   the l4h application
+l4h/dom0/vmlinux       dom0's kernel (an ARCH=l4h ELF)
+l4h/dom0/initrd        dom0's initramfs (optional)
+l4h/l4h.conf           host settings (optional)
+\end{lstlisting}
+When the firmware does not say which partition that is (OVMF), GRUB uses
+the first partition with \file{l4h/dom0/vmlinux}, or else with
+\file{l4h/l4h.conf}. Files there override any appended to
+\texttt{l4h-root}. To change dom0, replace the files and
+reboot the host. dom0 itself may do so when it holds the boot disk.
+
+\file{l4h.conf} has one \texttt{key=value} per line (Table~\ref{tab:settings})
+and \texttt{\#} comments. GRUB also reads it, as a script, so write no
+spaces around \texttt{=} and put values with spaces in double quotes:
+\begin{lstlisting}
+# Latitude.sh m4.metal.small
+serial_port=0x2f8
+serial_irq=3
+uplink_nic=01:00.1
+dom0_mem_mb=2048
+dom0_cmdline="console=hvc0 root=/dev/vda2 rw"
+\end{lstlisting}
+\texttt{l4h-root} prints any line it does not understand
+(\texttt{l4h-root: config line 3: '...' ignored}) and keeps the default.
+
+\begin{caveat}
+Some seL4 options cannot be set at boot, so there is one application per
+variant. \cmd{tools/build-efi.sh} builds both into \file{build/efi}:
+\file{l4h-generic.efi} (x2APIC, PCID) for QEMU and GCE, and
+\file{l4h-xapic-nopcid.efi} for machines whose firmware leaves x2APIC off
+or whose CPU lacks PCID, such as Latitude.sh's m4.metal.small. The generic
+variant stops early in boot on those machines.
+\end{caveat}
+
+Each tagged release on GitHub carries, for x86\_64:
+\begin{itemize}
+  \item both applications, built in release mode;
+  \item \file{l4h-dom0-x86\_64.tar.xz}: the \texttt{ARCH=l4h} kernel
+        (\file{vmlinux}, for \file{l4h/dom0/vmlinux}), its configuration, a
+        static \cmd{l4hctl} and an example \file{l4h.conf}. Add an
+        initramfs or a root filesystem of your choice, with \cmd{l4hctl} in
+        it (Sections on busybox and Debian dom0s below);
+  \item \file{l4h-debug-x86\_64.tar.xz}: the same build with debug
+        information, to turn fault addresses into source lines with
+        \cmd{addr2line};
+  \item \file{SHA256SUMS}.
+\end{itemize}
 
 At boot, \texttt{l4h-root}:
 \begin{enumerate}
@@ -372,9 +481,16 @@ objcopy --strip-debug build/linux-l4h/vmlinux build/vmlinux
 tools/mkinitramfs.sh build/vm.cpio.gz          # a guest: busybox with a shell
 tools/mkinitramfs.sh build/dom0.cpio.gz my-dom0-init \
     tools/l4hctl/target/release/l4hctl build/vmlinux build/vm.cpio.gz
-L4H_DOM0_KERNEL=$PWD/build/vmlinux L4H_DOM0_INITRD=$PWD/build/dom0.cpio.gz \
-    L4H_DOM0_MEM_MB=512 tools/build-host.sh
+tools/build-host.sh
+tools/add-modules.py host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
+    build/l4h-root-dom0.elf dom0-kernel=build/vmlinux \
+    dom0-initrd=build/dom0.cpio.gz l4h-config=my-l4h.conf
 \end{lstlisting}
+where \file{my-l4h.conf} holds, for example, \texttt{dom0\_mem\_mb=512}.
+For a UEFI machine, put the same files on the EFI partition instead
+(\cmd{tools/mkimage.sh -k build/vmlinux -i build/dom0.cpio.gz -c
+my-l4h.conf}).
+
 
 Here \file{my-dom0-init} is a shell script that becomes dom0's
 \file{/init}. For example:
@@ -400,14 +516,14 @@ Any distribution that runs on an x86\_64 Linux kernel can be dom0 or a guest,
 as long as its kernel is an \texttt{ARCH=l4h} build. \cmd{tests/mkdebian.sh} builds
 \file{build/debian.img}, a Debian 13 ext4 filesystem with systemd, a getty on
 \texttt{hvc0} and DHCP on \texttt{eth0}. To boot it as dom0 from the first
-host disk:
+host disk, use \file{build/vmlinux} as dom0's kernel, no initramfs, and
+this \file{l4h.conf}:
 
-\begin{lstlisting}[language=bash]
-L4H_DOM0_KERNEL=$PWD/build/vmlinux L4H_DOM0_INITRD= \
-L4H_DOM0_MEM_MB=1024 L4H_DOM0_VCPUS=2 \
-L4H_DOM0_CMDLINE="console=hvc0 root=/dev/vda rw" tools/build-host.sh
-\end{lstlisting}
-\cmd{tests/run-debian.sh} does this and boots the result under QEMU.
+\begin{lstlisting}
+dom0_mem_mb=1024
+dom0_vcpus=2
+dom0_cmdline="console=hvc0 root=/dev/vda rw"
+\end{lstlisting} \cmd{tests/run-debian.sh} boots this under QEMU.
 
 %======================================================================
 \chapter{Booting a host}
@@ -452,18 +568,23 @@ tools/run-qemu.sh host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
 \end{itemize}
 
 \cmd{tools/run-dom0.sh INITRD [CMDLINE] [TIMEOUT]} combines the steps for
-development. It builds Linux, embeds the given initramfs as dom0, builds the
-host, and boots it with output in \file{build/qemu.log}. It stops QEMU when
+development. It builds Linux and the host, appends Linux and the given
+initramfs to \texttt{l4h-root} as dom0, and boots it with output in \file{build/qemu.log}. It stops QEMU when
 all guests have stopped or after \texttt{TIMEOUT} seconds (default 60).
 Extra QEMU arguments go in \texttt{L4H\_QEMU\_ARGS}.
 
 \section{UEFI disk image}
 
-\cmd{tools/mkimage.sh OUT.raw [l4h-root.elf]} builds a GPT disk image whose
-EFI system partition holds a standalone GRUB, the seL4 kernel and
-\texttt{l4h-root}. GRUB boots seL4 with multiboot2 and the serial port set
-explicitly (\texttt{console\_port=0x3f8 debug\_port=0x3f8}). The size is a
-whole number of GiB, as GCE requires.
+\cmd{tools/mkimage.sh [-e l4h.efi] [-k vmlinux] [-i initrd] [-c l4h.conf]
+OUT.raw [l4h-root.elf]} builds a GPT disk image whose EFI system partition
+holds l4h's UEFI application (built from \texttt{l4h-root}, or the one
+given with \texttt{-e}) and, with \texttt{-k}, \texttt{-i} and \texttt{-c},
+dom0 and \file{l4h.conf} (Section~\ref{sec:esp}). GRUB boots seL4 with
+multiboot2 and the serial port set explicitly
+(\texttt{console\_port=0x3f8 debug\_port=0x3f8}, or \texttt{serial\_port}).
+The partition has 64 MiB to spare for larger dom0 images
+(\texttt{L4H\_ESP\_MB} sets its size). The disk is a whole number of GiB,
+as GCE requires.
 
 To boot the image locally the way a GCE VM would (q35, OVMF, NVMe boot disk,
 virtio-net):
@@ -472,8 +593,9 @@ tools/mkimage.sh build/l4h.raw
 tools/run-uefi.sh build/l4h.raw
 \end{lstlisting}
 The boot disk is itself an NVMe disk, so it shows up as host disk 0. Unless
-you set \texttt{L4H\_DOM0\_DISKS=0}, dom0 receives it. dom0 can use the space
-after the EFI partition, but it must not modify the partition itself.
+you set \texttt{dom0\_disks=0}, dom0 receives it. dom0 can use the space
+after the EFI partition. In the partition itself it may replace the files
+in \file{l4h/}, but nothing else.
 
 \section{Google Compute Engine}
 
@@ -1060,8 +1182,9 @@ Message & Usual cause \\
 
 \begin{description}[style=nextline]
   \item[Nothing appears on the serial port after GRUB.] seL4 must be told
-    the serial port on UEFI systems. Use the images from
-    \cmd{tools/mkimage.sh}, which pass \texttt{console\_port=0x3f8}.
+    the serial port on UEFI systems. Use the application from
+    \cmd{tools/mkefi.sh}, which passes \texttt{console\_port=0x3f8}, and set
+    \texttt{serial\_port} in \file{l4h.conf} if the console is elsewhere.
   \item[The guest console stays empty.] Check that the command line
     contains \texttt{console=hvc0}. Guest output is also copied to the host
     serial port with a \texttt{[vm$N$]} prefix; look there for early boot

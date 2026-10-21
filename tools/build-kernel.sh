@@ -5,11 +5,15 @@
 # (default X2APIC, faster under virtualization).  L4H_PCID=OFF builds for
 # CPUs without process-context identifiers (CPUID.1:ECX.PCID), such as the
 # AMD EPYC 4004 series; seL4 otherwise stops in its first boot checks.
+# L4H_KERNEL_VARIANT=NAME builds in build/kernel-NAME and installs to
+# build/sel4-NAME instead, leaving the default build alone
+# (tools/build-efi.sh builds the shipped variants so).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/build/seL4-src
-out=$root/build/kernel
-prefix=$root/build/sel4
+variant=${L4H_KERNEL_VARIANT:+-$L4H_KERNEL_VARIANT}
+out=$root/build/kernel$variant
+prefix=$root/build/sel4$variant
 export PATH=$root/.venv/bin:$PATH
 
 source "$root/tools/prepare-kernel.sh"

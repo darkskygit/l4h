@@ -307,7 +307,17 @@ We need no IOMMU, since no device is passed into a guest.
   doubled vertically, wrapping instead of scrolling so the framebuffer is
   never read. For machines whose serial port is out of reach but whose
   screen is not, such as Latitude.sh servers behind their BMC's web proxy
-  (§10.1); `tools/mkimage.sh` adds it with `L4H_FB_CONSOLE=1`.
+  (§10.1); the `fb_console` setting adds it (§10).
+- **0021, extra boot modules (x86).** seL4 loads the first multiboot
+  module as the root task and ignores the rest, and their memory is not
+  safe: the root task's image is moved over wherever the loader put them,
+  and what survives becomes ordinary Untypeds, cleared on retype. The
+  kernel now copies each later module (up to 8) to page-aligned memory
+  above the root task's loaded image, leaves that memory out of the RAM it
+  manages, so it reaches the root task as device Untypeds that retype
+  into frames without clearing, and lists the modules with their loader
+  strings in a bootinfo chunk (`SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES`).
+  This is how dom0 is loaded from disk (§10).
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -1025,7 +1035,7 @@ the host keeps that dynamic plumbing simple.
 
 | Component | Instances | Role |
 |-----------|-----------|------|
-| `l4h-root` | 1 | Allocates guest RAM blocks, I/O pools, host objects and vCPU scheduling contexts. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's embedded images and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
+| `l4h-root` | 1 | Allocates guest RAM blocks, I/O pools, host objects and vCPU scheduling contexts. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's images (modules) and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
 | `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC and X550 uplink drivers. |
@@ -1048,7 +1058,7 @@ whole message and breaks timing, so prints are kept rare:
 - The serial monitor's replies and the opt-in watchdog dumps always print.
 
 **Guest boot protocol.** The guest boots without firmware or a bootloader.
-Root parses dom0's embedded ELF. For runtime guests, the dom0 `l4hctl`
+Root parses dom0's ELF (§9.1). For runtime guests, the dom0 `l4hctl`
 client parses the ELF and root copies uploaded segments and initramfs
 bytes into the new guest's boot frames. Root constructs the kernel VSpace
 and `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
@@ -1071,11 +1081,44 @@ The control protocol has its own version, currently 1.
 
 ### 9.1 Control plane: dom0 and the runtime API
 
-**Starting dom0.** `tools/build-host.sh` builds the services and root.
-`host/l4h-root/build.rs` embeds their ELFs, dom0's kernel and initramfs,
-and its command line. `L4H_DOM0_*` environment variables set its memory,
-vCPUs, I/O pool, disks and NICs; rebuilding root applies changes. There
-is no runtime TOML manifest. The user manual lists the variables.
+**Starting dom0.** `tools/build-host.sh` builds the services and root,
+and `host/l4h-root/build.rs` embeds the services' ELFs. dom0's kernel,
+initramfs and the host settings are named modules (`dom0-kernel`,
+`dom0-initrd`, `l4h-config`); root has no dom0 built in. They come from:
+
+- **The EFI system partition** (deployment). l4h ships as one UEFI
+  application per seL4 variant (§10), the same for every host. GRUB
+  reads `/l4h/dom0/vmlinux`, `/l4h/dom0/initrd` and `/l4h/l4h.conf`
+  and passes them as boot modules. seL4 keeps them intact (patch
+  0021); root maps them for good, since restarting dom0 loads them
+  again. QEMU's multiboot `-initrd` can pass the same modules.
+- **Root's own ELF** (x86_64 and aarch64; aarch64 has no boot loader
+  that passes modules). `tools/add-modules.py` appends the files to a
+  built `l4h-root.elf` as one more `PT_LOAD` segment, right after root's
+  last one, in the program header of `PT_GNU_STACK` (which seL4
+  ignores), and writes the segment's address and size into an anchor
+  static in root (`bootmod.rs`). The kernel or the loader then maps the
+  files with the rest of root; no Rust is rebuilt. The QEMU scripts do
+  this from `L4H_DOM0_KERNEL`, `L4H_DOM0_INITRD` and `L4H_CONFIG`
+  (`tools/dom0-modules.sh`).
+
+Boot loader modules win over appended ones of the same name. Without a
+`dom0-kernel`, root starts no dom0 and serves only the serial monitor.
+
+The settings (dom0's memory, vCPUs, I/O pool, disks, NICs, internal
+switches and command line; the uplink NICs, the boot disk, the serial port
+and IRQ, the framebuffer console and the watchdog) default to the
+`L4H_*` variables root was built with. `l4h.conf` overrides them: one
+`key=value` per line, in lowercase without the prefix (`dom0_mem_mb=1024`,
+`uplink_nic=01:00.1`). GRUB sources the same file for `serial_port` and
+`fb_console`, so it is written as GRUB script: no spaces around `=`, values
+with spaces in double quotes. Root reports unknown keys and bad values
+and keeps the defaults. The user manual lists the settings.
+
+dom0 can rewrite the EFI partition when it holds the boot disk, so a
+compromised dom0 persists across reboots. That is within dom0's trust
+(it decides what runs), and nothing verifies the files: Secure Boot is
+off.
 
 dom0 is guest #0 and receives a host-owned `l4hctl` device page. Its VMM
 has a control forwarding capability to root. Other guests' VMMs do not.
@@ -1171,7 +1214,7 @@ external orchestration can run in dom0.
   invalid requests. dom0 cannot breach host isolation, but it is fully trusted
   to decide *what* runs. In particular, dom0 can attach any disk to itself.
 - If dom0 crashes, the other guests keep running. `l4h-root` restarts dom0
-  from its embedded images and settings, and the new dom0 recovers state
+  from the same images and settings, and the new dom0 recovers state
   with `vm_list` and `switch_info`. The authoritative state lives in
   `l4h-root`.
 - Debugging fallback: a minimal serial monitor in `l4h-root` (`list`,
@@ -1183,10 +1226,33 @@ external orchestration can run in dom0.
 ## 10. Boot and deployment
 
 - **Firmware.** UEFI → GRUB (EFI) → multiboot2. QEMU uses OVMF for this
-  path, or plain `-kernel` multiboot for development. The boot files are
-  the seL4 kernel and `l4h-root`, the latter loaded as a module and
-  embedding the service ELFs, dom0 images and settings. Images for other
-  guests come through the dom0 API.
+  path, or plain `-kernel` multiboot for development. `tools/mkefi.sh`
+  builds l4h as one UEFI application: a standalone GRUB whose memdisk
+  holds the seL4 kernel and `l4h-root` (with the service ELFs). GRUB
+  loads dom0 and `l4h.conf` from the EFI partition it was loaded from or,
+  since `$cmdpath` is empty under OVMF, the first partition with
+  `/l4h/dom0/vmlinux` (§9.1). Images for other guests come through the
+  dom0 API.
+- **Variants.** The application is the same for every host except for
+  seL4 options fixed at build time. `tools/build-efi.sh` builds the
+  shipped ones into `build/efi/`: `l4h-generic.efi` (x2APIC, PCID: QEMU,
+  GCE) and `l4h-xapic-nopcid.efi` (Latitude.sh, below). The host
+  components do not depend on these options, so all variants share one
+  `l4h-root`.
+- **Releases.** CI (`.github/workflows/release.yml`) builds, for x86_64
+  only, and attaches to the GitHub release of each pushed `v*` tag, with
+  `SHA256SUMS`:
+  - both applications, in release mode;
+  - `l4h-dom0-x86_64.tar.xz` (`tools/build-dom0.sh`): the `ARCH=l4h`
+    kernel without debug information, its config, a static `l4hctl` and
+    an example `l4h.conf`, for a dom0 of any distribution;
+  - `l4h-debug-x86_64.tar.xz`: the applications' build unstripped (root,
+    components, each variant's kernel), for `addr2line` on fault
+    addresses. The components are packed into root without debug
+    information, which was about 20 MiB of each application, loaded and
+    kept in root's memory for nothing.
+
+  No aarch64 binaries are published yet.
 
 - **Platform discovery** is done by seL4 using ACPI: MADT, cores and IOAPIC.
   `l4h-root` handles PCI enumeration over MCFG/ECAM, or port I/O config, and
@@ -1212,25 +1278,27 @@ external orchestration can run in dom0.
      router VM (often dom0) owns the instance MAC (§8.3).
 3. **Bare metal: Latitude.sh m4.metal.small** (Supermicro H13SRE-F, AMD
    EPYC 4244P, Intel X550, Micron 7500 NVMe; UEFI). Deployed with
-   l4h-sandbox (its `deployments/latitude-sh-l4es`). Build options for
-   such machines, all off by default:
-   - `L4H_LAPIC_MODE=XAPIC` (`tools/build-kernel.sh`): the firmware leaves
-     x2APIC off. `L4H_PCID=OFF`: the CPU has no PCID, and seL4 otherwise
-     stops in its first boot check. There is no TSC-deadline timer; the
-     APIC countdown serves, as on N2.
-   - `L4H_SERIAL_PORT`/`L4H_SERIAL_IRQ` (GRUB, seL4, the l4h-root monitor):
+   l4h-sandbox (its `deployments/latitude-sh-l4es`). It needs the
+   `xapic-nopcid` variant and these settings, all off by default
+   (`l4h.conf` keys, or the `L4H_`-prefixed uppercase variables at build
+   time, §9.1):
+   - Kernel `L4H_LAPIC_MODE=XAPIC` (`tools/build-kernel.sh`): the firmware
+     leaves x2APIC off. `L4H_PCID=OFF`: the CPU has no PCID, and seL4
+     otherwise stops in its first boot check. There is no TSC-deadline
+     timer; the APIC countdown serves, as on N2. These two are the
+     variant: seL4 fixes them at build time.
+   - `serial_port`/`serial_irq` (GRUB, seL4, the l4h-root monitor):
      serial-over-LAN is COM2 (0x2f8, IRQ 3), per the ACPI SPCR table.
-   - `L4H_UPLINK_NIC=bus:dev.fn` (l4h-root): the uplink when it is not
-     the first NIC, here the X550's second port. `L4H_BOOT_DISK`: the
-     controller that becomes host disk 0, so dom0 gets it.
-   - `L4H_UPLINK2_NIC=bus:dev.fn` (l4h-root): a second uplink, on
+   - `uplink_nic=bus:dev.fn`: the uplink when it is not the first NIC,
+     here the X550's second port. `boot_disk`: the controller that
+     becomes host disk 0, so dom0 gets it.
+   - `uplink2_nic=bus:dev.fn`: a second uplink, on
      switch 1 (dom0's internal switches follow it), where dom0 gets one
      more vNIC with that NIC's MAC. dom0 tells its vNICs apart by MAC
      (`CTL_SWITCH_INFO` lists each port's VM and MAC), not by order. On Latitude the first port carries the
      private storage network (a tagged VLAN, which l4h passes through).
-   - `L4H_FB_CONSOLE=1` (`tools/mkimage.sh`, l4h-root): GRUB and the seL4
-     console (patch 0020) on the screen; the dashboard keeps to the upper
-     half.
+   - `fb_console=1` (GRUB, seL4, l4h-root): GRUB and the seL4 console
+     (patch 0020) on the screen; the dashboard keeps to the upper half.
 4. Later targets: AWS (ENA and NVMe) and Azure (MANA and NVMe), each mainly
    adding one NIC driver.
 
@@ -1238,15 +1306,19 @@ external orchestration can run in dom0.
 
 - **Image.** `tools/mkimage.sh` builds a GPT disk image. Its EFI system
   partition holds:
-  - a standalone GRUB EFI binary;
-  - the seL4 kernel, loaded with `multiboot2` and
-    `console_port=0x3f8 debug_port=0x3f8`, because UEFI firmware need not
-    fill in the BIOS data area that seL4 otherwise reads the port from;
-  - `l4h-root`, which carries dom0's images, as `module2`.
+  - `EFI/BOOT/BOOTX64.EFI`, the l4h application (`tools/mkefi.sh`): GRUB
+    with the seL4 kernel, loaded with `multiboot2` and
+    `console_port=0x3f8 debug_port=0x3f8` (or `serial_port`), because
+    UEFI firmware need not fill in the BIOS data area that seL4 otherwise
+    reads the port from, and `l4h-root` as the first `module2`;
+  - optionally `/l4h/dom0/vmlinux`, `/l4h/dom0/initrd` and
+    `/l4h/l4h.conf` (`-k`, `-i`, `-c`), the later `module2`s. Without
+    them root starts no dom0.
 - **Local test.** `tests/run-uefitest.sh` boots that image the way GCE
   would, under OVMF on a q35 machine: NVMe boot disk, virtio-net NIC, KVM
-  without VMX. dom0 sees the boot disk as host disk 0 and gets DHCP
-  through the virtio-net uplink.
+  without VMX. dom0 and an `l4h.conf` (which
+  sets dom0's command line and keeps the boot disk from it) come from the
+  EFI partition. dom0 gets DHCP through the virtio-net uplink.
 - **Deployment.** `tools/gce-image.sh` packages the image as
   `disk.raw.tar.gz` and prints the `gcloud` import and instance commands
   (N2, `nic-type=VIRTIO_NET`; `nic-type=GVNIC` on C3 and later; image
@@ -1415,7 +1487,7 @@ l4h/
   host/              Rust workspace: l4h-abi, l4h-host, l4h-rt, l4h-root, l4h-vmm, l4h-blkd, l4h-netd, l4h-virtio
   tools/l4hctl/      dom0 userspace CLI and library for the control API
   third_party/sddf/  submodule (design reference; no linked C drivers)
-  tools/             build-kernel.sh, build-linux.sh, build-host.sh, mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh
+  tools/             build-kernel.sh, build-linux.sh, build-host.sh, mkefi.sh (UEFI application), build-efi.sh (its variants), add-modules.py (dom0 into a built root), mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh
   tests/             host-level integration tests driven by QEMU + expect-style console scripting
 ```
 
@@ -1590,7 +1662,7 @@ memory the guest can retype.
   host one root CNode slot.
 - **Boot blocks.** `l4h-root` turns a block into host frames (a level-2 RAM
   CNode, 512 frames, mapped in the direct map) when an image is loaded into
-  it (`VM_LOAD`, or dom0's embedded image). At `VM_START` the boot blocks
+  it (`VM_LOAD`, or dom0's image). At `VM_START` the boot blocks
   are the prefix of RAM up to the end of the kernel, the initrd and
   anything loaded, plus `BOOT_SLACK` (one) block for the guest kernel's
   memory until it has mapped the rest; at least one block must be left for

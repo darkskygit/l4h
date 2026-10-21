@@ -66,6 +66,27 @@ impl DevMem {
         r.cap.untyped_retype(&FRAME_BP, &Dest::root(s.start).cnode, s.start, n).expect("device frames");
         Some(s.map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(i).cap()).collect())
     }
+
+    /// 4 KiB frames covering the page-aligned range [paddr, paddr + size),
+    /// which may span several device Untypeds and need not be aligned to
+    /// its size.
+    pub fn frames_range(&mut self, slots: &mut Slots, paddr: usize, size: usize) -> Option<Vec<cap::Granule>> {
+        assert!(paddr % 4096 == 0 && size % 4096 == 0);
+        let (mut at, end) = (paddr, paddr + size);
+        let mut out = Vec::with_capacity(size / 4096);
+        while at < end {
+            let r = self.free.iter().find(|r| r.paddr <= at && at < r.paddr + (1 << r.size_bits))?;
+            // The largest aligned block at `at` inside both r and the
+            // range, of at most RETYPE_FAN_OUT frames.
+            let bits = (at.trailing_zeros() as usize)
+                .min(usize::BITS as usize - 1 - (end - at).leading_zeros() as usize)
+                .min(r.size_bits)
+                .min(12 + crate::RETYPE_FAN_OUT.trailing_zeros() as usize);
+            out.extend(self.frames(slots, at, 1 << bits)?);
+            at += 1 << bits;
+        }
+        Some(out)
+    }
 }
 
 fn slot_cap(i: usize) -> cap::Untyped {

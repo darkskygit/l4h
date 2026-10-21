@@ -4,8 +4,8 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 make -s -C "$root/tests/testguest"
-L4H_DOM0_KERNEL="$root/build/testguest/testguest.elf" L4H_DOM0_INITRD= L4H_DOM0_MEM_MB=64 \
-    "$root/tools/build-host.sh"
+export L4H_DOM0_KERNEL="$root/build/testguest/testguest.elf" L4H_DOM0_INITRD=
+L4H_DOM0_MEM_MB=64 "$root/tools/build-host.sh"
 log=$root/build/testguest/qemu.log
 disk=$root/build/testguest/disk.img
 rm -f "$disk"

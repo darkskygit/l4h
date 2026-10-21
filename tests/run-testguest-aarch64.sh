@@ -5,8 +5,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 [ -f "$root/build/sel4-aarch64/bin/kernel.elf" ] || "$root/tools/build-kernel-aarch64.sh" >/dev/null
 "$root/tools/build-loader-aarch64.sh"
 make -s -C "$root/tests/testguest" -f Makefile.aarch64
-L4H_DOM0_KERNEL="$root/build/testguest-aarch64/testguest.elf" L4H_DOM0_INITRD= L4H_DOM0_MEM_MB=64 \
-    "$root/tools/build-host-aarch64.sh"
+export L4H_DOM0_KERNEL="$root/build/testguest-aarch64/testguest.elf" L4H_DOM0_INITRD=
+L4H_DOM0_MEM_MB=64 "$root/tools/build-host-aarch64.sh"
 log=$root/build/testguest-aarch64/qemu.log
 disk=$root/build/testguest-aarch64/disk.img
 truncate -s 1M "$disk"

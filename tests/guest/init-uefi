@@ -4,6 +4,7 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 echo "UEFITEST: dom0 up"
+echo "UEFITEST: cmdline $(cat /proc/cmdline)"
 l4hctl info
 l4hctl disks
 l4hctl nics

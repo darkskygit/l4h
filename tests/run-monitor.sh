@@ -9,8 +9,8 @@ mkdir -p "$out"
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
-L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/vm.cpio.gz" \
-    L4H_DOM0_CMDLINE=console=hvc0 "$l4h_host_build"
+export L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/vm.cpio.gz"
+L4H_DOM0_CMDLINE=console=hvc0 "$l4h_host_build"
 log=$root/build/qemu-monitor.log
 fifo=$(mktemp -u)
 mkfifo "$fifo"

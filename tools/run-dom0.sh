@@ -20,8 +20,8 @@ rm -f "$log"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
-L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" \
-    L4H_DOM0_INITRD="$initrd" L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-256} \
+export L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$initrd"
+L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-256} \
     L4H_DOM0_VCPUS=${L4H_DOM0_VCPUS:-1} L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} L4H_DOM0_CMDLINE="$cmdline" \
     "$l4h_host_build"
 "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \

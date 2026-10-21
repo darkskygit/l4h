@@ -13,8 +13,8 @@ img=$root/build/debian.img
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vmlinux.stripped"
-L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" L4H_DOM0_INITRD= \
-    L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-1024} L4H_DOM0_VCPUS=${1:-2} \
+export L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" L4H_DOM0_INITRD=
+L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-1024} L4H_DOM0_VCPUS=${1:-2} \
     L4H_DOM0_CMDLINE="console=hvc0 root=/dev/vda rw${DEBIAN_ROLE:+ l4h.role=$DEBIAN_ROLE}" "$root/tools/build-host.sh"
 log=$root/build/qemu-debian.log
 [ "${DEBIAN_KEEP:-0}" = 1 ] || cp --sparse=always "$img" "$root/build/debian-run.img"

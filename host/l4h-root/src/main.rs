@@ -19,7 +19,9 @@ macro_rules! info {
 
 mod balloon;
 mod blkd;
+mod bootmod;
 mod component;
+mod config;
 mod ctl;
 mod dashboard;
 mod devmem;
@@ -58,82 +60,13 @@ const RESERVE_SLOTS: usize = 32768;
 /// Longest free slot range kept for vNIC ports and disk DMA buffers.
 const RESERVE_RANGE: usize = 4096;
 
-static DOM0_KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-kernel"));
-static DOM0_INITRD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dom0-initrd"));
-static DOM0_CMDLINE: &str = include_str!(concat!(env!("OUT_DIR"), "/dom0-cmdline"));
-
-/// A decimal number, or hexadecimal after "0x".
-const fn parse_usize(s: Option<&str>, default: usize) -> usize {
-    match s {
-        None => default,
-        Some(s) => {
-            let b = s.as_bytes();
-            let (mut i, radix) = if b.len() > 2 && b[0] == b'0' && b[1] == b'x' { (2, 16) } else { (0, 10) };
-            let mut v = 0;
-            while i < b.len() {
-                let d = match b[i] {
-                    b'0'..=b'9' => b[i] - b'0',
-                    b'a'..=b'f' => b[i] - b'a' + 10,
-                    b'A'..=b'F' => b[i] - b'A' + 10,
-                    _ => panic!("not a number"),
-                };
-                v = v * radix + d as usize;
-                i += 1;
-            }
-            v
-        }
-    }
+/// dom0's images, the modules `dom0-kernel` and `dom0-initrd` (bootmod).
+/// Kept for restarts.
+pub struct Dom0Images {
+    pub kernel: &'static [u8],
+    pub initrd: &'static [u8],
 }
 
-/// A PCI address "bus:device.function" (hexadecimal) as bus << 8 |
-/// device << 3 | function, or None.
-const fn parse_bdf(s: Option<&str>) -> Option<u32> {
-    let Some(s) = s else { return None };
-    let b = s.as_bytes();
-    let mut v = [0u32; 3];
-    let (mut i, mut f) = (0, 0);
-    while i < b.len() {
-        match b[i] {
-            b':' | b'.' => f += 1,
-            c => {
-                let d = match c {
-                    b'0'..=b'9' => c - b'0',
-                    b'a'..=b'f' => c - b'a' + 10,
-                    b'A'..=b'F' => c - b'A' + 10,
-                    _ => panic!("not a PCI address"),
-                };
-                v[f] = v[f] * 16 + d as u32;
-            }
-        }
-        i += 1;
-    }
-    Some(v[0] << 8 | v[1] << 3 | v[2])
-}
-const DOM0_MEM_MB: usize = parse_usize(option_env!("L4H_DOM0_MEM_MB"), 256);
-const DOM0_VCPUS: usize = parse_usize(option_env!("L4H_DOM0_VCPUS"), 1);
-/* dom0's I/O pool (a power of two, 1-256 MiB). */
-const DOM0_IO_POOL_MB: usize = parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), guest::IO_POOL_DEFAULT >> 20);
-/* Disks passed to dom0 at boot (the first n); the rest are free for the
- * control API. */
-const DOM0_DISKS: usize = parse_usize(option_env!("L4H_DOM0_DISKS"), 64);
-/* vNICs of dom0 on switch 0, which has the first NIC as its uplink. */
-const DOM0_NICS: usize = parse_usize(option_env!("L4H_DOM0_NICS"), 1);
-/* The PCI address (bus:dev.fn) of the uplink NIC, when it is not the first
- * NIC: e.g. the public port of a two-port card. */
-const UPLINK_NIC: Option<u32> = parse_bdf(option_env!("L4H_UPLINK_NIC"));
-/* The PCI address of a second uplink NIC: the uplink of switch 1, where
- * dom0 has one more vNIC, with the NIC's MAC address; the internal
- * switches follow. E.g. a provider's storage network on the other port. */
-const UPLINK2_NIC: Option<u32> = parse_bdf(option_env!("L4H_UPLINK2_NIC"));
-/* The PCI address of the boot disk's controller, when it is not the first
- * disk controller: it becomes host disk 0. */
-const BOOT_DISK: Option<u32> = parse_bdf(option_env!("L4H_BOOT_DISK"));
-/* Internal switches, after switch 0 and the second uplink's (1..=n, or
- * 2..=n+1), created at first boot, each with one more vNIC of dom0 (a
- * normal port, for routing between it and isolated guests). */
-const DOM0_INTERNAL_SWITCHES: usize = parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0);
-/* Seconds between watchdog dumps of guest vCPU state; 0 disables. */
-const WATCHDOG_SECS: usize = parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0);
 const TIMER_BADGE: u64 = 1 << 40;
 
 /// Facts about the host the guests run on.
@@ -235,26 +168,12 @@ fn tsc_hz(bootinfo: &sel4::BootInfoPtr) -> u64 {
 /// bootinfo chunk added by kernel patch 0018; zero if it is missing.
 #[cfg(target_arch = "aarch64")]
 fn cpu_id(bootinfo: &sel4::BootInfoPtr) -> [u64; 5] {
-    // SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS: rust-sel4's extra() skips IDs
-    // it does not know, so walk the chunks here.
+    // SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS
     const ID_REGS: u64 = 7;
-    let granule = sel4::FrameObjectType::GRANULE.bytes();
-    let extra = unsafe {
-        core::slice::from_raw_parts(bootinfo.ptr().cast::<u8>().add(granule), bootinfo.footprint_size() - granule)
-    };
-    let word = |i: usize| u64::from_le_bytes(extra[i..i + 8].try_into().unwrap());
-    let mut off = 0;
-    while off + 16 <= extra.len() {
-        let (id, len) = (word(off), word(off + 8) as usize);
-        if len < 16 || len > extra.len() - off {
-            break;
-        }
-        if id == ID_REGS && len >= 16 + 5 * 8 {
-            return core::array::from_fn(|i| word(off + 16 + 8 * i));
-        }
-        off += len;
+    match bootmod::extra_chunk(bootinfo, ID_REGS) {
+        Some(c) if c.len() >= 5 * 8 => core::array::from_fn(|i| u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap())),
+        _ => [0; 5],
     }
-    [0; 5]
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -278,6 +197,8 @@ pub struct Host {
     pub total_bytes: usize,
     pub monitor: Option<monitor::Monitor>,
     pub dashboard: Option<dashboard::Dashboard>,
+    pub cfg: config::Config,
+    pub dom0: Dom0Images,
 }
 
 impl Host {
@@ -498,6 +419,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let reply = alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
     let mut wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
     let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
+    let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
+    let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
+    let cfg = config::Config::new(module("l4h-config"));
+    let dom0 = Dom0Images { kernel: module("dom0-kernel").unwrap_or(&[]), initrd: module("dom0-initrd").unwrap_or(&[]) };
     let info = HostInfo {
         cores,
         tsc_hz: tsc_hz(bootinfo),
@@ -550,8 +475,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             balloon = Some(d);
         }
     }
-    // The boot disk first: dom0 takes the first DOM0_DISKS host disks.
-    if let Some(bdf) = BOOT_DISK {
+    // The boot disk first: dom0 takes the first dom0_disks host disks.
+    if let Some(bdf) = cfg.boot_disk {
         match ctrls.iter().position(|c: &Controller| netd::bdf(&c.pci) == bdf) {
             Some(i) => {
                 let c = ctrls.remove(i);
@@ -580,13 +505,17 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         total_bytes,
         monitor: None,
         dashboard: None,
+        cfg,
+        dom0,
     };
     h.scan_disks();
-    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn);
-    h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem);
+    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq);
+    h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
-    if DOM0_KERNEL.is_empty() {
-        info!("l4h-root: no dom0 kernel embedded, nothing to do");
+    if h.dom0.kernel.is_empty() {
+        sel4::debug_println!("l4h-root: no dom0 kernel, nothing to do");
+    } else if elf::Elf::parse(h.dom0.kernel).is_err() {
+        sel4::debug_println!("l4h-root: the dom0 kernel is not an ELF image, not starting dom0");
     } else {
         boot_dom0(&mut h);
     }
@@ -594,18 +523,18 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 }
 
 pub fn boot_dom0(h: &mut Host) {
-    let ram_base = elf::Elf::parse(DOM0_KERNEL).expect("dom0 kernel").bounds().0 as usize;
+    let ram_base = elf::Elf::parse(h.dom0.kernel).expect("dom0 kernel").bounds().0 as usize;
     let cfg = GuestConfig {
         name: "dom0",
-        ram: DOM0_MEM_MB << 20,
-        vcpus: DOM0_VCPUS,
-        io_pool: DOM0_IO_POOL_MB << 20,
+        ram: h.cfg.dom0_mem_mb << 20,
+        vcpus: h.cfg.dom0_vcpus,
+        io_pool: h.cfg.dom0_io_pool_mb << 20,
         vspaces: 64,
         ram_base,
         dom0: true,
     };
     let id = h.create_guest(&cfg).expect("cannot create dom0");
-    for d in 0..h.disks.len().min(DOM0_DISKS) {
+    for d in 0..h.disks.len().min(h.cfg.dom0_disks) {
         if let Err(e) = h.attach_disk(id, d, false, 0, 0) {
             sel4::debug_println!("l4h-root: cannot give disk {} to dom0: error {}", d, e);
         }
@@ -615,7 +544,7 @@ pub fn boot_dom0(h: &mut Host) {
     let sw = 0;
     if h.netd.switches == 0 {
         h.netd.create_switch();
-        let nic = match UPLINK_NIC {
+        let nic = match h.cfg.uplink_nic {
             None => (!h.netd.nics.is_empty()).then_some(0),
             Some(bdf) => {
                 let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
@@ -633,13 +562,13 @@ pub fn boot_dom0(h: &mut Host) {
     // like GCE's only deliver frames for the instance's own address, so
     // dom0 is then the host's router (DESIGN.md §8.3).
     let uplink = h.netd.nics.iter().position(|n| n.switch == Some(sw));
-    for i in 0..DOM0_NICS {
+    for i in 0..h.cfg.dom0_nics {
         let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };
         h.create_nic(id, sw, mac, true, false).expect("dom0 NIC");
     }
     // The second uplink NIC, if any, on switch 1, then the internal
     // switches. dom0 finds its vNICs by MAC, not by their order.
-    let uplink2 = UPLINK2_NIC.and_then(|bdf| {
+    let uplink2 = h.cfg.uplink2_nic.and_then(|bdf| {
         let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
         if n.is_none() {
             sel4::debug_println!("l4h-root: no second uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
@@ -655,15 +584,17 @@ pub fn boot_dom0(h: &mut Host) {
         h.create_nic(id, 1, mac, true, false).expect("dom0 NIC");
     }
     let first = 1 + uplink2.is_some() as usize;
-    while (h.netd.switches as usize) < first + DOM0_INTERNAL_SWITCHES {
+    while (h.netd.switches as usize) < first + h.cfg.dom0_internal_switches {
         h.netd.create_switch();
     }
-    for i in first..first + DOM0_INTERNAL_SWITCHES {
+    for i in first..first + h.cfg.dom0_internal_switches {
         h.create_nic(id, i as u32, 0, true, false).expect("dom0 internal NIC");
     }
+    let (kernel, initrd) = (h.dom0.kernel, h.dom0.initrd);
+    let cmdline = h.cfg.dom0_cmdline.clone();
     h.with_guest(id, |h, g| {
         assert!(
-            guest::load_embedded(g, &mut h.alloc, &mut h.wins.a, &h.info, DOM0_KERNEL, DOM0_INITRD, DOM0_CMDLINE.trim()),
+            guest::load_embedded(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, initrd, &cmdline),
             "dom0 image does not fit"
         );
     });
@@ -722,7 +653,7 @@ pub fn set_mr(i: usize, v: u64) {
 fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
     let hyp_ep = h.info.hyp_ep;
     arm_timer(&h.info);
-    let mut next_watchdog = rdtsc() + h.info.tsc_hz * WATCHDOG_SECS as u64;
+    let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
     let mut last_balance = rdtsc();
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
@@ -739,9 +670,9 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             last_balance = now;
             h.alloc.report_free(now, h.info.tsc_hz * balloon::REPORT_DELAY_MS / 1000);
             dashboard::Dashboard::tick(h);
-            if WATCHDOG_SECS != 0 && rdtsc() >= next_watchdog {
+            if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                 watchdog_dump(h);
-                next_watchdog = rdtsc() + h.info.tsc_hz * WATCHDOG_SECS as u64;
+                next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
             }
             arm_timer(&h.info);
             None

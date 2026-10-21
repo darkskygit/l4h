@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boot l4h the way GCE does: UEFI firmware, GRUB multiboot2 from the image
-# built by tools/mkimage.sh, NVMe boot disk, virtio-net.
+# built by tools/mkimage.sh, NVMe boot disk, virtio-net.  GRUB loads dom0
+# and l4h.conf from the EFI partition.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/guest
@@ -11,10 +12,15 @@ objcopy --strip-debug "$root/build/linux-l4h/vmlinux" "$root/build/linux-l4h/vml
 (cd "$root/tools/l4hctl" && cargo +stable build -q --release)
 "$root/tools/mkinitramfs.sh" "$out/uefi.cpio.gz" "$root/tests/guest/init-uefi" \
     "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" >/dev/null
+env -u L4H_DOM0_DISKS -u L4H_DOM0_CMDLINE "$root/tools/build-host.sh"
 # The boot disk is a host disk too: keep it away from dom0.
-L4H_DOM0_KERNEL="$root/build/linux-l4h/vmlinux.stripped" L4H_DOM0_INITRD="$out/uefi.cpio.gz" \
-    L4H_DOM0_DISKS=0 L4H_DOM0_CMDLINE=console=hvc0 "$root/tools/build-host.sh"
-"$root/tools/mkimage.sh" "$root/build/l4h.raw"
+cat > "$out/uefi.conf" <<'CONF'
+# tests/run-uefitest.sh
+dom0_disks=0
+dom0_cmdline="console=hvc0 uefitest=esp"
+CONF
+"$root/tools/mkimage.sh" -k "$root/build/linux-l4h/vmlinux.stripped" -i "$out/uefi.cpio.gz" \
+    -c "$out/uefi.conf" "$root/build/l4h.raw"
 log=$root/build/qemu-uefi.log
 timeout "${UEFITEST_TIMEOUT:-120}" "$root/tools/run-uefi.sh" "$root/build/l4h.raw" </dev/null >"$log" 2>&1 &
 qemu=$!
@@ -23,5 +29,6 @@ while kill -0 "$qemu" 2>/dev/null; do
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true
-grep -aE "UEFITEST|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic|Boot" "$log" || true
+grep -aE "UEFITEST|boot module|disk [0-9]|nic [0-9]|memory:|cores:|l4h-root: [0-9]+ core|panic|Boot" "$log" || true
+grep -aq "UEFITEST: cmdline .*uefitest=esp" "$log"
 grep -aq "UEFITEST: network ok" "$log"

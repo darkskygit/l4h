@@ -1,51 +1,53 @@
 #!/usr/bin/env bash
 # Build a UEFI-bootable disk image: GPT with an EFI system partition that
-# holds a standalone GRUB (multiboot2) plus the seL4 kernel and l4h-root.
+# holds l4h as one UEFI application (tools/mkefi.sh) and, optionally, dom0
+# and the host settings in /l4h (DESIGN.md §10).
 # This is the image format GCE imports (tar -Sczf image.tar.gz disk.raw;
 # gcloud compute images create ... --guest-os-features=UEFI_COMPATIBLE).
-# Usage: mkimage.sh <out.raw> [l4h-root.elf]
-# L4H_SERIAL_PORT (default 0x3f8, COM1) is the console port of GRUB and
-# seL4, e.g. 0x2f8 (COM2) for Supermicro serial-over-LAN.
-# L4H_FB_CONSOLE=1 also shows GRUB and the seL4 console on the screen
-# (kernel option fb_console), for machines whose serial port is out of
-# reach but whose graphical console is not.
+# Usage: mkimage.sh [-e l4h.efi] [-k vmlinux] [-i initrd] [-c l4h.conf]
+#                   <out.raw> [l4h-root.elf]
+#   -e  use this application instead of building one from l4h-root.elf
+#   -k, -i, -c  dom0's kernel and initramfs, and the settings, copied to
+#       /l4h/dom0/vmlinux, /l4h/dom0/initrd and /l4h/l4h.conf
+# L4H_SERIAL_PORT and L4H_FB_CONSOLE=1 go to tools/mkefi.sh.  L4H_ESP_MB
+# sizes the partition (default: the payload plus 64 MiB, room for larger
+# dom0 images later).
 set -euo pipefail
-serial=${L4H_SERIAL_PORT:-0x3f8}
-terminal=serial fbcon=
-if [ "${L4H_FB_CONSOLE:-0}" = 1 ]; then terminal="serial console" fbcon=" fb_console"; fi
 root=$(cd "$(dirname "$0")/.." && pwd)
+efi= dom0_kernel= dom0_initrd= config=
+while getopts e:k:i:c: o; do
+    case $o in
+        e) efi=$OPTARG ;;
+        k) dom0_kernel=$OPTARG ;;
+        i) dom0_initrd=$OPTARG ;;
+        c) config=$OPTARG ;;
+        *) exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
 out=$1
 rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
-kernel=$root/build/sel4/bin/kernel.elf
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-cat > "$work/grub.cfg" <<CFG
-set timeout=0
-serial --port=$serial --speed=115200
-terminal_input serial
-terminal_output $terminal
-search --no-floppy --set=root --file /boot/l4h-root.elf
-menuentry "l4h" {
-    multiboot2 /boot/kernel.elf console_port=$serial debug_port=$serial$fbcon
-    module2 /boot/l4h-root.elf
-    boot
-}
-CFG
-grub-mkstandalone -O x86_64-efi -o "$work/BOOTX64.EFI" \
-    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile efi_gop video video_fb" \
-    --locales= --fonts= --themes= \
-    "boot/grub/grub.cfg=$work/grub.cfg"
+if [ -z "$efi" ]; then
+    efi=$work/BOOTX64.EFI
+    "$root/tools/mkefi.sh" "$efi" "$rootserver" >/dev/null
+fi
 
 # EFI system partition: FAT32, sized for the payload.
-payload=$(( ($(stat -c %s "$kernel") + $(stat -c %s "$rootserver") + $(stat -c %s "$work/BOOTX64.EFI")) / 1048576 ))
-esp_mb=$(( payload + 40 ))
+payload=0
+for f in "$efi" $dom0_kernel $dom0_initrd $config; do
+    payload=$(( payload + $(stat -c %s "$f") ))
+done
+esp_mb=${L4H_ESP_MB:-$(( payload / 1048576 + 64 ))}
 dd if=/dev/zero of="$work/esp.img" bs=1M count="$esp_mb" status=none
 mformat -i "$work/esp.img" -F -v L4HEFI ::
-mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT ::/boot
-mcopy -i "$work/esp.img" "$work/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i "$work/esp.img" "$kernel" ::/boot/kernel.elf
-mcopy -i "$work/esp.img" "$rootserver" ::/boot/l4h-root.elf
+mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT ::/l4h ::/l4h/dom0
+mcopy -i "$work/esp.img" "$efi" ::/EFI/BOOT/BOOTX64.EFI
+[ -n "$dom0_kernel" ] && mcopy -i "$work/esp.img" "$dom0_kernel" ::/l4h/dom0/vmlinux
+[ -n "$dom0_initrd" ] && mcopy -i "$work/esp.img" "$dom0_initrd" ::/l4h/dom0/initrd
+[ -n "$config" ] && mcopy -i "$work/esp.img" "$config" ::/l4h/l4h.conf
 
 # GPT disk: ESP from 1 MiB; GCE wants a whole number of GiB.
 disk_gb=$(( (esp_mb + 2 + 1023) / 1024 ))

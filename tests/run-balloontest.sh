@@ -19,8 +19,8 @@ hold=12
 cp "$l4h_linux_out/vmlinux.stripped" "$out/vmlinux"
 "$root/tools/mkinitramfs.sh" "$out/balloontest.cpio.gz" "$root/tests/guest/init-balloontest" \
     "$l4h_ctl" "$out/vmlinux" "$out/balloonvm.cpio.gz" >/dev/null
-L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/balloontest.cpio.gz" \
-    L4H_DOM0_MEM_MB=256 L4H_DOM0_VCPUS=1 L4H_WATCHDOG_SECS=0 \
+export L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$out/balloontest.cpio.gz"
+L4H_DOM0_MEM_MB=256 L4H_DOM0_VCPUS=1 L4H_WATCHDOG_SECS=0 \
     L4H_DOM0_CMDLINE="console=hvc0 BT_HOLD=$((hold * l4h_test_slow))" "$l4h_host_build"
 
 baseline=${BALLOONTEST_BASELINE:-0}
