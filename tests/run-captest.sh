@@ -14,9 +14,8 @@ mkdir -p "$out"
 "$l4h_cc" -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
 "$root/tools/mkinitramfs.sh" "$out/capvm.cpio.gz" "$root/tests/guest/init-capvm" \
     "$out/selftest" >/dev/null
-cp "$l4h_linux_out/vmlinux.stripped" "$out/vmlinux"
 "$root/tools/mkinitramfs.sh" "$out/captest.cpio.gz" "$root/tests/guest/init-captest" \
-    "$l4h_ctl" "$out/vmlinux" "$out/capvm.cpio.gz" >/dev/null
+    "$l4h_ctl" "$out/capvm.cpio.gz" >/dev/null
 "$root/tools/run-dom0.sh" "$out/captest.cpio.gz" \
     "console=hvc0 captest_cap=${1:-25} captest_rounds=${2:-2}" ${CAPTEST_TIMEOUT:-900} \
     | grep -E "CAPTEST|l4h-root: guest|panic" || true

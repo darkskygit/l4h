@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the guest kernel + root task with a given dom0 initramfs/cmdline and
 # boot it in QEMU.  Usage: run-dom0.sh <initrd> [cmdline] [timeout]
+# L4H_KMODS=1 builds and adds the kernel's module tree (/dev/l4hkmod).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 initrd=$(realpath "$1")
@@ -20,7 +21,11 @@ rm -f "$log"
 "$root/tools/build-linux.sh" vmlinux >"$root/build/linux-build.log" 2>&1 \
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
-export L4H_DOM0_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$initrd"
+export L4H_GUEST_KERNEL="$l4h_linux_out/vmlinux.stripped" L4H_DOM0_INITRD="$initrd" L4H_GUEST_KMODS=
+if [ "${L4H_KMODS:-0}" = 1 ]; then
+    "$root/tools/build-kmods.sh" >/dev/null
+    L4H_GUEST_KMODS=$l4h_linux_out/kmods.erofs
+fi
 L4H_DOM0_MEM_MB=${L4H_DOM0_MEM_MB:-256} \
     L4H_DOM0_VCPUS=${L4H_DOM0_VCPUS:-1} L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} L4H_DOM0_CMDLINE="$cmdline" \
     "$l4h_host_build"

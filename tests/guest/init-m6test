@@ -14,7 +14,7 @@ cpu() {
     for i in 1 2 3 4 5 6 7 8 9; do cpu1 "$1"; sleep 0.2; done | sort -n | sed -n 5p
 }
 if ! l4hctl list | grep -q " hog "; then
-    id=$(l4hctl create hog --kernel /bin/vmlinux --initrd /bin/densvm.cpio.gz --mem 128 \
+    id=$(l4hctl create hog --initrd /bin/densvm.cpio.gz --mem 128 \
         --cmdline "console=hvc0 quiet HOG=1") || fail "create"
     l4hctl console "$id" --until "DENSVM: ready" --timeout "$((60 * slow))" >/dev/null || fail "guest boot"
     echo "M6TEST: rebooting dom0"

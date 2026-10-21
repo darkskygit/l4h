@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 
-pub const CTL_VERSION: u32 = 1;
+pub const CTL_VERSION: u32 = 2;
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: usize = 1 << 20;
 pub const CTL_NAME_MAX: usize = 32;
@@ -164,57 +164,6 @@ impl Ctl {
     }
 }
 
-/// The parts of a guest kernel ELF needed to load it.
-pub struct Kernel {
-    pub entry: u64,
-    pub ram_base: u64,
-    pub end_gpa: u64,
-    /// (guest-physical address, bytes)
-    pub segments: Vec<(u64, Vec<u8>)>,
-}
-
-pub fn rd<const N: usize>(b: &[u8], off: usize) -> Result<[u8; N]> {
-    b.get(off..off + N).map(|s| s.try_into().unwrap()).ok_or(Error("truncated ELF".into()))
-}
-
-pub fn parse_kernel(b: &[u8]) -> Result<Kernel> {
-    if b.len() < 64 || &b[..4] != b"\x7fELF" || b[4] != 2 || b[5] != 1 {
-        return err("not a 64-bit little-endian ELF");
-    }
-    #[cfg(target_arch = "x86_64")]
-    const MACHINE: u16 = 62;
-    #[cfg(target_arch = "aarch64")]
-    const MACHINE: u16 = 183;
-    if u16::from_le_bytes(rd(b, 18)?) != MACHINE {
-        return err("kernel architecture does not match this guest");
-    }
-    let entry = u64::from_le_bytes(rd(b, 24)?);
-    let phoff = u64::from_le_bytes(rd(b, 32)?) as usize;
-    let phentsize = u16::from_le_bytes(rd(b, 54)?) as usize;
-    let phnum = u16::from_le_bytes(rd(b, 56)?) as usize;
-    let mut loads = Vec::new();
-    for i in 0..phnum {
-        let p = phoff + i * phentsize;
-        if u32::from_le_bytes(rd(b, p)?) != 1 {
-            continue;
-        }
-        let off = u64::from_le_bytes(rd(b, p + 8)?) as usize;
-        let vaddr = u64::from_le_bytes(rd(b, p + 16)?);
-        let filesz = u64::from_le_bytes(rd(b, p + 32)?) as usize;
-        let memsz = u64::from_le_bytes(rd(b, p + 40)?);
-        let data = b.get(off..off + filesz).ok_or(Error("segment beyond end of file".into()))?.to_vec();
-        loads.push((vaddr, memsz, data));
-    }
-    let ram_base = loads.iter().map(|l| l.0).min().ok_or(Error("no loadable segments".into()))? & !0xfff;
-    let end = loads.iter().map(|l| l.0 + l.1).max().unwrap();
-    Ok(Kernel {
-        entry,
-        ram_base,
-        end_gpa: (end - ram_base + 0xfff) & !0xfff,
-        segments: loads.into_iter().map(|(v, _, d)| (v - ram_base, d)).collect(),
-    })
-}
-
 pub fn load(ctl: &Ctl, vm: u64, gpa: u64, data: &[u8]) -> Result<()> {
     for (i, chunk) in data.chunks(CTL_LOAD_MAX).enumerate() {
         ctl.call(CTL_VM_LOAD, &[vm, gpa + (i * CTL_LOAD_MAX) as u64], &[], chunk)?;
@@ -241,8 +190,6 @@ pub struct VmSpec<'a> {
     /// RAM in bytes.
     pub mem: u64,
     pub vcpus: u64,
-    /// The guest kernel ELF.
-    pub kernel: &'a [u8],
     /// The initramfs (several concatenated archives are fine); may be empty.
     pub initrd: &'a [u8],
     pub cmdline: &'a str,
@@ -289,16 +236,16 @@ impl Ctl {
         Ok(HostInfo { cores: v[0], free: v[1], total: v[2], disks: v[3], vms: v[4], nics: v[5] })
     }
 
-    /// Create a VM, attach its disks and NICs, load it and start it.
+    /// Create a VM, attach its disks and NICs, load its initrd and start
+    /// it with the host's kernel.
     /// Returns the VM id and the MAC of each NIC.  On failure the VM is
     /// destroyed again.
     pub fn create_vm(&self, o: &VmSpec) -> Result<(u64, Vec<u64>)> {
-        let k = parse_kernel(o.kernel)?;
         let mut name = [0u8; CTL_NAME_MAX];
         let n = o.name.len().min(CTL_NAME_MAX - 1);
         name[..n].copy_from_slice(&o.name.as_bytes()[..n]);
-        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, k.ram_base, 0, o.io_pool], &name, &[])?;
-        let vm = resp.vals[0];
+        let resp = self.call(CTL_VM_CREATE, &[o.mem, o.vcpus, 0, 0, o.io_pool], &name, &[])?;
+        let (vm, initrd_gpa) = (resp.vals[0], resp.vals[1]);
         let r = (|| {
             for &(disk, ro, start, sectors) in &o.disks {
                 self.call(CTL_BLK_ATTACH, &[vm, disk, ro as u64, start, sectors], &[], &[])?;
@@ -307,16 +254,12 @@ impl Ctl {
             for &(sw, mac, flags) in &o.nics {
                 macs.push(self.call(CTL_NIC_CREATE, &[vm, sw, mac, flags], &[], &[])?.vals[0]);
             }
-            for (gpa, data) in &k.segments {
-                load(self, vm, *gpa, data)?;
-            }
-            let initrd_gpa = k.end_gpa + (1 << 20);
             if !o.initrd.is_empty() {
                 load(self, vm, initrd_gpa, o.initrd)?;
             }
             let mut cmdline = o.cmdline.as_bytes().to_vec();
             cmdline.truncate(CTL_DATA_MAX - 1);
-            self.call(CTL_VM_START, &[vm, k.entry, k.end_gpa, initrd_gpa, o.initrd.len() as u64], &cmdline, &[])?;
+            self.call(CTL_VM_START, &[vm, initrd_gpa, o.initrd.len() as u64], &cmdline, &[])?;
             Ok((vm, macs))
         })();
         if r.is_err() {

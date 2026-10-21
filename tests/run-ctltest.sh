@@ -13,7 +13,6 @@ mkdir -p "$out/ctlroot"
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
 rm -rf "$out/ctlroot"/* && mkdir -p "$out/ctlroot"
 cp "$out/vm.cpio.gz" "$out/ctlroot/"
-cp "$l4h_linux_out/vmlinux.stripped" "$out/ctlroot/vmlinux"
 rm -f "$out/ctl.img"
 mkfs.ext4 -q -F "$out/ctl.img" 32M
 # Disks 1 and 2: a byte pattern, read slowly (throttled) so that requests
@@ -24,7 +23,7 @@ for i in 1 2; do head -c 32M /dev/zero | tr '\000' '\245' > "$out/dma$i.img"; do
 slow=throttling.bps-read=2097152
 # mkinitramfs copies extra files into /bin; move the payload to / in init.
 "$root/tools/mkinitramfs.sh" "$out/ctltest.cpio.gz" "$root/tests/guest/init-ctltest" \
-    "$l4h_ctl" "$out/ctlroot/vmlinux" "$out/ctlroot/vm.cpio.gz" >/dev/null
+    "$l4h_ctl" "$out/ctlroot/vm.cpio.gz" >/dev/null
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
 L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0,disable-legacy=on \
     -drive file=$out/dma1.img,if=none,id=d1,format=raw,$slow -device virtio-blk-pci,drive=d1,disable-legacy=on \

@@ -137,6 +137,15 @@ config L4H_ATTEST
 	  attests, as configfs-tsm reports (with VIRT_DRIVERS) and through
 	  /dev/l4h-attest.  Hosts without a TPM offer none.
 
+config L4H_KMOD
+	bool "The kernel's module tree from the l4h host"
+	default y
+	depends on BLOCK
+	help
+	  The read-only block device /dev/l4hkmod: an EROFS image of this
+	  kernel's /lib/modules, with its modules and the tree to build
+	  external modules against, which the host shares with every guest.
+
 endmenu
 
 config ARCH_SUSPEND_POSSIBLE

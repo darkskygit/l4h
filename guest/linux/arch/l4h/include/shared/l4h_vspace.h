@@ -10,5 +10,10 @@ void l4h_mm_release(struct mm_struct *mm);
 int l4h_map_fault(struct mm_struct *mm, unsigned long address);
 void l4h_mm_flush_deferred(struct mm_struct *mm);
 void l4h_vspace_init(void);
+unsigned long l4h_vspace_get(void);
+void l4h_vspace_put(unsigned long root);
+void *l4h_kernel_va_get(unsigned long size);
+void l4h_kernel_va_put(void *va);
+unsigned long l4h_kernel_map_frame(unsigned long frame, unsigned long va);
 
 #endif

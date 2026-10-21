@@ -40,11 +40,12 @@ gcc -O2 -static -pthread -o "$out/selftest" "$root/tests/guest/selftest.c"
 "$root/tools/mkinitramfs.sh" "$out/disk.cpio.gz" "$root/tests/guest/init-gcedisk" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-gce" \
-    "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" "$out/vmlinux" \
+    "$root/tools/l4hctl/target/release/l4hctl" "$root/tests/guest/udhcpc.script" \
     "$out/selftest.cpio.gz" "$out/disk.cpio.gz" "$out/vm.cpio.gz" >/dev/null
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=1024 L4H_DOM0_CMDLINE=console=hvc0 L4H_WATCHDOG_SECS=${L4H_WATCHDOG_SECS:-0} \
     "$root/tools/build-host.sh"
-"$root/tools/mkimage.sh" -k "$out/vmlinux" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
+L4H_GUEST_KERNEL=$out/vmlinux L4H_GUEST_KMODS= \
+    "$root/tools/mkimage.sh" -i "$out/dom0.cpio.gz" "$out/$name.raw" >/dev/null
 "$root/tools/gce-image.sh" "$out/$name.raw" "$name" >/dev/null
 rm -f "$out/$name.raw"
 

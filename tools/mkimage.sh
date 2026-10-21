@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 # Build a UEFI-bootable disk image: GPT with an EFI system partition that
-# holds l4h as one UEFI application (tools/mkefi.sh) and, optionally, dom0
-# and the host settings in /l4h (DESIGN.md §10).
+# holds l4h as one UEFI application (tools/mkefi.sh), with the guest kernel
+# in it, and, optionally, dom0's initramfs and the host settings in /l4h
+# (DESIGN.md §10).
 # This is the image format GCE imports (tar -Sczf image.tar.gz disk.raw;
 # gcloud compute images create ... --guest-os-features=UEFI_COMPATIBLE).
-# Usage: mkimage.sh [-e l4h.efi] [-k vmlinux] [-i initrd] [-c l4h.conf]
+# Usage: mkimage.sh [-e l4h.efi] [-i initrd] [-c l4h.conf]
 #                   <out.raw> [l4h-root.elf]
 #   -e  use this application instead of building one from l4h-root.elf
-#   -k, -i, -c  dom0's kernel and initramfs, and the settings, copied to
-#       /l4h/dom0/vmlinux, /l4h/dom0/initrd and /l4h/l4h.conf
-# L4H_SERIAL_PORT and L4H_FB_CONSOLE=1 go to tools/mkefi.sh.  L4H_ESP_MB
+#   -i, -c  dom0's initramfs and the settings, copied to /l4h/dom0/initrd
+#       and /l4h/l4h.conf
+# L4H_SERIAL_PORT, L4H_FB_CONSOLE=1, L4H_GUEST_KERNEL and L4H_GUEST_KMODS
+# go to tools/mkefi.sh.  L4H_ESP_MB
 # sizes the partition (default: the payload plus 64 MiB, room for larger
 # dom0 images later).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-efi= dom0_kernel= dom0_initrd= config=
-while getopts e:k:i:c: o; do
+efi= dom0_initrd= config=
+while getopts e:i:c: o; do
     case $o in
         e) efi=$OPTARG ;;
-        k) dom0_kernel=$OPTARG ;;
         i) dom0_initrd=$OPTARG ;;
         c) config=$OPTARG ;;
         *) exit 2 ;;
@@ -37,7 +38,7 @@ fi
 
 # EFI system partition: FAT32, sized for the payload.
 payload=0
-for f in "$efi" $dom0_kernel $dom0_initrd $config; do
+for f in "$efi" $dom0_initrd $config; do
     payload=$(( payload + $(stat -c %s "$f") ))
 done
 esp_mb=${L4H_ESP_MB:-$(( payload / 1048576 + 64 ))}
@@ -45,7 +46,6 @@ dd if=/dev/zero of="$work/esp.img" bs=1M count="$esp_mb" status=none
 mformat -i "$work/esp.img" -F -v L4HEFI ::
 mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT ::/l4h ::/l4h/dom0
 mcopy -i "$work/esp.img" "$efi" ::/EFI/BOOT/BOOTX64.EFI
-[ -n "$dom0_kernel" ] && mcopy -i "$work/esp.img" "$dom0_kernel" ::/l4h/dom0/vmlinux
 [ -n "$dom0_initrd" ] && mcopy -i "$work/esp.img" "$dom0_initrd" ::/l4h/dom0/initrd
 [ -n "$config" ] && mcopy -i "$work/esp.img" "$config" ::/l4h/l4h.conf
 

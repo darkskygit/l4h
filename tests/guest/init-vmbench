@@ -8,7 +8,7 @@ mount -t tmpfs tmp /tmp
 fail() { echo "VMBENCH: FAIL: $*"; poweroff -f; }
 N=$(sed -n 's/.*VMB_N=\([0-9]*\).*/\1/p' /proc/cmdline)
 free_mib() { l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p'; }
-create() { l4hctl create "$1" --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem "$2" --vcpus "$3" \
+create() { l4hctl create "$1" --initrd /bin/vm.cpio.gz --mem "$2" --vcpus "$3" \
     --cmdline "console=hvc0 quiet" || fail "create $1"; }
 ready() { l4hctl console "$1" --until "GUEST: ready" --timeout 120 >/dev/null || fail "guest $1 did not boot"; }
 # min / median / max of the numbers in a file

@@ -5,7 +5,7 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 fail() { echo "SHAREDBLK: FAIL: $*"; poweroff -f; }
-create() { l4hctl create "$1" --kernel /bin/vmlinux --initrd /bin/sharedvm.cpio.gz --mem 128 --disk "$2" --cmdline "console=hvc0 quiet pattern=${3:-A}"; }
+create() { l4hctl create "$1" --initrd /bin/sharedvm.cpio.gz --mem 128 --disk "$2" --cmdline "console=hvc0 quiet pattern=${3:-A}"; }
 waitfor() {
     l4hctl console "$1" --until "$2" --timeout 90 > /tmp/console || { cat /tmp/console; fail "$2"; }
     if grep -q 'SHAREDVM: FAIL' /tmp/console; then cat /tmp/console; fail guest; fi
@@ -63,7 +63,7 @@ many=""
 disks=""
 for i in $(seq 14); do disks="$disks --disk 0,ro,start=2048,sectors=16384"; done
 for i in 1 2 3 4 5; do
-    id=$(l4hctl create "many$i" --kernel /bin/vmlinux --initrd /bin/sharedvm.cpio.gz --mem 128 $disks \
+    id=$(l4hctl create "many$i" --initrd /bin/sharedvm.cpio.gz --mem 128 $disks \
         --cmdline "console=hvc0 quiet pattern=A") || fail "create-many$i"
     many="$many $id"
 done
@@ -76,7 +76,7 @@ grep -q '^disk 0:.*attachments 0$' /tmp/disks || { cat /tmp/disks; fail attachme
 echo "SHAREDBLK: 72 attachments of one disk"
 # Slow hardware retains more than five seconds of DMA work at destroy.
 # The controller must be quarantined and its I/O pool kept out of use.
-q=$(l4hctl create quarantine --kernel /bin/vmlinux --initrd /bin/sharedvm.cpio.gz --mem 128 \
+q=$(l4hctl create quarantine --initrd /bin/sharedvm.cpio.gz --mem 128 \
     --disk 1,start=2048,sectors=16384 --cmdline "console=hvc0 quiet quarantine=1") || fail create-quarantine
 waitfor "$q" 'SHAREDVM: quarantine busy'
 l4hctl destroy "$q" || fail destroy-quarantine

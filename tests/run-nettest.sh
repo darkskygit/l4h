@@ -12,9 +12,8 @@ mkdir -p "$out"
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/netvm.cpio.gz" "$root/tests/guest/init-netvm" >/dev/null
-cp "$l4h_linux_out/vmlinux.stripped" "$out/vmlinux"
 "$root/tools/mkinitramfs.sh" "$out/nettest.cpio.gz" "$root/tests/guest/init-nettest" \
-    "$l4h_ctl" "$out/vmlinux" "$out/netvm.cpio.gz" \
+    "$l4h_ctl" "$out/netvm.cpio.gz" \
     "$root/tests/guest/udhcpc.script" >/dev/null
 L4H_DOM0_MEM_MB=384 \
 L4H_QEMU_ARGS="-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on" \

@@ -322,8 +322,8 @@ We need no IOMMU, since no device is passed into a guest.
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
   syscalls. Several of those (NBSend\*, Yield, SetTLSBase, the debug calls)
-  do not fault without capabilities. `tests/testguest` sweeps all seL4
-  syscall numbers.
+  do not fault without capabilities. `tests/guest/abitest` sweeps all
+  seL4 syscall numbers.
 
 **Decision:** l4h carries E1–E3 and the fixes above as patches in
 `kernel/patches/`, and proposes them upstream through the seL4 RFC process. They are designed as independent
@@ -641,6 +641,43 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
 
 Host hypercalls and device requests still validate their arguments,
 including pool addresses, device indices and lifecycle state.
+
+### 5.6 One guest kernel, and its module tree
+
+- **l4h ships the guest kernel.** seL4's ABI is not stable: syscall
+  numbers, invocation labels, object types, message layouts and the user
+  context are compiled into `os-sel4` from the l4h seL4 build, and the
+  guest relies on the kernel extensions (§4). A guest kernel only works
+  with the host it was built with, so guests do not bring their own. The
+  UEFI application holds one `vmlinux` (the boot module `guest-kernel`),
+  which dom0 and every VM run. `vm_start` takes an initramfs and a command
+  line, and root loads the kernel itself; it parses the ELF once, at boot
+  (`kimage.rs`).
+- **Its module tree.** `tools/build-kmods.sh` builds an EROFS image
+  (LZMA, about 9 MiB) of the kernel's `/lib/modules`: its modules, depmod's
+  files, and `<release>/build`, the tree to build external modules
+  against. That is kbuild's `install-extmod-build` plus what it misses for
+  `ARCH=l4h`: the headers outside `arch/l4h/include`, those of the ISA's
+  own architecture, `abi.h` and libsel4's headers. Its `Makefile` sets
+  `ARCH=l4h`, so `make -C /lib/modules/$(uname -r)/build M=$PWD` works in
+  a guest as on any distribution. The image is the boot module
+  `guest-kmods`, and is optional.
+- **Shared read-only.** Root copies the image into 2 MiB pages at boot and
+  maps them read-only into every guest at `L4H_KMOD_VA` (bootinfo
+  `kmod_va`, `kmod_size`): one copy in host memory for all guests, and a
+  few capability slots per guest. `drivers/kmod.c` makes it the read-only
+  block device `/dev/l4hkmod`, and `mount -t erofs -o ro /dev/l4hkmod
+  /lib/modules` gives modprobe the modules and module builds the tree.
+- **Modules may use the l4h ABI.** A module comes from the kernel's own
+  build, so it can call seL4 and use the ABI directly. The kernel exports
+  its capability allocator (`l4h_slot_alloc`, `l4h_obj_alloc`, …), process
+  VSpaces (`l4h_vspace_get`), kernel mappings of frames it did not make
+  (`l4h_kernel_map_frame`) and os-sel4's vCPU state. `tests/guest/abitest`
+  tests the ABI and E1–E3 below Linux that way, where a freestanding test
+  guest used to.
+- **Measured.** The kernel and the module image are part of the UEFI
+  application, which PCR 4 covers. Launch digests (§9.2) still cover the
+  kernel image in guest RAM, which is the same for every guest of a host.
 
 ---
 
@@ -1085,16 +1122,18 @@ The control protocol has its own version, currently 1.
 ### 9.1 Control plane: dom0 and the runtime API
 
 **Starting dom0.** `tools/build-host.sh` builds the services and root,
-and `host/l4h-root/build.rs` embeds the services' ELFs. dom0's kernel,
-initramfs and the host settings are named modules (`dom0-kernel`,
-`dom0-initrd`, `l4h-config`); root has no dom0 built in. They come from:
+and `host/l4h-root/build.rs` embeds the services' ELFs. The guest kernel
+and its module tree (§5.6), dom0's initramfs and the host settings are
+named modules (`guest-kernel`, `guest-kmods`, `dom0-initrd`,
+`l4h-config`); root has none of them built in. They come from:
 
-- **The EFI system partition** (deployment). l4h ships as one UEFI
-  application per seL4 variant (§10), the same for every host. GRUB
-  reads `/l4h/dom0/vmlinux`, `/l4h/dom0/initrd` and `/l4h/l4h.conf`
-  and passes them as boot modules. seL4 keeps them intact (patch
-  0021); root maps them for good, since restarting dom0 loads them
-  again. QEMU's multiboot `-initrd` can pass the same modules.
+- **The UEFI application and the EFI system partition** (deployment). l4h
+  ships as one UEFI application per seL4 variant (§10), the same for every
+  host. GRUB passes the guest kernel and its module tree from its memdisk,
+  and `/l4h/dom0/initrd` and `/l4h/l4h.conf` from the partition, as boot
+  modules. seL4 keeps them intact (patch 0021); root maps them for good,
+  since restarting dom0 loads them again. QEMU's multiboot `-initrd` can
+  pass the same modules.
 - **Root's own ELF** (x86_64 and aarch64; aarch64 has no boot loader
   that passes modules). `tools/add-modules.py` appends the files to a
   built `l4h-root.elf` as one more `PT_LOAD` segment, right after root's
@@ -1102,11 +1141,11 @@ initramfs and the host settings are named modules (`dom0-kernel`,
   ignores), and writes the segment's address and size into an anchor
   static in root (`bootmod.rs`). The kernel or the loader then maps the
   files with the rest of root; no Rust is rebuilt. The QEMU scripts do
-  this from `L4H_DOM0_KERNEL`, `L4H_DOM0_INITRD` and `L4H_CONFIG`
-  (`tools/dom0-modules.sh`).
+  this from `L4H_GUEST_KERNEL`, `L4H_GUEST_KMODS`, `L4H_DOM0_INITRD` and
+  `L4H_CONFIG` (`tools/dom0-modules.sh`).
 
 Boot loader modules win over appended ones of the same name. Without a
-`dom0-kernel`, root starts no dom0 and serves only the serial monitor.
+`guest-kernel`, root starts no guests and serves only the serial monitor.
 
 The settings (dom0's memory, vCPUs, I/O pool, disks, NICs, internal
 switches and command line; the uplink NICs, the boot disk, the serial port
@@ -1157,11 +1196,12 @@ external orchestration can run in dom0.
   device's data area, 1 MiB of host-owned frames mapped into dom0, and
   sets the request's source offset to 0 and length to the ioctl buffer
   length: `l4h-root` never reads dom0's RAM.
-- `l4hctl` parses the guest kernel ELF in dom0 userspace and loads it with
-  raw `VM_LOAD(vm, gpa, bytes)` writes. `l4h-root` copies page by page from
-  the data area to the new guest's frames and never parses guest images.
+- `l4hctl` loads the initramfs with raw `VM_LOAD(vm, gpa, bytes)` writes,
+  from the GPA `vm_create` returns. `l4h-root` copies page by page from the
+  data area to the new guest's frames and never parses what guests load.
   The lifecycle is `vm_create` → (`blk_attach` / `nic_create` / `vm_load`)* → `vm_start`
-  (writes the boot info and spawns the guest's `l4h-vmm`) → `vm_destroy`.
+  (loads the guest kernel, writes the boot info and spawns the guest's
+  `l4h-vmm`) → `vm_destroy`.
 - `vm_shutdown` (`l4hctl shutdown [--reboot]`) is the ACPI-power-button
   equivalent. `l4h-root` sets `power_request` in the guest's console page
   and raises the console's event line on vCPU 0. The guest runs
@@ -1264,8 +1304,7 @@ The chain has four links.
    entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
    length ‖ cmdline)`, with u64 little-endian integers.
    - Root reads the image back from guest RAM before the guest starts.
-     `vm_start` fails if anything was loaded outside the kernel image and
-     the initramfs.
+     `vm_start` fails if dom0 loaded anything outside the initramfs.
    - Root writes {instance, RAM, vCPUs, dom0, digest} into a registry page
      that trustd maps read-only. Root never calls trustd, whose TPM commands
      can take seconds.
@@ -1305,8 +1344,8 @@ The chain has four links.
    - the PCRs have the expected values (`--pcr`);
    - the EK certificate chains to the manufacturer's CA (`--ek-ca`);
    - the report verifies under K and carries the verifier's nonce and the
-     expected launch digest. `measure` computes the digest from the kernel,
-     initramfs and command line.
+     expected launch digest. `measure` computes the digest from the kernel
+     (`vmlinux` in a release's debug archive), initramfs and command line.
 
    **AK enrollment.** A quote only proves something if the AK is in a real
    TPM. `make-credential` encrypts a secret to the EK (from its certificate)
@@ -1392,11 +1431,12 @@ a locality, so a command only runs if trustd ran the `_DSM`.
 - **Firmware.** UEFI → GRUB (EFI) → multiboot2. QEMU uses OVMF for this
   path, or plain `-kernel` multiboot for development. `tools/mkefi.sh`
   builds l4h as one UEFI application: a standalone GRUB whose memdisk
-  holds the seL4 kernel and `l4h-root` (with the service ELFs). GRUB
-  loads dom0 and `l4h.conf` from the EFI partition it was loaded from or,
-  since `$cmdpath` is empty under OVMF, the first partition with
-  `/l4h/dom0/vmlinux` (§9.1). Images for other guests come through the
-  dom0 API.
+  holds the seL4 kernel, `l4h-root` (with the service ELFs), the guest
+  kernel and its module tree (§5.6). GRUB loads dom0's initramfs and
+  `l4h.conf` from the EFI partition it was loaded from or, since
+  `$cmdpath` is empty under OVMF, the first partition with
+  `/l4h/dom0/initrd` (§9.1). Initramfs images for other guests come
+  through the dom0 API.
 - **Variants.** The application is the same for every host except for
   seL4 options fixed at build time. `tools/build-efi.sh` builds the
   shipped ones into `build/efi/`: `l4h-generic.efi` (x2APIC, PCID: QEMU,
@@ -1476,12 +1516,11 @@ a locality, so a command only runs if trustd ran the `_DSM`.
     `console_port=0x3f8 debug_port=0x3f8` (or `serial_port`), because
     UEFI firmware need not fill in the BIOS data area that seL4 otherwise
     reads the port from, and `l4h-root` as the first `module2`;
-  - optionally `/l4h/dom0/vmlinux`, `/l4h/dom0/initrd` and
-    `/l4h/l4h.conf` (`-k`, `-i`, `-c`), the later `module2`s. Without
-    them root starts no dom0.
+  - optionally `/l4h/dom0/initrd` and `/l4h/l4h.conf` (`-i`, `-c`), the
+    later `module2`s.
 - **Local test.** `tests/run-uefitest.sh` boots that image the way GCE
   would, under OVMF on a q35 machine: NVMe boot disk, virtio-net NIC, KVM
-  without VMX. dom0 and an `l4h.conf` (which
+  without VMX. dom0's initramfs and an `l4h.conf` (which
   sets dom0's command line and keeps the boot disk from it) come from the
   EFI partition. dom0 gets DHCP through the virtio-net uplink.
 - **Deployment.** `tools/gce-image.sh` packages the image as
@@ -1567,8 +1606,7 @@ Rules that keep the port cheap:
   ptrace register sets, TLS, SMP, atomics, setjmp/longjmp, syscall restart,
   instruction-cache maintenance and module relocations are implemented.
   Modules use the large code model, like the guest kernel.
-- **Tests.** `run-testguest-aarch64.sh` covers the ABI with an attached
-  PCI disk. `L4H_ARCH=aarch64` selects the Linux integration tests, including
+- **Tests.** `run-abitest.sh` covers the ABI with an attached PCI disk. `L4H_ARCH=aarch64` selects the Linux integration tests, including
   1/4-vCPU self-tests, modules, virtio-blk/NVMe, VM lifecycle, networking and
   the serial monitor. CI has a QEMU/TCG job for these paths. The assembled
   image also runs directly on Apple Silicon macOS using QEMU/HVF with
@@ -1652,7 +1690,7 @@ l4h/
   host/              Rust workspace: l4h-abi, l4h-host, l4h-rt, l4h-root, l4h-vmm, l4h-blkd, l4h-netd, l4h-trustd, l4h-virtio
   tools/l4hctl/      dom0 userspace CLI and library for the control API
   third_party/sddf/  submodule (design reference; no linked C drivers)
-  tools/             build-kernel.sh, build-linux.sh, build-host.sh, mkefi.sh (UEFI application), build-efi.sh (its variants), add-modules.py (dom0 into a built root), mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh, l4h-attest.py (attestation verifier), swtpm.sh (a software TPM for QEMU)
+  tools/             build-kernel.sh, build-linux.sh, build-kmods.sh (the guest kernel's module tree), build-host.sh, mkefi.sh (UEFI application), build-efi.sh (its variants), add-modules.py (the guest kernel and dom0 into a built root), mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh, l4h-attest.py (attestation verifier), swtpm.sh (a software TPM for QEMU)
   tests/             host-level integration tests driven by QEMU + expect-style console scripting
 ```
 
@@ -1795,7 +1833,7 @@ memory the guest can retype.
   blkd's DMA memory can be device targets now, so a device that does not
   confirm the reset pins those (`Guest::destroy(pin_pool)`), not the
   guest's RAM.
-- **Tests.** `tests/testguest` plays a hostile driver against a virtio-blk
+- **Tests.** `tests/guest/abitest` plays a hostile driver against a virtio-blk
   disk: no `ACCESS_PLATFORM`, rings in RAM or across the pool's end,
   header, data or status in RAM, a buffer past the pool's end; a read
   through the pool still works. `tests/fuzz-virtq` places the pool at
@@ -1808,8 +1846,8 @@ memory the guest can retype.
 
 ### 15.2 Guest RAM as 2 MiB Untypeds (phase 2)
 
-- **seL4 semantics, settled first** (`tests/testguest`, `untyped_copy_test`
-  and `ram_blocks_test`, seL4 16.0.0). An Untyped can be copied only while
+- **seL4 semantics, settled first** (`tests/guest/abitest`,
+  `untyped_copy_test` and `ram_blocks_test`, seL4 16.0.0). An Untyped can be copied only while
   it has no children; the copy is a revocable MDB child of the original, and
   copying sets the original's free index to "full", so the two can never
   hand out the same memory. The guest retypes and revokes through its copy;
@@ -1827,7 +1865,7 @@ memory the guest can retype.
   host one root CNode slot.
 - **Boot blocks.** `l4h-root` turns a block into host frames (a level-2 RAM
   CNode, 512 frames, mapped in the direct map) when an image is loaded into
-  it (`VM_LOAD`, or dom0's image). At `VM_START` the boot blocks
+  it (the kernel, or an initramfs). At `VM_START` the boot blocks
   are the prefix of RAM up to the end of the kernel, the initrd and
   anything loaded, plus `BOOT_SLACK` (one) block for the guest kernel's
   memory until it has mapped the rest; at least one block must be left for

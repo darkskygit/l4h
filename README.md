@@ -18,6 +18,9 @@ current status of each part.
     apt.
   - 30 guests of 256 MiB run on 4 cores, with CPU caps, a vCPU balancer
     and steal time.
+  - Every guest runs the kernel l4h ships, and gets its modules and the
+    tree to build more against, read-only, as `/dev/l4hkmod` (an EROFS
+    image of `/lib/modules`).
 - **Block.** Passed-through virtio-blk, virtio-scsi and NVMe disks, or read-only and
   partial (LBA window) slices of them. I/O is zero-copy: devices DMA
   straight into guest memory.
@@ -28,14 +31,15 @@ current status of each part.
   - Checksum and TSO offloads.
   - Routing and NAT are done by a VM, for example Debian with nftables.
 - **Control.** dom0, the first guest, controls the host through
-  `/dev/l4hctl` and the `l4hctl` CLI: create, load, start, shutdown and
-  destroy VMs; console access; disks; switches; NICs; CPU caps. Destroying
+  `/dev/l4hctl` and the `l4hctl` CLI: create, start (with an initramfs
+  and a command line), shutdown and destroy VMs; console access; disks; switches; NICs; CPU caps. Destroying
   a VM returns all its memory.
 - **Memory under QEMU/KVM.** Memory not given to guests is reported
   free through virtio-balloon free page reporting, so QEMU drops it.
 - **Boot.** Multiboot under QEMU, or l4h as one UEFI application
-  (`tools/mkefi.sh`, one per seL4 variant with `tools/build-efi.sh`) that
-  loads dom0 and its settings from the EFI system partition; a UEFI disk
+  (`tools/mkefi.sh`, one per seL4 variant with `tools/build-efi.sh`), with
+  the guest kernel in it, that loads dom0's initramfs and the settings from
+  the EFI system partition; a UEFI disk
   image for GCE (`tools/mkimage.sh`, `tools/gce-image.sh`; tested on N2 and
   C3 with `tests/gce-test.sh`). On a host with a display
   the UEFI image shows a read-only status dashboard.
@@ -46,8 +50,7 @@ current status of each part.
   key, giving the guest's launch digest and the guest's own nonce. Guests
   get them through configfs-tsm or `l4hctl attest`; `tools/l4h-attest.py`
   verifies them.
-- **aarch64.** seL4, the host components and the ABI test guest run on
-  QEMU `virt` at EL1. Native AArch64 Linux guests support SMP, signals, TLS,
+- **aarch64.** seL4 and the host components run on QEMU `virt` at EL1. Native AArch64 Linux guests support SMP, signals, TLS,
   kernel modules, PCI virtio-blk/net and NVMe; virtualization is disabled.
 
 ## Layout
@@ -73,7 +76,7 @@ The host needs:
   guest;
 - gcc, Rust (stable, plus the nightly pinned by rust-sel4), cmake, ninja
   and the Python modules seL4 needs, in `.venv`;
-- busybox and e2fsprogs;
+- busybox, e2fsprogs and erofs-utils;
 - for the UEFI image: GRUB EFI, mtools, sfdisk and OVMF;
 - for aarch64: `gcc-aarch64-linux-gnu`, cross libc headers,
   `qemu-system-arm` and a static AArch64 BusyBox for guest initramfs images.
@@ -125,7 +128,7 @@ tools/run-dom0.sh build/my.cpio.gz "console=hvc0" 600   # output in build/qemu.l
 Inside dom0, `l4hctl help` lists the control commands, for example:
 
 ```sh
-l4hctl create web --kernel /vmlinux --initrd /web.cpio.gz --mem 512 --vcpus 2 \
+l4hctl create web --initrd /web.cpio.gz --mem 512 --vcpus 2 \
     --disk 0 --nic 0
 l4hctl console 1 --follow
 ```
@@ -134,7 +137,7 @@ l4hctl console 1 --follow
 
 | Test | What it checks |
 |------|----------------|
-| `tests/run-testguest.sh`, `tests/run-testguest-aarch64.sh` | guest ABI and seL4 extensions (freestanding guest) |
+| `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
 | `tests/run-objtest.sh [vcpus]` | object memory growth under fragmentation, block conversion, SMP memory stress, OOM recovery |
 | `tests/run-cryptotest.sh [vcpus] [secs] [MiB]` | dm-crypt with AES-NI (x86_64) or the ARMv8 Crypto Extensions (aarch64) vs generic C (cross-check, throughput), user SIMD state under concurrent kernel crypto |

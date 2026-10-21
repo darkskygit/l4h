@@ -14,9 +14,8 @@ mkdir -p "$out"
 "$l4h_cc" -O2 -static -o "$out/netbench" "$root/tests/guest/netbench.c"
 "$root/tools/mkinitramfs.sh" "$out/benchvm.cpio.gz" "$root/tests/guest/init-benchvm" "$out/netbench" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/benchsrc.cpio.gz" "$root/tests/guest/init-benchsrc" "$out/netbench" >/dev/null
-cp "$l4h_linux_out/vmlinux.stripped" "$out/vmlinux"
 "$root/tools/mkinitramfs.sh" "$out/bench.cpio.gz" "$root/tests/guest/init-bench" \
-    "$out/bench" "$l4h_ctl" "$out/vmlinux" \
+    "$out/bench" "$l4h_ctl" \
     "$out/benchvm.cpio.gz" "$out/benchsrc.cpio.gz" >/dev/null
 rm -f "$out/bench.img" && truncate -s 1G "$out/bench.img"
 L4H_DOM0_VCPUS=${1:-1} L4H_DOM0_MEM_MB=512 \

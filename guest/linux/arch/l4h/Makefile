@@ -5,6 +5,9 @@
 # Required on the command line (tools/build-linux.sh sets them):
 #   L4H_SEL4_INCLUDE  libsel4 include directory of the l4h seL4 build
 #   L4H_ABI_INCLUDE   directory containing l4h/abi.h
+# The module build tree that guests get (tools/build-kmods.sh) holds both.
+L4H_SEL4_INCLUDE ?= $(wildcard $(srctree)/l4h/sel4)
+L4H_ABI_INCLUDE ?= $(wildcard $(srctree)/l4h/abi)
 
 SUBARCH ?= x86_64
 ifeq ($(SUBARCH),aarch64)

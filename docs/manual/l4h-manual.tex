@@ -270,6 +270,8 @@ Command & Result \\
   whenever the defconfig changed since, it runs \texttt{defconfig}; edit
   \file{build/linux-l4h/.config} or run, for example,
   \cmd{tools/build-linux.sh menuconfig} to change it. \\
+\cmd{tools/build-kmods.sh} & Builds the guest kernel and its module tree,
+  \file{build/linux-l4h/kmods.erofs} (Section~\ref{sec:kmods}). \\
 \cmd{tools/build-host.sh} & Builds \texttt{l4h-vmm}, \texttt{l4h-blkd},
   \texttt{l4h-netd} and the root task \texttt{l4h-root}, which embeds them
   (dom0 is not built in, Chapter~\ref{ch:dom0}). The result is
@@ -318,27 +320,61 @@ with NAT and nftables, bridges and veth, and paravirtual steal-time
 accounting, all built in. It also has what l4h-sandbox needs for its dom0 (a
 router with a firewall, tagged VLANs, XFS and FAT) and its sandboxes
 (EROFS, dm-crypt, Docker through \texttt{iptables-nft}, the NFS client), so
-that the shipped kernel serves both. Any kernel built from
-\texttt{ARCH=l4h} can serve any guest; dom0 and the other guests usually
-share one \file{vmlinux}.
+that the shipped kernel serves both.
+
+Every guest runs this kernel: the one in the host's UEFI application
+(Chapter~\ref{ch:dom0}), or the one appended to \texttt{l4h-root} under
+QEMU. Guests cannot bring their own, because a guest kernel calls seL4
+directly and seL4's interface changes between versions: a kernel only works
+with the host it was built with. A different configuration therefore means a
+different host image.
+
+\section{Kernel modules in guests}
+\label{sec:kmods}
+
+The host also gives every guest the kernel's module tree, read-only: its
+modules, and the tree to build more against. It is the block device
+\file{/dev/l4hkmod}, an EROFS image of \file{/lib/modules}:
+\begin{lstlisting}[language=bash]
+mount -t erofs -o ro /dev/l4hkmod /lib/modules
+modprobe ...                                   # the kernel's own modules
+make -C /lib/modules/$(uname -r)/build M=$PWD  # an external module
+insmod my_module.ko
+\end{lstlisting}
+The build needs a compiler and make in the guest, as on any distribution;
+\texttt{ARCH=l4h} is implied. The tree is shared by all guests, so it
+costs the host its size, about 9~MiB, once. \cmd{tools/build-kmods.sh}
+builds it, and the UEFI application carries it (\texttt{L4H\_GUEST\_KMODS}
+in Table~\ref{tab:env} under QEMU). Without it, there is no
+\file{/dev/l4hkmod}.
+
+Modules can also use the l4h interface and seL4 directly: the tree has
+\file{l4h/abi/l4h/abi.h} and libsel4's headers, and the kernel exports its
+capability slots and objects (\texttt{l4h\_slot\_alloc},
+\texttt{l4h\_obj\_alloc}), process address spaces
+(\texttt{l4h\_vspace\_get}) and the vCPUs' state.
+\file{tests/guest/abitest} is an example.
 
 %======================================================================
 \chapter{Configuring dom0 and the host image}
 \label{ch:dom0}
 
-An l4h host boots from two files: the seL4 kernel and \texttt{l4h-root}.
-dom0's kernel and initramfs, and \file{l4h.conf}, are separate files:
+An l4h host boots from the seL4 kernel, \texttt{l4h-root}, the guest
+kernel and its module tree (Section~\ref{sec:kmods}). dom0's initramfs and
+\file{l4h.conf} are separate files:
 \begin{itemize}
-  \item On a UEFI machine they sit on the EFI system partition, next to
-        l4h's UEFI application (Section~\ref{sec:esp}).
+  \item On a UEFI machine, l4h's UEFI application carries the first four,
+        and the others sit next to it on the EFI system partition
+        (Section~\ref{sec:esp}).
   \item Otherwise, and under QEMU on both x86\_64 and aarch64,
         \cmd{tools/add-modules.py IN.elf OUT.elf NAME=FILE...} appends
-        them to a built \file{l4h-root.elf}, under the names
-        \texttt{dom0-kernel}, \texttt{dom0-initrd} and \texttt{l4h-config}.
-        No Rust is rebuilt. \cmd{tools/run-qemu.sh} and
-        \cmd{tools/run-qemu-aarch64.sh} do this from the variables in
-        Table~\ref{tab:env}.
+        the guest kernel and the others to a built \file{l4h-root.elf},
+        under the names \texttt{guest-kernel}, \texttt{guest-kmods},
+        \texttt{dom0-initrd} and \texttt{l4h-config}. No Rust is rebuilt.
+        \cmd{tools/run-qemu.sh} and \cmd{tools/run-qemu-aarch64.sh} do
+        this from the variables in Table~\ref{tab:env}.
 \end{itemize}
+Without a guest kernel, \texttt{l4h-root} starts no guests.
 The host settings (Table~\ref{tab:settings}) default to the values
 \texttt{l4h-root} was built with; \file{l4h.conf} overrides them.
 
@@ -348,9 +384,12 @@ The host settings (Table~\ref{tab:settings}) default to the values
 \toprule
 Variable & Meaning & Default \\
 \midrule
-\texttt{L4H\_DOM0\_KERNEL} & dom0's kernel (an \texttt{ARCH=l4h} ELF; strip it with
-  \cmd{objcopy --strip-debug} to keep the image small), for the QEMU
-  scripts & none \\
+\texttt{L4H\_GUEST\_KERNEL} & the kernel dom0 and the other guests run (an
+  \texttt{ARCH=l4h} ELF; strip it with \cmd{objcopy --strip-debug} to keep
+  the image small), for the QEMU scripts; for \cmd{tools/mkefi.sh} &
+  none; \file{build/linux-l4h/vmlinux} \\
+\texttt{L4H\_GUEST\_KMODS} & its module tree, for the QEMU scripts and
+  \cmd{tools/mkefi.sh} & none; \file{kmods.erofs} next to the kernel \\
 \texttt{L4H\_DOM0\_INITRD} & dom0's initramfs, for the QEMU scripts; empty
   for none & none \\
 \texttt{L4H\_CONFIG} & an \file{l4h.conf}, for the QEMU scripts & none \\
@@ -364,8 +403,8 @@ Variable & Meaning & Default \\
   (debugging); 0 disables & 0 \\
 \bottomrule
 \end{tabularx}
-\caption{Environment variables. The first three are read when QEMU
-  boots the host; the others, when \cmd{tools/build-host.sh} builds it, set
+\caption{Environment variables. The first four are read when QEMU
+  boots the host or \cmd{tools/mkefi.sh} builds its image; the others, when \cmd{tools/build-host.sh} builds it, set
   the defaults of the settings in Table~\ref{tab:settings}.}
 \label{tab:env}
 \end{table}
@@ -409,17 +448,16 @@ Variable & Meaning & Default \\
 \label{sec:esp}
 
 l4h ships as one UEFI application, the same for every host: a standalone
-GRUB that carries the seL4 kernel and \texttt{l4h-root}
-(\cmd{tools/mkefi.sh OUT.efi}). It loads dom0 from the EFI system partition
-it was booted from:
+GRUB that carries the seL4 kernel, \texttt{l4h-root}, the guest kernel and
+its module tree (\cmd{tools/mkefi.sh OUT.efi}). It loads dom0's initramfs
+and the settings from the EFI system partition it was booted from:
 \begin{lstlisting}
 EFI/BOOT/BOOTX64.EFI   the l4h application
-l4h/dom0/vmlinux       dom0's kernel (an ARCH=l4h ELF)
 l4h/dom0/initrd        dom0's initramfs (optional)
 l4h/l4h.conf           host settings (optional)
 \end{lstlisting}
 When the firmware does not say which partition that is (OVMF), GRUB uses
-the first partition with \file{l4h/dom0/vmlinux}, or else with
+the first partition with \file{l4h/dom0/initrd}, or else with
 \file{l4h/l4h.conf}. Files there override any appended to
 \texttt{l4h-root}. To change dom0, replace the files and
 reboot the host. dom0 itself may do so when it holds the boot disk.
@@ -449,15 +487,17 @@ variant stops early in boot on those machines.
 
 Each tagged release on GitHub carries, for x86\_64:
 \begin{itemize}
-  \item both applications, built in release mode;
-  \item \file{l4h-dom0-x86\_64.tar.xz}: the \texttt{ARCH=l4h} kernel
-        (\file{vmlinux}, for \file{l4h/dom0/vmlinux}), its configuration, a
-        static \cmd{l4hctl} and an example \file{l4h.conf}. Add an
-        initramfs or a root filesystem of your choice, with \cmd{l4hctl} in
-        it (Sections on busybox and Debian dom0s below);
+  \item both applications, built in release mode, with the guest kernel
+        and its module tree in them;
+  \item \file{l4h-dom0-x86\_64.tar.xz}: a static \cmd{l4hctl} and an
+        example \file{l4h.conf}. Add an initramfs or a root filesystem of
+        your choice, with \cmd{l4hctl} in it (Sections on busybox and Debian
+        dom0s below);
   \item \file{l4h-debug-x86\_64.tar.xz}: the same build with debug
         information, to turn fault addresses into source lines with
-        \cmd{addr2line};
+        \cmd{addr2line}. Its \file{vmlinux} is the guest kernel, from
+        which verifiers compute launch digests
+        (Section~\ref{sec:attest});
   \item \file{l4h-attest.py}, which verifies attestation reports
         (Section~\ref{sec:attest});
   \item \file{SHA256SUMS}.
@@ -476,26 +516,26 @@ disk order, and its vNICs as \texttt{eth0}, \texttt{eth1}, \ldots
 
 \section{A minimal busybox dom0}
 
-dom0 needs the \cmd{l4hctl} binary and the images of the guests it will
-start. A guest's image can come from anywhere dom0 can read: its initramfs,
-a disk or the network. The simplest dom0 carries them in its initramfs:
+dom0 needs the \cmd{l4hctl} binary and the initramfs images of the guests
+it will start. They can come from anywhere dom0 can read: its initramfs, a
+disk or the network. The simplest dom0 carries them in its initramfs:
 
 \begin{lstlisting}[language=bash]
-tools/build-linux.sh
+tools/build-kmods.sh                           # the kernel and its module tree
 objcopy --strip-debug build/linux-l4h/vmlinux build/vmlinux
 (cd tools/l4hctl && cargo build --release)
 tools/mkinitramfs.sh build/vm.cpio.gz          # a guest: busybox with a shell
 tools/mkinitramfs.sh build/dom0.cpio.gz my-dom0-init \
-    tools/l4hctl/target/release/l4hctl build/vmlinux build/vm.cpio.gz
+    tools/l4hctl/target/release/l4hctl build/vm.cpio.gz
 tools/build-host.sh
 tools/add-modules.py host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
-    build/l4h-root-dom0.elf dom0-kernel=build/vmlinux \
+    build/l4h-root-dom0.elf guest-kernel=build/vmlinux \
+    guest-kmods=build/linux-l4h/kmods.erofs \
     dom0-initrd=build/dom0.cpio.gz l4h-config=my-l4h.conf
 \end{lstlisting}
 where \file{my-l4h.conf} holds, for example, \texttt{dom0\_mem\_mb=512}.
-For a UEFI machine, put the same files on the EFI partition instead
-(\cmd{tools/mkimage.sh -k build/vmlinux -i build/dom0.cpio.gz -c
-my-l4h.conf}).
+For a UEFI machine, put dom0's files on the EFI partition instead
+(\cmd{tools/mkimage.sh -i build/dom0.cpio.gz -c my-l4h.conf}).
 
 
 Here \file{my-dom0-init} is a shell script that becomes dom0's
@@ -506,7 +546,7 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 udhcpc -i eth0 -q
-l4hctl create web --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 256 --nic 0
+l4hctl create web --initrd /bin/vm.cpio.gz --mem 256 --nic 0
 exec /bin/sh
 \end{lstlisting}
 
@@ -519,11 +559,10 @@ down (\cmd{l4hctl shutdown}). \cmd{tools/mkinitramfs.sh} adds them.
 \section{A Debian dom0}
 
 Any distribution that runs on an x86\_64 Linux kernel can be dom0 or a guest,
-as long as its kernel is an \texttt{ARCH=l4h} build. \cmd{tests/mkdebian.sh} builds
+with the host's \texttt{ARCH=l4h} kernel. \cmd{tests/mkdebian.sh} builds
 \file{build/debian.img}, a Debian 13 ext4 filesystem with systemd, a getty on
 \texttt{hvc0} and DHCP on \texttt{eth0}. To boot it as dom0 from the first
-host disk, use \file{build/vmlinux} as dom0's kernel, no initramfs, and
-this \file{l4h.conf}:
+host disk, give dom0 no initramfs, and this \file{l4h.conf}:
 
 \begin{lstlisting}
 dom0_mem_mb=1024
@@ -581,11 +620,11 @@ Extra QEMU arguments go in \texttt{L4H\_QEMU\_ARGS}.
 
 \section{UEFI disk image}
 
-\cmd{tools/mkimage.sh [-e l4h.efi] [-k vmlinux] [-i initrd] [-c l4h.conf]
-OUT.raw [l4h-root.elf]} builds a GPT disk image whose EFI system partition
-holds l4h's UEFI application (built from \texttt{l4h-root}, or the one
-given with \texttt{-e}) and, with \texttt{-k}, \texttt{-i} and \texttt{-c},
-dom0 and \file{l4h.conf} (Section~\ref{sec:esp}). GRUB boots seL4 with
+\cmd{tools/mkimage.sh [-e l4h.efi] [-i initrd] [-c l4h.conf] OUT.raw
+[l4h-root.elf]} builds a GPT disk image whose EFI system partition holds
+l4h's UEFI application (built from \texttt{l4h-root} and the guest kernel,
+or the one given with \texttt{-e}) and, with \texttt{-i} and \texttt{-c},
+dom0's initramfs and \file{l4h.conf} (Section~\ref{sec:esp}). GRUB boots seL4 with
 multiboot2 and the serial port set explicitly
 (\texttt{console\_port=0x3f8 debug\_port=0x3f8}, or \texttt{serial\_port}).
 The partition has 64 MiB to spare for larger dom0 images
@@ -671,25 +710,22 @@ nic 0: pci 00:05.0 virtio-net, uplink of switch 0
 \section{Creating a VM}
 
 \begin{lstlisting}
-l4hctl create NAME --kernel FILE [--initrd FILE] [--mem MB] [--vcpus N]
+l4hctl create NAME [--initrd FILE] [--mem MB] [--vcpus N]
        [--cmdline STRING] [--io-pool MB]
        [--disk DISK[,ro][,start=SECTOR][,sectors=N]]...
        [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
 \end{lstlisting}
 
-\cmd{create} builds a VM, attaches its devices, loads its kernel and
-initramfs from dom0's files and starts it. It prints the new VM's id on
+\cmd{create} builds a VM, attaches its devices, loads its initramfs from
+dom0's files and starts it with the host's kernel. It prints the new VM's id on
 standard output, and each vNIC's MAC address on standard error. If any step
 fails, it destroys the half-built VM.
 
 \begin{description}[style=nextline]
   \item[\texttt{NAME}] Up to 31 bytes, shown by \cmd{list}. Names need not
     be unique.
-  \item[\texttt{--kernel FILE}] An \texttt{ARCH=l4h} kernel ELF
-    (required). \cmd{l4hctl} parses it in dom0 and copies its segments into
-    the guest's memory.
   \item[\texttt{--initrd FILE}] An initramfs, loaded 1 MiB above the
-    kernel.
+    kernel. Without one, the guest needs a root filesystem on a disk.
   \item[\texttt{--mem MB}] RAM, default 128 MiB, rounded up to whole 2~MiB
     blocks. The minimum is 8 MiB; the maximum is 64 GiB. The guest kernel
     also makes its page tables and other seL4 objects out of this RAM
@@ -720,7 +756,7 @@ A VM has at most 16 devices, counting its console.
 Example: a two-vCPU web server with a disk and two networks.
 \begin{lstlisting}
 # sw=$(l4hctl switch-create)
-# l4hctl create web --kernel /bin/vmlinux --mem 512 --vcpus 2 \
+# l4hctl create web --mem 512 --vcpus 2 \
       --disk 1 --nic 0 --nic $sw --cmdline "console=hvc0 root=/dev/vda rw"
 vm 1: nic on switch 0, mac 02:4c:34:00:01:01
 vm 1: nic on switch 1, mac 02:4c:34:00:01:02
@@ -835,7 +871,7 @@ For example, to give a guest the second partition of disk 1 read-only, take
 its start and size from \cmd{fdisk -l} in dom0 (while dom0 still owns the
 disk) or from the partition table:
 \begin{lstlisting}
-# l4hctl create ro-root --kernel /bin/vmlinux \
+# l4hctl create ro-root \
       --disk 1,ro,start=2099200,sectors=8388608 \
       --cmdline "console=hvc0 root=/dev/vda ro"
 \end{lstlisting}
@@ -945,9 +981,9 @@ switch and one on the internal switch. The setup below is the one
 In dom0:
 \begin{lstlisting}
 # sw=$(l4hctl switch-create)
-# l4hctl create router --kernel /bin/vmlinux --mem 512 --disk 0 \
+# l4hctl create router --mem 512 --disk 0 \
       --nic 0 --nic $sw --cmdline "console=hvc0 root=/dev/vda rw"
-# l4hctl create client --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz \
+# l4hctl create client --initrd /bin/vm.cpio.gz \
       --mem 128 --nic $sw
 \end{lstlisting}
 
@@ -1162,9 +1198,9 @@ interfaces of x86 PCs and servers:
 \end{itemize}
 It works like this:
 \begin{itemize}
-  \item the firmware measures the l4h application, with seL4 and every
-        host component in it, into PCR~4. GRUB measures dom0's kernel,
-        initramfs and \file{l4h.conf} into PCR~9;
+  \item the firmware measures the l4h application, with seL4, every
+        host component and the guest kernel in it, into PCR~4. GRUB
+        measures dom0's initramfs and \file{l4h.conf} into PCR~9;
   \item at boot, the host generates a signing key and has the TPM quote it,
         together with the PCRs, using the TPM's attestation key (AK). That
         quote is the \emph{host evidence};
@@ -1193,7 +1229,9 @@ tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
 tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
     --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
 \end{lstlisting}
-\cmd{measure} prints the launch digest a guest gets from those files. With
+\cmd{measure} prints the launch digest a guest gets from those files;
+\file{vmlinux} is the host's guest kernel (in a release, the one in
+\file{l4h-debug-x86\_64.tar.xz}). With
 \cmd{l4hctl create}, the command line is the one given with
 \texttt{--cmdline}; for dom0, it is \texttt{dom0\_cmdline}. \cmd{verify}
 fails unless every check holds:
@@ -1257,15 +1295,15 @@ Message & Usual cause \\
   state, for example \cmd{shutdown} on a stopped VM, or devices added
   after the VM started. \\
 \texttt{invalid argument} & Out-of-range values: 0 or too many vCPUs, RAM
-  below 8 MiB, a cap above 100, a multicast MAC, a kernel that does not fit in the VM's RAM, or a request
+  below 8 MiB, a cap above 100, a multicast MAC, a kernel and initramfs that do not fit in the VM's RAM, or a request
   that targets dom0 itself. \\
 \texttt{no space for devices} & The VM already has 16 devices. \\
 \texttt{I/O error} & The disk failed to reset when its last owner was
   destroyed and is disabled until the host reboots
   (Section~\ref{sec:disk-failed}). \\
 \texttt{operation not permitted} & dom0 tried to destroy itself. \\
-\texttt{not a 64-bit little-endian ELF} & \texttt{--kernel} does not name a
-  kernel ELF; pass \file{vmlinux}, not a compressed image. \\
+\texttt{request 2 failed: not supported} & The host has no guest
+  kernel to create VMs with. \\
 \bottomrule
 \end{longtable}
 
@@ -1314,8 +1352,8 @@ needs 16~GiB. The Debian tests need \cmd{tests/mkdebian.sh} to have run once.
 Test & What it checks \\
 \midrule
 \endhead
-\cmd{run-testguest.sh},\newline\cmd{run-testguest-aarch64.sh} & the guest ABI
-  and seL4 extensions, with a freestanding guest \\
+\cmd{run-abitest.sh} & the guest ABI and seL4 extensions, from a module
+  built against the module tree \\
 \cmd{run-selftest.sh [vcpus]} & system calls, memory, signals, fork,
   threads, futexes, SMP stress \\
 \cmd{run-objtest.sh} & guest RAM blocks becoming seL4 objects and back
@@ -1389,7 +1427,7 @@ l4hctl\_call)}, whose argument points to a request, a response and, for
 \texttt{VM\_LOAD}, a data buffer. The structures are defined in
 \file{include/l4h/abi.h}:
 \begin{itemize}
-  \item a request has an operation, the ABI version (1), six 64-bit
+  \item a request has an operation, the ABI version (2), six 64-bit
         arguments and 1984 bytes of data;
   \item a response has a status (0 or a negative errno), six 64-bit values
         and 1984 bytes of data.
@@ -1403,17 +1441,17 @@ Op & Name & Arguments & Results \\
 \endhead
 1 & \texttt{HOST\_INFO} & -- & cores, free bytes, total bytes, disks, VMs,
   NICs \\
-2 & \texttt{VM\_CREATE} & RAM bytes, vCPUs, guest RAM base, -- (ignored;
-  formerly an object quota), I/O pool bytes (0: 4 MiB); name in data & VM
-  id \\
+2 & \texttt{VM\_CREATE} & RAM bytes, vCPUs, -- (ignored; formerly the
+  guest RAM base), -- (ignored; formerly an object quota), I/O pool bytes
+  (0: 4 MiB); name in data & VM id, lowest initrd address \\
 
 3 & \texttt{VM\_LOAD} & VM, guest-physical address, source offset, length;
   bytes in the ioctl buffer
   (at most 1 MiB), which the driver stages in the control device's
   host-owned data area & -- \\
 
-4 & \texttt{VM\_START} & VM, entry point, end of kernel, initrd address,
-  initrd size; command line in data & -- \\
+4 & \texttt{VM\_START} & VM, initrd address, initrd size; command line
+  in data & -- \\
 5 & \texttt{VM\_DESTROY} & VM & -- \\
 6 & \texttt{VM\_LIST} & first VM id & count; \texttt{struct l4h\_ctl\_vm}
   entries in data \\
@@ -1445,12 +1483,12 @@ the request's source offset to 0 and length to the ioctl buffer length.
 
 A VM is built in this order: \texttt{VM\_CREATE}, then any
 \texttt{BLK\_ATTACH}, \texttt{NIC\_CREATE} and \texttt{VM\_LOAD} requests,
-then \texttt{VM\_START}. Devices and images can only be added before the VM
-starts. The host never parses guest images: the client loads the kernel's
-segments to their addresses relative to the RAM base it passed to
-\texttt{VM\_CREATE}, and names the entry point in \texttt{VM\_START}.
-Everything loaded must lie in the kernel image, below its end, or in the
-initrd: that is what the launch digest covers (Section~\ref{sec:attest}).
-\texttt{VM\_START} fails with \texttt{EINVAL} otherwise.
+then \texttt{VM\_START}. Devices and the initramfs can only be added before
+the VM starts. \texttt{VM\_CREATE} returns the lowest address for the
+initramfs in \texttt{vals[1]}; \texttt{VM\_START} names where the client
+loaded it, and the host then loads its guest kernel below it. Everything
+the client loads must lie in the initramfs: with the kernel, that is what
+the launch digest covers (Section~\ref{sec:attest}). \texttt{VM\_START}
+fails with \texttt{EINVAL} otherwise.
 
 \end{document}

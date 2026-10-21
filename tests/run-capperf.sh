@@ -11,8 +11,7 @@ mkdir -p "$out"
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/perfvm.cpio.gz" "$root/tests/guest/init-capperfvm" >/dev/null
-cp "$l4h_linux_out/vmlinux.stripped" "$out/vmlinux"
 "$root/tools/mkinitramfs.sh" "$out/capperf.cpio.gz" "$root/tests/guest/init-capperf" \
-    "$l4h_ctl" "$out/vmlinux" "$out/perfvm.cpio.gz" >/dev/null
+    "$l4h_ctl" "$out/perfvm.cpio.gz" >/dev/null
 "$root/tools/run-dom0.sh" "$out/capperf.cpio.gz" "console=hvc0 capperf_caps=${1:-50}" ${CAPPERF_TIMEOUT:-900} \
     | grep -E "CAPPERF|panic" || true

@@ -52,6 +52,7 @@
 #include <linux/workqueue.h>
 #include <linux/proc_fs.h>
 #include <linux/errno.h>
+#include <linux/export.h>
 #include <asm/page.h>
 #include <as-layout.h>
 #include <l4h_sys.h>
@@ -459,6 +460,7 @@ unsigned long l4h_slot_alloc(void)
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	return s;
 }
+EXPORT_SYMBOL_GPL(l4h_slot_alloc);
 
 void l4h_slot_free(unsigned long cptr)
 {
@@ -468,6 +470,7 @@ void l4h_slot_free(unsigned long cptr)
 	__slot_free(cptr);
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 }
+EXPORT_SYMBOL_GPL(l4h_slot_free);
 
 /* Delete the capability in `cptr` and free the slot. */
 void l4h_slot_delete(unsigned long cptr)
@@ -477,6 +480,7 @@ void l4h_slot_delete(unsigned long cptr)
 	WARN_ON(err);
 	l4h_slot_free(cptr);
 }
+EXPORT_SYMBOL_GPL(l4h_slot_delete);
 
 /* ---- objects */
 
@@ -505,6 +509,7 @@ out:
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	return err;
 }
+EXPORT_SYMBOL_GPL(l4h_obj_alloc);
 
 void l4h_obj_free(struct l4h_obj *o)
 {
@@ -519,6 +524,7 @@ void l4h_obj_free(struct l4h_obj *o)
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	o->cptr = 0;
 }
+EXPORT_SYMBOL_GPL(l4h_obj_free);
 
 /* Copy capability `src` (depth 64 CPtr) into a new slot. */
 unsigned long l4h_cap_copy(unsigned long src, int rights)
@@ -533,6 +539,7 @@ unsigned long l4h_cap_copy(unsigned long src, int rights)
 	}
 	return s;
 }
+EXPORT_SYMBOL_GPL(l4h_cap_copy);
 
 /* Mint a badged copy of the capability in root slot `root_slot`. */
 unsigned long l4h_cap_mint_root(unsigned long root_slot, int rights, unsigned long badge)
@@ -547,6 +554,7 @@ unsigned long l4h_cap_mint_root(unsigned long root_slot, int rights, unsigned lo
 	}
 	return s;
 }
+EXPORT_SYMBOL_GPL(l4h_cap_mint_root);
 
 /* ---- frame blocks */
 

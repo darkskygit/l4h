@@ -11,7 +11,7 @@ l4hctl info || fail "info"
 l4hctl disks
 free0=""
 for i in 1 2 3; do
-    id=$(l4hctl create vm$i --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --vcpus 2) || fail "create $i"
+    id=$(l4hctl create vm$i --initrd /bin/vm.cpio.gz --mem 128 --vcpus 2) || fail "create $i"
     echo "CTLTEST: created vm $id"
     l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null || fail "vm $id did not boot"
     l4hctl list
@@ -25,14 +25,14 @@ for i in 1 2 3; do
 done
 # Disk pass-through to a guest, twice: the second sees the first's write.
 for i in 1 2; do
-    id=$(l4hctl create disk$i --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create disk$i"
+    id=$(l4hctl create disk$i --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create disk$i"
     l4hctl console "$id" --until "GUEST: disk ok" --timeout "$((60 * slow))" > /tmp/out || fail "disk vm $i"
     grep -q "GUEST: disk count $((i - 1))" /tmp/out || { cat /tmp/out; fail "disk count"; }
     l4hctl disks > /tmp/disks && grep -q "owner vm $id" /tmp/disks || fail "disk owner"
     l4hctl destroy "$id" || fail "destroy disk$i"
 done
 # Clean shutdown on request.
-id=$(l4hctl create shut --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128) || fail "create shut"
+id=$(l4hctl create shut --initrd /bin/vm.cpio.gz --mem 128) || fail "create shut"
 l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null || fail "shut vm boot"
 l4hctl shutdown "$id" || fail "shutdown request"
 l4hctl console "$id" --until "GUEST: shutting down" --timeout "$((30 * slow))" >/dev/null || fail "guest ignored shutdown"
@@ -43,7 +43,7 @@ done
 echo "CTLTEST: clean shutdown ok"
 l4hctl destroy "$id"
 # A read-only window of the disk.
-id=$(l4hctl create window --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
+id=$(l4hctl create window --initrd /bin/vm.cpio.gz --mem 128 \
     --disk 0,ro,start=8192,sectors=16384) || fail "create window"
 l4hctl console "$id" --until "GUEST: vda size" --timeout "$((60 * slow))" > /tmp/out || fail "window vm"
 sleep 1
@@ -53,7 +53,7 @@ l4hctl destroy "$id" || fail "destroy window"
 # Windows not aligned to 4 KiB are refused (an NVMe disk with 4 KiB blocks
 # would round them down, outside the window).
 for w in start=8193 start=8192,sectors=16383; do
-    if l4hctl create badwin --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
+    if l4hctl create badwin --initrd /bin/vm.cpio.gz --mem 128 \
         --disk 0,ro,$w 2>/tmp/err; then
         fail "unaligned window $w accepted"
     fi
@@ -66,11 +66,11 @@ echo "CTLTEST: unaligned windows refused"
 # must be quiesced before the guest's memory is reused, and work again
 # when attached to the next guest.
 for d in 1 2 1 2; do
-    id=$(l4hctl create dmaload --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 --disk $d \
+    id=$(l4hctl create dmaload --initrd /bin/vm.cpio.gz --mem 128 --disk $d \
         --cmdline "console=hvc0 l4htest=dmaload") || fail "create dmaload $d"
     l4hctl console "$id" --until "GUEST: dma busy" --timeout "$((60 * slow))" >/dev/null || fail "dmaload $d"
     l4hctl destroy "$id" || fail "destroy dmaload $d"
-    id=$(l4hctl create dmacheck --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 128 \
+    id=$(l4hctl create dmacheck --initrd /bin/vm.cpio.gz --mem 128 \
         --cmdline "console=hvc0 l4htest=dmacheck") || fail "create dmacheck"
     l4hctl console "$id" --until "GUEST: stale bytes" --timeout "$((90 * slow))" > /tmp/out || fail "dmacheck"
     grep -q "GUEST: stale bytes 0" /tmp/out || { cat /tmp/out; fail "disk $d DMA into reused memory"; }

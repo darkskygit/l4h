@@ -25,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/export.h>
+#include <linux/vmalloc.h>
 #include <asm/tlbflush.h>
 #include <asm/pgtable.h>
 #include <as-layout.h>
@@ -240,6 +241,50 @@ int os_protect_memory(void *addr, unsigned long len, int r, int w, int x)
 	return 0;
 }
 
+/*
+ * Frames the kernel did not make, for raw seL4 users such as
+ * tests/guest/abitest: l4h_kernel_va_get() reserves address space (it may
+ * sleep), l4h_kernel_map_frame() maps a copy of `frame` at a page of it
+ * and returns the copy's slot, and deleting that (l4h_slot_delete())
+ * unmaps it again.
+ */
+void *l4h_kernel_va_get(unsigned long size)
+{
+	struct vm_struct *area = get_vm_area(size, VM_IOREMAP);
+
+	return area ? area->addr : NULL;
+}
+EXPORT_SYMBOL_GPL(l4h_kernel_va_get);
+
+void l4h_kernel_va_put(void *va)
+{
+	free_vm_area(find_vm_area(va));
+}
+EXPORT_SYMBOL_GPL(l4h_kernel_va_put);
+
+unsigned long l4h_kernel_map_frame(unsigned long frame, unsigned long va)
+{
+	unsigned long flags, slot = l4h_cap_copy(frame, L4H_RIGHTS_ALL);
+	int err;
+
+	if (!slot)
+		return 0;
+	raw_spin_lock_irqsave(&kernel_as_lock, flags);
+	while ((err = l4h_page_map(slot, kernel_as.root, va, L4H_PROT_READ | L4H_PROT_WRITE)) ==
+	       L4H_ERR_FAILED_LOOKUP) {
+		err = as_add_table(&kernel_as, 0, va);
+		if (err)
+			break;
+	}
+	raw_spin_unlock_irqrestore(&kernel_as_lock, flags);
+	if (err) {
+		l4h_slot_delete(slot);
+		return 0;
+	}
+	return slot;
+}
+EXPORT_SYMBOL_GPL(l4h_kernel_map_frame);
+
 /* Is [addr, addr+size) mapped in the guest-kernel VSpace? */
 bool l4h_kernel_range_ok(unsigned long addr, unsigned long size)
 {
@@ -303,23 +348,10 @@ static void vs_detach(struct vs_slot *s)
 	list_move(&s->lru, &vs_free);
 }
 
-/*
- * Make sure `mm` has a VSpace and return it (and its generation).  Called
- * before running one of its threads, with the mm marked running so that it
- * is not evicted meanwhile.
- */
-unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
+/* A free pool entry, taken from the least recently activated mm without
+ * running threads if there is none.  Must hold vs_lock. */
+static struct vs_slot *vs_take(void)
 {
-	struct l4h_mm *m = mm_l4h(mm);
-	unsigned long flags;
-	struct vs_slot *s;
-
-	raw_spin_lock_irqsave(&vs_lock, flags);
-	if (m->vs >= 0) {
-		s = &vs_pool[m->vs];
-		list_move_tail(&s->lru, &vs_lru);
-		goto out;
-	}
 	if (list_empty(&vs_free)) {
 		struct vs_slot *victim = NULL, *it;
 		struct l4h_mm *vm;
@@ -338,7 +370,27 @@ unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 		vs_detach(victim);
 		raw_spin_unlock(&vm->lock);
 	}
-	s = list_first_entry(&vs_free, struct vs_slot, lru);
+	return list_first_entry(&vs_free, struct vs_slot, lru);
+}
+
+/*
+ * Make sure `mm` has a VSpace and return it (and its generation).  Called
+ * before running one of its threads, with the mm marked running so that it
+ * is not evicted meanwhile.
+ */
+unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
+{
+	struct l4h_mm *m = mm_l4h(mm);
+	unsigned long flags;
+	struct vs_slot *s;
+
+	raw_spin_lock_irqsave(&vs_lock, flags);
+	if (m->vs >= 0) {
+		s = &vs_pool[m->vs];
+		list_move_tail(&s->lru, &vs_lru);
+		goto out;
+	}
+	s = vs_take();
 	raw_spin_lock(&m->lock);
 	s->owner = mm;
 	m->vs = s - vs_pool;
@@ -364,6 +416,37 @@ void l4h_mm_release(struct mm_struct *mm)
 	}
 	raw_spin_unlock_irqrestore(&vs_lock, flags);
 }
+
+/*
+ * A process VSpace for raw seL4 use, such as the tests of the host's ABI
+ * (tests/guest/abitest): out of the pool, and empty, until
+ * l4h_vspace_put().  The caller deletes what it mapped there before it
+ * gives the VSpace back.
+ */
+unsigned long l4h_vspace_get(void)
+{
+	unsigned long flags, root;
+	struct vs_slot *s;
+
+	raw_spin_lock_irqsave(&vs_lock, flags);
+	s = vs_take();
+	list_del_init(&s->lru);
+	root = s->as.root;
+	raw_spin_unlock_irqrestore(&vs_lock, flags);
+	return root;
+}
+EXPORT_SYMBOL_GPL(l4h_vspace_get);
+
+void l4h_vspace_put(unsigned long root)
+{
+	struct vs_slot *s = &vs_pool[root & ((1ul << L4H_L2_INDEX_BITS) - 1)];
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&vs_lock, flags);
+	list_add(&s->lru, &vs_free);
+	raw_spin_unlock_irqrestore(&vs_lock, flags);
+}
+EXPORT_SYMBOL_GPL(l4h_vspace_put);
 
 static struct mm_struct *idp_mm(struct mm_id *mm_idp)
 {

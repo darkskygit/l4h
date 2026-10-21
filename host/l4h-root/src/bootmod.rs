@@ -1,5 +1,6 @@
-//! dom0's kernel and initramfs and the host settings, as named modules
-//! (`dom0-kernel`, `dom0-initrd`, `l4h-config`; DESIGN.md §9.1), from:
+//! The guest kernel and its module image, dom0's initramfs and the host
+//! settings, as named modules (`guest-kernel`, `guest-kmods`, `dom0-initrd`,
+//! `l4h-config`; DESIGN.md §9.1), from:
 //!
 //! - the boot loader (x86): GRUB reads them from the EFI system partition,
 //!   or QEMU's -initrd lists them after root.  seL4 keeps them intact as

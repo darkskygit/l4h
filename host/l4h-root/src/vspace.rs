@@ -25,6 +25,7 @@ mod aarch64 {
     pub const PML4_BP: ObjectBlueprint =
         ObjectBlueprint::Arch(ObjectBlueprintArm::SeL4Arch(ObjectBlueprintAArch64::VSpace));
     pub const FRAME_BP: ObjectBlueprint = ObjectBlueprint::Arch(ObjectBlueprintArm::SmallPage);
+    pub const LARGE_PAGE_BP: ObjectBlueprint = ObjectBlueprint::Arch(ObjectBlueprintArm::LargePage);
 
     /// Map `frame` at `vaddr` in `vspace`, creating page tables from `ctx`
     /// as needed (each failed lookup adds the missing level).
@@ -51,6 +52,23 @@ mod aarch64 {
             }
         }
     }
+
+    /// Map the 2 MiB page `frame` at `vaddr` (2 MiB aligned) in `vspace`.
+    /// A page table made for a failed lookup lands at the highest missing
+    /// level, so this never makes a last-level table where the page goes.
+    pub fn map_large_page(ctx: &mut ObjCtx, vspace: cap::VSpace, frame: cap::LargePage, vaddr: usize, rights: CapRights) {
+        loop {
+            match frame.frame_map(vspace, vaddr, rights.clone(), VmAttributes::DEFAULT) {
+                Ok(()) => return,
+                Err(e) if is_failed_lookup(e) => {
+                    let pt = ctx.cap::<cap_type::PT>(PT_BP);
+                    pt.pt_map(vspace, vaddr, VmAttributes::DEFAULT)
+                        .unwrap_or_else(|e| panic!("pt_map({:#x}) failed: {:?}", vaddr, e));
+                }
+                Err(e) => panic!("frame_map({:#x}) failed: {:?}", vaddr, e),
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -65,6 +83,7 @@ const PT_BP: ObjectBlueprint = ObjectBlueprint::Arch(ObjectBlueprintX86::PageTab
 pub const PML4_BP: ObjectBlueprint =
     ObjectBlueprint::Arch(ObjectBlueprintX86::SeL4Arch(ObjectBlueprintX64::PML4));
 pub const FRAME_BP: ObjectBlueprint = ObjectBlueprint::Arch(ObjectBlueprintX86::_4k);
+pub const LARGE_PAGE_BP: ObjectBlueprint = ObjectBlueprint::Arch(ObjectBlueprintX86::LargePage);
 
 #[allow(dead_code)]
 const _: Option<ObjectBlueprintArch> = None;
@@ -83,6 +102,18 @@ pub fn map_frame(
         match frame.frame_map(vspace, vaddr, rights.clone(), attrs) {
             Ok(()) => return,
             Err(e) if is_failed_lookup(e) => ensure_pt(ctx, vspace, vaddr),
+            Err(e) => panic!("frame_map({:#x}) failed: {:?}", vaddr, e),
+        }
+    }
+}
+
+/// Map the 2 MiB page `frame` at `vaddr` (2 MiB aligned) in `vspace`,
+/// creating the page directory and PDPT from `ctx` as needed.
+pub fn map_large_page(ctx: &mut ObjCtx, vspace: cap::VSpace, frame: cap::LargePage, vaddr: usize, rights: CapRights) {
+    loop {
+        match frame.frame_map(vspace, vaddr, rights.clone(), VmAttributes::DEFAULT) {
+            Ok(()) => return,
+            Err(e) if is_failed_lookup(e) => ensure_pd(ctx, vspace, vaddr),
             Err(e) => panic!("frame_map({:#x}) failed: {:?}", vaddr, e),
         }
     }

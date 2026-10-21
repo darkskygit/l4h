@@ -30,6 +30,7 @@ mod devmem;
 mod elf;
 mod font;
 mod guest;
+mod kimage;
 mod mem;
 mod monitor;
 mod netd;
@@ -62,13 +63,6 @@ const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 32768;
 /// Longest free slot range kept for vNIC ports and disk DMA buffers.
 const RESERVE_RANGE: usize = 4096;
-
-/// dom0's images, the modules `dom0-kernel` and `dom0-initrd` (bootmod).
-/// Kept for restarts.
-pub struct Dom0Images {
-    pub kernel: &'static [u8],
-    pub initrd: &'static [u8],
-}
 
 const TIMER_BADGE: u64 = 1 << 40;
 
@@ -201,7 +195,12 @@ pub struct Host {
     pub monitor: Option<monitor::Monitor>,
     pub dashboard: Option<dashboard::Dashboard>,
     pub cfg: config::Config,
-    pub dom0: Dom0Images,
+    /// The kernel all guests run, and its module image (kimage.rs).
+    pub kernel: Option<kimage::Kernel>,
+    pub kmods: Option<kimage::Kmods>,
+    /// dom0's initramfs, the module `dom0-initrd` (bootmod); kept for
+    /// restarts.
+    pub dom0_initrd: &'static [u8],
     pub trustd: Option<trustd::Trustd>,
 }
 
@@ -245,6 +244,9 @@ impl Host {
         let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info);
         if let (Ok(g), Some(t)) = (&mut g, &self.trustd) {
             t.give(g, &mut self.alloc, &mut self.wins.a);
+        }
+        if let (Ok(g), Some(k)) = (&mut g, &self.kmods) {
+            k.map(g, &mut self.alloc);
         }
         let slots = self.alloc.slots.untrack();
         match g {
@@ -435,7 +437,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
     let cfg = config::Config::new(module("l4h-config"));
-    let dom0 = Dom0Images { kernel: module("dom0-kernel").unwrap_or(&[]), initrd: module("dom0-initrd").unwrap_or(&[]) };
+    let kernel = module("guest-kernel").and_then(|k| {
+        kimage::Kernel::parse(k)
+            .inspect_err(|e| sel4::debug_println!("l4h-root: the guest kernel cannot be loaded: {}", e))
+            .ok()
+    });
+    let kmods = module("guest-kmods").and_then(|m| kimage::Kmods::new(&mut alloc, m));
+    let dom0_initrd = module("dom0-initrd").unwrap_or(&[]);
     let info = HostInfo {
         cores,
         tsc_hz: tsc_hz(bootinfo),
@@ -520,17 +528,17 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         monitor: None,
         dashboard: None,
         cfg,
-        dom0,
+        kernel,
+        kmods,
+        dom0_initrd,
         trustd,
     };
     h.scan_disks();
     h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
-    if h.dom0.kernel.is_empty() {
-        sel4::debug_println!("l4h-root: no dom0 kernel, nothing to do");
-    } else if elf::Elf::parse(h.dom0.kernel).is_err() {
-        sel4::debug_println!("l4h-root: the dom0 kernel is not an ELF image, not starting dom0");
+    if h.kernel.is_none() {
+        sel4::debug_println!("l4h-root: no guest kernel, nothing to do");
     } else {
         boot_dom0(&mut h);
     }
@@ -538,7 +546,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 }
 
 pub fn boot_dom0(h: &mut Host) {
-    let ram_base = elf::Elf::parse(h.dom0.kernel).expect("dom0 kernel").bounds().0 as usize;
+    let ram_base = h.kernel.as_ref().expect("guest kernel").ram_base;
     let cfg = GuestConfig {
         name: "dom0",
         ram: h.cfg.dom0_mem_mb << 20,
@@ -605,11 +613,11 @@ pub fn boot_dom0(h: &mut Host) {
     for i in first..first + h.cfg.dom0_internal_switches {
         h.create_nic(id, i as u32, 0, true, false).expect("dom0 internal NIC");
     }
-    let (kernel, initrd) = (h.dom0.kernel, h.dom0.initrd);
     let cmdline = h.cfg.dom0_cmdline.clone();
     h.with_guest(id, |h, g| {
+        let kernel = h.kernel.as_ref().unwrap();
         assert!(
-            guest::load_embedded(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, initrd, &cmdline),
+            guest::boot_with(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, h.dom0_initrd, &cmdline),
             "dom0 image does not fit"
         );
     });

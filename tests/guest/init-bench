@@ -7,11 +7,11 @@ echo "BENCH: start ($(nproc) vCPU)"
 /bin/bench /dev/vda
 # Network: dom0 -> guest TCP over an internal switch.
 sw=$(l4hctl switch-create)
-id=$(l4hctl create sink --kernel /bin/vmlinux --initrd /bin/benchvm.cpio.gz --mem 128 --nic "$sw" 2>/dev/null)
+id=$(l4hctl create sink --initrd /bin/benchvm.cpio.gz --mem 128 --nic "$sw" 2>/dev/null)
 l4hctl console "$id" --until "BENCHVM: ready" --timeout 60 >/dev/null
 # dom0 needs a NIC on that switch: it has one on switch 0 only, so use a
 # second guest as the sender instead.
-id2=$(l4hctl create src --kernel /bin/vmlinux --initrd /bin/benchsrc.cpio.gz --mem 128 --nic "$sw" 2>/dev/null)
+id2=$(l4hctl create src --initrd /bin/benchsrc.cpio.gz --mem 128 --nic "$sw" 2>/dev/null)
 l4hctl console "$id2" --until "BENCHSRC: done" --timeout 120 | grep "BENCH"
 l4hctl switch "$sw"
 l4hctl destroy "$id2"

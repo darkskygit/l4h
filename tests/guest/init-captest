@@ -8,7 +8,7 @@ mount -t tmpfs tmp /tmp
 fail() { echo "CAPTEST: FAIL: $*"; poweroff -f; }
 cap=$(sed -n 's/.*captest_cap=\([0-9]*\).*/\1/p' /proc/cmdline)
 rounds=$(sed -n 's/.*captest_rounds=\([0-9]*\).*/\1/p' /proc/cmdline)
-id=$(l4hctl create capvm --kernel /bin/vmlinux --initrd /bin/capvm.cpio.gz --mem 256 \
+id=$(l4hctl create capvm --initrd /bin/capvm.cpio.gz --mem 256 \
     --cmdline "console=hvc0 quiet caprounds=${rounds:-2}") || fail "create"
 l4hctl sched "$id" "${cap:-25}" || fail "sched"
 echo "CAPTEST: guest $id capped at ${cap:-25}%"

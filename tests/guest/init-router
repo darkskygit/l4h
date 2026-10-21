@@ -6,10 +6,10 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 fail() { echo "ROUTERTEST: FAIL: $*"; poweroff -f; }
 sw=$(l4hctl switch-create) || fail "switch"
-r=$(l4hctl create router --kernel /bin/vmlinux --mem 512 --disk 0 --nic 0 --nic "$sw" \
+r=$(l4hctl create router --mem 512 --disk 0 --nic 0 --nic "$sw" \
     --cmdline "console=hvc0 root=/dev/vda rw l4h.role=router") || fail "create router"
 l4hctl console "$r" --until "ROUTER: ready" --timeout 240 | grep "ROUTER:" || fail "router did not come up"
-c=$(l4hctl create client --kernel /bin/vmlinux --initrd /bin/netvm.cpio.gz --mem 96 --nic "$sw" \
+c=$(l4hctl create client --initrd /bin/netvm.cpio.gz --mem 96 --nic "$sw" \
     --cmdline "console=hvc0 IP0=192.168.77.2/24 GW=192.168.77.1 PING=10.0.2.2") || fail "create client"
 l4hctl console "$c" --until "NETVM: done" --timeout 60 > /tmp/c || fail "client"
 grep -q "NETVM: ping 10.0.2.2 ok" /tmp/c || { cat /tmp/c; fail "client cannot reach the outside through the router"; }

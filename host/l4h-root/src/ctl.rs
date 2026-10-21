@@ -101,19 +101,23 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if !io_pool.is_power_of_two() || !(crate::guest::IO_POOL_MIN..=crate::guest::IO_POOL_MAX).contains(&io_pool) {
                 return Err(EINVAL);
             }
-            // a[3] was the seL4 object quota: the guest's objects come
-            // from its own RAM now, so it is ignored.
+            // a[2] was the kernel's base VA, a[3] the seL4 object quota:
+            // guests run the host's kernel, and their objects come from
+            // their own RAM.
+            let kernel = h.kernel.as_ref().ok_or(ENOSYS)?;
+            let (ram_base, initrd_gpa) = (kernel.ram_base, kernel.initrd_gpa());
             let cfg = GuestConfig {
                 name,
                 ram,
                 vcpus,
                 io_pool,
                 vspaces: 64,
-                ram_base: a[2] as usize,
+                ram_base,
                 dom0: false,
             };
             let id = h.create_guest(&cfg).ok_or(ENOMEM)?;
             resp.vals[0] = id as u64;
+            resp.vals[1] = initrd_gpa as u64;
             Ok(())
         }
         abi::CTL_VM_LOAD => {
@@ -147,10 +151,10 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             let cmdline = cstr(&req.data);
             let ok = h
                 .with_guest(id, |h, g| {
+                    let kernel = h.kernel.as_ref().expect("guests run the host's kernel");
                     g.state == State::Created
                         && g.vmm.is_none()
-                        && g.write_boot_info(&mut h.alloc, &mut h.wins.a, &h.info, a[1], a[2] as usize, (a[3] as usize, a[4] as usize), cmdline)
-
+                        && crate::guest::boot(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, (a[1] as usize, a[2] as usize), cmdline)
                 })
                 .ok_or(ENOENT)?;
             if !ok {

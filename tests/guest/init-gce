@@ -5,7 +5,7 @@
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
-cd / && mv /bin/vmlinux /bin/*.cpio.gz / 2>/dev/null
+cd / && mv /bin/*.cpio.gz / 2>/dev/null
 ok=0; bad=0
 pass() { echo "GCETEST: ok: $*"; ok=$((ok + 1)); }
 step() { echo "GCETEST: [$(cut -d' ' -f1 /proc/uptime)s] $*"; }
@@ -39,7 +39,7 @@ else
 fi
 
 step "self-test guest"
-vm=$(l4hctl create selftest --kernel /vmlinux --initrd /selftest.cpio.gz --mem 512 --vcpus "$cores")
+vm=$(l4hctl create selftest --initrd /selftest.cpio.gz --mem 512 --vcpus "$cores")
 l4hctl console "$vm" --until "reboot: Power down" --timeout 900 > /tmp/st
 sleep 1; l4hctl console "$vm" > /tmp/st
 grep -E "^  |SELFTEST" /tmp/st | sed 's/^/GCETEST: selftest: /'
@@ -51,7 +51,7 @@ n=$(l4hctl info | sed -n 's/^disks: *//p')
 for d in $(seq 0 $((n - 1))); do
     l4hctl disks > /tmp/disks
     grep -q "^disk $d:.*owner -" /tmp/disks || continue
-    vm=$(l4hctl create disk$d --kernel /vmlinux --initrd /disk.cpio.gz --mem 256 --disk $d) || { fail "disk $d guest"; continue; }
+    vm=$(l4hctl create disk$d --initrd /disk.cpio.gz --mem 256 --disk $d) || { fail "disk $d guest"; continue; }
     l4hctl console "$vm" --until "reboot: Power down" --timeout 300 > /tmp/dt
     sleep 1; l4hctl console "$vm" | grep DISKTEST | sed "s/^/GCETEST: disk $d: /"
     l4hctl console "$vm" | grep -q "DISKTEST: PASS" && pass "disk $d pass-through"
@@ -61,7 +61,7 @@ done
 
 step "small guests"
 t0=$(date +%s); ids=""
-for i in $(seq 1 12); do ids="$ids $(l4hctl create small$i --kernel /vmlinux --initrd /vm.cpio.gz --mem 128)"; done
+for i in $(seq 1 12); do ids="$ids $(l4hctl create small$i --initrd /vm.cpio.gz --mem 128)"; done
 up=0
 for id in $ids; do l4hctl console "$id" --until "GUEST: ready" --timeout 120 >/dev/null && up=$((up + 1)); done
 [ "$up" = 12 ] && pass "12 small guests up in $(( $(date +%s) - t0 )) s" || fail "only $up of 12 small guests up"

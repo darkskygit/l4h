@@ -16,7 +16,7 @@ echo "NETTEST: dhcp: $(ip -4 addr show eth0 | sed -n 's/.*inet \([0-9.\/]*\).*/\
 ping -c 3 -W 2 10.0.2.2 >/dev/null || fail "ping the uplink gateway"
 echo "NETTEST: uplink ok"
 
-K="--kernel /bin/vmlinux --initrd /bin/netvm.cpio.gz --mem 96"
+K="--initrd /bin/netvm.cpio.gz --mem 96"
 run() { # name expect-pattern create-args...
     name=$1; pat=$2; shift 2
     id=$(l4hctl create "$name" $K "$@") || fail "create $name"

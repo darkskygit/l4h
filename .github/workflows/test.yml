@@ -60,8 +60,8 @@ jobs:
         run: tools/build-kernel.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux && ccache -s
-      - name: Guest ABI (freestanding test guest)
-        run: tests/run-testguest.sh
+      - name: Guest ABI and seL4 extensions (module), module tree
+        run: tests/run-abitest.sh
       - name: Linux self-test, 1 vCPU
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs
@@ -187,9 +187,9 @@ jobs:
       - name: Build Linux
         run: tools/build-linux.sh vmlinux
       - name: Guest ABI and PCI (EL1)
-        run: tests/run-testguest-aarch64.sh
+        run: tests/run-abitest.sh
       - name: Guest ABI (EL2 entry)
-        run: L4H_QEMU_VIRTUALIZATION=on tests/run-testguest-aarch64.sh
+        run: L4H_QEMU_VIRTUALIZATION=on tests/run-abitest.sh
       - name: Linux self-test, 1 vCPU
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs

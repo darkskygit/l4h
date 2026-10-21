@@ -1,9 +1,9 @@
 # Build what l4h ships for x86_64 and keep it as workflow artifacts:
-# - the UEFI applications, one per seL4 variant (tools/build-efi.sh);
+# - the UEFI applications, one per seL4 variant, with the guest kernel and
+#   its module tree (tools/build-efi.sh);
 # - l4h-debug-x86_64.tar.xz, the same build unstripped, for decoding fault
-#   addresses;
-# - l4h-dom0-x86_64.tar.xz, the dom0 kernel and userspace tools
-#   (tools/build-dom0.sh);
+#   addresses and computing launch digests;
+# - l4h-dom0-x86_64.tar.xz, the dom0 userspace tools (tools/build-dom0.sh);
 # - l4h-attest.py, the verifier of attestation reports.
 # A pushed v* tag also publishes them, with their checksums, as a GitHub
 # release.  aarch64 has no shipped artifacts yet (DESIGN.md §10).

@@ -25,7 +25,7 @@ use l4h_abi as abi;
 use l4h_host as host;
 
 use crate::component::Component;
-use crate::elf::Elf;
+use crate::kimage::Kernel;
 use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot, UtPool, UtRegion};
 use crate::vmm;
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
@@ -216,6 +216,8 @@ pub struct Guest {
     loaded: Vec<(usize, usize)>,
     /// The launch digest, set at boot (DESIGN.md §9.2).
     pub launch: Option<[u8; 32]>,
+    /// Bytes of the module image mapped at KMOD_VA (kimage.rs), 0 if none.
+    pub kmod_size: usize,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -509,6 +511,10 @@ impl Guest {
         bi.nr_blocks = self.blocks.len() as u64;
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces as u64;
+        if self.kmod_size != 0 {
+            bi.kmod_va = abi::KMOD_VA;
+            bi.kmod_size = self.kmod_size as u64;
+        }
 
         bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
         bi.io_pool_gpa = self.pool.gpa as u64;
@@ -726,6 +732,7 @@ pub fn create(
         attest: false,
         loaded: Vec::new(),
         launch: None,
+        kmod_size: 0,
     };
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();
@@ -901,27 +908,28 @@ pub fn create(
     Ok(g)
 }
 
-/// Load an ELF kernel and initrd embedded in the root task (dom0) and write
-/// the boot info.  Returns false if the image does not fit.
-pub fn load_embedded(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &HostInfo, kernel: &[u8], initrd: &[u8], cmdline: &str) -> bool {
-    let Ok(elf) = Elf::parse(kernel) else { return false };
-    let (lo, hi) = elf.bounds();
-    if (lo as usize) & !(PAGE - 1) != g.ram_base {
+/// Load the guest kernel into `g`, whose initrd (if any) is at `initrd`,
+/// and write the boot info.  Only the initrd may have been loaded before:
+/// the kernel is the host's.  Returns false if the parameters are bad or
+/// the image does not fit.
+pub fn boot(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &HostInfo, kernel: &Kernel, initrd: (usize, usize), cmdline: &[u8]) -> bool {
+    let within = |(gpa, len): (usize, usize)| gpa >= initrd.0 && gpa + len <= initrd.0 + initrd.1;
+    if g.ram_base != kernel.ram_base || (initrd.1 != 0 && initrd.0 < kernel.end) || !g.loaded.iter().all(|&r| within(r)) {
         return false;
     }
-    let kernel_end = ((hi as usize - g.ram_base) + PAGE - 1) & !(PAGE - 1);
-    let initrd_gpa = kernel_end + (1 << 20);
-    if !g.valid_gpa(initrd_gpa, initrd.len() + (1 << 20)) {
-        return false;
-    }
-    for seg in elf.segments() {
+    for seg in kernel.elf.segments() {
         if !g.write_ram(alloc, win, seg.vaddr as usize - g.ram_base, seg.data) {
             return false;
         }
     }
+    g.write_boot_info(alloc, win, host_info, kernel.elf.entry, kernel.end, initrd, cmdline)
+}
+
+/// Boot the guest kernel with an initrd held by the root task (dom0's).
+pub fn boot_with(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &HostInfo, kernel: &Kernel, initrd: &[u8], cmdline: &str) -> bool {
+    let initrd_gpa = kernel.initrd_gpa();
     if !initrd.is_empty() && !g.write_ram(alloc, win, initrd_gpa, initrd) {
         return false;
     }
-    g.write_boot_info(alloc, win, host_info, elf.entry, kernel_end, (initrd_gpa, initrd.len()), cmdline.as_bytes())
-
+    boot(g, alloc, win, host_info, kernel, (initrd_gpa, initrd.len()), cmdline.as_bytes())
 }

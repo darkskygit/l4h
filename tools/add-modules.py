@@ -2,8 +2,8 @@
 """Append named files to a built l4h-root ELF, for root to read at boot.
 
 Usage: add-modules.py IN.elf OUT.elf NAME=FILE...
-e.g.   add-modules.py l4h-root.elf root-dom0.elf dom0-kernel=vmlinux \\
-           dom0-initrd=dom0.cpio.gz l4h-config=l4h.conf
+e.g.   add-modules.py l4h-root.elf root-dom0.elf guest-kernel=vmlinux \\
+           guest-kmods=kmods.erofs dom0-initrd=dom0.cpio.gz l4h-config=l4h.conf
 
 The files become one more loadable segment, right after root's last one, so
 seL4 (x86_64) or the kernel loader (aarch64) maps them with the rest of

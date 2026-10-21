@@ -16,7 +16,7 @@ pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
     build-essential gcc g++ make cmake ninja-build python3 python3-venv
     libxml2-utils device-tree-compiler clang libclang-dev
     flex bison bc libelf-dev libssl-dev cpio rsync ccache
-    busybox-static e2fsprogs
+    busybox-static e2fsprogs erofs-utils
     qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin mtools fdisk
     swtpm swtpm-tools python3-cryptography acpica-tools)
 [[ $want == *" aarch64 "* ]] && pkgs+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-system-arm)

@@ -10,7 +10,6 @@ struct CreateOpts {
     name: String,
     mem: u64,
     vcpus: u64,
-    kernel: String,
     initrd: Option<String>,
     cmdline: String,
     disks: Vec<(u64, bool, u64, u64)>,
@@ -19,7 +18,6 @@ struct CreateOpts {
 }
 
 fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
-    let kernel = read_file(&o.kernel)?;
     let initrd = match &o.initrd {
         Some(p) => read_file(p)?,
         None => Vec::new(),
@@ -28,7 +26,6 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
         name: &o.name,
         mem: o.mem,
         vcpus: o.vcpus,
-        kernel: &kernel,
         initrd: &initrd,
         cmdline: &o.cmdline,
         disks: o.disks.clone(),
@@ -83,9 +80,10 @@ const USAGE: &str = "usage: l4hctl <command>
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
   list                         VMs
-  create NAME --kernel F [--initrd F] [--mem MB] [--vcpus N]
+  create NAME [--initrd F] [--mem MB] [--vcpus N]
          [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
-                               create and start a VM; prints its id
+                               create and start a VM, which runs the
+                               host's kernel; prints its id
          [--nic SWITCH[,mac=MAC][,nolock][,isolated]]...
          [--io-pool MB]        device I/O buffer pool (power of two, 1-256;
                                default 4)
@@ -246,7 +244,6 @@ fn run(args: &[String]) -> Result<i32> {
                 name,
                 mem: 128 << 20,
                 vcpus: 1,
-                kernel: String::new(),
                 initrd: None,
                 cmdline: "console=hvc0".into(),
                 disks: Vec::new(),
@@ -257,7 +254,6 @@ fn run(args: &[String]) -> Result<i32> {
             while let Some(a) = it.next() {
                 let mut val = || it.next().cloned().ok_or(Error(format!("{a}: missing value")));
                 match a.as_str() {
-                    "--kernel" => o.kernel = val()?,
                     "--initrd" => o.initrd = Some(val()?),
                     "--mem" => o.mem = parse_mib(&val()?)?,
                     "--vcpus" => o.vcpus = parse_num(&val()?)?,
@@ -303,9 +299,6 @@ fn run(args: &[String]) -> Result<i32> {
                     }
                     _ => return err(format!("create: unknown option {a}")),
                 }
-            }
-            if o.kernel.is_empty() {
-                return err("create: --kernel is required");
             }
             println!("{}", cmd_create(&ctl, &o)?);
         }

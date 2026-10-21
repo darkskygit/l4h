@@ -20,8 +20,8 @@ fi
 "$root/tools/build-l4hctl.sh"
 "$root/tools/mkinitramfs.sh" "$out/sharedvm.cpio.gz" "$root/tests/guest/init-sharedblkvm" >/dev/null
 "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-sharedblk" \
-    "$root/tools/l4hctl/target/release/l4hctl" "$out/vmlinux" "$out/sharedvm.cpio.gz" >/dev/null
-export L4H_DOM0_KERNEL="$out/vmlinux" L4H_DOM0_INITRD="$out/dom0.cpio.gz"
+    "$root/tools/l4hctl/target/release/l4hctl" "$out/sharedvm.cpio.gz" >/dev/null
+export L4H_GUEST_KERNEL="$out/vmlinux" L4H_DOM0_INITRD="$out/dom0.cpio.gz"
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=256 L4H_WATCHDOG_SECS=0 "$root/tools/build-host.sh" > "$out/host-build.log" 2>&1
 truncate -s 64M "$out/disk.raw"
 truncate -s 64M "$out/slow.raw"

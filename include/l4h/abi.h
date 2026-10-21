@@ -29,7 +29,7 @@ typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 3
+#define L4H_ABI_VERSION 4
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -122,8 +122,9 @@ typedef int64_t l4h_s64;
  * Guest-kernel VSpace layout
  *
  * Guest RAM is mapped at bootinfo.ram_base_va: GPA g <-> VA ram_base_va + g.
- * The guest kernel ELF is linked so that its first loadable segment starts
- * at ram_base_va (GPA 0).  The I/O pool follows RAM in the same direct map
+ * The guest kernel ELF (the one l4h ships: guests do not bring their own)
+ * is linked so that its first loadable segment starts at ram_base_va
+ * (GPA 0).  The I/O pool follows RAM in the same direct map
  * (bootinfo.io_pool_gpa).  Host-provided pages live in the special region.
  */
 #define L4H_SPECIAL_BASE        0x00007ff000000000ull
@@ -137,6 +138,10 @@ typedef int64_t l4h_s64;
 #define L4H_DEV_AREA_VA(d)      (L4H_SPECIAL_BASE + 0x10000000ull + (l4h_u64)(d) * 0x10000ull)
 /* Bulk data area of the control device (dom0 only, L4H_CTL_LOAD_MAX). */
 #define L4H_CTL_DATA_VA         (L4H_SPECIAL_BASE + 0x20000000ull)
+/* The kernel's modules and module build tree, read-only (bootinfo.kmod_size
+ * bytes, at most L4H_KMOD_MAX). */
+#define L4H_KMOD_VA             (L4H_SPECIAL_BASE + 0x30000000ull)
+#define L4H_KMOD_MAX            0x10000000ull
 /* First VA above the special region that the guest may never use. */
 #define L4H_SPECIAL_END         (L4H_SPECIAL_BASE + 0x40000000ull)
 
@@ -228,7 +233,12 @@ struct l4h_bootinfo {
 	/* aarch64: the CPU's ID_AA64ISAR0/ISAR1/ISAR2/PFR0/PFR1_EL1, which the
 	 * guest cannot read at EL0; all zero if unknown.  Unused on x86_64. */
 	l4h_u64 cpu_id[5];
-	l4h_u64 reserved[10];
+	/* An EROFS image of the guest kernel's /lib/modules: its modules and
+	 * the tree to build more against (<release>/build), shared read-only
+	 * by all guests at kmod_va.  kmod_size is 0 if the host has none. */
+	l4h_u64 kmod_va;
+	l4h_u64 kmod_size;
+	l4h_u64 reserved[8];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
 };
@@ -313,7 +323,7 @@ struct l4h_console_page {
  * (l4h_dev_desc.data_va), which belongs to the host: l4h-root never reads
  * dom0's RAM.  See DESIGN.md §9.1.
  */
-#define L4H_CTL_VERSION         1
+#define L4H_CTL_VERSION         2
 #define L4H_CTL_RESP_OFF        2048
 #define L4H_CTL_DATA_MAX        1984
 #define L4H_CTL_LOAD_MAX        (1u << 20)
@@ -335,18 +345,18 @@ struct l4h_ctl_resp {
 enum l4h_ctl_op {
 	/* -> vals: cores, free bytes, total bytes, nr disks, nr vms, nr NICs */
 	L4H_CTL_HOST_INFO = 1,
-	/* args: ram bytes (rounded up to 2 MiB), vcpus, ram_base_va, -
-	 * (ignored: there is no object quota any more, objects come from
-	 * guest RAM), I/O pool bytes (0 = default, else a power of two from
-	 * 1 MiB to 256 MiB); data: name -> vals[0] = vm */
+	/* args: ram bytes (rounded up to 2 MiB), vcpus, -, -, I/O pool bytes
+	 * (0 = default, else a power of two from 1 MiB to 256 MiB); data:
+	 * name -> vals[0] = vm, vals[1] = lowest GPA for the initrd (the
+	 * kernel lies below it) */
 
 	L4H_CTL_VM_CREATE = 2,
 	/* args: vm, dst gpa, src offset in the control data area, len
 	 * (<= L4H_CTL_LOAD_MAX) */
 	L4H_CTL_VM_LOAD = 3,
-	/* args: vm, entry, kernel_end gpa, initrd gpa, initrd size; data:
-	 * cmdline.  Everything VM_LOAD wrote must lie in [0, kernel_end) or
-	 * in the initrd, the memory the launch digest covers (DESIGN.md §9.2). */
+	/* args: vm, initrd gpa, initrd size; data: cmdline.  The host loads
+	 * its guest kernel and starts it.  Everything VM_LOAD wrote must lie
+	 * in the initrd, which the launch digest covers (DESIGN.md §9.2). */
 	L4H_CTL_VM_START = 4,
 	/* args: vm */
 	L4H_CTL_VM_DESTROY = 5,

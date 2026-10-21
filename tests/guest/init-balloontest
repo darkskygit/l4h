@@ -12,7 +12,7 @@ phase() { echo "BALLOONTEST: phase $1"; sleep "$hold"; }
 phase idle
 # Twice: memory reported free once must work as guest RAM again.
 for round in 1 2; do
-    id=$(l4hctl create fill$round --kernel /bin/vmlinux --initrd /bin/balloonvm.cpio.gz --mem 1024) \
+    id=$(l4hctl create fill$round --initrd /bin/balloonvm.cpio.gz --mem 1024) \
         || fail "create $round"
     l4hctl console "$id" --until "BALLOONVM: " --timeout 120 > /tmp/out || fail "vm $round did not finish"
     grep -q "BALLOONVM: ok" /tmp/out || { cat /tmp/out; fail "vm $round data"; }

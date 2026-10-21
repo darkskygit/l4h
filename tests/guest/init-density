@@ -17,7 +17,7 @@ i=1
 while [ "$i" -le "$N" ]; do
     hog=$((i % 2))
     [ -n "$(sed -n 's/.*DENS_ALLHOG=1.*/y/p' /proc/cmdline)" ] && hog=1
-    id=$(l4hctl create "d$i" --kernel /bin/vmlinux --initrd /bin/densvm.cpio.gz --mem "$MEM" \
+    id=$(l4hctl create "d$i" --initrd /bin/densvm.cpio.gz --mem "$MEM" \
         --cmdline "console=hvc0 quiet HOG=$hog") || fail "create guest $i"
     ids="$ids $id"
     i=$((i + 1))

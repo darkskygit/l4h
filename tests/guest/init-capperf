@@ -7,7 +7,7 @@ mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 caps=$(sed -n 's/.*capperf_caps=\([0-9,]*\).*/\1/p' /proc/cmdline | tr , ' ')
 for cap in 0 $caps; do
-    id=$(l4hctl create perfvm --kernel /bin/vmlinux --initrd /bin/perfvm.cpio.gz --mem 256 \
+    id=$(l4hctl create perfvm --initrd /bin/perfvm.cpio.gz --mem 256 \
         --cmdline "console=hvc0 quiet") || { echo "CAPPERF: create failed"; break; }
     [ "$cap" = 0 ] || l4hctl sched "$id" "$cap"
     t=0

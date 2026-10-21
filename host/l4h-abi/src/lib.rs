@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 3;
+pub const ABI_VERSION: u64 = 4;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -68,6 +68,8 @@ pub const fn dev_area_va(d: usize) -> u64 {
     SPECIAL_BASE + 0x1000_0000 + d as u64 * 0x1_0000
 }
 pub const CTL_DATA_VA: u64 = SPECIAL_BASE + 0x2000_0000;
+pub const KMOD_VA: u64 = SPECIAL_BASE + 0x3000_0000;
+pub const KMOD_MAX: u64 = 0x1000_0000;
 pub const SPECIAL_END: u64 = SPECIAL_BASE + 0x4000_0000;
 
 pub const PRIO_KERNEL: u64 = 100;
@@ -132,7 +134,9 @@ pub struct BootInfo {
     pub io_pool_size: u64,
     pub boot_blocks: u64,
     pub cpu_id: [u64; 5],
-    pub reserved: [u64; 10],
+    pub kmod_va: u64,
+    pub kmod_size: u64,
+    pub reserved: [u64; 8],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
 }
@@ -194,7 +198,7 @@ pub struct ConsolePage {
     pub input: [u8; CONSOLE_IN_SIZE],
 }
 
-pub const CTL_VERSION: u32 = 1;
+pub const CTL_VERSION: u32 = 2;
 pub const CTL_RESP_OFF: usize = 2048;
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: u64 = 1 << 20;
