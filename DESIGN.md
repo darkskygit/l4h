@@ -1113,7 +1113,12 @@ truly needed, it is bounded by a stated limit that is checked before
 the allocation, fails as an error rather than a panic, and is never
 made per request on a path whose size a guest or a client controls.
 A component without a heap says so (`component!(main, no_heap)`), and
-does not link `alloc`.
+does not link `alloc`. The root task, memd, netd, blkd and the VMM have
+no heap; per-request state is in fixed tables, and state too large for
+a stack is in statics (`l4h_host::fixed::{StaticCell, Scratch}`). The
+one heap is trustd's, for the third-party AML interpreter of the TPM
+start method: its size (`aml::HEAP`) is bounded by the firmware's
+tables, which trustd checks first, never by a guest.
 
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
 protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
@@ -1975,7 +1980,7 @@ memory the guest can retype.
 - **Host accounting.** The ×2 safety factor is gone: an arena starts with
   an estimate of what its owner needs and grows from the free blocks
   (1 MiB at a time) when it runs out (`Arena::retype`). The VMM's estimate
-  went from 8 MiB to what it maps (image, 1 MiB heap, 512 KiB stack).
+  went from 8 MiB to what it maps (image and 512 KiB stack; it has no heap).
 - **Buddy merging.** With RAM coming back in 2 MiB blocks, the host's free
   memory would end up in 2 MiB pieces, and an I/O pool (4 MiB) could no
   longer be found. `Alloc` now keeps the Untyped of every block it

@@ -25,9 +25,9 @@ const PAGE: usize = 4096;
 pub fn arena_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
     // Mapping caps (32 bytes per frame) and page tables for the I/O pool
     // (the VMM maps nothing else of the guest's memory), the VMM image
-    // with its 1 MiB heap and 512 KiB stack, its CNode, and the mappings
-    // of event pages, device pages and backend channels.
-    io_pool / 128 + io_pool / 512 + (5 << 19) + (32 << host::CNODE_BITS) + (vcpus + devices * 16) * 2 * PAGE
+    // (no heap) and its 512 KiB stack, its CNode, and the mappings of
+    // event pages, device pages and backend channels.
+    io_pool / 128 + io_pool / 512 + (3 << 19) + (32 << host::CNODE_BITS) + (vcpus + devices * 16) * 2 * PAGE
 }
 
 /// A device's host-side backend.

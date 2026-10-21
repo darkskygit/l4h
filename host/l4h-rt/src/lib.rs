@@ -1,7 +1,8 @@
 //! Runtime for l4h host components spawned by l4h-root.
 //!
 //! A component provides `fn component_main(info: &'static Info) -> !` and
-//! invokes `l4h_rt::component!(component_main)`.  l4h-root starts the
+//! invokes `l4h_rt::component!(component_main, no_heap)` (or `heap_size = N`
+//! where an allocator is truly needed, DESIGN.md §9).  l4h-root starts the
 //! component at its ELF entry with the stack set up (see l4h-host for the
 //! address-space layout).
 
@@ -125,9 +126,6 @@ macro_rules! component {
                 Err(_) => $crate::sel4_panicking_env::abort!("component main() panicked"),
             }
         }
-    };
-    ($main:path) => {
-        $crate::component!($main, heap_size = 1024 * 1024);
     };
     ($main:path, no_heap) => {
         #[global_allocator]

@@ -5,8 +5,6 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
 /// An informational message: printed only when `host::VERBOSE` (not in
 /// release builds).  Use `sel4::debug_println!` for critical errors only.
 macro_rules! info {
@@ -434,7 +432,7 @@ impl Host {
     }
 }
 
-#[root_task(stack_size = 1024 * 1024, heap_size = 32 * 1024 * 1024)]
+#[root_task(stack_size = 1024 * 1024)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;

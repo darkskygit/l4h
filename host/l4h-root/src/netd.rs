@@ -1,7 +1,6 @@
 //! Networking: the netd component (switches and uplink NICs) and the ports
 //! that connect guests' virtio-net devices to it.
 
-use alloc::vec::Vec;
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
@@ -9,7 +8,7 @@ use l4h_abi as abi;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{VirtioRegions, is_legacy_virtio, map_bars, virtio_regions};
+use crate::blkd::{VirtioRegions, is_legacy_virtio, map_bar_mask, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
@@ -202,17 +201,16 @@ pub fn spawn(
     };
     let mut nic_list = ArrayVec::new();
     for (n, d) in nics.into_iter().take(nr_nics).enumerate() {
-        let mut bars = Vec::new();
-        let virtio;
-        let used: &[u8] = if is_gvnic(&d) {
-            &[0, 2, d.msix.unwrap().table_bar]
+        let mut bars = [const { None }; 6];
+        // BARs used, bit b for BAR b.
+        let used = if is_gvnic(&d) {
+            1 | 1 << 2 | 1 << d.msix.unwrap().table_bar
         } else if is_ixgbe(&d) {
-            &[0, d.msix.unwrap().table_bar]
+            1 | 1 << d.msix.unwrap().table_bar
         } else {
-            virtio = crate::blkd::virtio_bars(&d);
-            &virtio
+            virtio_bar_mask(&d)
         };
-        map_bars(&comp, alloc, &mut arena, devmem, &d, &mut bars, used, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bar_mask(&comp, alloc, &mut arena, devmem, &d, &mut bars, used, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());

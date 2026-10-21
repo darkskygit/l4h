@@ -2,7 +2,6 @@
 //! a guest: a blkd component drives the device, and the guest's l4h-vmm
 //! presents it as virtio-l4h.
 
-use alloc::vec::Vec;
 use core::ops::Range;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -55,7 +54,7 @@ pub struct Controller {
     /// MSI vector (seL4 delivers vector n at CPU vector 0x30 + n).
     vector: u64,
     /// Frames of the BARs the driver uses, carved once.
-    bars: Vec<(u8, Vec<cap::Granule>)>,
+    bars: BarCache,
     /// blkd's client channels, shared by the controller's disks: this
     /// controller's row of CLIENTS.
     pub clients: &'static mut [Option<Attachment>; blk::MAX_CLIENTS],
@@ -107,7 +106,7 @@ impl Controller {
         assert!(row < pci::MAX_DISK_CTRLS, "more than {} disk controllers", pci::MAX_DISK_CTRLS);
         // Each row is handed out once, so this is its only reference.
         let clients = unsafe { &mut (*addr_of_mut!(CLIENTS))[row] };
-        Controller { pci, kind, vector, bars: Vec::new(), clients, failed: false, io: None, driver: None }
+        Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None }
     }
 
     pub fn started(&self) -> bool {
@@ -481,7 +480,7 @@ pub fn reset(disk: &mut Controller, pci: &Pci, alloc: &mut Alloc, devmem: &mut D
         let c = disk.pci.virtio_caps.iter().find(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG).unwrap();
         (c.bar, c.offset as usize + VIRTIO_DEVICE_STATUS)
     };
-    let frame = bar_frames(alloc, devmem, &disk.pci, &mut disk.bars, bar)[off / PAGE];
+    let frame = crate::devmem::granule(bar_frames(alloc, devmem, &disk.pci, &mut disk.bars, bar).start + off / PAGE);
     pci.enable_memory(&disk.pci);
     let ok = win.with_frame_attrs(&abs_of(frame), DEVICE_ATTRS, |page| unsafe {
         let r32 = |o: usize| (page.add(o) as *const u32).read_volatile();
@@ -562,28 +561,9 @@ pub fn virtio_bar_mask(d: &pci::Device) -> u8 {
     caps.map(|c| c.bar).chain(d.msix.map(|m| m.table_bar)).fold(0, |m, b| m | 1 << b)
 }
 
-/// virtio_bar_mask as a list, for netd.rs until it takes the mask.
-pub fn virtio_bars(d: &pci::Device) -> Vec<u8> {
-    let m = virtio_bar_mask(d);
-    (0..6).filter(|b| m & 1 << b != 0).collect()
-}
-
-/// map_bar_mask for a list of BARs, for netd.rs until it takes the mask.
-#[allow(clippy::too_many_arguments)]
-pub fn map_bars(
-    comp: &Component,
-    alloc: &mut Alloc,
-    arena: &mut Arena,
-    devmem: &mut DevMem,
-    d: &pci::Device,
-    cache: &mut Vec<(u8, Vec<cap::Granule>)>,
-    bars: &[u8],
-    bar_va: impl Fn(u8) -> usize,
-    keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
-) {
-    let mask = bars.iter().fold(0, |m, b| m | 1 << b);
-    map_bar_mask(comp, alloc, arena, devmem, d, cache, mask, bar_va, keep)
-}
+/// The frames of a device's BARs, carved on first use: their slots, by
+/// BAR.
+pub type BarCache = [Option<Range<Slot>>; 6];
 
 /// Map BARs `bars` (bit b for BAR b) of `d` into `comp`, uncached.  BAR
 /// frames are carved once and cached in `cache`.
@@ -594,18 +574,18 @@ pub fn map_bar_mask(
     arena: &mut Arena,
     devmem: &mut DevMem,
     d: &pci::Device,
-    cache: &mut Vec<(u8, Vec<cap::Granule>)>,
+    cache: &mut BarCache,
     bars: u8,
     bar_va: impl Fn(u8) -> usize,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
 ) {
     for b in (0..6).filter(|b| bars & 1 << b != 0) {
         let frames = bar_frames(alloc, devmem, d, cache, b);
-        for (i, f) in frames.iter().enumerate() {
+        for (i, f) in frames.map(crate::devmem::granule).enumerate() {
             comp.map_copy(
                 alloc,
                 arena,
-                &abs_of(*f),
+                &abs_of(f),
                 bar_va(b) + i * PAGE,
                 CapRights::read_write(),
                 DEVICE_ATTRS,
@@ -616,22 +596,15 @@ pub fn map_bar_mask(
 }
 
 /// The frames of BAR `b` of `d`, carved on first use and cached in `cache`.
-fn bar_frames<'a>(
-    alloc: &mut Alloc,
-    devmem: &mut DevMem,
-    d: &pci::Device,
-    cache: &'a mut Vec<(u8, Vec<cap::Granule>)>,
-    b: u8,
-) -> &'a [cap::Granule] {
-    if !cache.iter().any(|(i, _)| *i == b) {
-        let bar = d.bars[b as usize];
-        assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio BAR {} unusable", b);
-        let frames = alloc
-            .slots
-            .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
-            .map(|r| r.map(crate::devmem::granule).collect())
-            .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr));
-        cache.push((b, frames));
-    }
-    &cache.iter().find(|(i, _)| *i == b).unwrap().1
+fn bar_frames(alloc: &mut Alloc, devmem: &mut DevMem, d: &pci::Device, cache: &mut BarCache, b: u8) -> Range<Slot> {
+    cache[b as usize]
+        .get_or_insert_with(|| {
+            let bar = d.bars[b as usize];
+            assert!(!bar.is_io && bar.size > 0 && bar.size as usize <= BAR_STRIDE, "virtio BAR {} unusable", b);
+            alloc
+                .slots
+                .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
+                .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr))
+        })
+        .clone()
 }
