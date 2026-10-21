@@ -20,14 +20,15 @@ impl Rtc {
         #[cfg(target_arch = "x86_64")]
         { Self { port: crate::pci::io_ports(alloc, 0x70, 2), century: None } }
         #[cfg(target_arch = "aarch64")]
-        { Self { frame: _devmem.frames(&mut alloc.slots, 0x0901_0000, 4096).map(|f| f[0]) } }
+        { Self { frame: _devmem.frames(&mut alloc.slots, 0x0901_0000, 4096).map(|f| crate::devmem::granule(f.start)) } }
     }
 
     /// Only write a century register that firmware advertises: 0x32 can
     /// be ordinary battery-backed NVRAM on machines without one.
     #[cfg(target_arch = "x86_64")]
     pub fn find_century(&mut self, bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) {
-        self.century = crate::acpi::find(bootinfo, phys, b"FACP")
+        let mut fadt = [0; crate::acpi::FADT_LEN];
+        self.century = crate::acpi::find(bootinfo, phys, b"FACP", &mut fadt)
             .and_then(|t| t.get(108).copied())
             .filter(|&r| (0x0e..0x80).contains(&r));
     }

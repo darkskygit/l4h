@@ -4,8 +4,6 @@
 //! §10).  GRUB sources the same file, so it is also valid GRUB script: no
 //! spaces around `=`, and values with spaces in double quotes.
 
-use alloc::string::String;
-
 use crate::guest;
 
 /// A decimal number, or hexadecimal after "0x".
@@ -110,7 +108,7 @@ pub struct Config {
     /// normal port, for routing between it and isolated guests).
     pub dom0_internal_switches: usize,
     /// dom0's kernel command line.
-    pub dom0_cmdline: String,
+    pub dom0_cmdline: &'static str,
     /// The PCI address (bus:dev.fn) of the uplink NIC, when it is not the
     /// first NIC: e.g. the public port of a two-port card.
     pub uplink_nic: Option<u32>,
@@ -134,7 +132,7 @@ pub struct Config {
 impl Config {
     /// The settings built in, overridden by `text` (the `l4h-config`
     /// module).  Bad lines are reported and ignored.
-    pub fn new(text: Option<&[u8]>) -> Self {
+    pub fn new(text: Option<&'static [u8]>) -> Self {
         let mut c = Config {
             dom0_mem_mb: parse_usize(option_env!("L4H_DOM0_MEM_MB"), 256),
             dom0_vcpus: parse_usize(option_env!("L4H_DOM0_VCPUS"), 1),
@@ -142,7 +140,7 @@ impl Config {
             dom0_disks: parse_usize(option_env!("L4H_DOM0_DISKS"), 64),
             dom0_nics: parse_usize(option_env!("L4H_DOM0_NICS"), 1),
             dom0_internal_switches: parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0),
-            dom0_cmdline: option_env!("L4H_DOM0_CMDLINE").unwrap_or("console=hvc0").into(),
+            dom0_cmdline: option_env!("L4H_DOM0_CMDLINE").unwrap_or("console=hvc0"),
             uplink_nic: parse_bdf(option_env!("L4H_UPLINK_NIC")),
             uplink2_nic: parse_bdf(option_env!("L4H_UPLINK2_NIC")),
             boot_disk: parse_bdf(option_env!("L4H_BOOT_DISK")),
@@ -172,7 +170,7 @@ impl Config {
         c
     }
 
-    fn set(&mut self, key: &str, value: &str) -> bool {
+    fn set(&mut self, key: &str, value: &'static str) -> bool {
         let num = |v: &mut usize| try_parse_usize(value).map(|n| *v = n).is_some();
         let bdf = |v: &mut Option<u32>| try_parse_bdf(value).map(|n| *v = Some(n)).is_some();
         match key {
@@ -183,7 +181,7 @@ impl Config {
             "dom0_nics" => num(&mut self.dom0_nics),
             "dom0_internal_switches" => num(&mut self.dom0_internal_switches),
             "dom0_cmdline" => {
-                self.dom0_cmdline = value.into();
+                self.dom0_cmdline = value;
                 true
             }
             "uplink_nic" => bdf(&mut self.uplink_nic),

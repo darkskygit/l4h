@@ -14,18 +14,38 @@
 //! The boot loader's modules come first: they win over appended ones of
 //! the same name.
 
-use alloc::string::String;
-use alloc::vec::Vec;
-
 use crate::devmem::DevMem;
 use crate::mem::Alloc;
 
+#[derive(Clone, Copy)]
 pub struct Module {
     /// For a boot loader module, the last word of its string, which names
     /// its role (GRUB passes the words after the file name, QEMU the whole
     /// -initrd item).
-    pub name: String,
+    pub name: &'static str,
     pub data: &'static [u8],
+}
+
+/// Modules kept, at most (there are four roles); more are reported and
+/// ignored.
+pub const MAX_MODULES: usize = 16;
+
+/// The modules found, in order.
+pub struct Modules {
+    list: [Option<Module>; MAX_MODULES],
+}
+
+impl Modules {
+    fn push(&mut self, m: Module) {
+        match self.list.iter_mut().find(|s| s.is_none()) {
+            Some(s) => *s = Some(m),
+            None => sel4::debug_println!("l4h-root: more than {} modules, '{}' ignored", MAX_MODULES, m.name),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Module> {
+        self.list.iter().flatten()
+    }
 }
 
 /// Where tools/add-modules.py records the segment it appended (it finds
@@ -48,30 +68,30 @@ const NAME_LEN: usize = 64;
 const ENTRY: usize = NAME_LEN + 16;
 
 /// All modules: the boot loader's, then root's appended ones.
-pub fn load(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> Vec<Module> {
-    let mut out = loader_modules(bootinfo, alloc, devmem);
-    out.extend(appended());
-    for m in &out {
+pub fn load(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> Modules {
+    let mut out = Modules { list: [None; MAX_MODULES] };
+    loader_modules(bootinfo, alloc, devmem, &mut out);
+    appended(&mut out);
+    for m in out.iter() {
         info!("l4h-root: module '{}', {} KiB", m.name, m.data.len() >> 10);
     }
     out
 }
 
 /// The modules appended to root's image.
-fn appended() -> Vec<Module> {
-    let mut out = Vec::new();
+fn appended(out: &mut Modules) {
     // Volatile: the file is edited after the build.
     let (va, size) = unsafe {
         (core::ptr::read_volatile(&ANCHOR.va) as usize, core::ptr::read_volatile(&ANCHOR.size) as usize)
     };
     if size < 16 {
-        return out;
+        return;
     }
     let seg = unsafe { core::slice::from_raw_parts(va as *const u8, size) };
     let word = |i: usize| u64::from_le_bytes(seg[i..i + 8].try_into().unwrap()) as usize;
     if &seg[..8] != TABLE_MAGIC {
         sel4::debug_println!("l4h-root: appended modules: bad table, ignored");
-        return out;
+        return;
     }
     let count = word(8).min((size - 16) / ENTRY);
     for i in 0..count {
@@ -84,9 +104,8 @@ fn appended() -> Vec<Module> {
             sel4::debug_println!("l4h-root: appended module '{}' out of bounds, ignored", name);
             continue;
         }
-        out.push(Module { name: name.into(), data: &seg[off..end] });
+        out.push(Module { name, data: &seg[off..end] });
     }
-    out
 }
 
 /// The contents of the extra bootinfo chunk `id`, after its header.
@@ -112,13 +131,11 @@ pub fn extra_chunk(bootinfo: &sel4::BootInfoPtr, id: u64) -> Option<&'static [u8
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn loader_modules(_bootinfo: &sel4::BootInfoPtr, _alloc: &mut Alloc, _devmem: &mut DevMem) -> Vec<Module> {
-    Vec::new()
-}
+fn loader_modules(_bootinfo: &sel4::BootInfoPtr, _alloc: &mut Alloc, _devmem: &mut DevMem, _out: &mut Modules) {}
 
 /// Map the boot loader's modules listed in the bootinfo.
 #[cfg(target_arch = "x86_64")]
-fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem) -> Vec<Module> {
+fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut DevMem, out: &mut Modules) {
     use sel4::init_thread::slot;
     use sel4::{CapRights, VmAttributes};
 
@@ -131,8 +148,7 @@ fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut 
     // paddr, size and a 64-byte name (seL4_X86_BootModules_t).
     const BOOT_MODULES: u64 = 8;
     const ENTRY: usize = 16 + 64;
-    let mut out = Vec::new();
-    let Some(c) = extra_chunk(bootinfo, BOOT_MODULES) else { return out };
+    let Some(c) = extra_chunk(bootinfo, BOOT_MODULES) else { return };
     let word = |i: usize| u64::from_le_bytes(c[i..i + 8].try_into().unwrap()) as usize;
     let count = if c.len() >= 8 { word(0).min((c.len() - 8) / ENTRY) } else { 0 };
     let mut va = region.base;
@@ -141,24 +157,31 @@ fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut 
         let (paddr, size) = (word(e), word(e + 8));
         let raw = &c[e + 16..e + ENTRY];
         let raw = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
-        let name: String = core::str::from_utf8(raw).unwrap_or("").split_whitespace().last().unwrap_or("").into();
+        let name = core::str::from_utf8(raw).unwrap_or("").split_whitespace().last().unwrap_or("");
         let pages = size.div_ceil(4096);
         if va + pages * 4096 > region.end() {
             sel4::debug_println!("l4h-root: boot module '{}' of {} MiB does not fit, ignored", name, size >> 20);
             continue;
         }
-        let Some(frames) = alloc.slots.global(|slots| devmem.frames_range(slots, paddr, pages * 4096)) else {
-            sel4::debug_println!("l4h-root: boot module '{}' at {:#x} is not device memory, ignored", name, paddr);
-            continue;
-        };
-        alloc.global(|alloc| {
-            for (p, f) in frames.iter().enumerate() {
-                map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), *f, va + p * 4096, CapRights::read_only(), VmAttributes::DEFAULT);
-            }
+        // The frames are mapped as they are carved, a chunk at a time.
+        let mut at = va;
+        let carved = devmem.frames_range(alloc, paddr, pages * 4096, |alloc, frames| {
+            alloc.global(|alloc| {
+                for s in frames {
+                    let f = crate::devmem::granule(s);
+                    map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), f, at, CapRights::read_only(), VmAttributes::DEFAULT);
+                    at += 4096;
+                }
+            })
         });
+        if carved.is_none() {
+            sel4::debug_println!("l4h-root: boot module '{}' at {:#x} is not device memory, ignored", name, paddr);
+            // Past whatever of it was mapped before carving failed.
+            va = at;
+            continue;
+        }
         let data = unsafe { core::slice::from_raw_parts(va as *const u8, size) };
         out.push(Module { name, data });
         va += pages * 4096;
     }
-    out
 }

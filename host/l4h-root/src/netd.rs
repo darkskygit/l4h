@@ -102,7 +102,7 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 
 /// Start netd with the uplink NICs `nics`.
 pub fn spawn(
-    nics: Vec<pci::Device>,
+    nics: &[pci::Device],
     pci: &Pci,
     devmem: &mut DevMem,
     alloc: &mut Alloc,
@@ -239,7 +239,7 @@ pub fn spawn(
         comp.give(net::NETD_SLOT_IRQ_BASE + n as u64, irq, CapRights::all());
         pci.enable(&d);
         pci.enable_msix(&d);
-        let _ = nic_list.push(Nic { pci: d, switch: None });
+        let _ = nic_list.push(Nic { pci: *d, switch: None });
     }
     component::start(&comp);
     Netd { comp, arena, nics: nic_list, ports: [const { None }; net::MAX_PORTS], switches: 0 }

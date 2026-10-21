@@ -591,6 +591,7 @@ fn bar_frames<'a>(
         let frames = alloc
             .slots
             .global(|slots| devmem.frames(slots, bar.addr as usize, bar.size as usize))
+            .map(|r| r.map(crate::devmem::granule).collect())
             .unwrap_or_else(|| panic!("no device untyped for BAR {} at {:#x}", b, bar.addr));
         cache.push((b, frames));
     }

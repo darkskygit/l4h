@@ -52,7 +52,8 @@ impl Reset {
     /// The reset register, if the FADT has one.
     #[cfg(target_arch = "x86_64")]
     pub fn find(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Reset {
-        let Some(t) = crate::acpi::find(bootinfo, phys, b"FACP").filter(|t| t.len() > FADT_RESET_VALUE) else {
+        let mut fadt = [0; crate::acpi::FADT_LEN];
+        let Some(t) = crate::acpi::find(bootinfo, phys, b"FACP", &mut fadt).filter(|t| t.len() > FADT_RESET_VALUE) else {
             return Reset::default();
         };
         let flags = u32::from_le_bytes(t[FADT_FLAGS..FADT_FLAGS + 4].try_into().unwrap());

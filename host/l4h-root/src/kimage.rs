@@ -3,12 +3,11 @@
 //! its /lib/modules, with its modules and the tree to build more against,
 //! which every guest maps read-only (DESIGN.md §5.6).
 
-use alloc::vec::Vec;
-
 use sel4::init_thread::slot;
 use sel4::{CapRights, cap, cap_type};
 
 use l4h_abi as abi;
+use l4h_host::fixed::ArrayVec;
 
 use crate::elf::Elf;
 use crate::guest::{Guest, abs, root_cap};
@@ -45,9 +44,12 @@ impl Kernel {
     }
 }
 
+/// 2 MiB pages of the largest module image.
+const KMOD_PAGES: usize = abi::KMOD_MAX as usize / LARGE_PAGE;
+
 /// The module image, in 2 MiB pages that each guest maps a copy of.
 pub struct Kmods {
-    pages: Vec<cap::LargePage>,
+    pages: ArrayVec<cap::LargePage, KMOD_PAGES>,
     size: usize,
 }
 
@@ -64,15 +66,15 @@ impl Kmods {
             sel4::debug_println!("l4h-root: no memory for the module image");
             return None;
         }
-        let pages: Vec<cap::LargePage> = alloc.global(|alloc| {
-            (0..n)
-                .map(|i| {
-                    let p = alloc.object_cap::<cap_type::LargePage>(LARGE_PAGE_BP);
-                    let va = KMOD_ROOT_VA + i * LARGE_PAGE;
-                    map_large_page(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), p, va, CapRights::read_write());
-                    p
-                })
-                .collect()
+        let mut pages = ArrayVec::new();
+        alloc.global(|alloc| {
+            for i in 0..n {
+                let p = alloc.object_cap::<cap_type::LargePage>(LARGE_PAGE_BP);
+                let va = KMOD_ROOT_VA + i * LARGE_PAGE;
+                map_large_page(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), p, va, CapRights::read_write());
+                // n <= KMOD_PAGES: the size was checked above.
+                let _ = pages.push(p);
+            }
         });
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), KMOD_ROOT_VA as *mut u8, data.len()) };
         Some(Self { pages, size: data.len() })

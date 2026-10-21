@@ -1,7 +1,6 @@
 //! Spawning host components (l4h-vmm, blkd, netd, trustd, memd) as separate seL4
 //! processes with the layout defined in `l4h-host`.
 
-use alloc::collections::BTreeMap;
 use core::ptr;
 
 use sel4::init_thread::slot;
@@ -137,26 +136,27 @@ pub fn create(
     let c = Component { id: args.id, tcb, cnode, vspace, ntfn, service_ep, sc, cnode_bits };
 
     // ---- Load the ELF image, one fresh frame per page; pages are writable
-    // only if a writable segment covers them.
-    let mut writable: BTreeMap<usize, bool> = BTreeMap::new();
+    // only if a writable segment covers them.  Segments come in ascending
+    // order of address (as the ELF spec requires of PT_LOAD), so a page
+    // two segments share is the last one's: the page before is reused.
+    let page_range = |vaddr: u64, memsz: u64| (vaddr as usize & !(PAGE - 1))..(vaddr + memsz) as usize;
+    let writable = |page: usize| elf.segments().any(|s| s.writable && page_range(s.vaddr, s.memsz).contains(&page));
+    let mut last: Option<(usize, cap::Granule)> = None;
     for seg in elf.segments() {
-        let start = (seg.vaddr as usize) & !(PAGE - 1);
-        for page in (start..(seg.vaddr + seg.memsz) as usize).step_by(PAGE) {
-            *writable.entry(page).or_default() |= seg.writable;
-        }
-    }
-    let mut pages: BTreeMap<usize, cap::Granule> = BTreeMap::new();
-    for seg in elf.segments() {
-        let start = (seg.vaddr as usize) & !(PAGE - 1);
-        let end = (seg.vaddr + seg.memsz) as usize;
-        for page in (start..end).step_by(PAGE) {
-            let frame = *pages.entry(page).or_insert_with(|| {
-                let mut ctx = ObjCtx::arena(alloc, &mut *arena);
-                let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
-                let rights = if writable[&page] { CapRights::read_write() } else { CapRights::read_only() };
-                map_frame(&mut ctx, vspace, f, page, rights, VmAttributes::DEFAULT);
-                f
-            });
+        let range = page_range(seg.vaddr, seg.memsz);
+        assert!(last.is_none_or(|(p, _)| p <= range.start), "component ELF segments out of order");
+        for page in range.step_by(PAGE) {
+            let frame = match last {
+                Some((p, f)) if p == page => f,
+                _ => {
+                    let mut ctx = ObjCtx::arena(alloc, &mut *arena);
+                    let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
+                    let rights = if writable(page) { CapRights::read_write() } else { CapRights::read_only() };
+                    map_frame(&mut ctx, vspace, f, page, rights, VmAttributes::DEFAULT);
+                    last = Some((page, f));
+                    f
+                }
+            };
             // Copy the part of the segment's file data that lies in this page.
             let seg_lo = seg.vaddr as usize;
             let lo = page.max(seg_lo);
@@ -171,8 +171,8 @@ pub fn create(
         }
     }
 
-    // ---- Info pages and IPC buffer.
-    let mut info = alloc::vec![0u8; host::INFO_SIZE];
+    // ---- Info pages and IPC buffer.  The header and the configuration are
+    // written straight into the info frames (fresh, so zeroed).
     let hdr = host::InfoHeader {
         magic: host::INFO_MAGIC,
         kind: args.kind,
@@ -180,21 +180,23 @@ pub fn create(
         tsc_hz: host_info.tsc_hz,
         reserved: [0; 5],
     };
-    unsafe {
-        ptr::copy_nonoverlapping(
-            &hdr as *const host::InfoHeader as *const u8,
-            info.as_mut_ptr(),
-            core::mem::size_of::<host::InfoHeader>(),
-        );
-    }
+    let hdr = unsafe {
+        core::slice::from_raw_parts(&hdr as *const host::InfoHeader as *const u8, core::mem::size_of::<host::InfoHeader>())
+    };
     assert!(host::CONFIG_OFFSET + args.config.len() <= host::INFO_SIZE, "component config too large");
-    info[host::CONFIG_OFFSET..host::CONFIG_OFFSET + args.config.len()].copy_from_slice(args.config);
-    for (i, chunk) in info.chunks(PAGE).enumerate() {
+    for i in 0..host::INFO_SIZE / PAGE {
         let mut ctx = ObjCtx::arena(alloc, &mut *arena);
         let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
         map_frame(&mut ctx, vspace, f, host::INFO_VA + i * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
-        win.with_frame(&abs(f), |p| unsafe {
-            ptr::copy_nonoverlapping(chunk.as_ptr(), p, chunk.len());
+        let page = i * PAGE..(i + 1) * PAGE;
+        win.with_frame(&abs(f), |p| {
+            // The part of `src`, at `at` in the info area, in this page.
+            for (at, src) in [(0, hdr), (host::CONFIG_OFFSET, args.config)] {
+                let (lo, hi) = (at.max(page.start), (at + src.len()).min(page.end));
+                if lo < hi {
+                    unsafe { ptr::copy_nonoverlapping(src[lo - at..].as_ptr(), p.add(lo - page.start), hi - lo) };
+                }
+            }
         });
     }
     map_frame(

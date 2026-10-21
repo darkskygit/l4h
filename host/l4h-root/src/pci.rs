@@ -1,7 +1,5 @@
 //! PCI configuration: x86 I/O ports, or QEMU virt ECAM and GICv2m MSI.
 
-use alloc::vec::Vec;
-
 #[cfg(target_arch = "x86_64")]
 use sel4::cap_type;
 use sel4::init_thread::slot;
@@ -28,7 +26,7 @@ pub struct Bar {
     pub is_io: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Device {
     pub bus: u8,
     pub dev: u8,
@@ -43,7 +41,7 @@ pub struct Device {
     /// MSI-X capability: config offset, table BAR/offset, table size.
     pub msix: Option<Msix>,
     /// Vendor-specific capabilities (virtio): (cap offset, cfg_type, bar, offset, length, notify multiplier).
-    pub virtio_caps: Vec<VirtioCap>,
+    pub virtio_caps: VirtioCaps,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +59,54 @@ pub struct VirtioCap {
     pub offset: u32,
     pub length: u32,
     pub notify_off_multiplier: u32,
+}
+
+/// Virtio capabilities kept per device.  A device may list several of one
+/// type, of which a driver is to use the first it can (virtio 1.x §4.1.4);
+/// ours only ever look at the first, so only the first of each type is
+/// kept.  The spec defines fewer types than this.
+const MAX_VIRTIO_CAPS: usize = 8;
+
+/// A device's virtio capabilities, the first of each type, in the order
+/// the device lists them.
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioCaps {
+    caps: [VirtioCap; MAX_VIRTIO_CAPS],
+    len: usize,
+}
+
+impl VirtioCaps {
+    const fn new() -> Self {
+        let none = VirtioCap { cfg_type: 0, bar: 0, offset: 0, length: 0, notify_off_multiplier: 0 };
+        VirtioCaps { caps: [none; MAX_VIRTIO_CAPS], len: 0 }
+    }
+
+    fn push(&mut self, c: VirtioCap) {
+        if self.len < MAX_VIRTIO_CAPS && !self.iter().any(|o| o.cfg_type == c.cfg_type) {
+            self.caps[self.len] = c;
+            self.len += 1;
+        }
+    }
+}
+
+impl core::ops::Deref for VirtioCaps {
+    type Target = [VirtioCap];
+
+    fn deref(&self) -> &[VirtioCap] {
+        &self.caps[..self.len]
+    }
+}
+
+/// Formats an iterator's items as a list, for log lines.
+pub struct List<I>(pub I);
+
+impl<I: Iterator + Clone> core::fmt::Debug for List<I>
+where
+    I::Item: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.debug_list().entries(self.0.clone()).finish()
+    }
 }
 
 /// seL4 user interrupt vectors (CPU vector 0x30 + n, n <= 107 on x86),
@@ -233,9 +279,9 @@ impl Pci {
         bars
     }
 
-    fn caps(&self, bus: u8, dev: u8, func: u8) -> (Option<Msix>, Vec<VirtioCap>) {
+    fn caps(&self, bus: u8, dev: u8, func: u8) -> (Option<Msix>, VirtioCaps) {
         let mut msix = None;
-        let mut virtio = Vec::new();
+        let mut virtio = VirtioCaps::new();
         if self.read16(bus, dev, func, 6) & 0x10 == 0 {
             return (msix, virtio);
         }
@@ -270,55 +316,49 @@ impl Pci {
         (msix, virtio)
     }
 
-    pub fn enumerate(&self) -> Vec<Device> {
-        let mut out = Vec::new();
-        for bus in 0..=if cfg!(target_arch = "aarch64") { 15u8 } else { 255u8 } {
-            for dev in 0..32u8 {
-                let id = self.read32(bus, dev, 0, 0);
-                if id & 0xffff == 0xffff {
-                    continue;
-                }
-                let multi = self.read8(bus, dev, 0, 0xe) & 0x80 != 0;
-                for func in 0..if multi { 8 } else { 1 } {
-                    let id = self.read32(bus, dev, func, 0);
-                    if id & 0xffff == 0xffff {
-                        continue;
-                    }
-                    let class = self.read32(bus, dev, func, 8);
-                    let header = self.read8(bus, dev, func, 0xe) & 0x7f;
-                    let (msix, virtio_caps) = self.caps(bus, dev, func);
-                    #[allow(unused_mut)]
-                    let mut bars = if header == 0 { self.probe_bars(bus, dev, func) } else { [Bar::default(); 6] };
-                    #[cfg(target_arch = "aarch64")]
-                    for (n, b) in bars.iter_mut().enumerate() {
-                        if b.size == 0 || b.is_io { continue; }
-                        let addr = (self.next_bar.get() + b.size - 1) & !(b.size - 1);
-                        assert!(addr + b.size <= 0x3eff_0000, "PCI MMIO aperture exhausted");
-                        let off = 0x10 + 4 * n as u8;
-                        let flags = self.read32(bus, dev, func, off) & 0xf;
-                        self.write32(bus, dev, func, off, addr as u32 | flags);
-                        if flags & 6 == 4 { self.write32(bus, dev, func, off + 4, 0); }
-                        b.addr = addr;
-                        self.next_bar.set(addr + b.size);
-                    }
-                    out.push(Device {
-                        bus,
-                        dev,
-                        func,
-                        vendor: id as u16,
-                        device: (id >> 16) as u16,
-                        class: (class >> 24) as u8,
-                        subclass: (class >> 16) as u8,
-                        prog_if: (class >> 8) as u8,
-                        revision: class as u8,
-                        bars,
-                        msix,
-                        virtio_caps,
-                    });
-                }
-            }
+    /// Every PCI function, in bus, device, function order, each probed as
+    /// the iterator reaches it.
+    pub fn enumerate(&self) -> Devices<'_> {
+        Devices { pci: self, next: 0, multi: false }
+    }
+
+    /// The function at bus:dev.func, if there is one.
+    fn probe(&self, bus: u8, dev: u8, func: u8) -> Option<Device> {
+        let id = self.read32(bus, dev, func, 0);
+        if id & 0xffff == 0xffff {
+            return None;
         }
-        out
+        let class = self.read32(bus, dev, func, 8);
+        let header = self.read8(bus, dev, func, 0xe) & 0x7f;
+        let (msix, virtio_caps) = self.caps(bus, dev, func);
+        #[allow(unused_mut)]
+        let mut bars = if header == 0 { self.probe_bars(bus, dev, func) } else { [Bar::default(); 6] };
+        #[cfg(target_arch = "aarch64")]
+        for (n, b) in bars.iter_mut().enumerate() {
+            if b.size == 0 || b.is_io { continue; }
+            let addr = (self.next_bar.get() + b.size - 1) & !(b.size - 1);
+            assert!(addr + b.size <= 0x3eff_0000, "PCI MMIO aperture exhausted");
+            let off = 0x10 + 4 * n as u8;
+            let flags = self.read32(bus, dev, func, off) & 0xf;
+            self.write32(bus, dev, func, off, addr as u32 | flags);
+            if flags & 6 == 4 { self.write32(bus, dev, func, off + 4, 0); }
+            b.addr = addr;
+            self.next_bar.set(addr + b.size);
+        }
+        Some(Device {
+            bus,
+            dev,
+            func,
+            vendor: id as u16,
+            device: (id >> 16) as u16,
+            class: (class >> 24) as u8,
+            subclass: (class >> 16) as u8,
+            prog_if: (class >> 8) as u8,
+            revision: class as u8,
+            bars,
+            msix,
+            virtio_caps,
+        })
     }
 
     /// Enable memory decoding and bus mastering, disable INTx.
@@ -359,6 +399,39 @@ impl Pci {
     }
 }
 
+/// The PCI functions, from Pci::enumerate.
+pub struct Devices<'a> {
+    pci: &'a Pci,
+    /// The next function to look at, as bus << 8 | dev << 3 | func.
+    next: u32,
+    /// Its device has several functions.
+    multi: bool,
+}
+
+impl Iterator for Devices<'_> {
+    type Item = Device;
+
+    fn next(&mut self) -> Option<Device> {
+        let end = if cfg!(target_arch = "aarch64") { 16 << 8 } else { 256 << 8 };
+        while self.next < end {
+            let (bus, dev, func) = ((self.next >> 8) as u8, (self.next >> 3 & 0x1f) as u8, (self.next & 7) as u8);
+            if func == 0 {
+                if self.pci.read32(bus, dev, 0, 0) & 0xffff == 0xffff {
+                    self.next += 8;
+                    continue;
+                }
+                self.multi = self.pci.read8(bus, dev, 0, 0xe) & 0x80 != 0;
+            }
+            // Functions 1-7 only of a multi-function device.
+            self.next += if self.multi { 1 } else { 8 };
+            if let Some(d) = self.pci.probe(bus, dev, func) {
+                return Some(d);
+            }
+        }
+        None
+    }
+}
+
 /// MSI target address, and data for a reserved interrupt slot.
 pub const fn msi_address() -> u64 {
     #[cfg(target_arch = "x86_64")] { 0xfee0_0000 }
@@ -377,7 +450,7 @@ impl Pci {
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
         let frames = devmem.frames(&mut alloc.slots, 0x3f00_0000, 1 << 24).expect("PCI ECAM frames");
-        for (n, frame) in frames.into_iter().enumerate() {
+        for (n, frame) in frames.map(crate::devmem::granule).enumerate() {
             crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), frame,
                 Self::ECAM_VA + n * 4096, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);
         }

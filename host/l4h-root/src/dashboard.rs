@@ -100,8 +100,9 @@ impl Dashboard {
         }
         let wc = VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining);
         alloc.global(|alloc| {
-            for (i, f) in frames[first..first + pages].iter().enumerate() {
-                map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), *f, FB_VA + i * 4096, CapRights::read_write(), wc);
+            for (i, s) in (frames.start + first..frames.start + first + pages).enumerate() {
+                let f = crate::devmem::granule(s);
+                map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, FB_VA + i * 4096, CapRights::read_write(), wc);
             }
         });
         let fb = (FB_VA + (addr & 4095)) as *mut u8;

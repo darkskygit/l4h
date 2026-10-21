@@ -58,7 +58,7 @@ impl Monitor {
         use crate::mem::ObjCtx;
         const UART_VA: usize = crate::layout::UART.base;
         let frames = devmem.frames(&mut alloc.slots, 0x0900_0000, 4096)?;
-        crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), frames[0],
+        crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), crate::devmem::granule(frames.start),
             UART_VA, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);
         let irq_slot = alloc.slots.alloc();
         let dst = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(irq_slot).cap());

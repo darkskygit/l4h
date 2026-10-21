@@ -7,7 +7,6 @@
 //! Only x86 finds a TPM (in ACPI) so far: on aarch64, trustd never starts.
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
-use alloc::vec::Vec;
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
@@ -114,7 +113,9 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Optio
     /// TPM 2.0 at its standard address (PC Client PTP), where the ACPI
     /// table gives none (FIFO interface).
     const TPM_DEFAULT_BASE: usize = 0xfed4_0000;
-    let Some(t) = crate::acpi::find(bootinfo, phys, b"TPM2").filter(|t| t.len() >= 52) else {
+    // The TPM2 table, up to the Pluton doorbells (revision 4 is 76 bytes).
+    let mut buf = [0; 76];
+    let Some(t) = crate::acpi::find(bootinfo, phys, b"TPM2", &mut buf).filter(|t| t.len() >= 52) else {
         info!("l4h-root: no TPM, no attestation");
         return None;
     };
@@ -151,7 +152,8 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Optio
         l.loc = l.range(control & !(PAGE - 1), PAGE);
     }
     // The control area and the buffers it names.
-    let regs = phys.read_attrs(control, 0x30, DEVICE_ATTRS)?;
+    let mut regs = [0; 0x30];
+    phys.read_into_attrs(control, &mut regs, DEVICE_ATTRS)?;
     let w32 = |i: usize| u32::from_le_bytes(regs[i..i + 4].try_into().unwrap()) as usize;
     let (cmd, cmd_size) = (w32(0x1c) | w32(0x20) << 32, w32(0x18));
     let (rsp, rsp_size) = (w32(0x28) | w32(0x2c) << 32, w32(0x24));
@@ -203,15 +205,22 @@ pub fn spawn(
                 return None;
             }
         }
-        let aml = match l.start {
-            trust::START_ACPI => match crate::acpi::aml_tables(bootinfo, &mut phys) {
-                Some(a) => a,
-                None => {
-                    sel4::debug_println!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
-                    return None;
+        // The AML's size.  Its pages are carved now, so that copying it
+        // once trustd exists cannot fail for want of them.
+        let aml_size = match l.start {
+            trust::START_ACPI => {
+                let touch = |phys: &mut crate::acpi::Phys, pa: usize, len: usize| {
+                    (pa & !(PAGE - 1)..pa + len).step_by(PAGE).try_for_each(|p| phys.frame(p).map(drop))
+                };
+                match crate::acpi::aml_tables(bootinfo, &mut phys, touch) {
+                    Some(n) => n,
+                    None => {
+                        sel4::debug_println!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
+                        return None;
+                    }
                 }
-            },
-            _ => Vec::new(),
+            }
+            _ => 0,
         };
         info!(
             "l4h-root: TPM 2.0 ({}) at {:#x}",
@@ -223,8 +232,8 @@ pub fn spawn(
             },
             l.ranges[0].0
         );
-        let cfg = l.config(aml.len());
-        let (comp, arena, keep) = create(&cfg, alloc, win, asids, info, aml.len())?;
+        let cfg = l.config(aml_size);
+        let (comp, arena, keep) = create(&cfg, alloc, win, asids, info, aml_size)?;
         let mut keep_next = 0;
         let mut keep_slot = || {
             keep_next += 1;
@@ -233,16 +242,39 @@ pub fn spawn(
         let mut arena = arena;
         for (r, &(base, size)) in l.ranges.iter().enumerate() {
             for p in 0..size / PAGE {
-                let f = frames.get(&(base + p * PAGE)).copied().expect("TPM page carved above");
+                let f = frames.get(base + p * PAGE).expect("TPM page carved above");
                 let va = trust::TPM_VA + r * trust::RANGE_STRIDE + p * PAGE;
                 comp.map_copy(alloc, &mut arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep_slot());
             }
         }
-        // The ACPI tables, in fresh frames.
-        for (p, chunk) in aml.chunks(PAGE).enumerate() {
-            let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
-            win.with_frame(&abs_of(f), |dst| unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len()) });
-            comp.map_copy(alloc, &mut arena, &abs_of(f), trust::AML_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep_slot());
+        // The ACPI tables, copied into fresh frames a piece at a time, as
+        // trustd sees them: back to back from AML_VA.
+        if aml_size != 0 {
+            let mut at = 0;
+            let mut frame = None;
+            let copy = |phys: &mut crate::acpi::Phys, pa: usize, len: usize| {
+                let mut buf = [0; 512];
+                let mut done = 0;
+                while done < len {
+                    if at % PAGE == 0 {
+                        let f = arena.object_cap::<cap_type::Granule>(phys.alloc, FRAME_BP);
+                        comp.map_copy(phys.alloc, &mut arena, &abs_of(f), trust::AML_VA + at, CapRights::read_only(), VmAttributes::DEFAULT, keep_slot());
+                        frame = Some(f);
+                    }
+                    let n = (len - done).min(PAGE - at % PAGE).min(buf.len());
+                    phys.read_into(pa + done, &mut buf[..n])?;
+                    let off = at % PAGE;
+                    phys.win.with_frame(&abs_of(frame?), |dst| unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst.add(off), n) });
+                    (done, at) = (done + n, at + n);
+                }
+                Some(())
+            };
+            let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
+            if crate::acpi::aml_tables(bootinfo, &mut phys, copy) != Some(aml_size) {
+                sel4::debug_println!("l4h-root: cannot copy the ACPI tables for the TPM, no attestation");
+                alloc.reclaim(arena);
+                return None;
+            }
         }
         finish(comp, arena, alloc, &mut keep_slot, frames)
     }

@@ -44,14 +44,14 @@ mod vmm;
 mod vspace;
 mod window;
 
-use ::alloc::vec::Vec;
-use l4h_host::fixed::{ArrayVec, StaticCell};
+use l4h_host::fixed::StaticCell;
 
 use sel4::init_thread::slot;
 use sel4::{ObjectBlueprint, cap, cap_type};
 use sel4_root_task::{Never, root_task};
 
 use l4h_host as host;
+use l4h_host::fixed::ArrayVec;
 
 use crate::blkd::{Controller, Disk};
 use crate::component::ROOT_BADGE_COMPONENT;
@@ -70,6 +70,16 @@ const RESERVE_SLOTS: usize = 32768;
 const RESERVE_RANGE: usize = 4096;
 
 const TIMER_BADGE: u64 = 1 << 40;
+
+/// Host disks, at most: the units of all controllers (a virtio-scsi
+/// controller reports its own number).  Units beyond are reported and
+/// ignored.
+pub const MAX_DISKS: usize = 256;
+
+/// Disk controllers and host disks, in .bss: too large for the root task's
+/// stack, where `Host` is.  main takes each once.
+static mut CTRLS: ArrayVec<Controller, { pci::MAX_DISK_CTRLS }> = ArrayVec::new();
+static mut DISKS: ArrayVec<Disk, MAX_DISKS> = ArrayVec::new();
 
 /// Facts about the host the guests run on.
 pub struct HostInfo {
@@ -194,8 +204,8 @@ pub struct Host {
     pub pci: pci::Pci,
     pub devmem: devmem::DevMem,
     /// Disk controllers, and their units as host disks.
-    pub ctrls: Vec<Controller>,
-    pub disks: Vec<Disk>,
+    pub ctrls: &'static mut ArrayVec<Controller, { pci::MAX_DISK_CTRLS }>,
+    pub disks: &'static mut ArrayVec<Disk, MAX_DISKS>,
     pub netd: netd::Netd,
     pub guests: &'static mut [Option<Guest>; MAX_GUESTS],
     pub total_bytes: usize,
@@ -301,9 +311,15 @@ impl Host {
     /// order.  virtio-scsi controllers start now, to find their logical
     /// units; the others have one unit and start when first used.
     fn scan_disks(&mut self) {
+        let add = |disks: &mut ArrayVec<Disk, MAX_DISKS>, d: Disk| {
+            let (unit, ctrl) = (d.unit, d.ctrl);
+            if disks.push(d).is_err() {
+                sel4::debug_println!("l4h-root: more than {} disks, unit {} of controller {} ignored", MAX_DISKS, unit, ctrl);
+            }
+        };
         for c in 0..self.ctrls.len() {
             if self.ctrls[c].kind != l4h_host::blk::BLKD_VIRTIO_SCSI {
-                self.disks.push(Disk::new(c, 0));
+                add(self.disks, Disk::new(c, 0));
                 continue;
             }
             if let Err(e) = self.ensure_ctrl(c) {
@@ -314,7 +330,7 @@ impl Host {
             let units = self.ctrls[c].info(0).1;
             for u in 0..units {
                 if let Some(d) = self.ctrls[c].info(u).0 {
-                    self.disks.push(Disk { ctrl: c, ..d });
+                    add(self.disks, Disk { ctrl: c, ..d });
                 }
             }
         }
@@ -471,8 +487,10 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 
     // PCI devices: disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
-    let mut ctrls = Vec::new();
-    let mut nics = Vec::new();
+    // The statics' only references, taken once here; the root task is
+    // single-threaded.
+    let ctrls = unsafe { &mut *(&raw mut CTRLS) };
+    let mut nics = ArrayVec::<pci::Device, { host::net::MAX_NICS }>::new();
     let mut balloon = None;
     for d in pci.enumerate() {
         info!(
@@ -480,8 +498,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             d.bus, d.dev, d.func, d.vendor, d.device, d.class, d.subclass
         );
         if d.vendor == 0x1af4 || d.vendor == 0x1ae0 {
-            let caps: Vec<u8> = d.virtio_caps.iter().map(|c| c.cfg_type).collect();
-            let bars: Vec<_> = d.bars.iter().filter(|b| b.size != 0).map(|b| (b.addr, b.size, b.is_io)).collect();
+            let caps = pci::List(d.virtio_caps.iter().map(|c| c.cfg_type));
+            let bars = pci::List(d.bars.iter().filter(|b| b.size != 0).map(|b| (b.addr, b.size, b.is_io)));
             info!(
                 "l4h-root:   virtio caps {:?}, msix {:?}, bars {:x?}",
                 caps, d.msix.map(|m| (m.table_bar, m.table_size)), bars
@@ -500,10 +518,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
             let mut ctrl = Controller::new(d, v);
             blkd::reset(&mut ctrl, &pci, &mut alloc, &mut devmem, &mut wins.a, info.tsc_hz / 1000);
             pci.disable(&ctrl.pci);
-            ctrls.push(ctrl);
+            // Below MAX_DISK_CTRLS: checked above.
+            let _ = ctrls.push(ctrl);
         } else if netd::is_uplink(&d) {
             pci.disable(&d);
-            nics.push(d);
+            if nics.push(d).is_err() {
+                sel4::debug_println!("l4h-root: more than {} NICs, ignoring {:02x}:{:02x}.{}", host::net::MAX_NICS, d.bus, d.dev, d.func);
+            }
         } else if memd::is_balloon(&d) && balloon.is_none() {
             balloon = Some(d);
         }
@@ -511,10 +532,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // The boot disk first: dom0 takes the first dom0_disks host disks.
     if let Some(bdf) = cfg.boot_disk {
         match ctrls.iter().position(|c: &Controller| netd::bdf(&c.pci) == bdf) {
-            Some(i) => {
-                let c = ctrls.remove(i);
-                ctrls.insert(0, c);
-            }
+            Some(i) => ctrls[..=i].rotate_right(1),
             None => sel4::debug_println!("l4h-root: no boot disk at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7),
         }
     }
@@ -530,7 +548,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         #[cfg(target_arch = "x86_64")]
         acpi_frames,
     );
-    let netd = netd::spawn(nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
+    let netd = netd::spawn(&nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
         info,
@@ -540,7 +558,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         pci,
         devmem,
         ctrls,
-        disks: Vec::new(),
+        disks: unsafe { &mut *(&raw mut DISKS) },
         netd,
         guests: GUESTS.take(),
         total_bytes,
@@ -635,11 +653,11 @@ pub fn boot_dom0(h: &mut Host) {
     for i in first..first + h.cfg.dom0_internal_switches {
         h.create_nic(id, i as u32, 0, true, false).expect("dom0 internal NIC");
     }
-    let cmdline = h.cfg.dom0_cmdline.clone();
+    let cmdline = h.cfg.dom0_cmdline;
     h.with_guest(id, |h, g| {
         let kernel = h.kernel.as_ref().unwrap();
         assert!(
-            guest::boot_with(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, h.dom0_initrd, &cmdline),
+            guest::boot_with(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, h.dom0_initrd, cmdline),
             "dom0 image does not fit"
         );
     });

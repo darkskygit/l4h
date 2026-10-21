@@ -183,7 +183,7 @@ impl Memd {
             let Some(frames) = alloc.slots.global(|s| devmem.frames(s, bar.addr as usize, bar.size as usize)) else {
                 return;
             };
-            for (i, f) in frames.into_iter().enumerate() {
+            for (i, f) in frames.map(crate::devmem::granule).enumerate() {
                 let va = memd::BALLOON_VA + c.bar as usize * memd::BAR_STRIDE + i * PAGE;
                 let keep = self.keep_slot();
                 self.comp.map_copy(alloc, &mut self.arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep);
