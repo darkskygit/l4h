@@ -110,3 +110,46 @@ CONFIG_CRYPTO_AES_ARM64_BS=y
 CONFIG_VIRT_DRIVERS=y
 CONFIG_CONFIGFS_FS=y
 # CONFIG_VMGENID is not set
+# What dom0 and the guests of l4h-sandbox need besides the above, so that
+# the shipped kernel (tools/build-dom0.sh) serves both.
+# Root filesystems: an EROFS system image under an overlay whose upper
+# layer is ext4 on dm-crypt; dom0's image cache on XFS.
+CONFIG_EROFS_FS=y
+CONFIG_EROFS_FS_XATTR=y
+CONFIG_EROFS_FS_POSIX_ACL=y
+CONFIG_EROFS_FS_ZIP=y
+CONFIG_XFS_FS=y
+CONFIG_XFS_POSIX_ACL=y
+# FAT, for configuration partitions.
+CONFIG_VFAT_FS=y
+CONFIG_FAT_DEFAULT_UTF8=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_NLS_UTF8=y
+# A router VM's firewall, and tagged VLANs on its uplinks.
+CONFIG_NFT_LIMIT=y
+CONFIG_NFT_CONNLIMIT=y
+CONFIG_NFT_REJECT=y
+CONFIG_NFT_REJECT_INET=y
+CONFIG_NFT_NUMGEN=y
+CONFIG_NFT_HASH=y
+CONFIG_VLAN_8021Q=y
+# Docker: Debian's iptables is iptables-nft, which runs xt matches and
+# targets through nft_compat, so the legacy x_tables tables stay off.
+CONFIG_NFT_COMPAT=y
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
+CONFIG_NETFILTER_XT_MARK=y
+CONFIG_NETFILTER_XT_NAT=y
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y
+CONFIG_BRIDGE_NETFILTER=y
+# runc's session keyrings; `docker run --cpus`.
+CONFIG_KEYS=y
+CONFIG_CFS_BANDWIDTH=y
+# NFS client: v3 with NLM locking, and v4.0-v4.2.
+CONFIG_NFS_FS=y
+CONFIG_NFS_V3=y
+CONFIG_NFS_V3_ACL=y
+CONFIG_NFS_V4=y
+CONFIG_NFS_V4_1=y
+CONFIG_NFS_V4_2=y

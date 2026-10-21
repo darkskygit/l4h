@@ -34,7 +34,8 @@ fi
 if [ -n "${L4H_LINUX_CC:-}" ]; then
     mk+=(CC="$L4H_LINUX_CC")
 fi
-if [ ! -f "$out/.config" ]; then
+# Regenerate the config when the defconfig changed.
+if [ ! -f "$out/.config" ] || [ "$root/guest/linux/arch/l4h/configs/defconfig" -nt "$out/.config" ]; then
     "${mk[@]}" defconfig
 fi
 "${mk[@]}" -j"${L4H_JOBS:-$(nproc)}" "${@:-vmlinux}"
