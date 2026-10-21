@@ -121,15 +121,16 @@ const DOM0_NICS: usize = parse_usize(option_env!("L4H_DOM0_NICS"), 1);
 /* The PCI address (bus:dev.fn) of the uplink NIC, when it is not the first
  * NIC: e.g. the public port of a two-port card. */
 const UPLINK_NIC: Option<u32> = parse_bdf(option_env!("L4H_UPLINK_NIC"));
-/* The PCI address of a second uplink NIC: the uplink of a switch of its
- * own after the internal switches, where dom0 has one more vNIC, with the
- * NIC's MAC address. E.g. a provider's storage network on the other port. */
+/* The PCI address of a second uplink NIC: the uplink of switch 1, where
+ * dom0 has one more vNIC, with the NIC's MAC address; the internal
+ * switches follow. E.g. a provider's storage network on the other port. */
 const UPLINK2_NIC: Option<u32> = parse_bdf(option_env!("L4H_UPLINK2_NIC"));
 /* The PCI address of the boot disk's controller, when it is not the first
  * disk controller: it becomes host disk 0. */
 const BOOT_DISK: Option<u32> = parse_bdf(option_env!("L4H_BOOT_DISK"));
-/* Internal switches 1..=n, created at first boot, each with one more vNIC
- * of dom0 (a normal port, for routing between it and isolated guests). */
+/* Internal switches, after switch 0 and the second uplink's (1..=n, or
+ * 2..=n+1), created at first boot, each with one more vNIC of dom0 (a
+ * normal port, for routing between it and isolated guests). */
 const DOM0_INTERNAL_SWITCHES: usize = parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0);
 /* Seconds between watchdog dumps of guest vCPU state; 0 disables. */
 const WATCHDOG_SECS: usize = parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0);
@@ -636,27 +637,29 @@ pub fn boot_dom0(h: &mut Host) {
         let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };
         h.create_nic(id, sw, mac, true, false).expect("dom0 NIC");
     }
-    while (h.netd.switches as usize) < 1 + DOM0_INTERNAL_SWITCHES {
+    // The second uplink NIC, if any, on switch 1, then the internal
+    // switches. dom0 finds its vNICs by MAC, not by their order.
+    let uplink2 = UPLINK2_NIC.and_then(|bdf| {
+        let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
+        if n.is_none() {
+            sel4::debug_println!("l4h-root: no second uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+        }
+        n
+    });
+    if let Some(nic) = uplink2 {
+        if h.netd.switches == 1 {
+            h.netd.create_switch();
+            h.netd.attach_uplink(1, nic).expect("second uplink");
+        }
+        let mac = h.netd.nic_mac(nic).unwrap_or(0);
+        h.create_nic(id, 1, mac, true, false).expect("dom0 NIC");
+    }
+    let first = 1 + uplink2.is_some() as usize;
+    while (h.netd.switches as usize) < first + DOM0_INTERNAL_SWITCHES {
         h.netd.create_switch();
     }
-    for i in 1..=DOM0_INTERNAL_SWITCHES {
+    for i in first..first + DOM0_INTERNAL_SWITCHES {
         h.create_nic(id, i as u32, 0, true, false).expect("dom0 internal NIC");
-    }
-    if let Some(bdf) = UPLINK2_NIC {
-        match h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf) {
-            Some(nic) => {
-                let sw = 1 + DOM0_INTERNAL_SWITCHES as u32;
-                if h.netd.switches <= sw {
-                    while h.netd.switches <= sw {
-                        h.netd.create_switch();
-                    }
-                    h.netd.attach_uplink(sw, nic).expect("second uplink");
-                }
-                let mac = h.netd.nic_mac(nic).unwrap_or(0);
-                h.create_nic(id, sw, mac, true, false).expect("dom0 NIC");
-            }
-            None => sel4::debug_println!("l4h-root: no second uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7),
-        }
     }
     h.with_guest(id, |h, g| {
         assert!(

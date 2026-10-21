@@ -1223,9 +1223,10 @@ external orchestration can run in dom0.
    - `L4H_UPLINK_NIC=bus:dev.fn` (l4h-root): the uplink when it is not
      the first NIC, here the X550's second port. `L4H_BOOT_DISK`: the
      controller that becomes host disk 0, so dom0 gets it.
-   - `L4H_UPLINK2_NIC=bus:dev.fn` (l4h-root): a second uplink, on a
-     switch of its own after dom0's internal switches, where dom0 gets one
-     more vNIC with that NIC's MAC. On Latitude the first port carries the
+   - `L4H_UPLINK2_NIC=bus:dev.fn` (l4h-root): a second uplink, on
+     switch 1 (dom0's internal switches follow it), where dom0 gets one
+     more vNIC with that NIC's MAC. dom0 tells its vNICs apart by MAC
+     (`CTL_SWITCH_INFO` lists each port's VM and MAC), not by order. On Latitude the first port carries the
      private storage network (a tagged VLAN, which l4h passes through).
    - `L4H_FB_CONSOLE=1` (`tools/mkimage.sh`, l4h-root): GRUB and the seL4
      console (patch 0020) on the screen; the dashboard keeps to the upper
