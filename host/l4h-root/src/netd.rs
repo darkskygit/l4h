@@ -303,9 +303,8 @@ impl Netd {
         pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 2, Dest::root(keep_slots.start)).expect("port CNodes");
         let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slots.start).cap();
         let vmm_keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slots.start + 1).cap();
-        let chan: Vec<cap::Granule> =
-            frames.map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(i).cap()).collect();
-        for (i, f) in chan.iter().enumerate() {
+        let chan = frames.map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(i).cap());
+        for (i, f) in chan.enumerate() {
             let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
             // Paging structures for the port come from netd's own pool, and
             // outlive the guest: their root slots must not be tracked into
@@ -313,7 +312,7 @@ impl Netd {
             // grew into) while other ports still use them.
             let (comp, arena) = (&self.comp, &mut self.arena);
             alloc.global(|alloc| {
-                comp.map_copy(alloc, arena, &abs_of(*f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
+                comp.map_copy(alloc, arena, &abs_of(f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
             });
         }
         self.comp.give_badged(
