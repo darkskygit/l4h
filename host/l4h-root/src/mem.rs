@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use sel4::init_thread::slot;
+use l4h_host::memd::BLOCK_BITS;
 use sel4::{ObjectBlueprint, cap};
 
 use crate::memd::MemdLink;
@@ -335,7 +336,7 @@ impl Alloc {
     /// or exactly what is asked if memd has no larger block.
     fn grant(&mut self, bits: usize) -> bool {
         let Some(memd) = self.memd else { return false };
-        for gbits in [bits.max(GRANT_BITS), bits] {
+        for gbits in [bits.max(GRANT_BITS), bits.max(BLOCK_BITS)] {
             let s = self.slots.global(|s| s.alloc());
             if let Some(paddr) = memd.alloc(gbits, s) {
                 self.blocks.push(UtRegion::fresh(untyped_at(s), paddr, gbits));
@@ -460,13 +461,23 @@ impl Alloc {
         }
     }
 
-    /// Give memd every free block, once it runs: from then on, memory
-    /// comes from it.  The parents of blocks split here stay here, so memd
-    /// cannot merge those blocks with their buddies; only the blocks root
-    /// split at boot are concerned.
+    /// Units of memd's table: 2 MiB units up to the end of the last free
+    /// block memd will get (`hand_over`).
+    pub fn memd_units(&mut self) -> u64 {
+        self.merge_up_to(usize::MAX);
+        self.blocks.iter().filter(|b| b.size_bits >= BLOCK_BITS).map(|b| ((b.paddr + (1 << b.size_bits)) >> BLOCK_BITS) as u64).max().unwrap_or(0)
+    }
+
+    /// Give memd every free block of 2 MiB or more, once it runs: from
+    /// then on, memory comes from it.  Smaller blocks (boot Untypeds next
+    /// to reserved memory) stay here, for the root task's own objects.
+    /// The parents of blocks split here stay here, so memd cannot merge
+    /// those blocks with their buddies; only the blocks root split at boot
+    /// are concerned.
     pub fn hand_over(&mut self, memd: MemdLink) {
         self.merge_up_to(usize::MAX);
-        let blocks = core::mem::take(&mut self.blocks);
+        let (blocks, small) = core::mem::take(&mut self.blocks).into_iter().partition(|b| b.size_bits >= BLOCK_BITS);
+        self.blocks = small;
         self.give_back(memd, blocks);
         self.memd = Some(memd);
     }

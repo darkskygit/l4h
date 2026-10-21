@@ -91,26 +91,25 @@ pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
     sel4::Cap::from_bits(slot)
 }
 
+/// The allocator of a component without a heap (`component!(main,
+/// no_heap)`): every allocation fails, which aborts.  The component
+/// itself cannot allocate, since it does not link `alloc`; this only
+/// satisfies the runtime's crates.
+#[doc(hidden)]
+pub struct NoHeap;
+
+unsafe impl core::alloc::GlobalAlloc for NoHeap {
+    unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+
+    unsafe fn dealloc(&self, _: *mut u8, _: core::alloc::Layout) {}
+}
+
 #[macro_export]
 macro_rules! component {
-    ($main:path) => {
-        $crate::component!($main, heap_size = 1024 * 1024);
-    };
-    ($main:path, heap_size = $heap:expr) => {
-        const _: () = {
-            use $crate::sel4_dlmalloc::{StaticDlmalloc, StaticHeap};
-
-            const HEAP_SIZE: usize = $heap;
-            static STATIC_HEAP: StaticHeap<HEAP_SIZE> = StaticHeap::new();
-
-            #[global_allocator]
-            static GLOBAL_ALLOCATOR: StaticDlmalloc<
-                $crate::one_shot_mutex::sync::RawOneShotMutex,
-            > = StaticDlmalloc::new(STATIC_HEAP.bounds());
-
-            $crate::sel4_panicking_env::register_debug_put_char!($crate::sel4::debug_put_char);
-
-        };
+    (@entry $main:path) => {
+        $crate::sel4_panicking_env::register_debug_put_char!($crate::sel4::debug_put_char);
 
         $crate::sel4_runtime_common::declare_stack!(256 * 1024);
         $crate::sel4_runtime_common::declare_entrypoint_with_stack_init!();
@@ -126,5 +125,29 @@ macro_rules! component {
                 Err(_) => $crate::sel4_panicking_env::abort!("component main() panicked"),
             }
         }
+    };
+    ($main:path) => {
+        $crate::component!($main, heap_size = 1024 * 1024);
+    };
+    ($main:path, no_heap) => {
+        #[global_allocator]
+        static GLOBAL_ALLOCATOR: $crate::NoHeap = $crate::NoHeap;
+
+        $crate::component!(@entry $main);
+    };
+    ($main:path, heap_size = $heap:expr) => {
+        const _: () = {
+            use $crate::sel4_dlmalloc::{StaticDlmalloc, StaticHeap};
+
+            const HEAP_SIZE: usize = $heap;
+            static STATIC_HEAP: StaticHeap<HEAP_SIZE> = StaticHeap::new();
+
+            #[global_allocator]
+            static GLOBAL_ALLOCATOR: StaticDlmalloc<
+                $crate::one_shot_mutex::sync::RawOneShotMutex,
+            > = StaticDlmalloc::new(STATIC_HEAP.bounds());
+        };
+
+        $crate::component!(@entry $main);
     };
 }

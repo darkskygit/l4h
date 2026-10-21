@@ -1,36 +1,35 @@
 //! l4h-memd: the owner of the host's free memory and of every guest's RAM
 //! (DESIGN.md §16).
 //!
-//! At boot, l4h-root moves every free RAM Untyped here.  From then on it
-//! asks for memory for its own objects (MEMD_ALLOC) and returns it when it
-//! is free again (MEMD_FREE), and guest RAM is taken, given and revoked
-//! here: memd keeps the original Untyped of every 2 MiB block of a guest,
-//! hands copies to l4h-root (for the boot blocks it fills with frames) and
-//! to the guest, and revokes the originals when the guest is destroyed,
-//! which deletes everything made of them.  memd also reports free memory
-//! to the hypervisor l4h runs in (balloon.rs).
+//! At boot, l4h-root moves every free RAM Untyped of 2 MiB or more here.
+//! From then on it asks for memory for its own objects (MEMD_ALLOC) and
+//! returns it when it is free again (MEMD_FREE), and guest RAM is taken,
+//! given and revoked here: memd keeps the original Untyped of every 2 MiB
+//! block of a guest, hands copies to l4h-root (for the boot blocks it
+//! fills with frames) and to the guest, and revokes the originals when the
+//! guest is destroyed, which deletes everything made of them.  memd also
+//! reports free memory to the hypervisor l4h runs in (balloon.rs).
 //!
 //! memd serves l4h-root only, one call at a time, and never calls it.  It
 //! cannot read memory: every Untyped it has handed out has a child, so it
 //! cannot retype it, and revoking it first makes seL4 clear the memory
 //! before it is used again.
+//!
+//! memd has no heap: its state is the table l4h-root mapped (mem.rs) and
+//! fixed arrays, so no request, however large, can exhaust it.
 
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
 mod balloon;
 mod mem;
 
-use alloc::vec::Vec;
-
-use l4h_rt::host::memd::{self, BalloonConfig, MemdConfig, Status};
+use l4h_rt::host::memd::{self, BalloonConfig, MemdConfig, Status, BLOCK_BITS, MAX_GUESTS, XCHG_SLOTS};
 use l4h_rt::{Info, cap, host, sel4};
 use sel4::{CapRights, cap_type};
 
 use crate::balloon::Balloon;
-use crate::mem::{Mem, Slot, Slots, abs};
+use crate::mem::{List, Mem, State, abs};
 
 const ENODEV: u64 = 19;
 const ENOMEM: u64 = 12;
@@ -39,16 +38,18 @@ const EINVAL: u64 = 22;
 /// How often the free page reports are made and polled.
 const TICK_MS: u64 = 100;
 
-/// A guest's RAM: the original Untyped of each block (slot, paddr).
+/// A guest's RAM: its 2 MiB blocks, in order, on a list through the table.
+#[derive(Clone, Copy)]
 struct GuestRam {
-    blocks: Vec<(Slot, usize)>,
+    blocks: List,
     /// Radix of its block CNode.
     radix: usize,
+    live: bool,
 }
 
 struct Memd {
     mem: Mem,
-    guests: Vec<Option<GuestRam>>,
+    guests: [GuestRam; MAX_GUESTS],
     ticks_per_ms: u64,
 }
 
@@ -67,91 +68,105 @@ fn xchg(i: usize) -> sel4::AbsoluteCPtr {
 impl Memd {
     /// MEMD_ALLOC: `count` blocks of 2^bits bytes into the exchange slots.
     fn alloc(&mut self, bits: usize, count: usize) -> u64 {
-        if count > memd::XCHG_SLOTS || !(12..=47).contains(&bits) {
-            return EINVAL;
-        }
-        let mut got = Vec::new();
-        for _ in 0..count {
-            match self.mem.take(bits) {
-                Some(b) => got.push(b),
+        let k = match bits.checked_sub(BLOCK_BITS) {
+            Some(k) if k < memd::ORDERS && count <= XCHG_SLOTS => k,
+            _ => return EINVAL,
+        };
+        let mut got = [0u32; XCHG_SLOTS];
+        for n in 0..count {
+            match self.mem.take(k, State::Root) {
+                Some(i) => got[n] = i,
                 None => {
-                    for (s, paddr) in got {
-                        self.mem.add(s, paddr, bits);
+                    for &i in &got[..n] {
+                        self.mem.add(i, k);
                     }
                     return ENOMEM;
                 }
             }
         }
-        for (i, &(s, _)) in got.iter().enumerate() {
-            xchg(i).move_(&abs(s)).expect("memd: move to exchange");
-            self.mem.slots.free(s);
+        for (n, &i) in got[..count].iter().enumerate() {
+            xchg(n).move_(&abs(self.mem.slot(i, k))).expect("memd: move to exchange");
         }
         // Invocations use the message registers: the reply's go last.
-        for (i, (_, paddr)) in got.into_iter().enumerate() {
-            set_mr(1 + i, paddr as u64);
+        for (n, &i) in got[..count].iter().enumerate() {
+            set_mr(1 + n, (i as u64) << BLOCK_BITS);
         }
         0
     }
 
     /// MEMD_FREE: blocks from the exchange slots.
     fn free(&mut self, count: usize) -> u64 {
-        if count > memd::XCHG_SLOTS {
+        if count > XCHG_SLOTS {
             return EINVAL;
         }
-        // Read them all first: invocations use the message registers.
-        let blocks: Vec<(usize, usize)> = (0..count).map(|i| (mr(1 + 2 * i) as usize, mr(2 + 2 * i) as usize)).collect();
-        for (i, (paddr, bits)) in blocks.into_iter().enumerate() {
-            let s = self.mem.slots.alloc();
-            abs(s).move_(&xchg(i)).expect("memd: move from exchange");
-            self.mem.add(s, paddr, bits);
+        // Check them all first, reading the message registers before any
+        // invocation uses them.
+        let mut blocks = [(0u32, 0usize); XCHG_SLOTS];
+        for (n, b) in blocks[..count].iter_mut().enumerate() {
+            let Some((i, k)) = self.mem.block_at(mr(1 + 2 * n) as usize, mr(2 + 2 * n) as usize) else {
+                return EINVAL;
+            };
+            if !matches!(self.mem.state(i), State::None | State::Root) {
+                return EINVAL;
+            }
+            *b = (i, k);
+        }
+        for (n, &(i, k)) in blocks[..count].iter().enumerate() {
+            abs(self.mem.slot(i, k)).move_(&xchg(n)).expect("memd: move from exchange");
+            self.mem.add(i, k);
         }
         0
     }
 
     fn guest(&self, g: usize) -> Option<&GuestRam> {
-        self.guests.get(g)?.as_ref()
+        self.guests.get(g).filter(|r| r.live)
+    }
+
+    /// Block `b` of guest `g`: its unit.
+    fn guest_block(&self, g: usize, b: usize) -> Option<u32> {
+        self.guest(g).and_then(|r| self.mem.iter(r.blocks).nth(b))
     }
 
     fn guest_create(&mut self, g: usize, n: usize, radix: usize) -> u64 {
-        if g >= memd::MAX_GUESTS || self.guests[g].is_some() || n == 0 || radix > 20 || n > 1 << radix {
+        if g >= MAX_GUESTS || self.guests[g].live || n == 0 || radix > 20 || n > 1 << radix {
             return EINVAL;
         }
-        let mut blocks = Vec::with_capacity(n);
-        while blocks.len() < n {
-            match self.mem.take(memd::BLOCK_BITS) {
-                Some(b) => blocks.push(b),
+        let mut blocks = List::EMPTY;
+        while blocks.len < n {
+            match self.mem.take(0, State::Guest) {
+                Some(i) => self.mem.add_guest(&mut blocks, i),
                 None => {
-                    for (s, paddr) in blocks {
-                        self.mem.add(s, paddr, memd::BLOCK_BITS);
+                    while let Some(i) = self.mem.pop_guest(&mut blocks) {
+                        self.mem.add(i, 0);
                     }
                     return ENOMEM;
                 }
             }
         }
-        self.guests[g] = Some(GuestRam { blocks, radix });
+        self.guests[g] = GuestRam { blocks, radix, live: true };
         0
     }
 
     fn guest_copy(&mut self, g: usize, b: usize) -> u64 {
-        let Some(&(s, paddr)) = self.guest(g).and_then(|r| r.blocks.get(b)) else {
+        let Some(i) = self.guest_block(g, b) else {
             return EINVAL;
         };
         // Fails if the block already has a copy.
-        if xchg(0).copy(&abs(s), CapRights::all()).is_err() {
+        if xchg(0).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
             return EINVAL;
         }
-        set_mr(1, paddr as u64);
+        set_mr(1, (i as u64) << BLOCK_BITS);
         0
     }
 
     fn guest_give(&mut self, g: usize, first: usize) -> u64 {
         let Some(r) = self.guest(g) else { return EINVAL };
         let bcn = cap::<cap_type::CNode>(memd::SLOT_GUEST_BCN + g as u64);
-        for (b, &(s, _)) in r.blocks.iter().enumerate().skip(first) {
+        for (b, i) in self.mem.iter(r.blocks).enumerate().skip(first) {
             // A block without children: its copy is a sibling Untyped
             // that the guest can retype and revoke, and revoking the
             // original still deletes everything made from either.
-            if bcn.absolute_cptr_from_bits_with_depth(b as u64, r.radix).copy(&abs(s), CapRights::all()).is_err() {
+            if bcn.absolute_cptr_from_bits_with_depth(b as u64, r.radix).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
                 return EINVAL;
             }
         }
@@ -159,14 +174,16 @@ impl Memd {
     }
 
     fn guest_destroy(&mut self, g: usize) -> u64 {
-        if g >= memd::MAX_GUESTS {
+        if g >= MAX_GUESTS {
             return EINVAL;
         }
-        if let Some(r) = self.guests[g].take() {
-            for (s, paddr) in r.blocks {
-                abs(s).revoke().expect("memd: revoke guest block");
-                self.mem.add(s, paddr, memd::BLOCK_BITS);
+        if self.guests[g].live {
+            let mut blocks = self.guests[g].blocks;
+            while let Some(i) = self.mem.pop_guest(&mut blocks) {
+                abs(self.mem.slot(i, 0)).revoke().expect("memd: revoke guest block");
+                self.mem.add(i, 0);
             }
+            self.guests[g].live = false;
         }
         let _ = abs(memd::SLOT_GUEST_BCN + g as u64).delete();
         0
@@ -187,13 +204,13 @@ impl Memd {
 
     fn write_status(&self) {
         let (blocks, largest) = self.mem.block_stats();
-        let guest_blocks: usize = self.guests.iter().flatten().map(|r| r.blocks.len()).sum();
+        let guest_blocks: usize = self.guests.iter().filter(|r| r.live).map(|r| r.blocks.len).sum();
         let st = Status {
             free_bytes: self.mem.free_bytes() as u64,
             reported_bytes: self.mem.reported_bytes() as u64,
             free_blocks: blocks as u64,
             largest_block: largest as u64,
-            guest_bytes: (guest_blocks << memd::BLOCK_BITS) as u64,
+            guest_bytes: (guest_blocks << BLOCK_BITS) as u64,
         };
         unsafe { (memd::STATUS_VA as *mut Status).write_volatile(st) };
     }
@@ -208,8 +225,8 @@ fn arm_timer(ticks_per_ms: u64) {
 fn main(info: &'static Info) -> ! {
     let cfg: &MemdConfig = unsafe { info.config() };
     let mut d = Memd {
-        mem: Mem::new(Slots::new(memd::SLOT_DYN_BASE..1 << cfg.cnode_bits)),
-        guests: (0..memd::MAX_GUESTS).map(|_| None).collect(),
+        mem: Mem::new(cfg.units as usize),
+        guests: [GuestRam { blocks: List::EMPTY, radix: 0, live: false }; MAX_GUESTS],
         ticks_per_ms: info.header().tsc_hz / 1000,
     };
     d.write_status();
@@ -248,10 +265,8 @@ fn main(info: &'static Info) -> ! {
         };
         d.write_status();
         set_mr(0, resp);
-        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len.min(memd::XCHG_SLOTS + 1)), reply);
+        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len.min(XCHG_SLOTS + 1)), reply);
     }
 }
 
-// The free blocks and the guests' block tables: about 50 bytes per 2 MiB
-// of host memory.
-l4h_rt::component!(main, heap_size = 8 * 1024 * 1024);
+l4h_rt::component!(main, no_heap);

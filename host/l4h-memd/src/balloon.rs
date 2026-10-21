@@ -23,13 +23,13 @@ const F_REPORTING: u64 = 1 << 5;
 
 const PAGE: usize = 4096;
 
-/// Blocks smaller than this (2 MiB, the host's huge pages) are not reported.
-pub const MIN_BITS: usize = 21;
 /// Most bytes in one descriptor (lengths are 32 bits).
 pub const MAX_DESC_BITS: usize = 31;
 /// A block counts as free once it stayed free this long (as Linux does),
 /// so that memory freed and soon allocated again is not reported.
 pub const REPORT_DELAY_MS: u64 = 2000;
+/// Buffers of the reporting queue: the most a report holds.
+pub const QUEUE_SIZE: usize = 32;
 /// Longest wait for the device to return a report.
 const WAIT_MS: u64 = 2000;
 
@@ -68,7 +68,7 @@ impl Balloon {
         // the statistics queue is negotiated too, so that a device that
         // numbers them by what is negotiated agrees.
         let idx = 2 + (offered & F_STATS_VQ != 0) as u16 + (offered & F_FREE_PAGE_HINT != 0) as u16;
-        let Some(vq) = dev.setup_queue(&mut dma, idx, 32, NO_VECTOR) else {
+        let Some(vq) = dev.setup_queue(&mut dma, idx, QUEUE_SIZE as u16, NO_VECTOR) else {
             dev.fail();
             return None;
         };
@@ -79,7 +79,7 @@ impl Balloon {
 
     /// Buffers one report can hold.
     pub fn capacity(&self) -> usize {
-        self.vq.num as usize
+        (self.vq.num as usize).min(QUEUE_SIZE)
     }
 
     /// A report is in flight.

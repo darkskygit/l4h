@@ -2,10 +2,15 @@
 //! (DESIGN.md §16): its CSpace, the calls l4h-root makes to it, and the
 //! status page it keeps for l4h-root.
 //!
-//! memd's CSpace is one CNode of 2^cnode_bits slots (MemdConfig), large
-//! enough for every Untyped it can hold.  l4h-root holds a capability to
-//! it, and passes Untypeds and CNodes by moving them into the exchange
-//! slots and the guest slots below; memd never calls l4h-root.
+//! memd's CSpace is one CNode of 2^cnode_bits slots (MemdConfig), with a
+//! slot for every block it can hold (`block_slots`).  l4h-root holds a
+//! capability to it, and passes Untypeds and CNodes by moving them into
+//! the exchange slots and the guest slots below; memd never calls
+//! l4h-root.
+//!
+//! memd allocates nothing: what it knows of memory is a table with an
+//! entry per 2 MiB of physical address space (TABLE_VA), which l4h-root
+//! maps when it spawns memd, and memd never handles less than 2 MiB.
 
 /// Slot of guest g's block CNode (L4H_SLOT_BLOCKS of the guest), which
 /// l4h-root puts there before MEMD_GUEST_CREATE and memd deletes at
@@ -17,7 +22,7 @@ pub const MAX_GUESTS: usize = 64;
 /// most XCHG_SLOTS (MEMD_FREE takes two message registers for each).
 pub const SLOT_XCHG: u64 = 128;
 pub const XCHG_SLOTS: usize = 32;
-/// memd allocates its own slots from here.
+/// The blocks' slots start here (`block_slots`).
 pub const SLOT_DYN_BASE: u64 = 256;
 const _: () = assert!(SLOT_GUEST_BCN as usize + MAX_GUESTS <= SLOT_XCHG as usize);
 const _: () = assert!(SLOT_XCHG as usize + XCHG_SLOTS <= SLOT_DYN_BASE as usize);
@@ -25,13 +30,14 @@ const _: () = assert!(SLOT_XCHG as usize + XCHG_SLOTS <= SLOT_DYN_BASE as usize)
 /// Labels of l4h-root's calls on memd's service endpoint.  The reply's
 /// MR0 is 0 or an errno (ENOMEM, EINVAL).
 ///
-/// MR0 = size bits, MR1 = count (<= XCHG_SLOTS): `count` Untypeds of
+/// MR0 = size bits (BLOCK_BITS..=MAX_BITS), MR1 = count (<= XCHG_SLOTS): `count` Untypeds of
 /// 2^bits bytes without children, in the exchange slots; MR1.. of the
 /// reply = their physical addresses.
 pub const MEMD_ALLOC: u64 = 1;
 /// MR0 = count (<= XCHG_SLOTS), MR1.. = (physical address, size bits) of
 /// each: Untypeds without children that l4h-root put in the exchange
-/// slots, returned to the free memory.
+/// slots, returned to the free memory.  Each is a block memd gave, or one
+/// of at least 2^BLOCK_BITS bytes in the units of the table.
 pub const MEMD_FREE: u64 = 2;
 /// MR0 = guest, MR1 = blocks, MR2 = radix of its block CNode: take the
 /// guest's RAM, `blocks` 2 MiB blocks.  Nothing is given yet.
@@ -52,8 +58,42 @@ pub const MEMD_GUEST_DESTROY: u64 = 6;
 /// report.
 pub const MEMD_BALLOON: u64 = 7;
 
-/// Guest RAM comes in blocks of 2^BLOCK_BITS bytes.
+/// Guest RAM comes in blocks of 2^BLOCK_BITS bytes, the smallest memd
+/// handles: a unit of its table.
 pub const BLOCK_BITS: usize = 21;
+/// The largest block (seL4's largest Untyped).
+pub const MAX_BITS: usize = 47;
+/// Block sizes memd handles: 2^(BLOCK_BITS + order) bytes, order < ORDERS.
+pub const ORDERS: usize = MAX_BITS - BLOCK_BITS + 1;
+
+/// memd's table: an entry of UNIT_BYTES per 2 MiB unit of physical
+/// address space, from 0 to units << BLOCK_BITS (MemdConfig), zeroed.
+pub const TABLE_VA: usize = crate::SHARED_VA + 0x100_0000_0000;
+pub const UNIT_BYTES: usize = 24;
+
+pub const fn table_bytes(units: u64) -> usize {
+    (units as usize * UNIT_BYTES).next_multiple_of(4096)
+}
+// The table of a 48-bit physical address space fits below MMIO_VA.
+const _: () = assert!(TABLE_VA + table_bytes(1 << (48 - BLOCK_BITS)) <= crate::MMIO_VA);
+
+/// Slots for the blocks of a table of `units`: one for each block of each
+/// order that fits, at SLOT_DYN_BASE + first + index, where `first` is
+/// the sum of the counts of the smaller orders.
+pub const fn block_slots(units: u64) -> u64 {
+    let mut n = 0;
+    let mut k = 0;
+    while k < ORDERS {
+        n += units.div_ceil(1 << k);
+        k += 1;
+    }
+    n
+}
+
+/// Radix of memd's CNode for a table of `units`.
+pub const fn cnode_bits(units: u64) -> usize {
+    (SLOT_DYN_BASE + block_slots(units)).next_power_of_two().trailing_zeros() as usize
+}
 
 /// memd's status page, mapped read-only in l4h-root.  memd updates it
 /// after every call and report.
@@ -110,6 +150,8 @@ impl BalloonConfig {
 #[derive(Clone, Copy, Default)]
 pub struct MemdConfig {
     pub cnode_bits: u64,
+    /// Entries of the table at TABLE_VA.
+    pub units: u64,
 }
 
 /// Badge of memd's timer, on its bound notification.  l4h-root calls

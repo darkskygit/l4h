@@ -1100,6 +1100,18 @@ the host keeps that dynamic plumbing simple.
 | `l4h-trustd` | 0 or 1 | With a TPM: has the TPM quote its signing key, and signs guests' reports with it (§9.2). |
 | `l4h-memd` | 1 | Owns the free memory and every guest's RAM blocks; gives root memory for host objects; reports free memory to the hypervisor (§16). |
 
+**No dynamic allocation.** Host components are built so that nothing a
+guest, dom0 or a device does can exhaust their memory: a component that
+runs out cannot recover, and with it go every guest it serves (root or
+memd: the whole host). So their state is sized when they start, from
+constants (`MAX_GUESTS`, queue sizes) or from the host (memd's table),
+and lives in fixed arrays and tables, not on a heap. Where allocation is
+truly needed, it is bounded by a stated limit that is checked before
+the allocation, fails as an error rather than a panic, and is never
+made per request on a path whose size a guest or a client controls.
+A component without a heap says so (`component!(main, no_heap)`), and
+does not link `alloc`.
+
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
 protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
 Serial output uses seL4's printing syscall; root drives COM1 input for the
@@ -2159,25 +2171,50 @@ Behaviour is unchanged.
 - **Boot.** Root starts with every boot Untyped, as before, and allocates
   from them until memd runs: its own first objects, the module copies and
   memd itself (`memd::spawn`, right after the host facts are known). It
-  then moves every free block to memd (`Alloc::hand_over`), keeping the
+  then moves every free block of 2 MiB or more to memd
+  (`Alloc::hand_over`), keeping the
   parents of blocks it had split: memd cannot merge those with their
   buddies, which concerns only the blocks root split at boot. Device
   Untypeds stay with root.
-- **memd's CSpace** is one CNode (`SpawnArgs::cnode_bits`) with room for
-  three slots per 2 MiB of host memory, so that every block can be guest
-  RAM, free or a parent (512 KiB of CNode for a 4 GiB host). Root holds
-  its capability, and passes Untypeds by moving them into memd's exchange
+- **memd's table.** memd allocates nothing (no heap: `component!(main,
+  no_heap)`). What it knows of memory is a table with a 24-byte entry
+  per 2 MiB unit of physical address space, up to the end of the last
+  block it gets, which root sizes, zeroes and maps when it spawns memd
+  (`TABLE_VA`; 12 KiB for a 1 GiB host, 12 MiB for 1 TiB). memd never
+  handles less than 2 MiB: root keeps the smaller boot Untypeds, and asks
+  for no grant below 2 MiB. A block of 2^(21+k) bytes ("order k") is
+  described by the entry of its first unit, and the free blocks of each
+  order are on lists linked through their entries: those not reported to
+  the hypervisor in the order they were freed, and those reported. So
+  taking, freeing and finding a buddy are O(1), taking a block of order k
+  is O(orders), and nothing scans the free blocks except a merge (below)
+  and the report timer, which reads only the blocks it reports.
+- **memd's CSpace** is one CNode (`SpawnArgs::cnode_bits`) with a slot
+  for every block of every order that fits in the table, at a fixed
+  place (`l4h_host::memd::block_slots`): two slots per 2 MiB unit, to
+  the next power of two (64 KiB of CNode for a 1 GiB host). The halves
+  of a split block are always in consecutive slots, which is what a
+  retype needs, and no request can fill the CNode. Root holds its
+  capability, and passes Untypeds by moving them into memd's exchange
   slots (`l4h_host::memd`); memd never calls root, and l4h-root calls it
   synchronously.
 - **Root's memory** comes in *grants*: when root's free blocks cannot
   meet a request, it takes an untouched Untyped of 16 MiB (or exactly the
-  request, if larger) from memd (`MEMD_ALLOC`) and splits it as before.
+  request, if larger; or 2 MiB, if memd has no 16 MiB block) from memd
+  (`MEMD_ALLOC`) and splits it as before.
   Grants are never merged with each other. When a destroy or a failed
   create leaves root more than 48 MiB of free blocks, it merges them and
   returns whole grants (`MEMD_FREE`) beyond 32 MiB (`Alloc::trim`).
   Merging after every destroy instead made creates a fifth slower: the
-  next retype of a merged block clears all its halves used (§15.2). Host objects, arenas, I/O pools and ASID pools come
-  from root's blocks, as before.
+  next retype of a merged block clears all its halves used (§15.2). Host
+  objects, arenas, I/O pools and ASID pools come from root's blocks, as
+  before.
+- **Merging** in memd is lazy for the same reason: free buddies merge
+  only when no block is large enough for a request, in one pass over the
+  free blocks of the smaller orders. A pass that finds nothing more to
+  merge is not repeated until a block is freed or a report returns, so a
+  host whose free memory is in 2 MiB pieces does not pay a pass per
+  grant.
 - **Guest RAM is memd's** (`MEMD_GUEST_*`). At create, root gives memd a
   copy of the guest's block CNode capability, and memd takes the guest's
   2 MiB blocks. When an image is loaded into a block, memd gives root a
@@ -2205,5 +2242,6 @@ Behaviour is unchanged.
   faults, root's next call to it never returns: the host stops.
 - **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 2`, above every
   guest, with a full budget: root waits for it.
-- **Limits.** memd's heap is 8 MiB, about 50 bytes per 2 MiB block of
-  host memory: enough for hosts of about 300 GiB.
+- **Limits.** None but the table: its size follows the host's memory,
+  and no request makes memd use more of anything. A 1 TiB host needs
+  12 MiB of table and 64 MiB of CNode.

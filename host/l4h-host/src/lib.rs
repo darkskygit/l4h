@@ -5,6 +5,7 @@
 #![no_std]
 
 pub mod blk;
+pub mod fixed;
 pub mod memd;
 pub mod net;
 pub mod trust;

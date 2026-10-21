@@ -1,5 +1,14 @@
-//! The host's free memory: power-of-two Untyped blocks, buddy style, and
-//! the slots of memd's CNode that hold them.
+//! The host's free memory: power-of-two Untyped blocks of 2 MiB and more,
+//! buddy style, kept in a table with an entry per 2 MiB unit of physical
+//! address space (TABLE_VA, mapped and sized by l4h-root).
+//!
+//! A block of 2^(BLOCK_BITS + k) bytes ("order k") at unit i is described
+//! by the entry of unit i, its head, and its Untyped is in a slot of its
+//! own (`slot`), so nothing here allocates and every operation is O(1)
+//! or O(ORDERS), save merging, which is O(free blocks) and done only when
+//! no block is large enough.  The free blocks of each order are on lists
+//! linked through their entries: those not reported to the hypervisor, in
+//! the order they were freed, and those reported.
 //!
 //! A request takes the smallest block that fits and splits it in halves
 //! as needed, so large aligned allocations never waste memory on
@@ -14,10 +23,7 @@
 //! Blocks that stay free are reported to the hypervisor, if it takes free
 //! page reports (`balloon`), so that it can drop their memory.
 
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-use core::ops::Range;
-
+use l4h_rt::host::memd::{BLOCK_BITS, ORDERS, SLOT_DYN_BASE, TABLE_VA, UNIT_BYTES};
 use l4h_rt::{cap, host, sel4};
 use sel4::{ObjectBlueprint, cap_type};
 
@@ -34,187 +40,337 @@ pub fn abs(s: Slot) -> sel4::AbsoluteCPtr {
     cnode().absolute_cptr(cap::<cap_type::Null>(s))
 }
 
-pub fn untyped(s: Slot) -> sel4::cap::Untyped {
+fn untyped(s: Slot) -> sel4::cap::Untyped {
     cap::<cap_type::Untyped>(s)
 }
 
-/// Free slots of memd's CNode, as coalesced ranges.
-pub struct Slots {
-    free: BTreeMap<Slot, Slot>,
-}
+const NIL: u32 = u32::MAX;
 
-impl Slots {
-    pub fn new(range: Range<Slot>) -> Self {
-        let mut free = BTreeMap::new();
-        free.insert(range.start, range.end);
-        Slots { free }
-    }
-
-    pub fn alloc(&mut self) -> Slot {
-        self.alloc_range(1).start
-    }
-
-    /// `n` consecutive slots (the lowest range that fits).
-    pub fn alloc_range(&mut self, n: u64) -> Range<Slot> {
-        let (start, end) = self
-            .free
-            .iter()
-            .find(|&(s, e)| e - s >= n)
-            .map(|(&s, &e)| (s, e))
-            .expect("memd: CNode full");
-        self.free.remove(&start);
-        if end - start > n {
-            self.free.insert(start + n, end);
-        }
-        start..start + n
-    }
-
-    pub fn free(&mut self, s: Slot) {
-        let (mut start, mut end) = (s, s + 1);
-        if let Some((&ps, &pe)) = self.free.range(..=s).next_back() {
-            assert!(pe <= s, "memd: slot {} freed twice", s);
-            if pe == s {
-                self.free.remove(&ps);
-                start = ps;
-            }
-        }
-        if let Some(ne) = self.free.remove(&end) {
-            end = ne;
-        }
-        self.free.insert(start, end);
-    }
-}
-
-/// What the hypervisor l4h runs in knows of a free block (balloon.rs).
+/// What a unit is.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Hint {
-    /// Not reported; free since this tick count.
-    Free(u64),
+#[repr(u8)]
+pub enum State {
+    /// Not the head of a block of ours (zeroed memory reads as this).
+    None = 0,
+    /// Head of a free block, not reported; free since `since`.
+    Free,
     /// In the report in flight: not to be used until the device returns it.
     Reporting,
     /// Reported: the hypervisor may have dropped the memory.
     Reported,
+    /// Given to l4h-root.
+    Root,
+    /// RAM of a guest, on its list.
+    Guest,
 }
 
-/// An untouched Untyped (no children) in a slot of ours.
-struct FreeBlock {
-    slot: Slot,
-    paddr: usize,
-    bits: usize,
-    hint: Hint,
+/// An entry of the table.
+#[repr(C)]
+struct Unit {
+    /// Links of the list the block is on.
+    next: u32,
+    prev: u32,
+    /// Orders k for which we keep the Untyped of the split block of order
+    /// k headed here.
+    split: u32,
+    state: State,
+    order: u8,
+    since: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<Unit>() == UNIT_BYTES);
+
+#[derive(Clone, Copy)]
+pub struct List {
+    head: u32,
+    tail: u32,
+    pub len: usize,
+}
+
+impl List {
+    pub const EMPTY: List = List { head: NIL, tail: NIL, len: 0 };
 }
 
 pub struct Mem {
-    pub slots: Slots,
-    blocks: Vec<FreeBlock>,
-    /// Split blocks, (paddr, size bits) -> slot of their Untyped.
-    parents: BTreeMap<(usize, usize), Slot>,
+    table: &'static mut [Unit],
+    /// First slot of each order's blocks.
+    first: [Slot; ORDERS],
+    free: [List; ORDERS],
+    reported: [List; ORDERS],
+    reporting: List,
+    /// Merging below this order will find nothing until a block is freed.
+    merged_below: usize,
     pub balloon: Option<Balloon>,
 }
 
+/// Size of a block of order k, in bytes.
+pub const fn bytes(k: usize) -> usize {
+    1 << (BLOCK_BITS + k)
+}
+
 impl Mem {
-    pub fn new(slots: Slots) -> Self {
-        Mem { slots, blocks: Vec::new(), parents: BTreeMap::new(), balloon: None }
+    /// The table of `units` entries at TABLE_VA, zeroed.
+    pub fn new(units: usize) -> Self {
+        let table = unsafe { core::slice::from_raw_parts_mut(TABLE_VA as *mut Unit, units) };
+        let mut first = [0; ORDERS];
+        let mut next = SLOT_DYN_BASE;
+        for (k, f) in first.iter_mut().enumerate() {
+            *f = next;
+            next += (units as u64).div_ceil(1 << k);
+        }
+        Mem {
+            table,
+            first,
+            free: [List::EMPTY; ORDERS],
+            reported: [List::EMPTY; ORDERS],
+            reporting: List::EMPTY,
+            merged_below: 0,
+            balloon: None,
+        }
     }
 
-    /// Add the Untyped in `slot`, which has no children, to the free
-    /// blocks.
-    pub fn add(&mut self, slot: Slot, paddr: usize, bits: usize) {
-        self.blocks.push(FreeBlock { slot, paddr, bits, hint: Hint::Free(host::ticks::now()) });
+    /// The slot of the block of order k at unit i.
+    pub fn slot(&self, i: u32, k: usize) -> Slot {
+        self.first[k] + (i >> k) as u64
+    }
+
+    pub fn state(&self, i: u32) -> State {
+        self.table[i as usize].state
+    }
+
+    pub fn order(&self, i: u32) -> usize {
+        self.table[i as usize].order as usize
+    }
+
+    /// Whether (paddr, bits) is a block of the table: aligned, at least a
+    /// unit and inside it.
+    pub fn block_at(&self, paddr: usize, bits: usize) -> Option<(u32, usize)> {
+        let k = bits.checked_sub(BLOCK_BITS).filter(|&k| k < ORDERS)?;
+        let i = paddr >> BLOCK_BITS;
+        (paddr % bytes(k) == 0 && i + (1 << k) <= self.table.len()).then_some((i as u32, k))
+    }
+
+    // Lists.
+
+    fn push_back(&mut self, l: &mut List, i: u32) {
+        let u = &mut self.table[i as usize];
+        u.next = NIL;
+        u.prev = l.tail;
+        match l.tail {
+            NIL => l.head = i,
+            t => self.table[t as usize].next = i,
+        }
+        l.tail = i;
+        l.len += 1;
+    }
+
+    fn push_front(&mut self, l: &mut List, i: u32) {
+        let u = &mut self.table[i as usize];
+        u.prev = NIL;
+        u.next = l.head;
+        match l.head {
+            NIL => l.tail = i,
+            h => self.table[h as usize].prev = i,
+        }
+        l.head = i;
+        l.len += 1;
+    }
+
+    fn unlink(&mut self, l: &mut List, i: u32) {
+        let (next, prev) = (self.table[i as usize].next, self.table[i as usize].prev);
+        match prev {
+            NIL => l.head = next,
+            p => self.table[p as usize].next = next,
+        }
+        match next {
+            NIL => l.tail = prev,
+            n => self.table[n as usize].prev = prev,
+        }
+        l.len -= 1;
+    }
+
+    /// The units on `l`, in order.
+    pub fn iter(&self, l: List) -> impl Iterator<Item = u32> + '_ {
+        let mut i = l.head;
+        core::iter::from_fn(move || {
+            let cur = i;
+            (cur != NIL).then(|| {
+                i = self.table[cur as usize].next;
+                cur
+            })
+        })
+    }
+
+    /// Put the block taken at unit i on a guest's list `l`.
+    pub fn add_guest(&mut self, l: &mut List, i: u32) {
+        self.table[i as usize].state = State::Guest;
+        self.push_back(l, i);
+    }
+
+    /// Take the first block off a guest's list `l`.
+    pub fn pop_guest(&mut self, l: &mut List) -> Option<u32> {
+        let i = l.head;
+        (i != NIL).then(|| {
+            self.unlink(l, i);
+            i
+        })
+    }
+
+    // Free blocks.
+
+    /// Put the block of order k at unit i, an untouched Untyped in its
+    /// slot, on the free lists.
+    fn put(&mut self, i: u32, k: usize, state: State, since: u64, front: bool) {
+        let u = &mut self.table[i as usize];
+        u.state = state;
+        u.order = k as u8;
+        u.since = since;
+        let mut l = if state == State::Reported { self.reported[k] } else { self.free[k] };
+        if front {
+            self.push_front(&mut l, i);
+        } else {
+            self.push_back(&mut l, i);
+        }
+        if state == State::Reported {
+            self.reported[k] = l;
+        } else {
+            self.free[k] = l;
+        }
+    }
+
+    /// Take the free block of order k at unit i off its list.
+    fn unput(&mut self, i: u32, k: usize) {
+        if self.state(i) == State::Reported {
+            let mut l = self.reported[k];
+            self.unlink(&mut l, i);
+            self.reported[k] = l;
+        } else {
+            let mut l = self.free[k];
+            self.unlink(&mut l, i);
+            self.free[k] = l;
+        }
+    }
+
+    /// Free the block of order k at unit i: its Untyped, without children,
+    /// is in its slot.
+    pub fn add(&mut self, i: u32, k: usize) {
+        self.put(i, k, State::Free, host::ticks::now(), false);
+        self.merged_below = 0;
     }
 
     pub fn free_bytes(&self) -> usize {
-        self.blocks.iter().map(|b| 1usize << b.bits).sum()
+        (0..ORDERS).map(|k| (self.free[k].len + self.reported[k].len) * bytes(k)).sum::<usize>() + self.reporting_bytes()
+    }
+
+    fn reporting_bytes(&self) -> usize {
+        self.iter(self.reporting).map(|i| bytes(self.order(i))).sum()
     }
 
     /// Free memory reported to the hypervisor, in bytes.
     pub fn reported_bytes(&self) -> usize {
-        self.blocks.iter().filter(|b| b.hint == Hint::Reported).map(|b| 1usize << b.bits).sum()
+        (0..ORDERS).map(|k| self.reported[k].len * bytes(k)).sum()
     }
 
     /// Free blocks: (count, bytes of the largest).
     pub fn block_stats(&self) -> (usize, usize) {
-        (self.blocks.len(), self.blocks.iter().map(|b| 1usize << b.bits).max().unwrap_or(0))
+        let mut n = self.reporting.len;
+        let mut largest = self.iter(self.reporting).map(|i| bytes(self.order(i))).max().unwrap_or(0);
+        for k in 0..ORDERS {
+            let m = self.free[k].len + self.reported[k].len;
+            n += m;
+            if m != 0 {
+                largest = largest.max(bytes(k));
+            }
+        }
+        (n, largest)
     }
 
-    /// Whether a block of 2^bits bytes can be split off now, without
+    /// Whether a block of order k or more can be taken now, without
     /// merging or waiting for a report.
-    fn has_block(&self, bits: usize) -> bool {
-        self.blocks.iter().any(|b| b.bits >= bits && b.hint != Hint::Reporting)
+    fn has_block(&self, k: usize) -> bool {
+        (k..ORDERS).any(|j| self.free[j].len + self.reported[j].len != 0)
     }
 
-    /// An untouched Untyped of exactly 2^bits bytes: (slot, paddr).  It is
-    /// the caller's until it gives it back with `add`.
-    pub fn take(&mut self, bits: usize) -> Option<(Slot, usize)> {
-        if !self.has_block(bits) {
+    /// An untouched Untyped of order k: its unit, whose state is now
+    /// `state`; the Untyped is in `slot(i, k)`, the caller's until it
+    /// gives it back with `add`.
+    pub fn take(&mut self, k: usize, state: State) -> Option<u32> {
+        if !self.has_block(k) {
             self.finish_report(true);
         }
-        if !self.has_block(bits) {
-            self.merge_up_to(bits);
+        if !self.has_block(k) {
+            self.merge_up_to(k);
         }
-        let (i, _) = self
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.bits >= bits && b.hint != Hint::Reporting)
-            .min_by_key(|(_, b)| (b.bits, b.paddr))?;
-        let mut b = self.blocks.swap_remove(i);
-        while b.bits > bits {
-            let half = b.bits - 1;
-            let s = self.slots.alloc_range(2);
-            untyped(b.slot)
-                .untyped_retype(&ObjectBlueprint::Untyped { size_bits: half }, &cnode().absolute_cptr_for_self(), s.start as usize, 2)
+        // The smallest block that fits; of those, one not reported (its
+        // memory is there), the most recently freed.
+        let j = (k..ORDERS).find(|&j| self.free[j].len + self.reported[j].len != 0)?;
+        let i = if self.free[j].len != 0 { self.free[j].tail } else { self.reported[j].tail };
+        let (hint, since) = (self.state(i), self.table[i as usize].since);
+        self.unput(i, j);
+        for o in (k..j).rev() {
+            // Split the block of order o + 1 at i: its halves go to the
+            // slots of i and its buddy, which are consecutive.
+            let buddy = i + (1 << o);
+            untyped(self.slot(i, o + 1))
+                .untyped_retype(&ObjectBlueprint::Untyped { size_bits: BLOCK_BITS + o }, &cnode().absolute_cptr_for_self(), self.slot(i, o) as usize, 2)
                 .expect("memd: split block");
+            debug_assert_eq!(self.slot(buddy, o), self.slot(i, o) + 1);
             // The parent is kept, to merge the halves again when both
-            // are free.
-            self.parents.insert((b.paddr, b.bits), b.slot);
-            self.blocks.push(FreeBlock { slot: s.start + 1, paddr: b.paddr + (1 << half), bits: half, hint: b.hint });
-            b = FreeBlock { slot: s.start, paddr: b.paddr, bits: half, hint: b.hint };
+            // are free.  The other half, freed as long ago as it, goes
+            // first in line to be reported.
+            self.table[i as usize].split |= 1 << (o + 1);
+            self.put(buddy, o, hint, since, true);
         }
-        Some((b.slot, b.paddr))
+        let u = &mut self.table[i as usize];
+        u.state = state;
+        u.order = k as u8;
+        Some(i)
     }
 
-    /// Merge free buddies, smallest first, into blocks of up to 2^bits
-    /// bytes, so that a request for 2^bits can be met.
-    fn merge_up_to(&mut self, bits: usize) {
-        loop {
-            let mut merged = false;
-            let mut i = 0;
-            while i < self.blocks.len() {
-                let (paddr, b) = (self.blocks[i].paddr, self.blocks[i].bits);
-                let parent = (paddr & !(1 << b), b + 1);
-                let buddy = paddr ^ (1 << b);
-                let pslot = self.parents.get(&parent).copied();
-                let j = self.blocks.iter().position(|x| x.paddr == buddy && x.bits == b);
-                let (Some(pslot), Some(j), true) = (pslot, j, b < bits) else {
-                    i += 1;
-                    continue;
-                };
-                if self.blocks[i].hint == Hint::Reporting || self.blocks[j].hint == Hint::Reporting {
-                    i += 1;
-                    continue;
+    /// Merge free buddies, smallest first, into blocks of up to order k,
+    /// so that a request for order k can be met.
+    fn merge_up_to(&mut self, k: usize) {
+        if k <= self.merged_below {
+            return;
+        }
+        for o in 0..k {
+            for reported in [false, true] {
+                let mut i = if reported { self.reported[o].head } else { self.free[o].head };
+                while i != NIL {
+                    let mut next = self.table[i as usize].next;
+                    let buddy = i ^ (1 << o);
+                    let parent = i & !(1 << o);
+                    let mergeable = self.table[parent as usize].split & (1 << (o + 1)) != 0
+                        && matches!(self.state(buddy), State::Free | State::Reported)
+                        && self.order(buddy) == o;
+                    if mergeable {
+                        if next == buddy {
+                            next = self.table[buddy as usize].next;
+                        }
+                        self.merge(parent, o);
+                    }
+                    i = next;
                 }
-                // Neither half has children: deleting both leaves the
-                // parent without children, so its next retype starts
-                // afresh (and clears what the halves used).
-                let (x, y) = (self.blocks.swap_remove(i.max(j)), self.blocks.swap_remove(i.min(j)));
-                let hint = if x.hint == Hint::Reported && y.hint == Hint::Reported {
-                    Hint::Reported
-                } else {
-                    Hint::Free(host::ticks::now())
-                };
-                for half in [x.slot, y.slot] {
-                    abs(half).delete().expect("memd: delete merged half");
-                    self.slots.free(half);
-                }
-                self.parents.remove(&parent);
-                self.blocks.push(FreeBlock { slot: pslot, paddr: parent.0, bits: parent.1, hint });
-                merged = true;
-            }
-            if !merged || self.has_block(bits) {
-                return;
             }
         }
+        self.merged_below = k;
+    }
+
+    /// Merge the free halves of order o of the split block at `parent`.
+    fn merge(&mut self, parent: u32, o: usize) {
+        let buddy = parent + (1 << o);
+        let reported = self.state(parent) == State::Reported && self.state(buddy) == State::Reported;
+        for h in [parent, buddy] {
+            self.unput(h, o);
+            // Neither half has children: deleting both leaves the parent
+            // without children, so its next retype starts afresh (and
+            // clears what the halves used).
+            abs(self.slot(h, o)).delete().expect("memd: delete merged half");
+        }
+        self.table[buddy as usize].state = State::None;
+        self.table[parent as usize].split &= !(1 << (o + 1));
+        let (state, since) = if reported { (State::Reported, 0) } else { (State::Free, host::ticks::now()) };
+        self.put(parent, o + 1, state, since, false);
     }
 
     /// Report the blocks that have been free for `delay` ticks to the
@@ -222,26 +378,39 @@ impl Mem {
     /// flight.  Called periodically.
     pub fn report_free(&mut self, now: u64, delay: u64) {
         self.finish_report(false);
-        let Some(dev) = &mut self.balloon else { return };
+        let Some(dev) = &self.balloon else { return };
         if dev.busy() {
             return;
         }
-        let mut ranges = Vec::new();
-        for b in &mut self.blocks {
-            let Hint::Free(since) = b.hint else { continue };
-            if b.bits < balloon::MIN_BITS || now.saturating_sub(since) < delay {
-                continue;
+        let cap = dev.capacity();
+        let mut ranges = [(0, 0); balloon::QUEUE_SIZE];
+        let mut n = 0;
+        for k in 0..ORDERS {
+            let piece = bytes(k).min(1 << balloon::MAX_DESC_BITS);
+            let per = bytes(k) / piece;
+            if n + per > cap {
+                // Neither this order's blocks nor any larger fit.
+                break;
             }
-            let piece = 1usize << b.bits.min(balloon::MAX_DESC_BITS);
-            let n = (1usize << b.bits) / piece;
-            if ranges.len() + n > dev.capacity() {
-                continue;
+            // Oldest first.
+            let mut i = self.free[k].head;
+            while i != NIL && n + per <= cap && now.saturating_sub(self.table[i as usize].since) >= delay {
+                let next = self.table[i as usize].next;
+                let paddr = (i as usize) << BLOCK_BITS;
+                for p in 0..per {
+                    ranges[n] = (paddr + p * piece, piece);
+                    n += 1;
+                }
+                self.unput(i, k);
+                self.table[i as usize].state = State::Reporting;
+                let mut l = self.reporting;
+                self.push_back(&mut l, i);
+                self.reporting = l;
+                i = next;
             }
-            ranges.extend((0..n).map(|k| (b.paddr + k * piece, piece)));
-            b.hint = Hint::Reporting;
         }
-        if !ranges.is_empty() {
-            dev.report(&ranges);
+        if n != 0 {
+            self.balloon.as_mut().unwrap().report(&ranges[..n]);
         }
     }
 
@@ -258,16 +427,21 @@ impl Mem {
             }
             return;
         }
-        let mut bytes = 0;
-        for b in &mut self.blocks {
-            if b.hint == Hint::Reporting {
-                b.hint = Hint::Reported;
-                bytes += 1usize << b.bits;
-            }
+        let mut bytes_back = 0;
+        while self.reporting.head != NIL {
+            let i = self.reporting.head;
+            let mut l = self.reporting;
+            self.unlink(&mut l, i);
+            self.reporting = l;
+            let k = self.order(i);
+            bytes_back += bytes(k);
+            self.put(i, k, State::Reported, 0, false);
         }
+        // Reporting blocks are not merged; they can be now.
+        self.merged_below = 0;
         l4h_rt::info!(
             "memd: balloon: reported {} MiB, {} of {} MiB free reported",
-            bytes >> 20, self.reported_bytes() >> 20, self.free_bytes() >> 20
+            bytes_back >> 20, self.reported_bytes() >> 20, self.free_bytes() >> 20
         );
     }
 }

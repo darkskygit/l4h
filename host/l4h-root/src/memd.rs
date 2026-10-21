@@ -26,8 +26,9 @@ static MEMD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-memd.elf"
 pub const MEMD_ID: u32 = 0x400;
 /// memd's status page in the root task.
 const STATUS_VA: usize = crate::layout::MEMD_STATUS.base;
-/// Mapping capabilities of the status page and the balloon's BARs and DMA.
-const KEEP_BITS: usize = 12;
+/// Mapping capabilities besides the table's: the status page, and the
+/// balloon's BARs and DMA.  A balloon whose BARs need more is left off.
+const KEEP_OTHERS: usize = 64;
 const PAGE: usize = 4096;
 
 const VIRTIO_VENDOR: u16 = 0x1af4;
@@ -143,13 +144,19 @@ pub struct Memd {
     comp: Component,
     arena: Arena,
     keep: cap::CNode,
+    keep_bits: usize,
     keep_next: u64,
 }
 
 impl Memd {
+    fn keep_left(&self) -> usize {
+        (1 << self.keep_bits) - self.keep_next as usize
+    }
+
     fn keep_slot(&mut self) -> sel4::AbsoluteCPtr {
+        assert!(self.keep_next < 1 << self.keep_bits, "memd: keep CNode full");
         self.keep_next += 1;
-        self.keep.absolute_cptr_from_bits_with_depth(self.keep_next - 1, KEEP_BITS)
+        self.keep.absolute_cptr_from_bits_with_depth(self.keep_next - 1, self.keep_bits)
     }
 
     /// Have memd report free memory through `d`, a virtio-balloon: map its
@@ -167,7 +174,8 @@ impl Memd {
                 continue;
             }
             let bar = d.bars[c.bar as usize];
-            if bar.is_io || bar.size == 0 || bar.size as usize > memd::BAR_STRIDE {
+            let pages = (bar.size as usize).div_ceil(PAGE);
+            if bar.is_io || bar.size == 0 || bar.size as usize > memd::BAR_STRIDE || pages + memd::DMA_PAGES > self.keep_left() {
                 return;
             }
             let Some(frames) = alloc.slots.global(|s| devmem.frames(s, bar.addr as usize, bar.size as usize)) else {
@@ -210,23 +218,18 @@ pub fn is_balloon(d: &pci::Device) -> bool {
         && d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG)
 }
 
-/// Radix of memd's CNode for a host with `bytes` of free memory: room for
-/// every 2 MiB block as guest RAM, free or a parent, and for what root
-/// splits smaller.
-fn cnode_bits(bytes: usize) -> usize {
-    let need = 3 * (bytes >> memd::BLOCK_BITS) + memd::SLOT_DYN_BASE as usize + 4096;
-    (need.next_power_of_two().trailing_zeros() as usize).max(14)
-}
-
 /// Spawn memd and hand it all free memory.
 pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo) -> Memd {
-    let bits = cnode_bits(alloc.free_bytes());
-    let cfg = MemdConfig { cnode_bits: bits as u64 };
+    let units = alloc.memd_units();
+    let bits = memd::cnode_bits(units);
+    let table_pages = memd::table_bytes(units) / PAGE;
+    let cfg = MemdConfig { cnode_bits: bits as u64, units };
     let cfg_bytes = unsafe {
         core::slice::from_raw_parts(&cfg as *const MemdConfig as *const u8, core::mem::size_of::<MemdConfig>())
     };
-    // Its CNode, image (with an 8 MiB heap) and paging structures.
-    let mut arena = alloc.arena((32 << bits) + (10 << 20)).expect("memory for memd");
+    // Its CNode, table (with its page tables), image and paging
+    // structures.
+    let mut arena = alloc.arena((32 << bits) + table_pages * PAGE * 513 / 512 + (2 << 20)).expect("memory for memd");
     let args = SpawnArgs {
         id: MEMD_ID,
         kind: host::KIND_MEMD,
@@ -242,8 +245,21 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
         cnode_bits: Some(bits),
     };
     let comp = component::create(&args, alloc, &mut arena, win, asids, info);
-    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
-    let mut m = Memd { comp, arena, keep, keep_next: 0 };
+    // Mapping capabilities: the table's, the status page, the balloon's
+    // BARs and DMA.
+    let keep_bits = (table_pages + KEEP_OTHERS).next_power_of_two().trailing_zeros() as usize;
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: keep_bits });
+    let mut m = Memd { comp, arena, keep, keep_bits, keep_next: 0 };
+
+    // The table, zeroed as seL4 makes new frames.
+    for p in 0..table_pages {
+        let f = m.arena.object(alloc, FRAME_BP);
+        let keep = m.keep_slot();
+        let frame = abs_of(root_cap::<cap_type::Granule>(f));
+        m.comp.map_copy(alloc, &mut m.arena, &frame, memd::TABLE_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep);
+        frame.delete().expect("delete table frame");
+        alloc.slots.free(f);
+    }
 
     // The status page: memd writes it, l4h-root reads it.
     let status = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
@@ -260,8 +276,8 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
     let link = MemdLink { ep: m.comp.service_ep, cnode: m.comp.cnode, cnode_bits: bits };
     alloc.hand_over(link);
     info!(
-        "l4h-root: memd holds {} MiB, {} KiB of CNode",
-        link.status().free_bytes >> 20, (32usize << bits) >> 10
+        "l4h-root: memd holds {} MiB, {} KiB of CNode, {} KiB of table",
+        link.status().free_bytes >> 20, (32usize << bits) >> 10, table_pages * PAGE >> 10
     );
     m
 }
