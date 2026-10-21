@@ -17,6 +17,7 @@ typedef __u8 l4h_u8;
 typedef __u16 l4h_u16;
 typedef __u32 l4h_u32;
 typedef __u64 l4h_u64;
+typedef __s32 l4h_s32;
 typedef __s64 l4h_s64;
 #else
 #include <stdint.h>
@@ -24,6 +25,7 @@ typedef uint8_t l4h_u8;
 typedef uint16_t l4h_u16;
 typedef uint32_t l4h_u32;
 typedef uint64_t l4h_u64;
+typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
@@ -65,8 +67,6 @@ typedef int64_t l4h_s64;
 #define L4H_SLOT_VSPACE         2   /* guest-kernel VSpace root */
 #define L4H_SLOT_HYP_EP         3   /* Call: hypercalls served by l4h-vmm */
 #define L4H_SLOT_ASID_POOL      4   /* reserved */
-/* Call: attestation, served by l4h-trustd (only with L4H_BOOT_ATTEST) */
-#define L4H_SLOT_ATTEST_EP      5
 
 
 /* Per-vCPU objects: root slots L4H_SLOT_VCPU(v) + L4H_VCPU_* */
@@ -185,6 +185,7 @@ enum l4h_dev_type {
 	L4H_DEV_VIRTIO = 1,     /* virtio-l4h transport, see l4h_virtio_regs */
 	L4H_DEV_CONSOLE = 2,    /* hvc console ring */
 	L4H_DEV_CTL = 3,        /* dom0 control channel (l4hctl) */
+	L4H_DEV_ATTEST = 4,     /* attestation by l4h-trustd, see l4h_attest_page */
 };
 
 struct l4h_dev_desc {
@@ -233,8 +234,6 @@ struct l4h_bootinfo {
 };
 
 #define L4H_BOOT_DOM0           (1ull << 0)
-/* The host has a TPM, and the guest an L4H_SLOT_ATTEST_EP (see below). */
-#define L4H_BOOT_ATTEST         (1ull << 1)
 
 /* ------------------------------------------------------------------------
  * virtio-l4h: the shared device page of an L4H_DEV_VIRTIO device.
@@ -441,37 +440,62 @@ enum l4h_hypercall {
 #define L4H_HC_CONSOLE_MAX_WORDS 32
 
 /* ------------------------------------------------------------------------
- * Attestation: seL4_Call(L4H_SLOT_ATTEST_EP) with the label below.  The
- * host proves what it booted with a TPM quote over its signing key, and
- * signs reports about the guest with that key (DESIGN.md §9.2):
+ * Attestation device (L4H_DEV_ATTEST, on hosts with a TPM): requests to
+ * l4h-trustd in the device page.  The host proves what it booted with a
+ * TPM quote over its signing key, and signs reports about the guest with
+ * that key (DESIGN.md §9.2).  Requests are asynchronous:
  *
- * - L4H_ATTEST_REPORT: MR0..MR7 = 64 bytes of the guest's own data (a
- *   verifier's nonce, a hash of a key), MR8 = offset.  Returns the report,
- *   a COSE_Sign1 (RFC 9052, ES256) over a CBOR map of claims.  The same
- *   data gives the same report, so it can be read in pieces.
- * - L4H_ATTEST_EVIDENCE: MR0 = offset.  Returns the host evidence, a CBOR
- *   map: the signing key, the TPM quote over it with the PCRs, the TPM's
+ * 1. The guest writes op, offset, in_len, blob_len and data, then a new
+ *    seq (the previous one plus one), and signals the device's kick
+ *    notification (L4H_SLOT_DEV_CNODE[kick_slot]).
+ * 2. The host writes status, total, out_len and data, then done = seq,
+ *    and raises the device's event line on vCPU 0.
+ *
+ * Results longer than L4H_ATTEST_PAGE_DATA come in pieces: the request's
+ * offset says where the reply's data starts.  If the host's attestation
+ * service fails, it sets state to L4H_ATTEST_FAILED and answers every
+ * request so far with -EIO; later requests get no answer.
+ *
+ * - L4H_ATTEST_REPORT: data = 64 bytes of the guest's own (a verifier's
+ *   nonce, a hash of a key).  Returns the report, a COSE_Sign1 (RFC 9052,
+ *   ES256) over a CBOR map of claims.  The same data gives the same
+ *   report, so it can be read in pieces.
+ * - L4H_ATTEST_EVIDENCE: returns the host evidence, a CBOR map: the
+ *   signing key, the TPM quote over it with the PCRs, the TPM's
  *   attestation key and its EK certificate.  It is the same for every
  *   guest until the host reboots.
- * - L4H_ATTEST_ACTIVATE: MR0 = credential blob length, MR1 = encrypted
- *   secret length, MR2.. = both, packed (the contents of the
- *   TPM2B_ID_OBJECT and TPM2B_ENCRYPTED_SECRET that TPM2_MakeCredential
- *   made for the attestation key).  Returns the decrypted credential,
- *   which proves to a verifier that the attestation key is in the TPM
- *   with that EK.
+ * - L4H_ATTEST_ACTIVATE: data = the credential blob (blob_len bytes) and
+ *   the encrypted secret, the contents of the TPM2B_ID_OBJECT and
+ *   TPM2B_ENCRYPTED_SECRET that TPM2_MakeCredential made for the
+ *   attestation key.  Returns the decrypted credential, which proves to a
+ *   verifier that the attestation key is in the TPM with that EK.  It can
+ *   take the TPM seconds.
  *
- * Replies: MR0 = 0 or -errno, MR1 = total length of the result, MR2 =
- * bytes in this reply (at most L4H_ATTEST_CHUNK, from the offset), MR3.. =
- * the bytes.  A call made while the host sets up its TPM (well under a
- * second, at boot) waits for it; -EIO: the TPM failed.
+ * status: 0 or -errno; -EIO: the TPM failed.
  */
-enum l4h_attest_call {
+enum l4h_attest_op {
 	L4H_ATTEST_REPORT = 1,
 	L4H_ATTEST_EVIDENCE = 2,
 	L4H_ATTEST_ACTIVATE = 3,
 };
 #define L4H_ATTEST_DATA_SIZE    64
-#define L4H_ATTEST_CHUNK        (8 * (120 - 3))
+#define L4H_ATTEST_FAILED       1
+#define L4H_ATTEST_PAGE_DATA    (4096 - 64)
+
+struct l4h_attest_page {
+	l4h_u32 seq;            /* guest: written last */
+	l4h_u32 op;             /* enum l4h_attest_op */
+	l4h_u32 offset;
+	l4h_u32 in_len;         /* bytes of data in the request */
+	l4h_u32 blob_len;       /* L4H_ATTEST_ACTIVATE */
+	l4h_u32 done;           /* host: written last */
+	l4h_s32 status;
+	l4h_u32 total;          /* the whole result's length */
+	l4h_u32 out_len;        /* bytes of data in the reply, from offset */
+	l4h_u32 state;          /* host: L4H_ATTEST_FAILED, or 0 */
+	l4h_u32 reserved[6];
+	l4h_u8 data[L4H_ATTEST_PAGE_DATA];
+};
 
 enum l4h_power {
 	L4H_POWER_OFF = 0,

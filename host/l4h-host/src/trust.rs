@@ -1,8 +1,11 @@
-//! l4h-trustd: the attestation service (DESIGN.md §9.2).  Guests call it
-//! on their L4H_SLOT_ATTEST_EP with the badge below; l4h-root tells it
-//! about guests through the registry page, which it writes and trustd only
-//! reads, so that root never waits for trustd (whose TPM commands can take
-//! seconds).
+//! l4h-trustd: the attestation service (DESIGN.md §9.2).  Each guest has
+//! an attestation device (L4H_DEV_ATTEST): a request page, which trustd
+//! maps at page_va(guest), and the kick notification, badged with
+//! kick_badge(guest).  trustd answers in the page and has root raise the
+//! device's event (ROOT_CALL_ATTEST_DONE).  l4h-root tells trustd about
+//! guests through the registry page, which it writes and trustd only
+//! reads: root never waits for trustd, whose TPM commands can take
+//! seconds.
 
 /// The TPM interface.
 pub const TPM_TIS: u32 = 1;
@@ -57,6 +60,18 @@ pub const TPM_VA: usize = crate::MMIO_VA;
 /// The registry page, read-only in trustd.
 pub const REGISTRY_VA: usize = crate::SHARED_VA;
 pub const AML_VA: usize = crate::SHARED_VA + 0x100_0000;
+/// The request pages, one per guest id; trustd owns them, so that they
+/// stay mapped while it answers a guest that is being destroyed.
+pub const PAGES_VA: usize = crate::SHARED_VA + 0x1000;
+pub const fn page_va(guest: usize) -> usize {
+    PAGES_VA + guest * 4096
+}
+/// The kick notification: guest g signals it with kick_badge(g).  The
+/// bound notification (SLOT_NTFN) is trustd's timer.
+pub const SLOT_KICK: u64 = crate::SLOT_FIRST_FREE;
+pub const fn kick_badge(guest: usize) -> u64 {
+    1 << guest
+}
 /// Most ACPI table bytes root gives trustd.
 pub const AML_MAX: usize = 4 << 20;
 
@@ -82,10 +97,7 @@ pub const RECORD_DOM0: u32 = 1;
 pub const MAX_RECORDS: usize = 64;
 const _: () = assert!(core::mem::size_of::<GuestRecord>() == 64);
 const _: () = assert!(MAX_RECORDS * core::mem::size_of::<GuestRecord>() <= 4096);
-
-/// Badge of a guest's capability to trustd's endpoint: this bit and the
-/// guest id.
-pub const BADGE_GUEST: u64 = 1 << 32;
+const _: () = assert!(MAX_RECORDS <= 64 && page_va(MAX_RECORDS) <= AML_VA);
 
 /// trustd -> root (ROOT_CALL_HW): an access the firmware's AML makes
 /// outside trustd's own ranges.  MR0 = HW_*, MR1 = physical address, I/O

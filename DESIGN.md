@@ -627,7 +627,8 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
 - TCB, SchedContext Bind and Unbind;
 - Signal;
 - Call to its VMM endpoint for device configuration, power-off and reboot;
-- Call to trustd's endpoint for attestation, on hosts with a TPM (§9.2).
+- Signal its devices' kick notifications, the attestation device's
+  included, which trustd serves on hosts with a TPM (§9.2).
 
 **Direct seL4 invocations rely on capability checks.** The CSpace that
 `l4h-root` hands the guest contains:
@@ -1237,7 +1238,11 @@ The chain has four links.
    verifier checks afterwards.
 2. **The host key.** `l4h-trustd` is the only component that maps the
    TPM. Root finds the TPM in the ACPI `TPM2` table (see **TPM interfaces**
-   below); trustd polls it at locality 0. At start, trustd:
+   below); trustd polls it at locality 0, sleeping on its kernel timer
+   (E3) between polls, from 20 µs up to 2 ms, rather than spinning. It
+   runs on the last core at priority `P_K + 1`, with at most 5 ms of every
+   20 ms, so that neither a slow TPM nor the firmware's AML can take a
+   core from guests. At start, trustd:
    - generates a P-256 key K in software, from TPM randomness;
    - creates the attestation key (AK), a restricted ECDSA P-256 signing
      key. It is a primary key of the endorsement hierarchy, so the same
@@ -1252,7 +1257,8 @@ The chain has four links.
    The quote shows PCR 15 as zero, which only a quote taken before the
    extension can. So K is the only key trustd issued since the TPM was last
    reset. After start, the TPM is only used for ActivateCredential. With
-   swtpm, start takes about 0.4 s; a guest that calls before then waits.
+   swtpm, start takes about 0.4 to 0.6 s. Requests that guests make before
+   then are answered once it is done.
 3. **Reports on guests.** Root measures each guest as it boots it, dom0
    included. The launch digest is `SHA-256("l4h-launch-v1" ‖ ram_base_va ‖
    entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
@@ -1263,9 +1269,20 @@ The chain has four links.
    - Root writes {instance, RAM, vCPUs, dom0, digest} into a registry page
      that trustd maps read-only. Root never calls trustd, whose TPM commands
      can take seconds.
-   - Each guest gets an endpoint to trustd in `L4H_SLOT_ATTEST_EP`, badged
-     with its id, and `L4H_BOOT_ATTEST` in its boot info. trustd only
-     answers a guest about itself.
+   - Each guest gets an attestation device (`L4H_DEV_ATTEST`). Requests are
+     asynchronous, so a vCPU never waits for trustd, which answers one
+     request at a time and can take seconds for ActivateCredential:
+     1. The guest writes its request into the device page, then a new
+        sequence number, and signals the kick notification. Its badge is
+        the guest's id, so trustd knows who asks, and trustd only answers
+        a guest about itself.
+     2. trustd answers in the page, sets `done` to the sequence number,
+        and asks root (`ROOT_CALL_ATTEST_DONE`) to raise the device's
+        event on the guest's vCPU 0. Meanwhile, Linux sleeps the caller.
+   - trustd owns the 64 request pages, one per guest id, and root lends
+     one to each guest. A page therefore stays mapped in trustd while
+     trustd answers a guest that root is destroying. trustd drops an
+     answer whose guest's instance changed while it worked.
    - `L4H_ATTEST_REPORT`, with 64 bytes of the guest's data, returns a
      COSE_Sign1 (ES256) signed by K. It carries a CBOR map: `v`, `ram`,
      `data`, `dom0`, `host` (SHA-256 of K), `guest`, `vcpus`, `launch` and
@@ -1274,8 +1291,9 @@ The chain has four links.
      COSE_Key, the AK's `TPMT_PUBLIC`, the quote (`TPMS_ATTEST`) and its
      signature, the quoted PCR values, and the EK certificate if the TPM
      has one in NV.
-   - Results longer than one message come in pieces. A report is
-     deterministic, so its pieces fit together.
+   - Results longer than the page come in pieces: each request gives the
+     offset its answer starts at. A report is deterministic, so its pieces
+     fit together.
    - Linux exposes both as configfs-tsm reports (provider `l4h`: `inblob`,
      `outblob`, and the evidence as `auxblob`) and through `/dev/l4h-attest`
      (`l4hctl attest`).
@@ -1319,9 +1337,10 @@ The chain has four links.
     the PCI functions the host drives. Reads of anything refused return
     all ones.
   - The interpreter runs in trustd, not root, because it still panics on
-    some AML. If trustd faults, root suspends it and deletes its
-    endpoint: guests calling it then get an error instead of waiting
-    forever, and no new guest gets attestation.
+    some AML. If trustd faults, root suspends it and revokes the guests'
+    kick capabilities. It marks every attestation page failed and answers
+    the request in it with -EIO, so no guest waits for its timeout. No new
+    guest gets attestation.
   - The crate is pinned to an upstream commit past 6.1.1, whose buffer
     comparison, which every `_DSM` needs for its UUID check, panics.
 - **CRB with Pluton**, start method 13: the start and reply doorbells
@@ -1348,7 +1367,8 @@ this does not cover:
 - **Disks and networks.** They are dom0's choice and not measured, as for
   confidential VMs.
 - **ActivateCredential.** It creates the EK on first use. An RSA EK takes
-  a hardware TPM seconds to create, and the calling vCPU waits.
+  a hardware TPM seconds to create, and other guests' requests wait
+  behind it (their vCPUs do not).
 - **aarch64.** It has no TPM path yet.
 - **CRB buffer sizes.** trustd uses the buffer sizes from the CRB
   registers. Linux also clips them to the device's `_CRS` because some

@@ -10,7 +10,7 @@ use core::ptr::{read_volatile, write_volatile};
 use l4h_rt::host;
 use l4h_rt::host::trust::{START_ACPI, START_PLUTON, TPM_TIS, TrustdConfig};
 
-use crate::aml;
+use crate::{aml, time};
 
 /// The longest a command may take: key generation on a slow TPM.
 const TIMEOUT_SECS: u64 = 120;
@@ -116,15 +116,21 @@ impl Tpm {
         })
     }
 
-    /// Spin until `done` holds, for at most `ms` (TIMEOUT_SECS if 0).
+    /// Poll until `done` holds, for at most `ms` (TIMEOUT_SECS if 0),
+    /// sleeping on the timer in between: from 20 us, doubling up to 2 ms,
+    /// so that quick operations finish quickly and slow ones (key
+    /// generation, seconds) cost next to no CPU.
     fn wait_ms(&self, what: &'static str, ms: u64, mut done: impl FnMut(&Self) -> bool) -> Result<(), Error> {
         let ticks = if ms == 0 { self.hz * TIMEOUT_SECS } else { self.hz * ms / 1000 };
         let deadline = host::ticks::now() + ticks;
+        let mut pause = self.hz / 50_000;
         while !done(self) {
-            if host::ticks::now() > deadline {
+            let now = host::ticks::now();
+            if now > deadline {
                 return Err(Error::Timeout(what));
             }
-            core::hint::spin_loop();
+            time::sleep_until((now + pause).min(deadline + 1));
+            pause = (pause * 2).min(self.hz / 500);
         }
         Ok(())
     }
@@ -149,10 +155,7 @@ impl Tpm {
             match u32::from_be_bytes(rsp[6..10].try_into().unwrap()) {
                 0 => return Ok(rsp),
                 RC_YIELDED | RC_TESTING | RC_RETRY if host::ticks::now() < deadline => {
-                    let pause = host::ticks::now() + self.hz / 1000;
-                    while host::ticks::now() < pause {
-                        core::hint::spin_loop();
-                    }
+                    time::sleep_ns(self.hz, 1_000_000);
                 }
                 rc => return Err(Error::Rc(rc)),
             }

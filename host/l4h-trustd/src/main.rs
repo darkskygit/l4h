@@ -9,6 +9,10 @@
 //! signs guests' reports; the quote, the attestation key and the EK
 //! certificate make the host evidence.  The TPM is only used at start,
 //! and for ActivateCredential.
+//!
+//! Guests ask through their attestation device (l4h_attest_page): a kick,
+//! then the answer in the page and an event, so that a vCPU never waits
+//! for us.  We answer one request at a time.
 
 #![no_std]
 #![no_main]
@@ -17,10 +21,13 @@ extern crate alloc;
 
 mod aml;
 mod cbor;
+mod time;
 mod tpm;
 mod tpm2;
 
 use alloc::vec::Vec;
+use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{Ordering, fence};
 
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
@@ -35,7 +42,6 @@ use crate::cbor::Enc;
 use crate::tpm::{Error, Tpm};
 
 const EINVAL: i64 = 22;
-const ENOENT: i64 = 2;
 const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
 
@@ -56,14 +62,6 @@ struct State {
     ek: Option<u32>,
     ek_ecc: bool,
     evidence: Vec<u8>,
-}
-
-fn mr(i: usize) -> u64 {
-    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
-}
-
-fn set_mr(i: usize, v: u64) {
-    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
 }
 
 /// The P-256 point of `key`, uncompressed (0x04, x, y).
@@ -185,23 +183,71 @@ impl State {
     }
 }
 
-/// Reply with bytes [off, off + ATTEST_CHUNK) of `data`.
-fn reply_data(data: &[u8], off: usize) -> usize {
-    let n = data.len().saturating_sub(off).min(abi::ATTEST_CHUNK);
-    set_mr(0, 0);
-    set_mr(1, data.len() as u64);
-    set_mr(2, n as u64);
-    for (w, chunk) in data[off.min(data.len())..off.min(data.len()) + n].chunks(8).enumerate() {
-        let mut b = [0u8; 8];
-        b[..chunk.len()].copy_from_slice(chunk);
-        set_mr(3 + w, u64::from_le_bytes(b));
-    }
-    3 + n.div_ceil(8)
+/// Per guest id: the request last answered, and for which guest instance
+/// (a new guest with the same id starts again from seq 1).
+#[derive(Clone, Copy, Default)]
+struct Answered {
+    instance: u64,
+    seq: u32,
 }
 
-/// `n` bytes packed in message registers from `first`.
-fn mr_bytes(first: usize, n: usize) -> Vec<u8> {
-    (0..n).map(|i| (mr(first + i / 8) >> (8 * (i % 8))) as u8).collect()
+fn page(id: usize) -> *mut abi::AttestPage {
+    trust::page_va(id) as *mut abi::AttestPage
+}
+
+/// The result of guest `id`'s request in its page, or -errno.
+fn execute(state: &mut Option<State>, id: usize, r: &GuestRecord) -> Result<Vec<u8>, i64> {
+    let p = page(id);
+    let (op, in_len, blob_len) = unsafe {
+        (addr_of!((*p).op).read_volatile(), addr_of!((*p).in_len).read_volatile() as usize, addr_of!((*p).blob_len).read_volatile() as usize)
+    };
+    // Our own copy: the guest may change the page meanwhile.
+    let mut data = alloc::vec![0u8; in_len.min(abi::ATTEST_PAGE_DATA)];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = unsafe { addr_of!((*p).data[i]).read_volatile() };
+    }
+    let Some(s) = state else { return Err(EIO) };
+    match op {
+        abi::ATTEST_REPORT => {
+            let mut d = [0u8; abi::ATTEST_DATA_SIZE];
+            let n = data.len().min(d.len());
+            d[..n].copy_from_slice(&data[..n]);
+            Ok(s.report(id, r, &d))
+        }
+        abi::ATTEST_EVIDENCE => Ok(s.evidence.clone()),
+        abi::ATTEST_ACTIVATE if blob_len <= data.len() => s.activate(&data[..blob_len], &data[blob_len..]).map_err(|e| {
+            info!("l4h-trustd: guest {}: ActivateCredential failed: {}", id, e);
+            EINVAL
+        }),
+        abi::ATTEST_ACTIVATE => Err(EINVAL),
+        _ => Err(ENOSYS),
+    }
+}
+
+/// Answer guest `id`'s request `seq`: the result's piece from the
+/// request's offset, then done = seq; root raises the device's event.
+fn answer(id: usize, seq: u32, result: Result<Vec<u8>, i64>) {
+    let p = page(id);
+    unsafe {
+        let off = addr_of!((*p).offset).read_volatile() as usize;
+        let (status, total, n) = match &result {
+            Ok(r) => {
+                let n = r.len().saturating_sub(off).min(abi::ATTEST_PAGE_DATA);
+                for (i, &b) in r[off.min(r.len())..][..n].iter().enumerate() {
+                    addr_of_mut!((*p).data[i]).write_volatile(b);
+                }
+                (0, r.len(), n)
+            }
+            Err(e) => (-e, 0, 0),
+        };
+        addr_of_mut!((*p).status).write_volatile(status as i32);
+        addr_of_mut!((*p).total).write_volatile(total as u32);
+        addr_of_mut!((*p).out_len).write_volatile(n as u32);
+        fence(Ordering::Release);
+        addr_of_mut!((*p).done).write_volatile(seq);
+    }
+    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[0] = id as u64);
+    cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP).call(sel4::MessageInfo::new(host::ROOT_CALL_ATTEST_DONE, 0, 0, 1));
 }
 
 fn main(info: &'static Info) -> ! {
@@ -213,52 +259,34 @@ fn main(info: &'static Info) -> ! {
             None
         }
     };
-    let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
-    let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
-    let (mut msg, mut badge) = ep.recv(reply);
+    // Guests kick while we set up the TPM too: their bits wait in the
+    // notification.
+    let kick = cap::<cap_type::Notification>(trust::SLOT_KICK);
+    let mut answered = [Answered::default(); trust::MAX_RECORDS];
     loop {
-        let id = (badge & 0xffff) as usize;
-        let rec = (badge & trust::BADGE_GUEST != 0).then(|| record(id)).flatten();
-        let words = match (&mut state, rec) {
-            (None, _) => {
-                set_mr(0, (-EIO) as u64);
-                1
+        let (_, mut kicked) = kick.wait();
+        while kicked != 0 {
+            let id = kicked.trailing_zeros() as usize;
+            kicked &= kicked - 1;
+            let Some(r) = record(id) else { continue };
+            let seq = unsafe { addr_of!((*page(id)).seq).read_volatile() };
+            fence(Ordering::Acquire);
+            let last = &mut answered[id];
+            if last.instance != r.instance {
+                *last = Answered { instance: r.instance, seq: 0 };
             }
-            (_, None) => {
-                set_mr(0, (-ENOENT) as u64);
-                1
+            if seq == last.seq {
+                continue;
             }
-            (Some(s), Some(r)) => match msg.label() {
-                abi::ATTEST_REPORT => {
-                    let data: [u8; abi::ATTEST_DATA_SIZE] = mr_bytes(0, abi::ATTEST_DATA_SIZE).try_into().unwrap();
-                    let off = mr(8) as usize;
-                    reply_data(&s.report(id, &r, &data), off)
-                }
-                abi::ATTEST_EVIDENCE => reply_data(&s.evidence, mr(0) as usize),
-                abi::ATTEST_ACTIVATE => {
-                    let (nb, ns) = (mr(0) as usize, mr(1) as usize);
-                    if nb.checked_add(ns).is_none_or(|n| 2 + n.div_ceil(8) > msg.length()) {
-                        set_mr(0, (-EINVAL) as u64);
-                        1
-                    } else {
-                        let b = mr_bytes(2, nb + ns);
-                        match s.activate(&b[..nb], &b[nb..]) {
-                            Ok(cred) => reply_data(&cred, 0),
-                            Err(e) => {
-                                info!("l4h-trustd: guest {}: ActivateCredential failed: {}", id, e);
-                                set_mr(0, (-EINVAL) as u64);
-                                1
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    set_mr(0, (-ENOSYS) as u64);
-                    1
-                }
-            },
-        };
-        (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, words), reply);
+            let result = execute(&mut state, id, &r);
+            // Destroyed meanwhile (or replaced by another guest): nobody
+            // waits for this answer.
+            if record(id).is_none_or(|now| now.instance != r.instance) {
+                continue;
+            }
+            answer(id, seq, result);
+            answered[id].seq = seq;
+        }
     }
 }
 

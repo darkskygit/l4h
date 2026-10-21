@@ -90,6 +90,8 @@ pub enum DevKind {
     Console,
     Ctl,
     Virtio(u32),
+    /// Served by trustd, which owns the page (trustd.rs).
+    Attest,
 }
 
 pub struct GuestDev {
@@ -207,7 +209,7 @@ pub struct Guest {
     pub ports: Vec<usize>,
     /// ASIDs held by its VSpaces (its own, its processes', its components').
     pub asids: usize,
-    /// It has a capability to trustd (L4H_BOOT_ATTEST).
+    /// It has an attestation device (trustd.rs).
     pub attest: bool,
     /// Guest RAM ranges loaded before boot: the image, which must lie in
     /// what the launch digest covers.
@@ -350,7 +352,18 @@ impl Guest {
             return None;
         }
         let page = self.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
-        let (vspace, ntfn) = (self.vspace, self.vmm_ntfn);
+        let kick = (self.vmm_ntfn, 1 << (host::VMM_BADGE_KICK_SHIFT as usize + d));
+        self.add_device_with(alloc, kind, page, kick)
+    }
+
+    /// Add a device with shared page `page`, whose kick notification is
+    /// `kick` (a notification and a badge).
+    pub fn add_device_with(&mut self, alloc: &mut Alloc, kind: DevKind, page: cap::Granule, kick: (cap::Notification, u64)) -> Option<usize> {
+        let d = self.devices.len();
+        if d >= MAX_GUEST_DEVICES || self.state != State::Created {
+            return None;
+        }
+        let vspace = self.vspace;
         let mut ctx = self.ctx(alloc);
         // The guest maps a copy; the original is kept for l4h-vmm.
         let copy = ctx.alloc.slots.alloc();
@@ -358,13 +371,13 @@ impl Guest {
         map_frame(&mut ctx, vspace, root_cap::<cap_type::Granule>(copy), abi::dev_area_va(d) as usize, CapRights::read_write(), VmAttributes::DEFAULT);
         self.dev_cn
             .absolute_cptr_from_bits_with_depth(d as u64, abi::ROOT_CNODE_BITS)
-            .mint(&abs(ntfn), CapRights::write_only(), 1 << (host::VMM_BADGE_KICK_SHIFT as usize + d))
+            .mint(&abs(kick.0), CapRights::write_only(), kick.1)
             .expect("device kick cap");
         // Console and control pages are also used by l4h-root itself.
         let root_va = match kind {
             DevKind::Ctl => Some(root_guest_va(self.id)),
             DevKind::Console => Some(root_guest_va(self.id) + PAGE),
-            DevKind::Virtio(_) => None,
+            DevKind::Virtio(_) | DevKind::Attest => None,
         };
         if let Some(va) = root_va {
             self.map_in_root(alloc, page, va);
@@ -497,7 +510,7 @@ impl Guest {
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces as u64;
 
-        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 } | if self.attest { abi::BOOT_ATTEST } else { 0 };
+        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
         bi.io_pool_gpa = self.pool.gpa as u64;
         bi.io_pool_size = self.pool.size as u64;
         bi.nr_devices = self.devices.len() as u64;
@@ -506,6 +519,7 @@ impl Guest {
                 DevKind::Console => (abi::DEV_CONSOLE, 0),
                 DevKind::Ctl => (abi::DEV_CTL, 0),
                 DevKind::Virtio(id) => (abi::DEV_VIRTIO, id),
+                DevKind::Attest => (abi::DEV_ATTEST, 0),
             };
             let (data_va, data_size) = match dev.kind {
                 DevKind::Ctl => (abi::CTL_DATA_VA, abi::CTL_LOAD_MAX),

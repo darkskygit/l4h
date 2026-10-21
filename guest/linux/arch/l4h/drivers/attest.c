@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Attestation by the l4h host (l4h-trustd, DESIGN.md §9.2), when the boot
- * info has L4H_BOOT_ATTEST:
+ * Attestation by the l4h host (l4h-trustd, DESIGN.md §9.2), through the
+ * attestation device (L4H_DEV_ATTEST, struct l4h_attest_page) on hosts
+ * with a TPM:
  *
  * - configfs-tsm reports (/sys/kernel/config/tsm/report, provider "l4h"):
  *   inblob is the report data (up to 64 bytes, zero padded), outblob the
  *   report (COSE_Sign1), auxblob the host evidence (CBOR).
- * - /dev/l4h-attest: ioctl(L4H_ATTEST_IOC) runs any attestation call,
+ * - /dev/l4h-attest: ioctl(L4H_ATTEST_IOC) makes any request,
  *   ActivateCredential included, for tools such as l4hctl.
+ *
+ * Requests are asynchronous: the caller sleeps until the host's answer
+ * raises the device's event, and the vCPU runs other tasks meanwhile.
  */
 #include <linux/fs.h>
 #include <linux/init.h>
-#include <linux/irqflags.h>
+#include <linux/interrupt.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/tsm.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <irq_kern.h>
 #include <l4h_sys.h>
 
 struct l4h_attest_ioc {
@@ -30,68 +36,78 @@ struct l4h_attest_ioc {
 };
 
 #define L4H_ATTEST_IOC _IOWR('L', 2, struct l4h_attest_ioc)
-#define MAX_MRS 120
+/* ActivateCredential creates the EK on first use: seconds on a slow TPM. */
+#define ATTEST_TIMEOUT (150 * HZ)
 
+static struct l4h_attest_page *page;
+static unsigned long kick_cap;
+static DECLARE_WAIT_QUEUE_HEAD(answered);
 static DEFINE_MUTEX(attest_lock);
+static u32 seq;
+
+static irqreturn_t attest_interrupt(int irq, void *data)
+{
+	wake_up(&answered);
+	return IRQ_HANDLED;
+}
 
 /*
- * Run attestation call `label` with argument registers in[0, n_in) and
- * collect its result, which may take several replies: the offset is
- * argument register off_mr (-1 for a call with a single reply).  Returns
- * a kvmalloc'ed buffer in *out.
+ * Run request `op` with `in_len` bytes of `in` (`blob_len` of them the
+ * credential blob) and collect its result, which may take several
+ * replies.  Returns a kvmalloc'ed buffer in *out.
  */
-static int attest_call(unsigned long label, const unsigned long *in, int n_in, int off_mr,
-		       u8 **out, size_t *out_len)
+static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 **out, size_t *out_len)
 {
-	unsigned long *mrs;
 	size_t total = 0, got = 0;
 	u8 *buf = NULL;
 	int ret = 0;
 
-	mrs = kmalloc_array(MAX_MRS, sizeof(*mrs), GFP_KERNEL);
-	if (!mrs)
-		return -ENOMEM;
+	if (in_len > L4H_ATTEST_PAGE_DATA)
+		return -EINVAL;
 	mutex_lock(&attest_lock);
 	do {
-		unsigned long flags, chunk;
-		int n;
+		u32 s = ++seq, n;
 
-		memcpy(mrs, in, n_in * sizeof(*mrs));
-		if (off_mr >= 0)
-			mrs[off_mr] = got;
-		/* The message registers are this vCPU's: stay on it. */
-		local_irq_save(flags);
-		n = l4h_call(L4H_CPTR(L4H_SLOT_ATTEST_EP), label, mrs, n_in, MAX_MRS);
-		local_irq_restore(flags);
-		if (n < 1) {
+		if (READ_ONCE(page->state) == L4H_ATTEST_FAILED) {
 			ret = -EIO;
 			break;
 		}
-		if ((long)mrs[0] < 0) {
-			ret = (long)mrs[0];
+		WRITE_ONCE(page->op, op);
+		WRITE_ONCE(page->offset, got);
+		WRITE_ONCE(page->in_len, in_len);
+		WRITE_ONCE(page->blob_len, blob_len);
+		if (in_len)
+			memcpy(page->data, in, in_len);
+		smp_wmb();
+		WRITE_ONCE(page->seq, s);
+		l4h_signal(kick_cap);
+		if (!wait_event_timeout(answered, READ_ONCE(page->done) == s, ATTEST_TIMEOUT)) {
+			ret = -ETIMEDOUT;
 			break;
 		}
-		chunk = mrs[2];
-		if (n < 3 || chunk > L4H_ATTEST_CHUNK || n < 3 + DIV_ROUND_UP(chunk, 8) ||
-		    (buf && mrs[1] != total) || got + chunk > mrs[1] || (!chunk && got < mrs[1])) {
-			ret = -EIO;
+		smp_rmb();
+		if (READ_ONCE(page->status)) {
+			ret = READ_ONCE(page->status);
 			break;
 		}
+		n = READ_ONCE(page->out_len);
 		if (!buf) {
-			total = mrs[1];
+			total = READ_ONCE(page->total);
 			buf = kvmalloc(max_t(size_t, total, 1), GFP_KERNEL);
 			if (!buf) {
 				ret = -ENOMEM;
 				break;
 			}
 		}
-		memcpy(buf + got, &mrs[3], chunk);
-		got += chunk;
-	} while (got < total && off_mr >= 0);
+		if (n > L4H_ATTEST_PAGE_DATA || READ_ONCE(page->total) != total || got + n > total ||
+		    (!n && got < total)) {
+			ret = -EIO;
+			break;
+		}
+		memcpy(buf + got, page->data, n);
+		got += n;
+	} while (got < total);
 	mutex_unlock(&attest_lock);
-	kfree(mrs);
-	if (!ret && got != total)
-		ret = -EIO;
 	if (ret) {
 		kvfree(buf);
 		return ret;
@@ -101,25 +117,17 @@ static int attest_call(unsigned long label, const unsigned long *in, int n_in, i
 	return 0;
 }
 
-static void pack(unsigned long *mrs, const u8 *b, size_t n)
-{
-	memset(mrs, 0, DIV_ROUND_UP(n, 8) * sizeof(*mrs));
-	memcpy(mrs, b, n);
-}
-
 static int attest_report(const u8 *data, size_t len, u8 **out, size_t *out_len)
 {
-	unsigned long mrs[9] = {};
+	u8 d[L4H_ATTEST_DATA_SIZE] = {};
 
-	pack(mrs, data, min_t(size_t, len, L4H_ATTEST_DATA_SIZE));
-	return attest_call(L4H_ATTEST_REPORT, mrs, 9, 8, out, out_len);
+	memcpy(d, data, min_t(size_t, len, sizeof(d)));
+	return attest_call(L4H_ATTEST_REPORT, d, sizeof(d), 0, out, out_len);
 }
 
 static int attest_evidence(u8 **out, size_t *out_len)
 {
-	unsigned long off = 0;
-
-	return attest_call(L4H_ATTEST_EVIDENCE, &off, 1, 0, out, out_len);
+	return attest_call(L4H_ATTEST_EVIDENCE, NULL, 0, 0, out, out_len);
 }
 
 #if IS_ENABLED(CONFIG_TSM_REPORTS)
@@ -180,8 +188,7 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		break;
 	case L4H_ATTEST_ACTIVATE:
 		in_len = (size_t)c.blob_len + c.secret_len;
-		/* Two length registers and the bytes, in one message. */
-		if (in_len > 8 * (MAX_MRS - 2))
+		if (in_len > L4H_ATTEST_PAGE_DATA)
 			return -EINVAL;
 		break;
 	case L4H_ATTEST_EVIDENCE:
@@ -195,22 +202,12 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (IS_ERR(in))
 			return PTR_ERR(in);
 	}
-	if (c.op == L4H_ATTEST_REPORT) {
+	if (c.op == L4H_ATTEST_REPORT)
 		ret = attest_report(in, in_len, &out, &len);
-	} else if (c.op == L4H_ATTEST_EVIDENCE) {
+	else if (c.op == L4H_ATTEST_EVIDENCE)
 		ret = attest_evidence(&out, &len);
-	} else {
-		unsigned long *mrs = kcalloc(MAX_MRS, sizeof(*mrs), GFP_KERNEL);
-
-		ret = -ENOMEM;
-		if (mrs) {
-			mrs[0] = c.blob_len;
-			mrs[1] = c.secret_len;
-			pack(mrs + 2, in, in_len);
-			ret = attest_call(L4H_ATTEST_ACTIVATE, mrs, 2 + DIV_ROUND_UP(in_len, 8), -1, &out, &len);
-			kfree(mrs);
-		}
-	}
+	else
+		ret = attest_call(L4H_ATTEST_ACTIVATE, in, in_len, c.blob_len, &out, &len);
 	kfree(in);
 	if (ret)
 		return ret;
@@ -239,10 +236,25 @@ static struct miscdevice attest_dev = {
 
 static int __init l4h_attest_init(void)
 {
-	int ret;
+	const struct l4h_bootinfo *bi = l4h_bootinfo;
+	unsigned int i;
+	int irq, ret;
 
-	if (!(l4h_bootinfo->flags & L4H_BOOT_ATTEST))
+	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++) {
+		if (bi->devices[i].type == L4H_DEV_ATTEST)
+			break;
+	}
+	if (i == bi->nr_devices || i == L4H_MAX_DEVICES)
 		return 0;
+	page = (struct l4h_attest_page *)bi->devices[i].page_va;
+	kick_cap = L4H_CPTR2(L4H_SLOT_DEV_CNODE, bi->devices[i].kick_slot);
+	irq = l4h_event_irq(bi->devices[i].event);
+	if (irq < 0)
+		return irq;
+	ret = request_irq(irq, attest_interrupt, 0, "l4h-attest", NULL);
+	if (ret)
+		return ret;
+	seq = READ_ONCE(page->seq);
 	ret = misc_register(&attest_dev);
 	if (ret)
 		return ret;

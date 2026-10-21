@@ -25,6 +25,8 @@ use l4h_rt::host::trust::{self, TrustdConfig};
 use l4h_rt::{cap, host, sel4};
 use sel4::cap_type;
 
+use crate::time;
+
 /// The start function of the CRB _DSM (TCG PC Client PTP): its UUID,
 /// 6bbf6cab-5463-4714-b7cd-f0203c0368d4, as ToUUID lays it out.
 const START_UUID: [u8; 16] = [
@@ -179,11 +181,13 @@ impl acpi::Handler for Hw {
     fn nanos_since_boot(&self) -> u64 {
         (host::ticks::now() as u128 * 1_000_000_000 / self.hz.max(1) as u128) as u64
     }
+    // Stall is a busy wait by the ACPI specification (at most 100 us);
+    // Sleep need not be.
     fn stall(&self, us: u64) {
         self.spin_ns(us * 1000);
     }
     fn sleep(&self, ms: u64) {
-        self.spin_ns(ms * 1_000_000);
+        time::sleep_ns(self.hz, ms * 1_000_000);
     }
     // One thread: mutexes are always free.
     fn create_mutex(&self) -> Handle {

@@ -205,9 +205,6 @@ void l4h_console_write(const char *s, unsigned int n);
 void __attribute__((noreturn)) l4h_power(int how);
 unsigned long long l4h_steal_ns(int cpu);
 unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, int n_out);
-/* seL4_Call(cptr) with `label` and message registers mrs[0, n_in); the
- * reply's registers go to mrs[0, n_out).  Returns the reply's length. */
-int l4h_call(unsigned long cptr, unsigned long label, unsigned long *mrs, int n_in, int n_out);
 
 /* ---- SMP */
 int l4h_start_vcpu(int cpu, unsigned long sp, void (*fn)(int cpu), void *task);

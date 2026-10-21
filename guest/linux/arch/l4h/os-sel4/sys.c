@@ -240,20 +240,6 @@ unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, i
 	return seL4_MessageInfo_get_length(info) ? seL4_GetMR(0) : 0;
 }
 
-int l4h_call(unsigned long cptr, unsigned long label, unsigned long *mrs, int n_in, int n_out)
-{
-	seL4_MessageInfo_t info;
-	int i, n;
-
-	for (i = 0; i < n_in; i++)
-		seL4_SetMR(i, mrs[i]);
-	info = seL4_Call(cptr, seL4_MessageInfo_new(label, 0, 0, n_in));
-	n = (int)seL4_MessageInfo_get_length(info);
-	for (i = 0; i < n_out && i < n; i++)
-		mrs[i] = seL4_GetMR(i);
-	return n;
-}
-
 void l4h_console_write(const char *s, unsigned int len)
 {
 	unsigned long mrs[1 + L4H_HC_CONSOLE_MAX_WORDS];

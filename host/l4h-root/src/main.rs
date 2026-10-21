@@ -242,15 +242,15 @@ impl Host {
         }
         self.alloc.slots.track(Default::default());
         let asids = self.asids.in_use;
-        let g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info);
+        let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info);
+        if let (Ok(g), Some(t)) = (&mut g, &self.trustd) {
+            t.give(g, &mut self.alloc, &mut self.wins.a);
+        }
         let slots = self.alloc.slots.untrack();
         match g {
             Ok(mut g) => {
                 g.slots = slots;
                 g.asids = self.asids.in_use - asids;
-                if let Some(t) = &self.trustd {
-                    t.give(&mut g);
-                }
                 self.guests[id] = Some(g);
                 Some(id)
             }
@@ -762,6 +762,10 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
             Some(0)
         }
         host::ROOT_CALL_HW if id == trustd::TRUSTD_ID as usize => Some(trustd::hw(h)),
+        host::ROOT_CALL_ATTEST_DONE if id == trustd::TRUSTD_ID as usize => {
+            trustd::done(h, mr(0) as usize);
+            Some(0)
+        }
         host::ROOT_CALL_CTL if is_vmm && h.guest(id).is_some_and(|g| g.dom0) => {
             ctl::handle(h, id);
             Some(0)

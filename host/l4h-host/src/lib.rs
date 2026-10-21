@@ -87,6 +87,8 @@ pub const ROOT_CALL_VMM_READY: u64 = 3;
 pub const ROOT_CALL_CTL: u64 = 4;
 /// trustd: a hardware access for the firmware's AML (trust::HW_*).
 pub const ROOT_CALL_HW: u64 = 5;
+/// trustd: it answered guest MR0's request; raise its device's event.
+pub const ROOT_CALL_ATTEST_DONE: u64 = 6;
 
 /// Badge bit set on every endpoint capability l4h-root gives to a guest
 /// for l4h-vmm's service endpoint; notification badges never have it.

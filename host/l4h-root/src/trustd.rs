@@ -1,7 +1,8 @@
 //! The attestation service, l4h-trustd (DESIGN.md §9.2): finding the TPM,
-//! starting trustd with it, giving guests their capability to it, the
-//! registry page through which trustd learns about guests, and the
-//! hardware accesses trustd's AML interpreter asks root for.
+//! starting trustd with it, giving guests their attestation device, the
+//! registry page through which trustd learns about guests, and what
+//! trustd asks root for: raising a device's event when it has answered,
+//! and the hardware accesses of its AML interpreter.
 //!
 //! Only x86 finds a TPM (in ACPI) so far: on aarch64, trustd never starts.
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
@@ -39,6 +40,10 @@ pub struct Trustd {
     arena: Arena,
     registry: *mut GuestRecord,
     next_instance: u64,
+    /// The request page of each guest id, mapped in trustd.
+    pages: Vec<cap::Granule>,
+    /// Guests signal it, badged with trust::kick_badge(id).
+    kick: cap::Notification,
     /// Device memory carved for trustd's ranges and its AML's accesses.
     #[cfg(target_arch = "x86_64")]
     frames: crate::acpi::Frames,
@@ -239,7 +244,7 @@ pub fn spawn(
             win.with_frame(&abs_of(f), |dst| unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len()) });
             comp.map_copy(alloc, &mut arena, &abs_of(f), trust::AML_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep_slot());
         }
-        finish(comp, arena, alloc, keep_slot(), frames)
+        finish(comp, arena, alloc, &mut keep_slot, frames)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -268,7 +273,8 @@ fn create(
         elf: TRUSTD_ELF,
         core: info.cores - 1,
         prio: abi::PRIO_KERNEL + 1,
-        // At most a quarter of a core: it polls the TPM at start.
+        // At most a quarter of a core, whatever the TPM or its firmware's
+        // AML does (trustd sleeps between polls of the TPM).
         budget_us: info.timeslice_us,
         period_us: 4 * info.timeslice_us,
         config: cfg_bytes,
@@ -280,9 +286,16 @@ fn create(
     Some((comp, arena, keep))
 }
 
-/// Map the registry page and start trustd.
+/// Map the registry and request pages, give trustd its kick notification,
+/// and start it.
 #[cfg(target_arch = "x86_64")]
-fn finish(comp: Component, mut arena: Arena, alloc: &mut Alloc, keep: sel4::AbsoluteCPtr, frames: crate::acpi::Frames) -> Option<Trustd> {
+fn finish(
+    comp: Component,
+    mut arena: Arena,
+    alloc: &mut Alloc,
+    keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
+    frames: crate::acpi::Frames,
+) -> Option<Trustd> {
     let registry = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
     alloc.global(|alloc| {
         let copy = alloc.slots.alloc();
@@ -292,21 +305,28 @@ fn finish(comp: Component, mut arena: Arena, alloc: &mut Alloc, keep: sel4::Abso
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(copy).cap();
         map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, REGISTRY_VA, CapRights::read_write(), VmAttributes::DEFAULT);
     });
-    comp.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep);
+    comp.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+    let mut pages = Vec::new();
+    for g in 0..trust::MAX_RECORDS {
+        let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+        comp.map_copy(alloc, &mut arena, &abs_of(f), trust::page_va(g), CapRights::read_write(), VmAttributes::DEFAULT, keep());
+        pages.push(f);
+    }
+    let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
+    comp.give(trust::SLOT_KICK, kick, CapRights::all());
     component::start(&comp);
-    Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord, next_instance: 1, frames })
+    Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord, next_instance: 1, pages, kick, frames })
 }
 
 impl Trustd {
-    /// Give guest `g` (being created) its capability to trustd.
-    pub fn give(&self, g: &mut Guest) {
-        g.give_badged(
-            abi::SLOT_ATTEST_EP,
-            self.comp.service_ep,
-            sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(),
-            trust::BADGE_GUEST | g.id as u64,
-        );
-        g.attest = true;
+    /// Give guest `g` (being created) its attestation device: its id's
+    /// request page, cleared, and a kick capability badged with its id.
+    pub fn give(&self, g: &mut Guest, alloc: &mut Alloc, win: &mut Window) {
+        let page = self.pages[g.id];
+        win.with_frame(&abs_of(page), |p| unsafe { core::ptr::write_bytes(p, 0, PAGE) });
+        if g.add_device_with(alloc, crate::guest::DevKind::Attest, page, (self.kick, trust::kick_badge(g.id))).is_some() {
+            g.attest = true;
+        }
     }
 
     /// Guest `g` starts: its reports describe it from now on.
@@ -334,14 +354,29 @@ impl Trustd {
         unsafe { core::ptr::addr_of_mut!((*self.registry.wrapping_add(id)).instance).write_volatile(0) };
     }
 
-    /// trustd faulted (the firmware's AML can make it panic): stop it, and
-    /// delete its endpoint so that guests calling it get an error instead
-    /// of waiting for good.  New guests get no attestation.
-    fn fail(self) {
+    /// trustd faulted (the firmware's AML can make it panic): stop it,
+    /// mark every guest's page failed and answer what it asked with -EIO,
+    /// so that no guest waits for good.  New guests get no attestation.
+    fn fail(self, h: &mut Host) {
         let _ = self.comp.tcb.tcb_suspend();
-        let ep = abs_of(self.comp.service_ep);
-        let _ = ep.revoke();
-        let _ = ep.delete();
+        let kick = abs_of(self.kick);
+        let _ = kick.revoke();
+        for id in 0..h.guests.len() {
+            if h.guest(id).is_none_or(|g| !g.attest) {
+                continue;
+            }
+            h.wins.a.with_frame(&abs_of(self.pages[id]), |p| unsafe {
+                let p = p as *mut abi::AttestPage;
+                core::ptr::addr_of_mut!((*p).state).write_volatile(abi::ATTEST_FAILED);
+                let seq = core::ptr::addr_of!((*p).seq).read_volatile();
+                core::ptr::addr_of_mut!((*p).status).write_volatile(-(crate::ctl::EIO as i32));
+                core::ptr::addr_of_mut!((*p).total).write_volatile(0);
+                core::ptr::addr_of_mut!((*p).out_len).write_volatile(0);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                core::ptr::addr_of_mut!((*p).done).write_volatile(seq);
+            });
+            done(h, id);
+        }
         sel4::debug_println!("l4h-root: trustd failed, no attestation");
     }
 }
@@ -350,8 +385,17 @@ impl Trustd {
 pub fn fault(h: &mut Host, id: u32) {
     if id == TRUSTD_ID {
         if let Some(t) = h.trustd.take() {
-            t.fail();
+            t.fail(h);
         }
+    }
+}
+
+/// ROOT_CALL_ATTEST_DONE: trustd answered guest `id`; raise the event of
+/// its attestation device.
+pub fn done(h: &mut Host, id: usize) {
+    let Some(g) = h.guests.get(id).and_then(|g| g.as_ref()) else { return };
+    if let Some(d) = g.devices.iter().position(|d| d.kind == crate::guest::DevKind::Attest) {
+        g.raise_event(&mut h.alloc, crate::guest::dev_event(d));
     }
 }
 
