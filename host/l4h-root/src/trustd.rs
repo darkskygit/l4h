@@ -184,6 +184,7 @@ pub fn spawn(
     win: &mut Window,
     asids: &mut AsidPools,
     info: &HostInfo,
+    #[cfg(target_arch = "x86_64")]
     frames: crate::acpi::Frames,
 ) -> Option<Trustd> {
     if TRUSTD_ELF.is_empty() {
@@ -249,7 +250,7 @@ pub fn spawn(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (bootinfo, alloc, devmem, win, asids, info, frames);
+        let _ = (bootinfo, alloc, devmem, win, asids, info);
         None
     }
 }

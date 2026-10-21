@@ -518,12 +518,17 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let mut asids = asids;
     // ACPI table pages are carved once: the reset register's, then
     // trustd's, from one map.
+    #[cfg(target_arch = "x86_64")]
     let mut acpi_frames = acpi::Frames::new();
     #[cfg(target_arch = "x86_64")]
     let reset = reset::Reset::find(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
     #[cfg(not(target_arch = "x86_64"))]
     let reset = reset::Reset::default();
-    let trustd = trustd::spawn(bootinfo, &mut alloc, &mut devmem, &mut wins.a, &mut asids, &info, acpi_frames);
+    let trustd = trustd::spawn(
+        bootinfo, &mut alloc, &mut devmem, &mut wins.a, &mut asids, &info,
+        #[cfg(target_arch = "x86_64")]
+        acpi_frames,
+    );
     let netd = netd::spawn(nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
