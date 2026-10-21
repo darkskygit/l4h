@@ -1062,10 +1062,13 @@ over guest user code, so a guest that spins cannot delay another guest's
 I/O. CPU may be overcommitted: 30 guests on 4 cores work, though each gets
 a share of a core.
 
-New vCPUs are placed on cores in turn. Every 100~ms, \texttt{l4h-root}
-measures how busy each vCPU was. If one core has more busy vCPUs than
-another, it moves one of them to the less loaded core. It keeps a guest's
-vCPUs on distinct cores where possible.
+New vCPUs are placed on physical cores in turn before filling their SMT
+siblings. Every 100~ms, \texttt{l4h-root} measures how busy each vCPU was.
+It balances busy vCPUs across physical cores first, then across logical
+CPUs, preferring to keep a guest's vCPUs on distinct physical cores where
+possible. A moved vCPU stays put for one second. On x86, CPU topology is
+discovered at boot; when unavailable, and on AArch64, every CPU is treated
+as an independent core.
 
 \begin{lstlisting}
 l4hctl top                      # CPU use of each VM in the last 100 ms
@@ -1379,6 +1382,8 @@ Test & What it checks \\
 \cmd{run-density.sh 30 256} & 30 guests of 256 MiB on 4 cores stay
   responsive \\
 \cmd{run-m6test.sh} & dom0 restart, CPU caps, steal time \\
+\cmd{run-schedtest.sh} & host-side CPU topology and migration policy \\
+\cmd{run-smttest.sh} & QEMU SMT discovery, placement and migration \\
 \cmd{run-captest.sh [cap\%] [rounds]} & self-test and fork loops in a guest
   capped from boot \\
 \cmd{run-capperf.sh [caps]} & fork/exec and CPU-bound timings, uncapped and

@@ -58,6 +58,8 @@ jobs:
           grep -c ^processor /proc/cpuinfo; free -g
       - name: Build seL4
         run: tools/build-kernel.sh
+      - name: CPU topology and migration policy
+        run: tests/run-schedtest.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux && ccache -s
       - name: Guest ABI and seL4 extensions (module), module tree
@@ -78,6 +80,8 @@ jobs:
         run: tests/run-nettest.sh
       - name: dom0 restart, CPU caps, steal time
         run: tests/run-m6test.sh
+      - name: SMT discovery, placement and migration
+        run: tests/run-smttest.sh
       - name: Resource limits
         run: tests/run-limits.sh
       - name: Guest memory overhead and lifecycle latency

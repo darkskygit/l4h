@@ -1,0 +1,40 @@
+#!/bin/sh
+# QEMU exposes CPUs 0/1 and 2/3 as two pairs of SMT siblings.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "SMTTEST: FAIL: $*"; poweroff -f; }
+
+# The runner checks root's initial CPU log, before any balancing, so the
+# placement assertion does not race with boot-time migrations.
+id=$(l4hctl create spread --initrd /bin/densvm.cpio.gz --mem 128 --vcpus 4 \
+    --cmdline "console=hvc0 quiet") || fail "create spread"
+l4hctl console "$id" --until "DENSVM: ready" --timeout 60 >/dev/null || fail "boot spread"
+echo "SMTTEST: four-vCPU guest booted"
+l4hctl destroy "$id" || fail "destroy spread"
+
+# With dom0 on CPU 0, round-robin puts these on 2, 1, 3. Both busy
+# guests initially share a physical core. The old flat balancer left
+# them there because each logical CPU had only one busy vCPU.
+a=$(l4hctl create hog-a --initrd /bin/densvm.cpio.gz --mem 128 \
+    --cmdline "console=hvc0 quiet HOG=1") || fail "create hog-a"
+l4hctl console "$a" --until "DENSVM: ready" --timeout 60 >/dev/null || fail "boot hog-a"
+idle=$(l4hctl create idle --initrd /bin/densvm.cpio.gz --mem 128 \
+    --cmdline "console=hvc0 quiet") || fail "create idle"
+l4hctl console "$idle" --until "DENSVM: ready" --timeout 60 >/dev/null || fail "boot idle"
+b=$(l4hctl create hog-b --initrd /bin/densvm.cpio.gz --mem 128 \
+    --cmdline "console=hvc0 quiet HOG=1") || fail "create hog-b"
+l4hctl console "$b" --until "DENSVM: ready" --timeout 60 >/dev/null || fail "boot hog-b"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    ca=$(l4hctl cores "$a") || fail "cores hog-a"
+    cb=$(l4hctl cores "$b") || fail "cores hog-b"
+    [ "$((ca / 2))" -ne "$((cb / 2))" ] && break
+done
+echo "SMTTEST: busy guests on CPUs $ca and $cb"
+[ "$((ca / 2))" -ne "$((cb / 2))" ] || fail "busy guests still share SMT siblings"
+l4hctl send "$a" --wait "DENSVM: pong alive" alive >/dev/null || fail "hog-a after migration"
+l4hctl send "$b" --wait "DENSVM: pong alive" alive >/dev/null || fail "hog-b after migration"
+for id in "$a" "$idle" "$b"; do l4hctl destroy "$id" || fail "destroy $id"; done
+echo "SMTTEST: PASS"
+poweroff -f

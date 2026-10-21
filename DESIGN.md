@@ -729,9 +729,10 @@ including pool addresses, device indices and lifecycle state.
   - It moves vCPUs between cores by re-running `SchedControl_Configure` on
     another core's SchedControl cap. `SC_K` and `SC_U` of a vCPU always move
     together.
-  - It keeps each guest's vCPUs on distinct cores where possible, which limits
-    lock-holder preemption.
-  - SMT sibling placement policy is future work.
+  - It spreads busy vCPUs across physical cores before filling SMT siblings,
+    preferring to keep a guest's vCPUs on distinct physical cores where
+    possible. This reduces execution-resource contention and lock-holder
+    preemption.
 - **Fairness caveat.** Because `P_K > P_U` for every guest, a guest's kernel
   work can briefly pre-empt another guest's user work, bounded by `SC_K`
   budgets. If measurements show this matters, the balancer can lower `P_K` for
@@ -746,17 +747,27 @@ including pool addresses, device indices and lifecycle state.
 
 **Revised during implementation (v1).**
 
-- **Placement and balancing.** New guests are placed round-robin. Every
-  100 ms `l4h-root` reads `SchedContext_Consumed` for both SCs of every
-  vCPU.
+- **Placement and balancing.** New vCPUs are placed round-robin, visiting
+  one logical CPU per physical core before its other SMT threads. At boot,
+  root visits each seL4 CPU using its own SC and reads CPUID topology
+  (x86 leaves 1F/0B, or AMD topology extensions on Zen and later), then
+  returns to its boot CPU. This maps actual CPU IDs, including gaps and
+  multiple sockets, without assuming seL4 CPU numbering describes siblings.
+  Missing or inconsistent topology falls back to independent CPUs; AArch64
+  currently uses that flat topology. Every 100 ms `l4h-root` reads
+  `SchedContext_Consumed` for both SCs of every vCPU.
   - A vCPU is *busy* if it got at least half of its fair share among the
     vCPUs active on its core. Measuring this way still counts a starved
     vCPU on a crowded core.
-  - The balancer evens out the number of busy vCPUs per core. It moves one
-    vCPU per period from the core with the most to the core with the
-    fewest, and only when that strictly lowers the maximum.
-  - It prefers guests with no vCPU on the target core. A moved vCPU stays
-    put for 1 s.
+  - The balancer evens out busy-vCPU counts per physical core first, then
+    per logical CPU. It moves at most one vCPU per period, reducing the
+    sum of squared counts at the first level that improves. A difference
+    of one on logical CPUs also permits a move from a CPU with at least
+    two busy vCPUs to a target below 50% utilization, provided physical
+    contention does not worsen. Equal-load siblings stay put.
+  - Equivalent moves prefer guests with no other vCPU on the target
+    physical core, then on the target logical CPU. A moved vCPU stays put
+    for 1 s. vCPUs in cooldown still count towards contention.
   - The interval is measured, not assumed: root work such as building a
     guest can delay a period.
 - **CPU caps** (`vm_set_sched`, `l4hctl sched`) give a vCPU one budget,

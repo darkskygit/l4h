@@ -826,7 +826,7 @@ pub fn create(
 
     // ---- vCPUs.
     for v in 0..cfg.vcpus {
-        let core = (host_info.next_core() + v) % host_info.cores;
+        let core = host_info.next_core();
         let mut ctx = ObjCtx::arena(alloc, &mut g.arena);
         let ktcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
         let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
@@ -905,6 +905,7 @@ pub fn create(
         "l4h-root: guest {} '{}' created: {} MiB RAM in {} blocks, {} vCPU(s), {} MiB I/O pool, {} KiB host objects",
         id, g.name, ram >> 20, nr_blocks, cfg.vcpus, g.pool.size >> 20, g.arena.bytes() >> 10
     );
+    info!("l4h-root: guest {} '{}' initial CPUs {:?}", id, g.name, g.vcpus.iter().map(|v| v.core).collect::<Vec<_>>());
     Ok(g)
 }
 

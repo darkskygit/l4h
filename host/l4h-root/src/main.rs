@@ -70,6 +70,7 @@ const TIMER_BADGE: u64 = 1 << 40;
 /// Facts about the host the guests run on.
 pub struct HostInfo {
     pub cores: usize,
+    pub topology: sched::topology::Topology,
     pub tsc_hz: u64,
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
@@ -85,11 +86,11 @@ pub struct HostInfo {
 }
 
 impl HostInfo {
-    /// Core for the next guest's vCPU 0.
+    /// CPU for the next vCPU, visiting physical cores before SMT siblings.
     pub fn next_core(&self) -> usize {
         let c = self.placement.get();
         self.placement.set(c + 1);
-        c % self.cores
+        self.topology.placement(c)
     }
 
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
@@ -424,6 +425,8 @@ impl Host {
 #[root_task(heap_size = 32 * 1024 * 1024)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let cores = bootinfo.inner().numNodes as usize;
+    let topology = sched::topology::discover(bootinfo);
+    info!("l4h-root: CPU physical cores {:?}", topology.physical);
     let mut alloc = Alloc::new(Slots::new(bootinfo.empty().range()), bootinfo);
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
@@ -448,6 +451,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let dom0_initrd = module("dom0-initrd").unwrap_or(&[]);
     let info = HostInfo {
         cores,
+        topology,
         tsc_hz: tsc_hz(bootinfo),
         cpu_id: cpu_id(bootinfo),
         hyp_ep,

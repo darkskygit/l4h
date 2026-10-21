@@ -1,5 +1,5 @@
 //! Host CPU scheduling (DESIGN.md §7): per-guest CPU caps and a balancer
-//! that moves vCPUs between cores by the CPU time they consumed.
+//! that spreads busy vCPUs across physical cores before SMT siblings.
 //!
 //! seL4 does not balance; every vCPU's two scheduling contexts (SC_K, SC_U)
 //! live on one core until `SchedControl_Configure` on another core's
@@ -10,13 +10,11 @@ use alloc::vec::Vec;
 use crate::Host;
 use crate::guest::State;
 
+mod policy;
+pub mod topology;
+
 /// Balancer period.
 pub const BALANCE_MS: u64 = 100;
-/// A vCPU using this share of a period (percent) is active.
-const ACTIVE_PCT: u64 = 2;
-/// A core whose vCPUs used less than this share of a period (percent) has
-/// room for one more busy vCPU.
-const LIGHT_PCT: u64 = 50;
 /// A vCPU that moved stays put for this many periods.
 const COOLDOWN: u32 = 10;
 
@@ -124,19 +122,14 @@ pub fn set_cap(h: &mut Host, gid: usize, cap_pct: u32) -> bool {
 /// last step, move at most one vCPU.
 ///
 /// A vCPU is *busy* if it used at least half of its fair share of its
-/// core (among the vCPUs active there).  Busy
-/// vCPUs on one core compete for it, so the balancer evens out their
-/// number: one moves from the core with the most to the core with the
-/// fewest when that strictly reduces the maximum (a difference of two, or
-/// of one if the target core is lightly loaded).
+/// logical CPU (among the vCPUs active there). Balance their number per
+/// physical core first, then per logical CPU. SMT siblings share execution
+/// resources even when each has only one busy vCPU.
 pub fn balance(h: &mut Host, elapsed_us: u64) {
     let cores = h.info.cores;
     if elapsed_us == 0 {
         return;
     }
-    let mut load = alloc::vec![0u64; cores];
-    let mut active = alloc::vec![0u64; cores];
-    // (guest, vcpu, core, consumed, movable)
     let mut sample = Vec::new();
     // Capped vCPUs whose budget split changed: (guest, vcpu, core).
     let mut resplit = Vec::new();
@@ -170,11 +163,7 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
                     unsafe { core::ptr::addr_of_mut!((*page).steal_ns).write_volatile(ns) };
                 }
             }
-            load[vcpu.core] += c;
-            if c * 100 >= elapsed_us * ACTIVE_PCT {
-                active[vcpu.core] += 1;
-            }
-            sample.push((g.id, v, vcpu.core, c, vcpu.cooldown == 0));
+            sample.push(policy::Sample { guest: g.id, vcpu: v, cpu: vcpu.core, used: c, movable: vcpu.cooldown == 0 });
         }
     }
     for &(gid, v, core) in &resplit {
@@ -183,35 +172,11 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
     if cores < 2 {
         return;
     }
-    // Busy: at least half of a fair share among the core's active vCPUs
-    // (a starved vCPU on a crowded core still counts).
-    let mut busy = alloc::vec![0u32; cores];
-    let mut cand = Vec::new();
-    for &(gid, v, core, c, movable) in &sample {
-        if c * 100 >= elapsed_us * ACTIVE_PCT && c * active[core] * 2 >= elapsed_us {
-            busy[core] += 1;
-            if movable {
-                cand.push((gid, v, core, c));
-            }
-        }
-    }
-    // Balance the number of busy vCPUs per core.  Ties: by load.
-    let src = (0..cores).max_by_key(|&c| (busy[c], load[c])).unwrap();
-    let dst = (0..cores).min_by_key(|&c| (busy[c], load[c])).unwrap();
-    let light = load[dst] * 100 < elapsed_us * LIGHT_PCT;
-    if busy[src] < busy[dst] + 2 && !(busy[src] == busy[dst] + 1 && light && busy[src] >= 2) {
-        return;
-    }
-    let sibling_on = |gid: usize, core: usize| h.guest(gid).is_some_and(|g| g.vcpus.iter().any(|v| v.core == core));
-    let pick = cand
-        .iter()
-        .filter(|&&(_, _, c, _)| c == src)
-        .min_by_key(|&&(gid, _, _, used)| (sibling_on(gid, dst), u64::MAX - used));
-    let Some(&(gid, v, _, _)) = pick else { return };
+    let Some(policy::Migration { guest: gid, vcpu: v, src, dst }) = policy::choose(&h.info.topology, &sample, elapsed_us) else { return };
     if configure(h, gid, v, dst) {
         info!(
-            "l4h-root: balancer: guest {} vCPU {}: core {} -> {} (busy {:?})",
-            gid, v, src, dst, busy
+            "l4h-root: balancer: guest {} vCPU {}: core {} -> {} (physical {} -> {})",
+            gid, v, src, dst, h.info.topology.physical[src], h.info.topology.physical[dst]
         );
         let vcpu = &mut h.guests[gid].as_mut().unwrap().vcpus[v];
         vcpu.core = dst;
