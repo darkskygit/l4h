@@ -12,7 +12,7 @@ use crate::blkd::{VirtioRegions, is_legacy_virtio, map_bars, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
-use crate::mem::{Alloc, Arena, Dest, UtPool};
+use crate::mem::{Alloc, Arena, Dest};
 use crate::pci::{self, Pci};
 use crate::vmm;
 use crate::vspace::FRAME_BP;
@@ -136,10 +136,10 @@ pub fn spawn(
             virtio_regions(d, bar_va)
         };
         let s = alloc.slots.alloc();
-        let region = alloc.split(NIC_DMA_BITS, s).expect("NIC DMA memory");
+        let mut region = alloc.split(NIC_DMA_BITS, s).expect("NIC DMA memory");
         let paddr = region.paddr;
         let frames = alloc.slots.alloc_range((1 << NIC_DMA_BITS) / PAGE);
-        UtPool { regions: alloc::vec![region] }
+        region
             .retype(&FRAME_BP, frames.len(), Dest::root(frames.start))
             .expect("NIC DMA frames");
         dma.push(frames);
@@ -279,8 +279,9 @@ impl Netd {
         let s = alloc.slots.alloc();
         let region = alloc.split(PORT_BITS, s).ok_or(ctl::ENOMEM)?;
         g.arena.own(s, region.paddr, PORT_BITS);
-        let mut pool = UtPool { regions: alloc::vec![region] };
+        let mut pool = region;
         let frames = alloc.slots.alloc_range(net::PORT_PAGES);
+        let chan_slots = frames.clone();
         pool.retype(&FRAME_BP, frames.len(), Dest::root(frames.start)).expect("port frames");
         // CNodes keeping netd's and the VMM's mappings of the port.
         let keep_slots = alloc.slots.alloc_range(2);
@@ -313,7 +314,7 @@ impl Netd {
         call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]);
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
         let mac_bytes = mac.to_be_bytes();
-        Ok((p, vmm::Backend::Net { chan, kick, mac: mac_bytes[2..8].try_into().unwrap(), keep: vmm_keep }))
+        Ok((p, vmm::Backend::Net { chan: chan_slots, kick, mac: mac_bytes[2..8].try_into().unwrap(), keep: vmm_keep }))
     }
 
     /// Disconnect port `p`; netd stops using its memory.

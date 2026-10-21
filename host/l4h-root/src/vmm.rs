@@ -2,16 +2,17 @@
 //! pool (not its RAM), event pages, device pages and the vCPU
 //! notifications.
 
-use alloc::vec::Vec;
+use core::ops::Range;
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
 use l4h_host as host;
+use l4h_host::fixed::{ArrayVec, Scratch};
 
 use crate::component::{self, Component, SpawnArgs};
 use crate::guest::{Guest, dev_event};
-use crate::mem::Alloc;
+use crate::mem::{Alloc, Slot};
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
 
@@ -33,13 +34,13 @@ pub fn arena_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
 pub enum Backend {
     Blk {
         /// Frames of the blkd channel, mapped at vmm_chan_va(d).
-        chan: Vec<cap::Granule>,
+        chan: ArrayVec<cap::Granule, { host::blk::CHANNEL_PAGES }>,
         /// Notification of blkd (badged for this client).
         kick: cap::Notification,
     },
     Net {
-        /// Frames of the netd port, mapped at vmm_chan_va(d).
-        chan: Vec<cap::Granule>,
+        /// Slots of the frames of the netd port, mapped at vmm_chan_va(d).
+        chan: Range<Slot>,
         /// Notification of netd (badged for this port).
         kick: cap::Notification,
         mac: [u8; 6],
@@ -50,6 +51,9 @@ pub enum Backend {
 
 const SLOT_KICK_BASE: u64 = 32;
 
+/// The VMM's configuration under construction.
+static CONFIG: Scratch<core::mem::MaybeUninit<host::VmmConfig>> = Scratch::new(core::mem::MaybeUninit::zeroed());
+
 /// Create the guest's l4h-vmm (not started) for its devices and backends.
 pub fn spawn(
     g: &mut Guest,
@@ -59,7 +63,25 @@ pub fn spawn(
     host_info: &HostInfo,
 ) -> Component {
     let backends = core::mem::take(&mut g.backends);
-    let mut cfg: alloc::boxed::Box<host::VmmConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
+    let comp = CONFIG.with(|cfg| {
+        *cfg = core::mem::MaybeUninit::zeroed();
+        create(g, unsafe { cfg.assume_init_mut() }, &backends, alloc, win, asids, host_info)
+    });
+    map(g, &comp, &backends, alloc);
+    g.backends = backends;
+    comp
+}
+
+/// Write the VMM's configuration into `cfg` and create it.
+fn create(
+    g: &mut Guest,
+    cfg: &mut host::VmmConfig,
+    backends: &[(usize, Backend)],
+    alloc: &mut Alloc,
+    win: &mut Window,
+    asids: &mut AsidPools,
+    host_info: &HostInfo,
+) -> Component {
     cfg.guest_id = g.id as u32;
     cfg.nr_vcpus = g.vcpus.len() as u32;
     cfg.io_pool_gpa = g.pool.gpa as u64;
@@ -95,7 +117,7 @@ pub fn spawn(
         }
     }
     let cfg_bytes = unsafe {
-        core::slice::from_raw_parts(&*cfg as *const host::VmmConfig as *const u8, core::mem::size_of::<host::VmmConfig>())
+        core::slice::from_raw_parts(cfg as *const host::VmmConfig as *const u8, core::mem::size_of::<host::VmmConfig>())
     };
 
     let core = g.vcpus[0].core;
@@ -112,8 +134,11 @@ pub fn spawn(
         service_ep: Some(g.vmm_ep),
         cnode_bits: None,
     };
-    let comp = component::create(&args, alloc, &mut g.arena, win, asids, host_info);
+    component::create(&args, alloc, &mut g.arena, win, asids, host_info)
+}
 
+/// Map the guest's I/O pool, event, device and channel pages into its VMM.
+fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &mut Alloc) {
     // ---- The I/O pool at IO_POOL_VA, the only guest memory the VMM maps.
     // The mapping capabilities are kept in a CNode of the guest's arena.
     let pages = g.pool.pages();
@@ -157,8 +182,8 @@ pub fn spawn(
                 comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
             }
             Backend::Net { chan, kick, keep, .. } => {
-                for (i, f) in chan.iter().enumerate() {
-                    let fc = crate::component::abs_of(*f);
+                for (i, f) in chan.clone().enumerate() {
+                    let fc = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Granule>::from_index(f).cap());
                     let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, 10);
                     comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
                 }
@@ -166,6 +191,4 @@ pub fn spawn(
             }
         }
     }
-    g.backends = backends;
-    comp
 }

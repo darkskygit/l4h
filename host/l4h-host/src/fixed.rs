@@ -34,6 +34,14 @@ impl<T, const N: usize> ArrayVec<T, N> {
         Ok(())
     }
 
+    /// Append `v` where the caller has already checked that it fits (a
+    /// bound checked on input); panics if not.
+    pub fn must_push(&mut self, v: T) {
+        assert!(self.len < N, "ArrayVec of {} full", N);
+        self.buf[self.len].write(v);
+        self.len += 1;
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
@@ -111,6 +119,18 @@ impl<T: Copy, const N: usize> ArrayVec<T, N> {
             self.len += 1;
         }
         Ok(())
+    }
+}
+
+/// Collects at most N elements; panics on more (for iterators a caller's
+/// check keeps within capacity, like `must_push`).
+impl<T, const N: usize> FromIterator<T> for ArrayVec<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut v = Self::new();
+        for x in iter {
+            v.must_push(x);
+        }
+        v
     }
 }
 
@@ -245,6 +265,54 @@ impl<const N: usize> core::fmt::Display for ArrayString<N> {
 impl<const N: usize> core::fmt::Debug for ArrayString<N> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         core::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+/// A static that is handed out once, as `&'static mut`: for state too
+/// large for a stack, in a single-threaded component.
+pub struct StaticCell<T> {
+    taken: core::sync::atomic::AtomicBool,
+    value: core::cell::UnsafeCell<T>,
+}
+
+// Only one `&mut` is ever handed out (`take`).
+unsafe impl<T> Sync for StaticCell<T> {}
+
+impl<T> StaticCell<T> {
+    pub const fn new(value: T) -> Self {
+        StaticCell { taken: core::sync::atomic::AtomicBool::new(false), value: core::cell::UnsafeCell::new(value) }
+    }
+
+    /// The value; panics if it was taken before.
+    pub fn take(&'static self) -> &'static mut T {
+        assert!(!self.taken.swap(true, core::sync::atomic::Ordering::AcqRel), "static taken twice");
+        unsafe { &mut *self.value.get() }
+    }
+}
+
+/// A static buffer lent out for the length of a call (`with`): scratch
+/// space too large for a stack, such as a structure built before it is
+/// copied out, in a single-threaded component.
+pub struct Scratch<T> {
+    busy: core::sync::atomic::AtomicBool,
+    value: core::cell::UnsafeCell<T>,
+}
+
+// Only one `&mut` is lent at a time (`with`).
+unsafe impl<T> Sync for Scratch<T> {}
+
+impl<T> Scratch<T> {
+    pub const fn new(value: T) -> Self {
+        Scratch { busy: core::sync::atomic::AtomicBool::new(false), value: core::cell::UnsafeCell::new(value) }
+    }
+
+    /// Run `f` on the buffer, as left by the last call; panics if called
+    /// from inside `f`.
+    pub fn with<R>(&'static self, f: impl FnOnce(&mut T) -> R) -> R {
+        assert!(!self.busy.swap(true, core::sync::atomic::Ordering::AcqRel), "scratch in use");
+        let r = f(unsafe { &mut *self.value.get() });
+        self.busy.store(false, core::sync::atomic::Ordering::Release);
+        r
     }
 }
 

@@ -1258,7 +1258,10 @@ external orchestration can run in dom0.
   console device page, which hvc polls.
 - **Reclaim.** Each guest holds RAM block Untypeds, its I/O pool, a
   host-object arena and its blkds' arenas. Root CNode slots allocated
-  on the guest's behalf are tracked. `vm_destroy` first quiesces the
+  on the guest's behalf are tracked: the root task keeps a bitmap of its
+  free slots and an owner byte per slot (`mem::Slots`, 576 KiB for 2^19
+  slots), and `vm_destroy` deletes the guest's by a scan of the owner
+  bytes. `vm_destroy` first quiesces the
   attached disks, then revokes those Untypeds, returns them to the free
   pool and deletes the tracked slots. ASIDs are released by the kernel
   when VSpaces die. Repeated create/destroy leaves free memory unchanged

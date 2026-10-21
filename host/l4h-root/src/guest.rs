@@ -13,9 +13,6 @@
 //! with frames for the image).  memd revokes the originals at destroy,
 //! which deletes whatever the guest and l4h-root made of them.
 
-use alloc::collections::BTreeSet;
-use alloc::string::String;
-use alloc::vec::Vec;
 use core::ptr;
 
 use sel4::init_thread::slot;
@@ -23,11 +20,12 @@ use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type
 
 use l4h_abi as abi;
 use l4h_host as host;
+use l4h_host::fixed::{ArrayString, ArrayVec, Scratch};
 
 use crate::component::Component;
 use crate::kimage::Kernel;
 use crate::layout;
-use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot, UtPool, UtRegion};
+use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot, UtRegion};
 use crate::{memd, vmm};
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
 use crate::window::Window;
@@ -112,12 +110,45 @@ pub fn dev_event(d: usize) -> u32 {
     16 + d as u32
 }
 
-/// A 2 MiB block of guest RAM (memd holds its Untyped).
-pub struct Block {
-    /// A block l4h-root filled with frames (a boot block): its level-2 RAM
-    /// CNode.
-    frames: Option<cap::CNode>,
+/// Disjoint ranges of guest RAM, (gpa, len) in order: what was loaded
+/// before boot.  When there are more islands than fit, the two closest
+/// merge, which covers more than was loaded: checks against it can only
+/// be stricter.
+#[derive(Default)]
+pub struct Ranges(ArrayVec<(usize, usize), 16>);
+
+impl Ranges {
+    pub fn add(&mut self, gpa: usize, len: usize) {
+        let (mut lo, mut hi) = (gpa, gpa + len);
+        // Absorb every range this touches.
+        self.0.retain(|&(g, l)| {
+            let touches = g <= hi && lo <= g + l;
+            if touches {
+                lo = lo.min(g);
+                hi = hi.max(g + l);
+            }
+            !touches
+        });
+        let i = self.0.iter().position(|&(g, _)| g > lo).unwrap_or(self.0.len());
+        if self.0.is_full() {
+            // Merge the two ranges with the smallest gap between them.
+            let j = (1..self.0.len()).min_by_key(|&j| self.0[j].0 - (self.0[j - 1].0 + self.0[j - 1].1)).unwrap();
+            let (g, l) = self.0.remove(j);
+            let prev = &mut self.0[j - 1];
+            prev.1 = g + l - prev.0;
+            return self.add(lo, hi - lo);
+        }
+        let _ = self.0.insert(i, (lo, hi - lo));
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.0.iter().copied()
+    }
 }
+
+/// Boot info under construction (16 KiB), before it is copied into the
+/// guest's frames.
+static BOOTINFO: Scratch<core::mem::MaybeUninit<abi::BootInfo>> = Scratch::new(core::mem::MaybeUninit::zeroed());
 
 /// The guest's I/O pool: host-owned, physically contiguous memory above
 /// guest RAM in guest-physical space.  All device I/O goes through it
@@ -172,51 +203,53 @@ pub enum State {
 
 pub struct Guest {
     pub id: usize,
-    pub name: String,
+    pub name: ArrayString<{ abi::CTL_NAME_MAX }>,
     pub arena: Arena,
-    /// Root slots allocated for this guest; cleaned up by `destroy`.
-    pub slots: BTreeSet<Slot>,
     pub cnode: cap::CNode,
     pub vspace: cap::VSpace,
     pub ram_base: usize,
-    pub blocks: Vec<Block>,
+    /// Blocks of RAM (memd holds their Untypeds).
+    pub nr_blocks: usize,
+    /// Blocks l4h-root filled with frames (boot blocks), one bit each;
+    /// their level-2 RAM CNodes are in `ram_l1`.
+    filled: [u64; abi::MAX_BLOCKS / 64],
     /// Level-1 RAM CNodes, one per GiB of guest-physical space.
-    ram_l1: Vec<cap::CNode>,
+    ram_l1: ArrayVec<cap::CNode, { abi::MAX_RAM_L1 }>,
     /// Blocks [0, boot_blocks) are host frames; set at boot.
     pub boot_blocks: usize,
     pub pool: IoPool,
     /// dom0: the control device's data area (VM_LOAD source), mapped in
     /// the root task at root_ctl_data_va(id).
     ctl_data: bool,
-    pub vcpus: Vec<Vcpu>,
+    pub vcpus: ArrayVec<Vcpu, { abi::MAX_VCPUS }>,
     pub state: State,
     pub dom0: bool,
     vspaces: usize,
-    bootinfo: Vec<cap::Granule>,
+    bootinfo: ArrayVec<cap::Granule, { abi::BOOTINFO_SIZE as usize / PAGE }>,
     entry: u64,
     /// Objects l4h-vmm serves the guest with: its endpoint (the guest's
     /// HYP_EP), its bound notification (device kicks) and the device pages.
     pub vmm_ep: cap::Endpoint,
     pub vmm_ntfn: cap::Notification,
     dev_cn: cap::CNode,
-    pub devices: Vec<GuestDev>,
+    pub devices: ArrayVec<GuestDev, MAX_GUEST_DEVICES>,
     /// Host side of each virtio device, by device index.
-    pub backends: Vec<(usize, vmm::Backend)>,
-    pub console_ring: Vec<cap::Granule>,
+    pub backends: ArrayVec<(usize, vmm::Backend), MAX_GUEST_DEVICES>,
+    pub console_ring: ArrayVec<cap::Granule, { host::CONSOLE_RING_PAGES }>,
     pub vmm: Option<Component>,
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,
     /// Disk windows attached to the guest: (controller, blkd client).
-    pub disks: Vec<(usize, usize)>,
+    pub disks: ArrayVec<(usize, usize), MAX_GUEST_DEVICES>,
     /// netd ports of its virtio-net devices.
-    pub ports: Vec<usize>,
+    pub ports: ArrayVec<usize, MAX_GUEST_DEVICES>,
     /// ASIDs held by its VSpaces (its own, its processes', its components').
     pub asids: usize,
     /// It has an attestation device (trustd.rs).
     pub attest: bool,
     /// Guest RAM ranges loaded before boot: the image, which must lie in
     /// what the launch digest covers.
-    loaded: Vec<(usize, usize)>,
+    loaded: Ranges,
     /// The launch digest, set at boot (DESIGN.md §9.2).
     pub launch: Option<[u8; 32]>,
     /// Bytes of the module image mapped at KMOD_VA (kimage.rs), 0 if none.
@@ -238,7 +271,11 @@ impl Guest {
     }
 
     pub fn ram_size(&self) -> usize {
-        self.blocks.len() * BLOCK
+        self.nr_blocks * BLOCK
+    }
+
+    fn is_filled(&self, b: usize) -> bool {
+        self.filled[b / 64] & (1 << (b % 64)) != 0
     }
 
     /// Destination for a capability in the guest's root CNode.
@@ -261,8 +298,13 @@ impl Guest {
     /// The frame capability backing guest-physical address `gpa`, which
     /// must be in a block l4h-root filled with frames.
     pub fn ram_frame(&self, gpa: usize) -> sel4::AbsoluteCPtr {
-        let cn = self.blocks[gpa / BLOCK].frames.expect("guest RAM block without host frames");
-        cn.absolute_cptr_from_bits_with_depth(((gpa % BLOCK) / PAGE) as u64, abi::RAM_L2_BITS)
+        let b = gpa / BLOCK;
+        assert!(self.is_filled(b), "guest RAM block without host frames");
+        // Through the level-1 RAM CNode, which holds the block's level-2
+        // CNode at its index (both without guard).
+        let l2 = b & ((1 << abi::RAM_L2_BITS) - 1);
+        self.ram_l1[b >> abi::RAM_L2_BITS]
+            .absolute_cptr_from_bits_with_depth(((l2 << abi::RAM_L2_BITS) | (gpa % BLOCK) / PAGE) as u64, 2 * abi::RAM_L2_BITS)
     }
 
     pub fn valid_gpa(&self, gpa: usize, len: usize) -> bool {
@@ -274,7 +316,7 @@ impl Guest {
     /// block's Untyped, mapped in the direct map.  The block becomes a
     /// boot block: the guest gets no Untyped for it.
     fn block_frames(&mut self, alloc: &mut Alloc, b: usize) {
-        if self.blocks[b].frames.is_some() {
+        if self.is_filled(b) {
             return;
         }
         let l2 = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
@@ -285,11 +327,10 @@ impl Guest {
         // A copy of the block's Untyped, which memd revokes at destroy.
         let ut = alloc.slots.alloc();
         let paddr = memd::guest_copy(alloc, self.id, b, ut);
-        let region = UtRegion::fresh(root_cap::<cap_type::Untyped>(ut), paddr, abi::BLOCK_SHIFT);
-        UtPool { regions: ::alloc::vec![region] }
+        UtRegion::fresh(root_cap::<cap_type::Untyped>(ut), paddr, abi::BLOCK_SHIFT)
             .retype(&FRAME_BP, BLOCK_FRAMES, Dest { cnode: abs(l2), offset: 0 })
             .expect("RAM frames");
-        self.blocks[b].frames = Some(l2);
+        self.filled[b / 64] |= 1 << (b % 64);
         // The direct map uses the original frame caps; the guest maps
         // copies elsewhere.
         let tmp = alloc.slots.alloc();
@@ -330,7 +371,7 @@ impl Guest {
             return false;
         }
         if len != 0 {
-            self.loaded.push((gpa, len));
+            self.loaded.add(gpa, len);
         }
         let mut off = 0;
         while off < len {
@@ -403,7 +444,7 @@ impl Guest {
             }
             self.ctl_data = true;
         }
-        self.devices.push(GuestDev { kind, page });
+        self.devices.must_push(GuestDev { kind, page });
         Some(d)
     }
 
@@ -473,16 +514,16 @@ impl Guest {
         // Everything loaded must be measured: the kernel image or the
         // initramfs.
         let within = |(gpa, len): (usize, usize), (lo, n): (usize, usize)| gpa >= lo && gpa + len <= lo + n;
-        if !self.loaded.iter().all(|&r| within(r, (0, kernel_end)) || within(r, initrd)) {
+        if !self.loaded.iter().all(|r| within(r, (0, kernel_end)) || within(r, initrd)) {
             return false;
         }
         // Boot blocks: a prefix of RAM up to the image (and anything else
         // loaded), plus slack.  The guest needs at least one block of its
         // own for seL4 objects.
         let image_end = kernel_end.max(initrd.0 + initrd.1);
-        let loaded = self.blocks.iter().rposition(|b| b.frames.is_some()).map_or(0, |b| b + 1);
+        let loaded = (0..self.nr_blocks).rev().find(|&b| self.is_filled(b)).map_or(0, |b| b + 1);
         let boot = image_end.div_ceil(BLOCK).max(loaded) + BOOT_SLACK;
-        if boot >= self.blocks.len() {
+        if boot >= self.nr_blocks {
             return false;
         }
         for b in 0..boot {
@@ -492,7 +533,25 @@ impl Guest {
             return false;
         }
         self.boot_blocks = boot;
-        let mut bi: alloc::boxed::Box<abi::BootInfo> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
+        BOOTINFO.with(|bi| {
+            *bi = core::mem::MaybeUninit::zeroed();
+            self.fill_boot_info(unsafe { bi.assume_init_mut() }, win, host_info, entry, kernel_end, initrd, cmdline);
+        });
+        self.entry = entry;
+        true
+    }
+
+    fn fill_boot_info(
+        &mut self,
+        bi: &mut abi::BootInfo,
+        win: &mut Window,
+        host_info: &HostInfo,
+        entry: u64,
+        kernel_end: usize,
+        initrd: (usize, usize),
+        cmdline: &[u8],
+    ) {
+        let ram = self.ram_size();
         bi.magic = abi::BOOTINFO_MAGIC;
         bi.abi_version = abi::ABI_VERSION;
         bi.guest_id = self.id as u64;
@@ -506,7 +565,7 @@ impl Guest {
         bi.nr_vcpus = self.vcpus.len() as u64;
         bi.tsc_hz = host_info.tsc_hz;
         bi.cpu_id = host_info.cpu_id;
-        bi.nr_blocks = self.blocks.len() as u64;
+        bi.nr_blocks = self.nr_blocks as u64;
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces as u64;
         if self.kmod_size != 0 {
@@ -547,7 +606,7 @@ impl Guest {
         }
 
         let bi_bytes = unsafe {
-            core::slice::from_raw_parts(&*bi as *const abi::BootInfo as *const u8, core::mem::size_of::<abi::BootInfo>())
+            core::slice::from_raw_parts(bi as *const abi::BootInfo as *const u8, core::mem::size_of::<abi::BootInfo>())
         };
         for (p, frame) in self.bootinfo.iter().enumerate() {
             let lo = (p * PAGE).min(bi_bytes.len());
@@ -558,8 +617,6 @@ impl Guest {
                 ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len());
             });
         }
-        self.entry = entry;
-        true
     }
 
     /// The launch digest (DESIGN.md §9.2): SHA-256 over the image as it is
@@ -631,10 +688,7 @@ impl Guest {
         }
         // Capabilities that do not derive from the arena (badged endpoints,
         // copies of global objects) are left in their slots.
-        for s in self.slots {
-            let _ = abs(root_cap::<cap_type::Null>(s)).delete();
-            alloc.slots.free(s);
-        }
+        alloc.slots.free_owned(self.id);
     }
 }
 
@@ -705,36 +759,36 @@ pub fn create(
 
     let mut g = Guest {
         id,
-        name: String::from(cfg.name),
+        name: ArrayString::from_str_truncate(cfg.name),
         arena,
-        slots: BTreeSet::new(),
         cnode: root_cap::<cap_type::CNode>(cnode_slot),
         vspace,
         ram_base,
-        blocks: Vec::new(),
-        ram_l1: Vec::new(),
+        nr_blocks: 0,
+        filled: [0; abi::MAX_BLOCKS / 64],
+        ram_l1: ArrayVec::new(),
         boot_blocks: 0,
         pool: IoPool { gpa: pool_gpa, paddr: 0, size: 0, frames: cap::CNode::from_bits(0), radix: 0 },
         ctl_data: false,
-        vcpus: Vec::new(),
+        vcpus: ArrayVec::new(),
         state: State::Created,
         dom0: cfg.dom0,
         vspaces: cfg.vspaces,
-        bootinfo: Vec::new(),
+        bootinfo: ArrayVec::new(),
         entry: 0,
         vmm_ep: cap::Endpoint::from_bits(0),
         vmm_ntfn: cap::Notification::from_bits(0),
         dev_cn: cap::CNode::from_bits(0),
-        devices: Vec::new(),
-        backends: Vec::new(),
-        console_ring: Vec::new(),
+        devices: ArrayVec::new(),
+        backends: ArrayVec::new(),
+        console_ring: ArrayVec::new(),
         vmm: None,
         cpu_cap_pct: 0,
-        disks: Vec::new(),
-        ports: Vec::new(),
+        disks: ArrayVec::new(),
+        ports: ArrayVec::new(),
         asids: 0,
         attest: false,
-        loaded: Vec::new(),
+        loaded: Ranges::default(),
         launch: None,
         kmod_size: 0,
     };
@@ -758,7 +812,7 @@ pub fn create(
     for n in 0..n_l1 {
         let cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
         g.give_badged(abi::SLOT_RAM_L1_BASE + n, cn, CapRights::all(), guard0);
-        g.ram_l1.push(cn);
+        g.ram_l1.must_push(cn);
     }
     let block_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: block_radix });
     let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix).into_word();
@@ -766,7 +820,7 @@ pub fn create(
     if !memd::guest_create(alloc, id, nr_blocks, block_cn, block_radix) {
         return Err(Some(g));
     }
-    g.blocks.extend((0..nr_blocks).map(|_| Block { frames: None }));
+    g.nr_blocks = nr_blocks;
     let tmp = alloc.slots.alloc();
 
     // ---- I/O pool: one physically contiguous Untyped retyped into frames,
@@ -775,7 +829,7 @@ pub fn create(
     let pool_bits = cfg.io_pool.trailing_zeros() as usize;
     let pool_radix = pool_bits - 12;
     let pool_slot = alloc.slots.alloc();
-    let Some(region) = alloc.split(pool_bits, pool_slot) else {
+    let Some(mut region) = alloc.split(pool_bits, pool_slot) else {
         alloc.slots.free(pool_slot);
         alloc.slots.free(tmp);
         return Err(Some(g));
@@ -783,7 +837,7 @@ pub fn create(
     let pool_paddr = region.paddr;
     g.arena.own(pool_slot, pool_paddr, pool_bits);
     let frames = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });
-    crate::mem::UtPool { regions: ::alloc::vec![region] }
+    region
         .retype(&FRAME_BP, pool_pages, Dest { cnode: abs(frames), offset: 0 })
         .expect("I/O pool frames");
     g.pool = IoPool { gpa: pool_gpa, paddr: pool_paddr, size: cfg.io_pool, frames, radix: pool_radix };
@@ -870,7 +924,7 @@ pub fn create(
         g.give_badged(base + abi::VCPU_IPI, ntfn, CapRights::write_only(), abi::BADGE_IPI);
         g.give(base + abi::VCPU_IPCBUF, ipcbuf, CapRights::read_write());
         g.give(base + abi::VCPU_EVENT, event, CapRights::read_write());
-        g.vcpus.push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
+        g.vcpus.must_push(Vcpu { ktcb, ntfn, event, sc_k, sc_u, core, cooldown: 0, usage: 0, k_share: crate::sched::K_SHARE_INIT, wall_ticks: 0, run_ticks: 0, steal_ns: 0 });
     }
 
     // ---- Event pages in the root task too (steal time).
@@ -884,7 +938,7 @@ pub fn create(
         let frame = g.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let vspace = g.vspace;
         map_frame(&mut g.ctx(alloc), vspace, frame, abi::BOOTINFO_VA as usize + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
-        g.bootinfo.push(frame);
+        g.bootinfo.must_push(frame);
     }
 
     // ---- Console (input page, output ring) and, for dom0, control.
@@ -893,7 +947,7 @@ pub fn create(
         let f = g.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let va = root_guest_va(id) + GUEST_RING_OFF + i * PAGE;
         g.map_in_root(alloc, f, va);
-        g.console_ring.push(f);
+        g.console_ring.must_push(f);
     }
     if cfg.dom0 {
         g.add_device(alloc, DevKind::Ctl).unwrap();
@@ -903,7 +957,13 @@ pub fn create(
         "l4h-root: guest {} '{}' created: {} MiB RAM in {} blocks, {} vCPU(s), {} MiB I/O pool, {} KiB host objects",
         id, g.name, ram >> 20, nr_blocks, cfg.vcpus, g.pool.size >> 20, g.arena.bytes() >> 10
     );
-    info!("l4h-root: guest {} '{}' initial CPUs {:?}", id, g.name, g.vcpus.iter().map(|v| v.core).collect::<Vec<_>>());
+    if host::VERBOSE {
+        sel4::debug_print!("l4h-root: guest {} '{}' initial CPUs", id, g.name);
+        for v in &g.vcpus {
+            sel4::debug_print!(" {}", v.core);
+        }
+        sel4::debug_println!();
+    }
     Ok(g)
 }
 
@@ -913,7 +973,7 @@ pub fn create(
 /// the image does not fit.
 pub fn boot(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &HostInfo, kernel: &Kernel, initrd: (usize, usize), cmdline: &[u8]) -> bool {
     let within = |(gpa, len): (usize, usize)| gpa >= initrd.0 && gpa + len <= initrd.0 + initrd.1;
-    if g.ram_base != kernel.ram_base || (initrd.1 != 0 && initrd.0 < kernel.end) || !g.loaded.iter().all(|&r| within(r)) {
+    if g.ram_base != kernel.ram_base || (initrd.1 != 0 && initrd.0 < kernel.end) || !g.loaded.iter().all(within) {
         return false;
     }
     for seg in kernel.elf.segments() {

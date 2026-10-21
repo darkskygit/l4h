@@ -12,7 +12,7 @@ use l4h_host::{self as host, blk};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
-use crate::mem::{Alloc, Arena, Dest, UtPool};
+use crate::mem::{Alloc, Arena, Dest};
 use crate::pci::{self, Pci};
 use crate::vmm;
 use crate::vspace::FRAME_BP;
@@ -229,11 +229,11 @@ pub fn start(
 
     // ---- DMA memory: one physically contiguous chunk.
     let dma_slot = alloc.slots.alloc();
-    let dma_region = alloc.split(DMA_BITS, dma_slot).expect("blkd DMA memory");
+    let mut dma_region = alloc.split(DMA_BITS, dma_slot).expect("blkd DMA memory");
     let dma_paddr = dma_region.paddr;
     let n_dma = (1 << DMA_BITS) / PAGE;
     let dma_frames = alloc.slots.alloc_range(n_dma);
-    UtPool { regions: alloc::vec![dma_region] }
+    dma_region
         .retype(&FRAME_BP, n_dma, Dest::root(dma_frames.start))
         .expect("blkd DMA frames");
     arena.own(dma_slot, dma_paddr, DMA_BITS);
@@ -326,7 +326,7 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index:
     window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc) -> (usize, vmm::Backend) {
     let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
     let driver = ctrl.driver.as_mut().expect("started blkd");
-    let chan: Vec<cap::Granule> = (0..blk::CHANNEL_PAGES)
+    let chan: l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES }> = (0..blk::CHANNEL_PAGES)
         .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
     let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
     // Initial values are delivered via the service call, not guest-chosen IDs.

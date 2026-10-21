@@ -45,6 +45,7 @@ mod vspace;
 mod window;
 
 use ::alloc::vec::Vec;
+use l4h_host::fixed::{ArrayVec, StaticCell};
 
 use sel4::init_thread::slot;
 use sel4::{ObjectBlueprint, cap, cap_type};
@@ -60,6 +61,8 @@ use crate::window::{Window, Windows};
 
 pub const RETYPE_FAN_OUT: usize = 16384;
 pub const MAX_GUESTS: usize = 64;
+/// The guests, by id: too large for a stack.
+static GUESTS: StaticCell<[Option<Guest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
 /// Memory and root CNode slots kept back from guest requests.
 const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 32768;
@@ -101,7 +104,7 @@ impl HostInfo {
 
 /// ASID pools; x86_64 seL4 has 8 pools of 512 ASIDs each in total.
 pub struct AsidPools {
-    pools: Vec<(cap::AsidPool, usize)>,
+    pools: ArrayVec<(cap::AsidPool, usize), { 1 << sel4::sys::seL4_NumASIDPoolsBits }>,
     /// ASIDs assigned to live VSpaces (exact: guests return theirs).
     pub in_use: usize,
 }
@@ -143,7 +146,8 @@ impl AsidPools {
             .expect("out of ASID pools");
         let pool = sel4::init_thread::Slot::<cap_type::AsidPool>::from_index(pool_slot).cap();
         pool.asid_pool_assign(vspace).expect("ASID assign");
-        self.pools.push((pool, 1));
+        // At most seL4_NumASIDPoolsBits pools: in_use < ASID_CAPACITY.
+        self.pools.must_push((pool, 1));
     }
 }
 
@@ -193,7 +197,7 @@ pub struct Host {
     pub ctrls: Vec<Controller>,
     pub disks: Vec<Disk>,
     pub netd: netd::Netd,
-    pub guests: Vec<Option<Guest>>,
+    pub guests: &'static mut [Option<Guest>; MAX_GUESTS],
     pub total_bytes: usize,
     pub monitor: Option<monitor::Monitor>,
     pub dashboard: Option<dashboard::Dashboard>,
@@ -214,11 +218,11 @@ impl Host {
     /// Run `f` on guest `id` with root slot allocations tracked into it.
     pub fn with_guest<R>(&mut self, id: usize, f: impl FnOnce(&mut Host, &mut Guest) -> R) -> Option<R> {
         let mut g = self.guests.get_mut(id)?.take()?;
-        self.alloc.slots.track(core::mem::take(&mut g.slots));
+        self.alloc.slots.track(id);
         let asids = self.asids.in_use;
         let r = f(self, &mut g);
         g.asids += self.asids.in_use - asids;
-        g.slots = self.alloc.slots.untrack();
+        self.alloc.slots.untrack();
         self.guests[id] = Some(g);
         Some(r)
     }
@@ -229,7 +233,7 @@ impl Host {
 
     /// Resources a guest operation may need, checked before starting it so
     /// that requests fail cleanly instead of exhausting the root task.
-    fn can_afford(&self, bytes: usize, asids: usize) -> bool {
+    pub fn can_afford(&self, bytes: usize, asids: usize) -> bool {
         bytes.checked_add(RESERVE_BYTES).is_some_and(|b| self.alloc.free_bytes() >= b)
             && self.asids.available() >= asids
             && self.alloc.slots.available() >= RESERVE_SLOTS
@@ -242,10 +246,7 @@ impl Host {
             return None;
         }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
-        if self.guests.len() <= id {
-            self.guests.resize_with(id + 1, || None);
-        }
-        self.alloc.slots.track(Default::default());
+        self.alloc.slots.track(id);
         let asids = self.asids.in_use;
         let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info);
         if let (Ok(g), Some(t)) = (&mut g, &self.trustd) {
@@ -254,10 +255,9 @@ impl Host {
         if let (Ok(g), Some(k)) = (&mut g, &self.kmods) {
             k.map(g, &mut self.alloc);
         }
-        let slots = self.alloc.slots.untrack();
+        self.alloc.slots.untrack();
         match g {
             Ok(mut g) => {
-                g.slots = slots;
                 g.asids = self.asids.in_use - asids;
                 self.guests[id] = Some(g);
                 Some(id)
@@ -266,16 +266,8 @@ impl Host {
                 // Give back whatever was built.
                 self.asids.in_use = asids;
                 match partial {
-                    Some(mut g) => {
-                        g.slots = slots;
-                        g.destroy(&mut self.alloc, false);
-                    }
-                    None => {
-                        for s in slots {
-                            let _ = guest::abs(guest::root_cap::<cap_type::Null>(s)).delete();
-                            self.alloc.slots.free(s);
-                        }
-                    }
+                    Some(g) => g.destroy(&mut self.alloc, false),
+                    None => self.alloc.slots.free_owned(id),
                 }
                 info!("l4h-root: cannot create guest '{}': out of memory", cfg.name);
                 None
@@ -352,8 +344,9 @@ impl Host {
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
             let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, read_only, &mut h.alloc);
             blkd::activate(&h.ctrls[c], unit, client, g, &backend, &mut h.wins.a);
-            g.backends.push((d, backend));
-            g.disks.push((c, client));
+            // One each per device, of which add_device allows no more.
+            g.backends.must_push((d, backend));
+            g.disks.must_push((c, client));
             Ok(())
         })
         .ok_or(ctl::ENOENT)?
@@ -393,8 +386,8 @@ impl Host {
                 return Err(ctl::EINVAL);
             }
             let (p, backend) = h.netd.add_port(g, d, switch, mac, lock, isolated, &mut h.alloc)?;
-            g.backends.push((d, backend));
-            g.ports.push(p);
+            g.backends.must_push((d, backend));
+            g.ports.must_push(p);
             Ok(mac)
         })
         .ok_or(ctl::ENOENT)?
@@ -425,7 +418,7 @@ impl Host {
     }
 }
 
-#[root_task(heap_size = 32 * 1024 * 1024)]
+#[root_task(stack_size = 1024 * 1024, heap_size = 32 * 1024 * 1024)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
@@ -440,7 +433,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // wakes the serve loop out of its receive on hyp_ep.
     let wd_ntfn = alloc.object_cap::<cap_type::Notification>(ObjectBlueprint::Notification);
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
-    let reply = alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
+    let reply = ReplySlot::new(&mut alloc);
     let mut wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
     let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
@@ -472,7 +465,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         epoch_ticks: rdtsc(),
         placement: core::cell::Cell::new(0),
     };
-    let mut asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
+    let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
     // From here on, memory comes from memd.
     let mut memd = memd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
 
@@ -549,7 +542,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         ctrls,
         disks: Vec::new(),
         netd,
-        guests: Vec::new(),
+        guests: GUESTS.take(),
         total_bytes,
         monitor: None,
         dashboard: None,
@@ -702,7 +695,39 @@ pub fn set_mr(i: usize, v: u64) {
 }
 
 /// Serve calls from host components and faults of guest kernels.
-fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
+/// The serve loop's reply object, made from an Untyped of its own so that
+/// one left unanswered can be replaced without using more memory.
+struct ReplySlot {
+    ut: cap::Untyped,
+    reply: cap::Reply,
+}
+
+impl ReplySlot {
+    fn new(alloc: &mut Alloc) -> Self {
+        let (ut_slot, slot) = (alloc.slots.alloc(), alloc.slots.alloc());
+        let ut = alloc.split(12, ut_slot).expect("reply object memory").cap;
+        let r = ReplySlot { ut, reply: sel4::init_thread::Slot::<cap_type::Reply>::from_index(slot).cap() };
+        r.make();
+        r
+    }
+
+    fn make(&self) {
+        self.ut
+            .untyped_retype(&ObjectBlueprint::Reply, &mem::root_cnode_dest(), self.reply.bits() as usize, 1)
+            .expect("reply object");
+    }
+
+    /// Replace the reply object, which is bound to a caller left
+    /// unanswered (a faulted or stopped thread): revoking the Untyped
+    /// deletes it, which leaves that thread inactive for good.
+    fn renew(&self) {
+        slot::CNODE.cap().absolute_cptr(self.ut).revoke().expect("revoke reply object");
+        self.make();
+    }
+}
+
+fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
+    let reply = reply_slot.reply;
     let hyp_ep = h.info.hyp_ep;
     arm_timer(&h.info);
     let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
@@ -751,9 +776,9 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             }
             None => {
                 // A reply object left unanswered (a faulted or stopped
-                // thread) stays bound to its caller: use a fresh one.
+                // thread) stays bound to its caller: make it afresh.
                 if !notified {
-                    reply = h.alloc.object_cap::<cap_type::Reply>(ObjectBlueprint::Reply);
+                    reply_slot.renew();
                 }
                 (info, badge) = hyp_ep.recv(reply);
             }

@@ -95,12 +95,13 @@ impl MemdLink {
     /// physical address, size bits).  Their slots are left empty.
     pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
         assert!(blocks.len() <= memd::XCHG_SLOTS);
-        let mut args = alloc::vec![blocks.len() as u64];
+        let mut args = [0; 1 + 2 * memd::XCHG_SLOTS];
+        args[0] = blocks.len() as u64;
         for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
             self.xchg(i).move_(&abs_of(ut)).expect("memd: return block");
-            args.extend([paddr as u64, bits as u64]);
+            (args[1 + 2 * i], args[2 + 2 * i]) = (paddr as u64, bits as u64);
         }
-        assert_eq!(self.call(memd::MEMD_FREE, &args), 0, "memd: free");
+        assert_eq!(self.call(memd::MEMD_FREE, &args[..1 + 2 * blocks.len()]), 0, "memd: free");
     }
 }
 
@@ -168,9 +169,10 @@ impl Memd {
         else {
             return;
         };
-        let mut mapped = alloc::vec::Vec::new();
+        // BARs mapped, one bit each.
+        let mut mapped = 0u8;
         for c in [common, notify, device] {
-            if mapped.contains(&c.bar) {
+            if mapped & (1 << c.bar) != 0 {
                 continue;
             }
             let bar = d.bars[c.bar as usize];
@@ -186,7 +188,7 @@ impl Memd {
                 let keep = self.keep_slot();
                 self.comp.map_copy(alloc, &mut self.arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep);
             }
-            mapped.push(c.bar);
+            mapped |= 1 << c.bar;
         }
         let frames = alloc.slots.global(|s| s.alloc_range(memd::DMA_PAGES));
         let Some(paddr) = self.arena.retype(alloc, &FRAME_BP, memd::DMA_PAGES, Dest::root(frames.start)) else {
