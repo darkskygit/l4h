@@ -1236,12 +1236,15 @@ The chain has four links.
    into PCR 8. Secure Boot is not needed: nothing is checked at boot, the
    verifier checks afterwards.
 2. **The host key.** `l4h-trustd` is the only component that maps the
-   TPM. Root finds the TPM in the ACPI `TPM2` table; trustd polls its FIFO
-   or CRB registers at locality 0. At start, trustd:
+   TPM. Root finds the TPM in the ACPI `TPM2` table (see **TPM interfaces**
+   below); trustd polls it at locality 0. At start, trustd:
    - generates a P-256 key K in software, from TPM randomness;
    - creates the attestation key (AK), a restricted ECDSA P-256 signing
      key. It is a primary key of the endorsement hierarchy, so the same
-     template gives the same key on every boot;
+     template gives the same key on every boot. It has an empty password
+     and no dictionary-attack protection (`noDA`). trustd never shuts the
+     TPM down orderly, and the TPM counts each such boot as a failed
+     authorization, so a protected key would be locked out after a few;
    - quotes PCRs 0–15 with the AK, with `SHA-256("l4h-trustd-key-v1" ‖ K)`
      as qualifying data;
    - extends PCR 15 with that same value.
@@ -1295,6 +1298,36 @@ The chain has four links.
    both keys can do it. The verifier then pins the AK's name (`--ak-name`),
    which stays the same across boots.
 
+**TPM interfaces.** These follow Linux's `tpm_crb` and `tpm_tis`:
+
+- **FIFO (TIS)**, start method 6: locality 0's registers at 0xfed40000.
+- **CRB**, start method 7: the locality registers, with the control area
+  at 0x40 in their page, and the command and response buffers that the
+  control area names.
+- **CRB with the ACPI start method**, 2 or 8: AMD's firmware TPM, which
+  runs in the PSP. It has no locality registers and no idle state, and its
+  buffers are in reserved RAM. Every command starts with the TPM device's
+  `_DSM` (function 1 of GUID `6bbf6cab-…`), which is firmware code in
+  AML. Root gives trustd the FADT, the DSDT and the SSDTs. trustd loads
+  them into the `acpi` crate's interpreter, finds the `MSFT0101` device
+  whose `_DSM` offers that function, runs only that device's and its
+  parents' `_INI`, and calls the `_DSM` after setting the start bit, as
+  Linux does.
+  - Accesses outside trustd's own TPM ranges go to root (`ROOT_CALL_HW`).
+    Root refuses RAM, device memory already in use, I/O ports already
+    handed out (seL4 refuses to issue them twice), and config writes to
+    the PCI functions the host drives. Reads of anything refused return
+    all ones.
+  - The interpreter runs in trustd, not root, because it still panics on
+    some AML. If trustd faults, root suspends it and deletes its
+    endpoint: guests calling it then get an error instead of waiting
+    forever, and no new guest gets attestation.
+  - The crate is pinned to an upstream commit past 6.1.1, whose buffer
+    comparison, which every `_DSM` needs for its UUID check, panics.
+- **CRB with Pluton**, start method 13: the start and reply doorbells
+  named in the TPM2 table, rung after each request, as Linux does.
+  Untested: QEMU has no Pluton.
+
 **Trust.** A report is worth what the host TCB is worth: seL4, root,
 trustd, blkd, netd and the guest's VMM (§3), all identified by PCR 4.
 dom0 decides what runs but cannot forge a report, because root computes
@@ -1317,9 +1350,20 @@ this does not cover:
 - **ActivateCredential.** It creates the EK on first use. An RSA EK takes
   a hardware TPM seconds to create, and the calling vCPU waits.
 - **aarch64.** It has no TPM path yet.
+- **CRB buffer sizes.** trustd uses the buffer sizes from the CRB
+  registers. Linux also clips them to the device's `_CRS` because some
+  firmware reports larger buffers, and trustd does not do that.
 
-`tests/run-attesttest.sh` boots under OVMF with swtpm, over CRB and then
-FIFO, and checks the whole chain, the credential included.
+`tests/run-attesttest.sh` boots under OVMF with swtpm three times: CRB,
+then FIFO, then CRB with the ACPI start method, and checks the whole
+chain each time, the credential included. For the third boot, it has GRUB
+replace QEMU's TPM2 table with one for start method 2, and add an SSDT
+(`tests/ftpm`) with an `MSFT0101` device. That device's `_DSM` does what
+the PSP's firmware would: it takes the locality, starts the command, waits
+for it, and counts on QEMU's debug port. QEMU ignores the start bit without
+a locality, so a command only runs if trustd ran the `_DSM`.
+`tools/mkefi.sh` swaps the tables with `L4H_ACPI_TABLES` and
+`L4H_ACPI_EXCLUDE`, which can also work around broken firmware tables.
 
 ---
 

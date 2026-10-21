@@ -32,9 +32,13 @@ if [ -f /bin/cred ]; then
     echo "ATTEST: secret $(l4hctl attest activate /bin/cred)"
 fi
 if [ -f /bin/vmlinux ]; then
+    # Its console, printed once it is done: the host also copies it to the
+    # serial port, and the two copies would interleave.
     id=$(l4hctl create attestvm --kernel /bin/vmlinux --initrd /bin/vm.cpio.gz --mem 64 \
         --cmdline "console=hvc0 attest_nonce=$nonce") && \
-        l4hctl console "$id" --until "ATTESTVM: done" --timeout 60
+        l4hctl console "$id" --until "ATTESTVM: done" --timeout 60 > /tmp/vm.out
+    sleep 1
+    grep ATTESTVM /tmp/vm.out
 fi
 echo "ATTEST: done"
 poweroff -f

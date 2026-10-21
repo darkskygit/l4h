@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+mod aml;
 mod cbor;
 mod tpm;
 mod tpm2;

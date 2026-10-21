@@ -1147,7 +1147,16 @@ guest kernel accepts:
 \label{sec:attest}
 
 On a host with a TPM~2.0, any guest can prove to a remote party, the
-verifier, what it booted and on which host:
+verifier, what it booted and on which host. l4h supports the TPM
+interfaces of x86 PCs and servers:
+\begin{itemize}
+  \item discrete TPMs (FIFO/TIS, or CRB);
+  \item Intel PTT (CRB);
+  \item AMD firmware TPMs (fTPM, CRB with the ACPI start method). For these,
+        the host runs the firmware's ACPI code for each TPM command;
+  \item Microsoft Pluton, though this is untested.
+\end{itemize}
+It works like this:
 \begin{itemize}
   \item the firmware measures the l4h application, with seL4 and every
         host component in it, into PCR~4. GRUB measures dom0's kernel,
@@ -1332,9 +1341,10 @@ Test & What it checks \\
 \cmd{run-monitor.sh} & the serial monitor \\
 \cmd{run-uefitest.sh} & the UEFI image with NVMe boot disk and virtio-net,
   as on GCE \\
-\cmd{run-attesttest.sh} & attestation with a software TPM (swtpm): reports
-  on dom0 and a guest verify against the host evidence, and the AK's
-  credential round trip works \\
+\cmd{run-attesttest.sh} & attestation with a software TPM (swtpm), over
+  CRB, FIFO and the ACPI start method of AMD fTPMs (which needs
+  \cmd{iasl}): reports on dom0 and a guest verify against the host
+  evidence, and the AK's credential round trip works \\
 \cmd{run-debian.sh}, \cmd{run-workload.sh} & Debian with systemd, fio
   verification, a parallel build, fsck, data surviving a reboot \\
 \cmd{run-bench.sh} & micro-benchmarks \\

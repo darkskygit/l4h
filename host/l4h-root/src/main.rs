@@ -732,6 +732,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
     if badge & HYP_BADGE_FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         sel4::debug_println!("l4h-root: component {:#x} fault: {:x?}", id, fault);
+        trustd::fault(h, id as u32);
         return None;
     }
     // Component ids below 0x100 are guest VMMs; the id is the guest's.
@@ -760,6 +761,7 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
             }
             Some(0)
         }
+        host::ROOT_CALL_HW if id == trustd::TRUSTD_ID as usize => Some(trustd::hw(h)),
         host::ROOT_CALL_CTL if is_vmm && h.guest(id).is_some_and(|g| g.dom0) => {
             ctl::handle(h, id);
             Some(0)

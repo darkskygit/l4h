@@ -44,6 +44,7 @@ const FIXED_PARENT: u32 = 1 << 4;
 const SENSITIVE_DATA_ORIGIN: u32 = 1 << 5;
 const USER_WITH_AUTH: u32 = 1 << 6;
 const ADMIN_WITH_POLICY: u32 = 1 << 7;
+const NO_DA: u32 = 1 << 10;
 const RESTRICTED: u32 = 1 << 16;
 const DECRYPT: u32 = 1 << 17;
 const SIGN: u32 = 1 << 18;
@@ -161,12 +162,15 @@ impl<'a> Rsp<'a> {
 /// TPMT_PUBLIC of the attestation key: a restricted ECDSA P-256 signing
 /// key, a primary key of the endorsement hierarchy.  The same template
 /// gives the same key on every boot (until the endorsement seed changes),
-/// so a verifier enrolls it once.
+/// so a verifier enrolls it once.  Its password is empty, so it is out of
+/// dictionary-attack protection (noDA): we never shut the TPM down
+/// orderly, and each such boot counts as a failed authorization, which
+/// would lock a protected key out after a few.
 pub fn ak_template() -> Vec<u8> {
     let mut t = Cmd(Vec::new());
     t.u16(ALG_ECC)
         .u16(ALG_SHA256)
-        .u32(FIXED_TPM | FIXED_PARENT | SENSITIVE_DATA_ORIGIN | USER_WITH_AUTH | RESTRICTED | SIGN)
+        .u32(FIXED_TPM | FIXED_PARENT | SENSITIVE_DATA_ORIGIN | USER_WITH_AUTH | NO_DA | RESTRICTED | SIGN)
         .tpm2b(&[])
         .u16(ALG_NULL) // symmetric
         .u16(ALG_ECDSA)

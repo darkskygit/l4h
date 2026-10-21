@@ -1,12 +1,16 @@
 //! TPM 2.0 transports at locality 0: the FIFO (TIS) and CRB interfaces of
-//! the TCG PC Client Platform TPM Profile.  Commands are polled: trustd
-//! takes no interrupt.
+//! the TCG PC Client Platform TPM Profile, CRB with each start method
+//! Linux's tpm_crb has on x86: the start register, the ACPI start method
+//! (AMD fTPM) and Pluton's doorbells.  Commands are polled: trustd takes no
+//! interrupt.
 
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 use l4h_rt::host;
-use l4h_rt::host::trust::{TPM_CRB, TPM_TIS, TrustdConfig};
+use l4h_rt::host::trust::{START_ACPI, START_PLUTON, TPM_TIS, TrustdConfig};
+
+use crate::aml;
 
 /// The longest a command may take: key generation on a slow TPM.
 const TIMEOUT_SECS: u64 = 120;
@@ -38,13 +42,19 @@ impl core::fmt::Display for Error {
 
 pub struct Tpm {
     iface: u32,
-    regs: usize,
+    start: u32,
+    /// FIFO: the registers; CRB: the locality registers, if any.
+    loc: usize,
+    ctrl: usize,
     cmd: (usize, usize),
     rsp: (usize, usize),
+    /// Pluton's doorbells.
+    bells: (usize, usize),
+    acpi: Option<aml::Start>,
     hz: u64,
 }
 
-// TIS (FIFO) registers.
+// FIFO (TIS) registers.
 const TIS_ACCESS: usize = 0x00;
 const TIS_STS: usize = 0x18;
 const TIS_FIFO: usize = 0x24;
@@ -57,57 +67,59 @@ const STS_GO: u32 = 0x20;
 const STS_DATA: u32 = 0x10;
 const STS_EXPECT: u32 = 0x08;
 
-// CRB registers.
+// CRB locality registers.
 const CRB_LOC_STATE: usize = 0x00;
 const CRB_LOC_CTRL: usize = 0x08;
-const CRB_CTRL_REQ: usize = 0x40;
-const CRB_CTRL_STS: usize = 0x44;
-const CRB_CTRL_START: usize = 0x4c;
 const LOC_ASSIGNED: u32 = 0x02;
 const LOC_VALID: u32 = 0x80;
+// CRB control area.
+const CRB_CTRL_REQ: usize = 0x00;
+const CRB_CTRL_STS: usize = 0x04;
+const CRB_CTRL_CANCEL: usize = 0x08;
+const CRB_CTRL_START: usize = 0x0c;
 const REQ_READY: u32 = 0x01;
 const REQ_IDLE: u32 = 0x02;
 const STS_FATAL: u32 = 0x01;
 
+fn r8(a: usize) -> u8 {
+    unsafe { read_volatile(a as *const u8) }
+}
+
+fn w8(a: usize, v: u8) {
+    unsafe { write_volatile(a as *mut u8, v) }
+}
+
+fn r32(a: usize) -> u32 {
+    unsafe { read_volatile(a as *const u32) }
+}
+
+fn w32(a: usize, v: u32) {
+    unsafe { write_volatile(a as *mut u32, v) }
+}
+
 impl Tpm {
     pub fn new(cfg: &TrustdConfig, hz: u64) -> Result<Self, Error> {
-        let base = host::trust::TPM_VA;
-        let size = cfg.mmio_size as usize;
-        let inside = |off: u64, len: u64| off.checked_add(len).is_some_and(|e| e <= size as u64);
-        if cfg.iface == TPM_CRB && !(inside(cfg.cmd_off, cfg.cmd_size) && inside(cfg.rsp_off, cfg.rsp_size)) {
-            return Err(Error::Bad("CRB buffers outside the mapped registers"));
-        }
-        if cfg.iface != TPM_TIS && cfg.iface != TPM_CRB {
-            return Err(Error::Bad("unknown TPM interface"));
-        }
+        let acpi = match cfg.start {
+            START_ACPI => Some(aml::Start::new(cfg, hz).map_err(Error::Bad)?),
+            _ => None,
+        };
         Ok(Tpm {
             iface: cfg.iface,
-            regs: base,
-            cmd: (base + cfg.cmd_off as usize, cfg.cmd_size as usize),
-            rsp: (base + cfg.rsp_off as usize, cfg.rsp_size as usize),
+            start: cfg.start,
+            loc: cfg.loc_va as usize,
+            ctrl: cfg.ctrl_va as usize,
+            cmd: (cfg.cmd_va as usize, cfg.cmd_size as usize),
+            rsp: (cfg.rsp_va as usize, cfg.rsp_size as usize),
+            bells: (cfg.start_va as usize, cfg.reply_va as usize),
+            acpi,
             hz,
         })
     }
 
-    fn r8(&self, off: usize) -> u8 {
-        unsafe { read_volatile((self.regs + off) as *const u8) }
-    }
-
-    fn w8(&self, off: usize, v: u8) {
-        unsafe { write_volatile((self.regs + off) as *mut u8, v) }
-    }
-
-    fn r32(&self, off: usize) -> u32 {
-        unsafe { read_volatile((self.regs + off) as *const u32) }
-    }
-
-    fn w32(&self, off: usize, v: u32) {
-        unsafe { write_volatile((self.regs + off) as *mut u32, v) }
-    }
-
-    /// Spin until `done` holds.
-    fn wait(&self, what: &'static str, mut done: impl FnMut(&Self) -> bool) -> Result<(), Error> {
-        let deadline = host::ticks::now() + self.hz * TIMEOUT_SECS;
+    /// Spin until `done` holds, for at most `ms` (TIMEOUT_SECS if 0).
+    fn wait_ms(&self, what: &'static str, ms: u64, mut done: impl FnMut(&Self) -> bool) -> Result<(), Error> {
+        let ticks = if ms == 0 { self.hz * TIMEOUT_SECS } else { self.hz * ms / 1000 };
+        let deadline = host::ticks::now() + ticks;
         while !done(self) {
             if host::ticks::now() > deadline {
                 return Err(Error::Timeout(what));
@@ -115,6 +127,10 @@ impl Tpm {
             core::hint::spin_loop();
         }
         Ok(())
+    }
+
+    fn wait(&self, what: &'static str, done: impl FnMut(&Self) -> bool) -> Result<(), Error> {
+        self.wait_ms(what, 0, done)
     }
 
     /// Send `cmd` and return the response, whose code is checked.  The
@@ -144,44 +160,43 @@ impl Tpm {
     }
 
     fn exec_tis(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
-        self.w8(TIS_ACCESS, ACCESS_REQUEST);
-        self.wait("locality", |t| t.r8(TIS_ACCESS) & (ACCESS_VALID | ACCESS_ACTIVE) == ACCESS_VALID | ACCESS_ACTIVE)?;
+        let regs = self.loc;
+        w8(regs + TIS_ACCESS, ACCESS_REQUEST);
+        self.wait("locality", |_| r8(regs + TIS_ACCESS) & (ACCESS_VALID | ACCESS_ACTIVE) == ACCESS_VALID | ACCESS_ACTIVE)?;
         let r = self.tis_command(cmd);
         // Back to idle, whatever happened, and give up the locality.
-        self.w8(TIS_STS, STS_READY as u8);
-        self.w8(TIS_ACCESS, ACCESS_ACTIVE);
+        w8(regs + TIS_STS, STS_READY as u8);
+        w8(regs + TIS_ACCESS, ACCESS_ACTIVE);
         r
     }
 
-    fn burst(&self) -> usize {
-        ((self.r32(TIS_STS) >> 8) & 0xffff) as usize
-    }
-
     fn tis_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
-        self.w8(TIS_STS, STS_READY as u8);
-        self.wait("command ready", |t| t.r32(TIS_STS) & STS_READY != 0)?;
+        let regs = self.loc;
+        let burst = || ((r32(regs + TIS_STS) >> 8) & 0xffff) as usize;
+        w8(regs + TIS_STS, STS_READY as u8);
+        self.wait("command ready", |_| r32(regs + TIS_STS) & STS_READY != 0)?;
         let mut sent = 0;
         while sent < cmd.len() {
-            self.wait("burst count", |t| t.burst() != 0)?;
-            let n = self.burst().min(cmd.len() - sent);
+            self.wait("burst count", |_| burst() != 0)?;
+            let n = burst().min(cmd.len() - sent);
             for &b in &cmd[sent..sent + n] {
-                self.w8(TIS_FIFO, b);
+                w8(regs + TIS_FIFO, b);
             }
             sent += n;
         }
-        self.wait("status", |t| t.r32(TIS_STS) & STS_VALID != 0)?;
-        if self.r32(TIS_STS) & STS_EXPECT != 0 {
+        self.wait("status", |_| r32(regs + TIS_STS) & STS_VALID != 0)?;
+        if r32(regs + TIS_STS) & STS_EXPECT != 0 {
             return Err(Error::Bad("TPM expects more command bytes"));
         }
-        self.w8(TIS_STS, STS_GO as u8);
-        self.wait("response", |t| t.r32(TIS_STS) & (STS_VALID | STS_DATA) == STS_VALID | STS_DATA)?;
+        w8(regs + TIS_STS, STS_GO as u8);
+        self.wait("response", |_| r32(regs + TIS_STS) & (STS_VALID | STS_DATA) == STS_VALID | STS_DATA)?;
         let mut rsp = Vec::new();
         let mut want = 10;
         while rsp.len() < want {
-            self.wait("response data", |t| t.burst() != 0)?;
-            let n = self.burst().min(want - rsp.len());
+            self.wait("response data", |_| burst() != 0)?;
+            let n = burst().min(want - rsp.len());
             for _ in 0..n {
-                rsp.push(self.r8(TIS_FIFO));
+                rsp.push(r8(regs + TIS_FIFO));
             }
             if want == 10 && rsp.len() >= 10 {
                 want = u32::from_be_bytes(rsp[2..6].try_into().unwrap()) as usize;
@@ -193,29 +208,74 @@ impl Tpm {
         Ok(rsp)
     }
 
+    /// The ACPI start method has no idle state (as Linux tpm_crb).
+    fn has_idle(&self) -> bool {
+        self.start != START_ACPI
+    }
+
+    /// Pluton: ring the start doorbell once the reply doorbell is 1, and
+    /// with `wait`, until the TPM takes the request.
+    fn doorbell(&self, wait: bool) -> Result<(), Error> {
+        if self.start != START_PLUTON {
+            return Ok(());
+        }
+        let (start, reply) = self.bells;
+        self.wait("Pluton reply doorbell", |_| r32(reply) == 1)?;
+        w32(start, 1);
+        if wait {
+            self.wait_ms("Pluton start doorbell", 200, |_| r32(start) == 0)?;
+        }
+        Ok(())
+    }
+
+    /// Write `bit` to CTRL_REQ and wait until the TPM clears it.
+    fn request(&self, bit: u32, what: &'static str) -> Result<(), Error> {
+        if !self.has_idle() {
+            return Ok(());
+        }
+        w32(self.ctrl + CRB_CTRL_REQ, bit);
+        self.doorbell(true)?;
+        let ctrl = self.ctrl;
+        self.wait(what, |_| r32(ctrl + CRB_CTRL_REQ) & bit == 0)
+    }
+
     fn exec_crb(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
         if cmd.len() > self.cmd.1 {
             return Err(Error::Bad("command larger than the CRB buffer"));
         }
-        self.w32(CRB_LOC_CTRL, 1);
-        self.wait("locality", |t| t.r32(CRB_LOC_STATE) & (LOC_VALID | LOC_ASSIGNED) == LOC_VALID | LOC_ASSIGNED)?;
+        let loc = self.loc;
+        if loc != 0 {
+            w32(loc + CRB_LOC_CTRL, 1);
+            self.wait("locality", |_| r32(loc + CRB_LOC_STATE) & (LOC_VALID | LOC_ASSIGNED) == LOC_VALID | LOC_ASSIGNED)?;
+        }
         let r = self.crb_command(cmd);
-        self.w32(CRB_CTRL_REQ, REQ_IDLE);
-        self.w32(CRB_LOC_CTRL, 2);
-        r
+        let idle = self.request(REQ_IDLE, "go idle");
+        if loc != 0 {
+            w32(loc + CRB_LOC_CTRL, 2);
+        }
+        let r = r?;
+        idle.map(|()| r)
     }
 
     fn crb_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
-        self.w32(CRB_CTRL_REQ, REQ_READY);
-        self.wait("command ready", |t| t.r32(CRB_CTRL_REQ) & REQ_READY == 0)?;
-        if self.r32(CRB_CTRL_STS) & STS_FATAL != 0 {
+        let ctrl = self.ctrl;
+        self.request(REQ_READY, "command ready")?;
+        if r32(ctrl + CRB_CTRL_STS) & STS_FATAL != 0 {
             return Err(Error::Bad("TPM in failure mode"));
         }
+        w32(ctrl + CRB_CTRL_CANCEL, 0);
         for (i, &b) in cmd.iter().enumerate() {
             unsafe { write_volatile((self.cmd.0 + i) as *mut u8, b) };
         }
-        self.w32(CRB_CTRL_START, 1);
-        self.wait("response", |t| t.r32(CRB_CTRL_START) & 1 == 0)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // The start register, also with the other start methods (the
+        // device is an MSFT0101: Linux does the same).
+        w32(ctrl + CRB_CTRL_START, 1);
+        if let Some(a) = &self.acpi {
+            a.start().map_err(Error::Bad)?;
+        }
+        self.doorbell(false)?;
+        self.wait("response", |_| r32(ctrl + CRB_CTRL_START) & 1 == 0)?;
         let byte = |i: usize| unsafe { read_volatile((self.rsp.0 + i) as *const u8) };
         let mut rsp: Vec<u8> = (0..10).map(byte).collect();
         let n = u32::from_be_bytes(rsp[2..6].try_into().unwrap()) as usize;

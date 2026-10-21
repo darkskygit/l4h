@@ -39,7 +39,8 @@ current status of each part.
   image for GCE (`tools/mkimage.sh`, `tools/gce-image.sh`; tested on N2 and
   C3 with `tests/gce-test.sh`). On a host with a display
   the UEFI image shows a read-only status dashboard.
-- **Attestation.** On a host with a TPM 2.0, `l4h-trustd` has the TPM
+- **Attestation.** On a host with a TPM 2.0 (FIFO, CRB, AMD fTPM through
+  the firmware's ACPI `_DSM`, or Pluton), `l4h-trustd` has the TPM
   quote its signing key along with the measured boot (the l4h application,
   then dom0's files). It signs CBOR (COSE) reports on each guest with that
   key, giving the guest's launch digest and the guest's own nonce. Guests
@@ -151,7 +152,7 @@ l4hctl console 1 --follow
 | `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon) is dropped: QEMU's memory use idle, with a guest and after destroying it |
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`) |
 | `tests/run-uefitest.sh` | UEFI/GRUB boot image with NVMe and virtio-net, as on GCE |
-| `tests/run-attesttest.sh` | attestation with swtpm: reports on dom0 and a guest, host evidence, AK credential |
+| `tests/run-attesttest.sh` | attestation with swtpm over CRB, FIFO and the AMD fTPM ACPI start method: reports on dom0 and a guest, host evidence, AK credential |
 | `tests/run-debian.sh`, `tests/run-workload.sh` | Debian + systemd, fio verify, parallel build, fsck (`tests/mkdebian.sh` first) |
 | `tests/run-bench.sh` | micro-benchmarks |
 | `tests/run-fuzz.sh` | hostile-guest virtqueue fuzzing of l4h-vmm |

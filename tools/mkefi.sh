@@ -15,6 +15,10 @@
 # Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
 # L4H_SERIAL_PORT (default 0x3f8) and L4H_FB_CONSOLE=1 set the defaults of
 # the serial_port and fb_console settings, which l4h.conf overrides.
+# L4H_ACPI_TABLES (.aml files) has GRUB give l4h these ACPI tables too, and
+# L4H_ACPI_EXCLUDE (a comma-separated list of signatures) none of the
+# firmware's with those: to work around broken firmware tables, or to test
+# TPM interfaces QEMU has none of (tests/run-attesttest.sh).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$1
@@ -22,6 +26,17 @@ rootserver=${2:-$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf}
 kernel=${3:-$root/build/sel4/bin/kernel.elf}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+acpi_cmd= acpi_files=()
+if [ -n "${L4H_ACPI_TABLES:-}" ]; then
+    acpi_cmd="acpi${L4H_ACPI_EXCLUDE:+ --exclude=$L4H_ACPI_EXCLUDE}"
+    i=0
+    for t in $L4H_ACPI_TABLES; do
+        acpi_cmd+=" (memdisk)/boot/acpi/$i.aml"
+        acpi_files+=("boot/acpi/$i.aml=$t")
+        i=$((i + 1))
+    done
+fi
 
 # l4h.conf is key=value lines, which GRUB sources as variable assignments:
 # it reads serial_port and fb_console itself.
@@ -47,6 +62,7 @@ if [ "\$fb_console" = 1 ]; then
 else
     terminal_output serial
 fi
+$acpi_cmd
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 (memdisk)/boot/l4h-root.elf
 if [ -n "\$esp" ]; then
@@ -60,9 +76,9 @@ CFG
 # seL4 loads only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$work/l4h-root.elf"
 grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
-    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo efi_gop video video_fb tpm" \
+    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
     "boot/kernel.elf=$kernel" \
-    "boot/l4h-root.elf=$work/l4h-root.elf"
+    "boot/l4h-root.elf=$work/l4h-root.elf" "${acpi_files[@]}"
 echo "$out: $(( $(stat -c %s "$out") >> 10 )) KiB"

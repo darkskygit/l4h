@@ -3,7 +3,9 @@
 # (swtpm), dom0 and a guest it starts get reports, tools/l4h-attest.py
 # verifies them against the host evidence and makes a credential for the
 # attestation key, which dom0 decrypts on a second boot (TIS this time,
-# CRB the first).
+# CRB the first).  A third boot has the TPM look like an AMD fTPM: the
+# ACPI start method, through a _DSM in AML (tests/ftpm), which trustd
+# runs for every command; GRUB swaps QEMU's TPM2 table for ours.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -25,18 +27,21 @@ CONF
 # A fresh TPM, so that the EK certificate is the one from this CA.
 rm -rf "$out/tpm"
 attest=$root/tools/l4h-attest.py
+# Extra QEMU arguments, and environment for tools/mkimage.sh, of the next
+# boot.
+qemu_extra=() image_env=()
 boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
     local name=$1 dev=$2
     shift 2
     "$root/tools/mkinitramfs.sh" "$out/run/$name.cpio.gz" "$root/tests/guest/init-attest" \
         "$l4h_ctl" "$out/run/vmlinux" "$out/run/vm.cpio.gz" "$@" >/dev/null
-    "$root/tools/mkimage.sh" -k "$out/run/vmlinux" -i "$out/run/$name.cpio.gz" -c "$out/run/l4h.conf" \
+    env "${image_env[@]}" "$root/tools/mkimage.sh" -k "$out/run/vmlinux" -i "$out/run/$name.cpio.gz" -c "$out/run/l4h.conf" \
         "$out/run/$name.raw" >/dev/null
     "$root/tools/swtpm.sh" "$out/tpm"
     local log=$out/$name.log  # build/*/*.log: kept by CI on failure
     timeout "${ATTESTTEST_TIMEOUT:-180}" "$root/tools/run-uefi.sh" "$out/run/$name.raw" \
         -chardev socket,id=tpm,path="$out/tpm/sock" -tpmdev emulator,id=tpm0,chardev=tpm \
-        -device "$dev",tpmdev=tpm0 </dev/null >"$log" 2>&1 &
+        -device "$dev",tpmdev=tpm0 "${qemu_extra[@]}" </dev/null >"$log" 2>&1 &
     local qemu=$!
     while kill -0 "$qemu" 2>/dev/null; do
         grep -aq "ATTEST: done\|l4h-root: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
@@ -45,11 +50,12 @@ boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
     wait "$qemu" 2>/dev/null || true
     grep -aE "ATTEST|trustd|TPM|panic" "$log" | cut -c1-160 || true
 }
-# The hex after "<what> " on a line of a log, as a file: the longest, as
-# the serial copy of a guest's console ("[vm1] ...") may be cut short.
+# The hex of the first line of a log that is "<what> <hex>" and nothing
+# else: prints from other cores (the serial copy of a guest's console,
+# "[vm1] ...") can interleave with a line, character by character.
 field() {  # field <log> <what> <out file>
-    grep -a "$2 " "$1" | sed "s/.*$2 \([0-9a-f]*\).*/\1/" | awk '{ print length, $0 }' | sort -n | tail -1 \
-        | python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().split()[-1]))" > "$3"
+    grep -a "^$2 [0-9a-f]*"$'\r'"*$" "$1" | head -1 | tr -d '\r' | sed "s/^$2 //" \
+        | python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip()))" > "$3"
     [ -s "$3" ] || { echo "no $2 in $1"; exit 1; }
 }
 fail() { echo "ATTESTTEST: FAIL: $*"; exit 1; }
@@ -96,4 +102,24 @@ python3 "$attest" verify "$out/run/dom0.report2" "$out/run/evidence2" --data "$n
     --ek-ca "$ca" > "$out/run/dom0.json2" || fail "second boot report"
 [ "$(json "$out/run/dom0.json2" 'd["host"]["key"]')" != "$(json "$out/run/dom0.json" 'd["host"]["key"]')" ] \
     || fail "same host key on both boots"
+echo "ATTESTTEST: TIS and the credential work"
+
+for t in tpm2 ssdt; do
+    iasl -p "$out/run/$t" "$root/tests/ftpm/$t.asl" >"$out/run/iasl.log" 2>&1 || fail "iasl $t.asl"
+done
+secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" || fail "make-credential"
+image_env=(L4H_ACPI_TABLES="$out/run/tpm2.aml $out/run/ssdt.aml" L4H_ACPI_EXCLUDE=TPM2)
+qemu_extra=(-chardev file,id=dbg,path="$out/run/debugcon" -device isa-debugcon,iobase=0x402,chardev=dbg)
+boot boot3 tpm-crb "$out/run/cred"
+log=$out/boot3.log
+grep -aq "TPM 2.0 (CRB, ACPI start)" "$log" || fail "not the ACPI start method"
+starts=$(tr -cd S < "$out/run/debugcon" | wc -c)
+[ "$starts" -ge 10 ] || fail "only $starts starts through _DSM"
+grep -aq "ATTEST: secret $secret" "$log" || fail "credential not activated (ACPI start)"
+field "$log" "ATTEST: dom0 report" "$out/run/dom0.report3"
+field "$log" "ATTEST: evidence" "$out/run/evidence3"
+python3 "$attest" verify "$out/run/dom0.report3" "$out/run/evidence3" --data "$nonce" --ak-name "$ak" \
+    --ek-ca "$ca" > "$out/run/dom0.json3" || fail "ACPI start report"
+echo "ATTESTTEST: ACPI start method: $starts commands through _DSM"
 echo "ATTESTTEST: PASS"

@@ -1,29 +1,37 @@
 //! The attestation service, l4h-trustd (DESIGN.md §9.2): finding the TPM,
-//! starting trustd with it, giving guests their capability to it, and the
-//! registry page through which trustd learns about guests.
+//! starting trustd with it, giving guests their capability to it, the
+//! registry page through which trustd learns about guests, and the
+//! hardware accesses trustd's AML interpreter asks root for.
+//!
+//! Only x86 finds a TPM (in ACPI) so far: on aarch64, trustd never starts.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
 use alloc::vec::Vec;
 
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
-use l4h_host::trust::{self, GuestRecord, TrustdConfig};
 use l4h_host as host;
+use l4h_host::trust::{self, GuestRecord, TrustdConfig};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
 use crate::mem::{Alloc, Arena, ObjCtx};
-use crate::vspace::map_frame;
+use crate::vspace::{FRAME_BP, map_frame};
 use crate::window::Window;
-use crate::{AsidPools, HostInfo};
+use crate::{AsidPools, Host, HostInfo, mr};
+
+pub use l4h_host::trust::AML_MAX;
 
 static TRUSTD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-trustd.elf"));
 
 const PAGE: usize = 4096;
-const TRUSTD_ID: u32 = 0x300;
+pub const TRUSTD_ID: u32 = 0x300;
 /// The registry page in the root task.
 const REGISTRY_VA: usize = 0x0000_7500_0000_0000;
+/// Mapping capabilities trustd's ranges and AML pages can need.
+const KEEP_BITS: usize = 12;
 
 pub struct Trustd {
     comp: Component,
@@ -31,85 +39,136 @@ pub struct Trustd {
     arena: Arena,
     registry: *mut GuestRecord,
     next_instance: u64,
+    /// Device memory carved for trustd's ranges and its AML's accesses.
+    #[cfg(target_arch = "x86_64")]
+    frames: crate::acpi::Frames,
 }
 
-/// The TPM, from its ACPI table: its interface, and the frames of its
-/// registers (and CRB buffers).
+/// Where the TPM is: its interface and the ranges trustd maps, with the
+/// registers and buffers in them as (range, offset in it).
+#[derive(Default)]
+struct Layout {
+    iface: u32,
+    start: u32,
+    ranges: Vec<(usize, usize)>,
+    loc: Option<(usize, usize)>,
+    ctrl: Option<(usize, usize)>,
+    cmd: Option<(usize, usize, usize)>,
+    rsp: Option<(usize, usize, usize)>,
+    start_bell: Option<(usize, usize)>,
+    reply_bell: Option<(usize, usize)>,
+}
+
+impl Layout {
+    /// A new range covering [paddr, paddr + len): (range, offset).
+    fn range(&mut self, paddr: usize, len: usize) -> Option<(usize, usize)> {
+        let base = paddr & !(PAGE - 1);
+        let size = (paddr + len).next_multiple_of(PAGE) - base;
+        if size > trust::RANGE_STRIDE || self.ranges.len() == trust::MAX_RANGES {
+            return None;
+        }
+        self.ranges.push((base, size));
+        Some((self.ranges.len() - 1, paddr - base))
+    }
+
+    fn va((r, off): (usize, usize)) -> u64 {
+        (trust::TPM_VA + r * trust::RANGE_STRIDE + off) as u64
+    }
+
+    fn config(&self, aml_size: usize) -> TrustdConfig {
+        let mut ranges = [trust::Range::default(); trust::MAX_RANGES];
+        for (r, &(paddr, size)) in self.ranges.iter().enumerate() {
+            ranges[r] = trust::Range { paddr: paddr as u64, size: size as u64 };
+        }
+        let va = |x: Option<(usize, usize)>| x.map_or(0, Self::va);
+        let buf = |x: Option<(usize, usize, usize)>| x.map_or((0, 0), |(r, off, n)| (Self::va((r, off)), n as u64));
+        let (cmd_va, cmd_size) = buf(self.cmd);
+        let (rsp_va, rsp_size) = buf(self.rsp);
+        TrustdConfig {
+            iface: self.iface,
+            start: self.start,
+            ranges,
+            loc_va: va(self.loc),
+            ctrl_va: va(self.ctrl),
+            cmd_va,
+            cmd_size,
+            rsp_va,
+            rsp_size,
+            start_va: va(self.start_bell),
+            reply_va: va(self.reply_bell),
+            aml_size: aml_size as u64,
+        }
+    }
+}
+
+/// The TPM, from its ACPI table (DESIGN.md §9.2).
 #[cfg(target_arch = "x86_64")]
-fn find_tpm(
-    bootinfo: &sel4::BootInfoPtr,
-    alloc: &mut Alloc,
-    devmem: &mut DevMem,
-    win: &mut Window,
-) -> Option<(TrustdConfig, Vec<cap::Granule>)> {
+fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Option<Layout> {
     use crate::blkd::DEVICE_ATTRS;
-    /// Most TPM register and buffer space we map.
-    const MAX_MMIO: usize = 0x1_0000;
     /// TPM 2.0 at its standard address (PC Client PTP), where the ACPI
     /// table gives none (FIFO interface).
     const TPM_DEFAULT_BASE: usize = 0xfed4_0000;
-    let mut phys = crate::acpi::Phys::new(alloc, devmem, win);
-    let Some(t) = crate::acpi::find(bootinfo, &mut phys, b"TPM2").filter(|t| t.len() >= 52) else {
+    let Some(t) = crate::acpi::find(bootinfo, phys, b"TPM2").filter(|t| t.len() >= 52) else {
         info!("l4h-root: no TPM, no attestation");
         return None;
     };
-    let control = u64::from_le_bytes(t[40..48].try_into().unwrap()) as usize;
-    let start = u32::from_le_bytes(t[48..52].try_into().unwrap());
-    let cfg = |iface, base: usize, size: usize| TrustdConfig {
-        iface,
-        reserved: 0,
-        mmio_paddr: base as u64,
-        mmio_size: size as u64,
-        cmd_off: 0,
-        cmd_size: 0,
-        rsp_off: 0,
-        rsp_size: 0,
+    let u64_at = |i: usize| u64::from_le_bytes(t[i..i + 8].try_into().unwrap()) as usize;
+    let control = u64_at(40);
+    let method = u32::from_le_bytes(t[48..52].try_into().unwrap());
+    let mut l = Layout::default();
+    let unusable = |why: &str| -> Option<Layout> {
+        sel4::debug_println!("l4h-root: TPM (start method {}) unusable, no attestation: {}", method, why);
+        None
     };
-    let cfg = match start {
+    if method == 6 {
         // FIFO ("TIS"): locality 0's registers.
-        6 => Some(cfg(trust::TPM_TIS, if control != 0 { control & !(PAGE - 1) } else { TPM_DEFAULT_BASE }, PAGE)),
-        // CRB with the start register: the control area is at 0x40 in
-        // locality 0's page; the buffers are where it says.
-        7 if control % PAGE == 0x40 => {
-            let regs = phys.read_attrs(control, 0x30, DEVICE_ATTRS)?;
-            let w32 = |i: usize| u32::from_le_bytes(regs[i..i + 4].try_into().unwrap()) as usize;
-            let cmd = w32(0x1c) | w32(0x20) << 32;
-            let (cmd_size, rsp_size) = (w32(0x18), w32(0x24));
-            let rsp = w32(0x28) | w32(0x2c) << 32;
-            let base = (control & !(PAGE - 1)).min(cmd).min(rsp) & !(PAGE - 1);
-            let end = (control + 0x30).max(cmd + cmd_size).max(rsp + rsp_size).next_multiple_of(PAGE);
-            if end - base > MAX_MMIO {
-                sel4::debug_println!("l4h-root: TPM CRB buffers too far from its registers, no attestation");
-                return None;
-            }
-            Some(TrustdConfig {
-                cmd_off: (cmd - base) as u64,
-                cmd_size: cmd_size as u64,
-                rsp_off: (rsp - base) as u64,
-                rsp_size: rsp_size as u64,
-                ..cfg(trust::TPM_CRB, base, end - base)
-            })
-        }
-        _ => {
-            sel4::debug_println!("l4h-root: TPM start method {} unsupported, no attestation", start);
-            None
-        }
-    }?;
-    let mmio: Option<Vec<_>> = (0..cfg.mmio_size as usize / PAGE).map(|p| phys.frame(cfg.mmio_paddr as usize + p * PAGE)).collect();
-    if mmio.is_none() {
-        sel4::debug_println!("l4h-root: TPM registers at {:#x} are not device memory, no attestation", cfg.mmio_paddr);
+        l.iface = trust::TPM_TIS;
+        l.loc = l.range(if control != 0 { control & !(PAGE - 1) } else { TPM_DEFAULT_BASE }, PAGE);
+        return Some(l);
     }
-    Some((cfg, mmio?))
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn find_tpm(
-    _bootinfo: &sel4::BootInfoPtr,
-    _alloc: &mut Alloc,
-    _devmem: &mut DevMem,
-    _win: &mut Window,
-) -> Option<(TrustdConfig, Vec<cap::Granule>)> {
-    None
+    l.iface = trust::TPM_CRB;
+    l.start = match method {
+        7 => trust::START_CRB,
+        2 | 8 => trust::START_ACPI,
+        13 => trust::START_PLUTON,
+        _ => return unusable("unsupported start method"),
+    };
+    if control == 0 {
+        return unusable("no control area");
+    }
+    // Only plain CRB has locality registers, the page the control area is
+    // at 0x40 of (as Linux tpm_crb).
+    if method == 7 {
+        if control % PAGE != 0x40 {
+            return unusable("control area not in the locality page");
+        }
+        l.loc = l.range(control & !(PAGE - 1), PAGE);
+    }
+    // The control area and the buffers it names.
+    let regs = phys.read_attrs(control, 0x30, DEVICE_ATTRS)?;
+    let w32 = |i: usize| u32::from_le_bytes(regs[i..i + 4].try_into().unwrap()) as usize;
+    let (cmd, cmd_size) = (w32(0x1c) | w32(0x20) << 32, w32(0x18));
+    let (rsp, rsp_size) = (w32(0x28) | w32(0x2c) << 32, w32(0x24));
+    if cmd == 0 || rsp == 0 || cmd_size < 10 || rsp_size < 10 {
+        return unusable("no command or response buffer");
+    }
+    l.ctrl = l.range(control, 0x30);
+    l.cmd = l.range(cmd, cmd_size).map(|(r, off)| (r, off, cmd_size));
+    l.rsp = l.range(rsp, rsp_size).map(|(r, off)| (r, off, rsp_size));
+    if method == 13 {
+        // Pluton: the doorbells' addresses (struct tpm2_crb_pluton in
+        // Linux) right after the table's fixed part, in place of the
+        // start method parameters.
+        if t.len() < 52 + 16 {
+            return unusable("no Pluton doorbells");
+        }
+        l.start_bell = l.range(u64_at(52), 4);
+        l.reply_bell = l.range(u64_at(60), 4);
+    }
+    if l.ctrl.is_none() || l.cmd.is_none() || l.rsp.is_none() || (method == 13 && l.reply_bell.is_none()) {
+        return unusable("registers or buffers too large");
+    }
+    Some(l)
 }
 
 /// Start trustd if the host has a TPM (and root was built with trustd).
@@ -124,26 +183,84 @@ pub fn spawn(
     if TRUSTD_ELF.is_empty() {
         return None;
     }
-    let (cfg, mmio) = find_tpm(bootinfo, alloc, devmem, win)?;
-    info!(
-        "l4h-root: TPM 2.0 ({}) at {:#x}",
-        if cfg.iface == trust::TPM_CRB { "CRB" } else { "FIFO" },
-        cfg.mmio_paddr
-    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut frames = crate::acpi::Frames::new();
+        let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
+        let l = find_tpm(bootinfo, &mut phys)?;
+        // The pages of each range.
+        let mut pages = Vec::new();
+        for &(base, size) in &l.ranges {
+            match (0..size / PAGE).map(|p| phys.frame(base + p * PAGE)).collect::<Option<Vec<_>>>() {
+                Some(f) => pages.push(f),
+                None => {
+                    sel4::debug_println!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
+                    return None;
+                }
+            }
+        }
+        let aml = match l.start {
+            trust::START_ACPI => match crate::acpi::aml_tables(bootinfo, &mut phys) {
+                Some(a) => a,
+                None => {
+                    sel4::debug_println!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
+                    return None;
+                }
+            },
+            _ => Vec::new(),
+        };
+        info!(
+            "l4h-root: TPM 2.0 ({}) at {:#x}",
+            match (l.iface, l.start) {
+                (trust::TPM_TIS, _) => "FIFO",
+                (_, trust::START_ACPI) => "CRB, ACPI start",
+                (_, trust::START_PLUTON) => "CRB, Pluton",
+                _ => "CRB",
+            },
+            l.ranges[0].0
+        );
+        let cfg = l.config(aml.len());
+        let (comp, arena, keep) = create(&cfg, alloc, win, asids, info, aml.len())?;
+        let mut keep_next = 0;
+        let mut keep_slot = || {
+            keep_next += 1;
+            keep.absolute_cptr_from_bits_with_depth(keep_next - 1, KEEP_BITS)
+        };
+        let mut arena = arena;
+        for (r, frames) in pages.iter().enumerate() {
+            for (p, f) in frames.iter().enumerate() {
+                let va = trust::TPM_VA + r * trust::RANGE_STRIDE + p * PAGE;
+                comp.map_copy(alloc, &mut arena, &abs_of(*f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep_slot());
+            }
+        }
+        // The ACPI tables, in fresh frames.
+        for (p, chunk) in aml.chunks(PAGE).enumerate() {
+            let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+            win.with_frame(&abs_of(f), |dst| unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len()) });
+            comp.map_copy(alloc, &mut arena, &abs_of(f), trust::AML_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep_slot());
+        }
+        finish(comp, arena, alloc, keep_slot(), frames)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (bootinfo, alloc, devmem, win, asids, info);
+        None
+    }
+}
 
-    let registry = alloc.object_cap::<cap_type::Granule>(crate::vspace::FRAME_BP);
-    alloc.global(|alloc| {
-        let copy = alloc.slots.alloc();
-        abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(copy).cap())
-            .copy(&abs_of(registry), CapRights::all())
-            .expect("registry copy");
-        let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(copy).cap();
-        map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, REGISTRY_VA, CapRights::read_write(), VmAttributes::DEFAULT);
-    });
-
-    let mut arena = alloc.arena(8 << 20).expect("trustd arena");
+/// Create trustd with configuration `cfg`, and the CNode that keeps its
+/// mapping capabilities.
+fn create(
+    cfg: &TrustdConfig,
+    alloc: &mut Alloc,
+    win: &mut Window,
+    asids: &mut AsidPools,
+    info: &HostInfo,
+    aml_size: usize,
+) -> Option<(Component, Arena, cap::CNode)> {
+    let mut arena = alloc.arena((8 << 20) + 2 * aml_size)?;
     let cfg_bytes = unsafe {
-        core::slice::from_raw_parts(&cfg as *const TrustdConfig as *const u8, core::mem::size_of::<TrustdConfig>())
+        core::slice::from_raw_parts(cfg as *const TrustdConfig as *const u8, core::mem::size_of::<TrustdConfig>())
     };
     let args = SpawnArgs {
         id: TRUSTD_ID,
@@ -159,14 +276,25 @@ pub fn spawn(
         service_ep: None,
     };
     let comp = component::create(&args, alloc, &mut arena, win, asids, info);
-    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: 5 });
-    let keep_slot = |i: usize| keep.absolute_cptr_from_bits_with_depth(i as u64, 5);
-    for (i, f) in mmio.iter().enumerate() {
-        comp.map_copy(alloc, &mut arena, &abs_of(*f), trust::TPM_VA + i * PAGE, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep_slot(i));
-    }
-    comp.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep_slot(31));
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
+    Some((comp, arena, keep))
+}
+
+/// Map the registry page and start trustd.
+#[cfg(target_arch = "x86_64")]
+fn finish(comp: Component, mut arena: Arena, alloc: &mut Alloc, keep: sel4::AbsoluteCPtr, frames: crate::acpi::Frames) -> Option<Trustd> {
+    let registry = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
+    alloc.global(|alloc| {
+        let copy = alloc.slots.alloc();
+        abs_of(sel4::init_thread::Slot::<cap_type::Null>::from_index(copy).cap())
+            .copy(&abs_of(registry), CapRights::all())
+            .expect("registry copy");
+        let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(copy).cap();
+        map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f, REGISTRY_VA, CapRights::read_write(), VmAttributes::DEFAULT);
+    });
+    comp.map_copy(alloc, &mut arena, &abs_of(registry), trust::REGISTRY_VA, CapRights::read_only(), VmAttributes::DEFAULT, keep);
     component::start(&comp);
-    Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord, next_instance: 1 })
+    Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord, next_instance: 1, frames })
 }
 
 impl Trustd {
@@ -205,4 +333,100 @@ impl Trustd {
     pub fn unregister(&mut self, id: usize) {
         unsafe { core::ptr::addr_of_mut!((*self.registry.wrapping_add(id)).instance).write_volatile(0) };
     }
+
+    /// trustd faulted (the firmware's AML can make it panic): stop it, and
+    /// delete its endpoint so that guests calling it get an error instead
+    /// of waiting for good.  New guests get no attestation.
+    fn fail(self) {
+        let _ = self.comp.tcb.tcb_suspend();
+        let ep = abs_of(self.comp.service_ep);
+        let _ = ep.revoke();
+        let _ = ep.delete();
+        sel4::debug_println!("l4h-root: trustd failed, no attestation");
+    }
+}
+
+/// A fault of trustd (component `id`)?  Then it is gone.
+pub fn fault(h: &mut Host, id: u32) {
+    if id == TRUSTD_ID {
+        if let Some(t) = h.trustd.take() {
+            t.fail();
+        }
+    }
+}
+
+/// ROOT_CALL_HW from trustd: one access the firmware's AML makes
+/// (trust::HW_*).  Returns what it read (all ones when refused).
+#[cfg(target_arch = "x86_64")]
+pub fn hw(h: &mut Host) -> u64 {
+    let (op, addr, off, width, value) = (mr(0), mr(1) as usize, mr(2) as usize, mr(3) as usize, mr(4));
+    let write = op & 1 != 0;
+    let r = match op {
+        trust::HW_MEM_READ | trust::HW_MEM_WRITE => {
+            let Some(t) = h.trustd.as_mut() else { return u64::MAX };
+            crate::acpi::Phys::new(&mut h.alloc, &mut h.devmem, &mut h.wins.a, &mut t.frames).access(addr, width, write, value)
+        }
+        trust::HW_IO_READ | trust::HW_IO_WRITE => io(&mut h.alloc, addr, width, write, value),
+        trust::HW_PCI_READ | trust::HW_PCI_WRITE => {
+            let (bus, dev, func) = ((addr >> 8) as u8, (addr >> 3 & 0x1f) as u8, (addr & 7) as u8);
+            let driven = h.ctrls.iter().map(|c| &c.pci).chain(h.netd.nics.iter().map(|n| &n.pci))
+                .any(|d| (d.bus, d.dev, d.func) == (bus, dev, func));
+            if addr >> 16 != 0 || off + width > 256 || off % width != 0 || !matches!(width, 1 | 2 | 4) || (write && driven) {
+                None
+            } else {
+                let (word, shift) = (off as u8 & !3, (off % 4) * 8);
+                let old = h.pci.read32(bus, dev, func, word);
+                let mask = if width == 4 { u32::MAX } else { ((1u32 << (8 * width)) - 1) << shift };
+                if write {
+                    h.pci.write32(bus, dev, func, word, (old & !mask) | ((value as u32) << shift & mask));
+                }
+                Some(((old & mask) >> shift) as u64)
+            }
+        }
+        _ => None,
+    };
+    r.unwrap_or_else(|| {
+        info!("l4h-root: trustd: refused hardware access {} at {:#x}+{:#x}", op, addr, off);
+        u64::MAX
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn hw(_h: &mut Host) -> u64 {
+    u64::MAX
+}
+
+/// An I/O port access, through a capability for just those ports: seL4
+/// refuses ports already given out (the serial port, PCI configuration,
+/// legacy NICs).
+#[cfg(target_arch = "x86_64")]
+fn io(alloc: &mut Alloc, port: usize, width: usize, write: bool, value: u64) -> Option<u64> {
+    if !matches!(width, 1 | 2 | 4) || port + width > 0x1_0000 {
+        return None;
+    }
+    let cap = crate::pci::io_ports(alloc, port as u16, width as u16)?;
+    let (c, p) = (cap.bits(), port as u16);
+    let r = sel4::with_ipc_buffer_mut(|ipc| {
+        let ipc = ipc.inner_mut();
+        match (width, write) {
+            (1, false) => ipc.seL4_X86_IOPort_In8(c, p).result as u64,
+            (2, false) => ipc.seL4_X86_IOPort_In16(c, p).result as u64,
+            (_, false) => ipc.seL4_X86_IOPort_In32(c, p).result as u64,
+            (1, true) => {
+                ipc.seL4_X86_IOPort_Out8(c, p as u64, value);
+                0
+            }
+            (2, true) => {
+                ipc.seL4_X86_IOPort_Out16(c, p as u64, value);
+                0
+            }
+            (_, true) => {
+                ipc.seL4_X86_IOPort_Out32(c, p as u64, value);
+                0
+            }
+        }
+    });
+    let _ = abs_of(cap).delete();
+    alloc.slots.free(cap.bits() as usize);
+    Some(r)
 }

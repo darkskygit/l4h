@@ -18,7 +18,7 @@ pkgs=(git ca-certificates curl xz-utils bzip2 wget sudo procps kmod
     flex bison bc libelf-dev libssl-dev cpio rsync ccache
     busybox-static e2fsprogs
     qemu-system-x86 qemu-utils ovmf grub-efi-amd64-bin mtools fdisk
-    swtpm swtpm-tools python3-cryptography)
+    swtpm swtpm-tools python3-cryptography acpica-tools)
 [[ $want == *" aarch64 "* ]] && pkgs+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-system-arm)
 [[ $want == *" debian "* ]] && pkgs+=(debootstrap debian-archive-keyring)
 export DEBIAN_FRONTEND=noninteractive

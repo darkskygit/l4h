@@ -85,6 +85,8 @@ pub const ROOT_CALL_LOG: u64 = 2;
 pub const ROOT_CALL_VMM_READY: u64 = 3;
 /// dom0's l4h-vmm: execute the control request in dom0's control page.
 pub const ROOT_CALL_CTL: u64 = 4;
+/// trustd: a hardware access for the firmware's AML (trust::HW_*).
+pub const ROOT_CALL_HW: u64 = 5;
 
 /// Badge bit set on every endpoint capability l4h-root gives to a guest
 /// for l4h-vmm's service endpoint; notification badges never have it.
