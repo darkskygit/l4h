@@ -1,0 +1,280 @@
+From 61647eb1a99f7d52a70499dff715fb3d390893f3 Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Tue, 20 Oct 2026 23:27:25 -0700
+Subject: [PATCH] x86: keep the extra boot modules for the root task
+
+seL4 loads the first boot module as the root task and ignores the others.
+Their memory is not even safe: the root task's image is moved down to the
+end of the kernel image, over wherever the boot loader put them, and what
+survives becomes ordinary Untypeds, which are cleared when retyped.
+
+Copy each later module (up to SEL4_X86_MAX_BOOT_MODULES) to page-aligned
+memory above the root task's loaded image, take that memory out of the
+available RAM so that it reaches the root task as device Untypeds, which
+retype into frames without clearing, and list the modules, with their
+loader-provided strings, in a new bootinfo chunk,
+SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES (seL4_X86_BootModules_t).  Both
+multiboot1 and multiboot2 are handled.
+---
+ include/arch/x86/arch/kernel/boot.h           |   3 +-
+ include/arch/x86/arch/kernel/boot_sys.h       |   1 +
+ .../x86/sel4/arch/bootinfo_types.h            |  19 ++++
+ libsel4/include/sel4/bootinfo_types.h         |   1 +
+ src/arch/x86/kernel/boot.c                    |  17 ++-
+ src/arch/x86/kernel/boot_sys.c                | 105 +++++++++++++++++-
+ 6 files changed, 143 insertions(+), 3 deletions(-)
+
+diff --git a/include/arch/x86/arch/kernel/boot.h b/include/arch/x86/arch/kernel/boot.h
+index a4f7fa057..e88efb4ee 100644
+--- a/include/arch/x86/arch/kernel/boot.h
++++ b/include/arch/x86/arch/kernel/boot.h
+@@ -38,7 +38,8 @@ bool_t init_sys_state(
+     acpi_rsdp_t      *acpi_rsdp,
+     seL4_X86_BootInfo_VBE *vbe,
+     seL4_X86_BootInfo_mmap_t *mb_mmap,
+-    seL4_X86_BootInfo_fb_t *fb_info
++    seL4_X86_BootInfo_fb_t *fb_info,
++    seL4_X86_BootModules_t *extra_mods
+ );
+ 
+ bool_t init_cpu(
+diff --git a/include/arch/x86/arch/kernel/boot_sys.h b/include/arch/x86/arch/kernel/boot_sys.h
+index dac433033..e674341f6 100644
+--- a/include/arch/x86/arch/kernel/boot_sys.h
++++ b/include/arch/x86/arch/kernel/boot_sys.h
+@@ -29,6 +29,7 @@ typedef struct boot_state {
+     seL4_X86_BootInfo_VBE vbe_info; /* Potential VBE information from multiboot */
+     seL4_X86_BootInfo_mmap_t mb_mmap_info; /* memory map information from multiboot */
+     seL4_X86_BootInfo_fb_t fb_info; /* framebuffer information as set by bootloader */
++    seL4_X86_BootModules_t extra_mods; /* boot modules after the first, kept for the root task */
+ } boot_state_t;
+ 
+ extern boot_state_t boot_state;
+diff --git a/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h b/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h
+index 0f43e2c61..313859d72 100644
+--- a/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h
++++ b/libsel4/arch_include/x86/sel4/arch/bootinfo_types.h
+@@ -130,3 +130,22 @@ typedef struct seL4_X86_BootInfo_mmap {
+ 
+ typedef struct multiboot2_fb seL4_X86_BootInfo_fb_t;
+ 
++/* SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES: the boot modules after the first
++ * (the root task's image).  The kernel moves each one to a page-aligned
++ * physical address and leaves that memory out of the RAM it manages, so it
++ * reaches the root task, unchanged, as device Untypeds.  The name is the
++ * module's string from the boot loader, truncated and NUL-terminated. */
++#define SEL4_X86_MAX_BOOT_MODULES 8
++#define SEL4_X86_BOOT_MODULE_NAME_LEN 64
++
++typedef struct seL4_X86_BootModule {
++    uint64_t paddr;
++    uint64_t size;
++    char name[SEL4_X86_BOOT_MODULE_NAME_LEN];
++} SEL4_PACKED seL4_X86_BootModule_t;
++
++typedef struct seL4_X86_BootModules {
++    seL4_BootInfoHeader header;
++    uint64_t count;
++    seL4_X86_BootModule_t modules[SEL4_X86_MAX_BOOT_MODULES];
++} SEL4_PACKED seL4_X86_BootModules_t;
+diff --git a/libsel4/include/sel4/bootinfo_types.h b/libsel4/include/sel4/bootinfo_types.h
+index 8f9d2db36..331de3147 100644
+--- a/libsel4/include/sel4/bootinfo_types.h
++++ b/libsel4/include/sel4/bootinfo_types.h
+@@ -107,6 +107,7 @@ typedef enum {
+     SEL4_BOOTINFO_HEADER_X86_TSC_FREQ       = 5, /* frequency is in MHz */
+     SEL4_BOOTINFO_HEADER_FDT                = 6, /* device tree */
+     SEL4_BOOTINFO_HEADER_AARCH64_ID_REGS    = 7, /* seL4_AArch64IdRegs */
++    SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES   = 8, /* seL4_X86_BootModules */
+     /* Add more IDs here, the two elements below must always be at the end. */
+     SEL4_BOOTINFO_HEADER_NUM,
+     SEL4_FORCE_LONG_ENUM(seL4_BootInfoID)
+diff --git a/src/arch/x86/kernel/boot.c b/src/arch/x86/kernel/boot.c
+index 93b320964..8f8216b1e 100644
+--- a/src/arch/x86/kernel/boot.c
++++ b/src/arch/x86/kernel/boot.c
+@@ -94,7 +94,8 @@ BOOT_CODE bool_t init_sys_state(
+     acpi_rsdp_t      *acpi_rsdp,
+     seL4_X86_BootInfo_VBE *vbe,
+     seL4_X86_BootInfo_mmap_t *mb_mmap,
+-    seL4_X86_BootInfo_fb_t *fb_info
++    seL4_X86_BootInfo_fb_t *fb_info,
++    seL4_X86_BootModules_t *extra_mods
+ )
+ {
+     cap_t         root_cnode_cap;
+@@ -138,6 +139,12 @@ BOOT_CODE bool_t init_sys_state(
+ 
+     // room for tsc frequency
+     extra_bi_size += sizeof(seL4_BootInfoHeader) + 4;
++    word_t extra_mods_size = 0;
++    if (extra_mods->count) {
++        extra_mods_size = sizeof(seL4_BootInfoHeader) + sizeof(extra_mods->count)
++                          + extra_mods->count * sizeof(extra_mods->modules[0]);
++        extra_bi_size += extra_mods_size;
++    }
+     word_t extra_bi_size_bits = calculate_extra_bi_size_bits(extra_bi_size);
+ 
+     /* The region of the initial thread is the user image + ipcbuf and boot info */
+@@ -226,6 +233,14 @@ BOOT_CODE bool_t init_sys_state(
+         extra_bi_offset += 4;
+     }
+ 
++    /* populate extra boot module block */
++    if (extra_mods_size) {
++        extra_mods->header.id = SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES;
++        extra_mods->header.len = extra_mods_size;
++        memcpy((void *)(rootserver.extra_bi + extra_bi_offset), extra_mods, extra_mods_size);
++        extra_bi_offset += extra_mods_size;
++    }
++
+ #ifdef CONFIG_KERNEL_MCS
+     /* set up sched control for each core */
+     init_sched_control(root_cnode_cap, CONFIG_MAX_NUM_NODES);
+diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
+index 666ce1911..2986c1556 100644
+--- a/src/arch/x86/kernel/boot_sys.c
++++ b/src/arch/x86/kernel/boot_sys.c
+@@ -76,6 +76,98 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
+     return 0;
+ }
+ 
++/* Note a boot module after the first, to hand to the root task. */
++BOOT_CODE static bool_t add_extra_module(paddr_t start, paddr_t end, char const *name)
++{
++    seL4_X86_BootModules_t *mods = &boot_state.extra_mods;
++    if (mods->count == SEL4_X86_MAX_BOOT_MODULES) {
++        printf("More than %d extra boot modules\n", (int)SEL4_X86_MAX_BOOT_MODULES);
++        return false;
++    }
++    seL4_X86_BootModule_t *m = &mods->modules[mods->count++];
++    m->paddr = start;
++    m->size = end - start;
++    word_t i = 0;
++    for (; name && name[i] && i < SEL4_X86_BOOT_MODULE_NAME_LEN - 1; i++) {
++        m->name[i] = name[i];
++    }
++    m->name[i] = '\0';
++    return true;
++}
++
++/* Take reg out of the available physical memory: it then becomes device
++ * memory, which the kernel neither uses nor clears. */
++BOOT_CODE static bool_t remove_mem_p_regs(p_region_t reg)
++{
++    mem_p_regs_t *regs = &boot_state.mem_p_regs;
++    for (word_t i = 0; i < regs->count; i++) {
++        p_region_t *r = &regs->list[i];
++        if (reg.end <= r->start || reg.start >= r->end) {
++            continue;
++        }
++        if (reg.start <= r->start && reg.end >= r->end) {
++            for (word_t j = i; j + 1 < regs->count; j++) {
++                regs->list[j] = regs->list[j + 1];
++            }
++            regs->count--;
++            i--;
++        } else if (reg.start <= r->start) {
++            r->start = reg.end;
++        } else if (reg.end >= r->end) {
++            r->end = reg.start;
++        } else {
++            if (regs->count == MAX_NUM_FREEMEM_REG) {
++                printf("Cannot split memory region 0x%lx-0x%lx, try increasing MAX_NUM_FREEMEM_REG\n",
++                       r->start, r->end);
++                return false;
++            }
++            for (word_t j = regs->count; j > i + 1; j--) {
++                regs->list[j] = regs->list[j - 1];
++            }
++            regs->list[i + 1] = (p_region_t) {
++                reg.end, r->end
++            };
++            r->end = reg.start;
++            regs->count++;
++            i++;
++        }
++    }
++    return true;
++}
++
++/* Move the extra boot modules to page-aligned memory at or above min_paddr,
++ * out of the way of the userland image, and keep that memory from the
++ * kernel.  The boot loader may have put them anywhere below the end of the
++ * last module, where the userland image is about to be moved. */
++BOOT_CODE static bool_t keep_extra_modules(paddr_t min_paddr)
++{
++    seL4_X86_BootModules_t *mods = &boot_state.extra_mods;
++    word_t total = 0;
++    for (word_t i = 0; i < mods->count; i++) {
++        total += ROUND_UP(mods->modules[i].size, PAGE_BITS);
++    }
++    if (total == 0) {
++        return true;
++    }
++    paddr_t start = find_load_paddr(min_paddr, total);
++    if (!start) {
++        printf("No memory for the extra boot modules (0x%lx bytes)\n", total);
++        return false;
++    }
++    paddr_t dst = start;
++    for (word_t i = 0; i < mods->count; i++) {
++        seL4_X86_BootModule_t *m = &mods->modules[i];
++        /* Above the end of all modules, so no source overlaps. */
++        memcpy((void *)dst, (void *)(word_t)m->paddr, m->size);
++        printf("  extra module '%s': 0x%lx bytes at 0x%lx\n", m->name, (word_t)m->size, dst);
++        m->paddr = dst;
++        dst += ROUND_UP(m->size, PAGE_BITS);
++    }
++    return remove_mem_p_regs((p_region_t) {
++        start, dst
++    });
++}
++
+ BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, paddr_t load_paddr)
+ {
+     v_region_t v_reg;
+@@ -180,7 +272,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
+             &boot_state.acpi_rsdp,
+             &boot_state.vbe_info,
+             &boot_state.mb_mmap_info,
+-            &boot_state.fb_info
++            &boot_state.fb_info,
++            &boot_state.extra_mods
+         )) {
+         return false;
+     }
+@@ -460,6 +553,10 @@ static BOOT_CODE bool_t try_boot_sys(void)
+         return false;
+     }
+ 
++    if (!keep_extra_modules(load_paddr)) {
++        return false;
++    }
++
+     /* calculate final location of userland images */
+     ui_p_regs.start = boot_state.ki_p_reg.end;
+     ui_p_regs.end = ui_p_regs.start + load_paddr - mods_end_paddr;
+@@ -549,6 +646,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
+         if (boot_state.mods_end_paddr < modules[i].end) {
+             boot_state.mods_end_paddr = modules[i].end;
+         }
++        if (i > 0 && !add_extra_module(modules[i].start, modules[i].end, (char const *)(word_t)modules[i].name)) {
++            return false;
++        }
+     }
+ 
+     /* initialize the memory. We track two kinds of memory regions. Physical memory
+@@ -660,6 +760,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+             if (boot_state.mods_end_paddr < module->end) {
+                 boot_state.mods_end_paddr = module->end;
+             }
++            if (mod_count > 1 && !add_extra_module(module->start, module->end, module->string)) {
++                return false;
++            }
+         } else if (tag->type == MULTIBOOT2_TAG_MEMORY) {
+             multiboot2_memory_t const *s = (multiboot2_memory_t *)(behind_tag + 8);
+             multiboot2_memory_t const *e = (multiboot2_memory_t *)((word_t)tag + tag->size);
+-- 
+2.47.3
+
