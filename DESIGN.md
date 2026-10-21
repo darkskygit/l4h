@@ -1355,6 +1355,14 @@ The chain has four links.
    both keys can do it. The verifier then pins the AK's name (`--ak-name`),
    which stays the same across boots.
 
+   **Rate limit.** ActivateCredential is the only request that uses the
+   TPM (about 80 ms each on a discrete Infineon TPM), and trustd answers
+   one request at a time, so a guest calling it in a loop would make the
+   others wait. Each guest instance may therefore make 5 at once, then
+   one a second (GCRA, one timestamp per guest id, reset when a new guest
+   takes the id). Beyond that trustd answers `-EAGAIN` without using the
+   TPM. Reports and evidence are not limited: they cost no TPM time.
+
 **TPM interfaces.** These follow Linux's `tpm_crb` and `tpm_tis`:
 
 - **FIFO (TIS)**, start method 6: locality 0's registers at 0xfed40000.
@@ -1407,7 +1415,9 @@ this does not cover:
   confidential VMs.
 - **ActivateCredential.** It creates the EK on first use. An RSA EK takes
   a hardware TPM seconds to create, and other guests' requests wait
-  behind it (their vCPUs do not).
+  behind it (their vCPUs do not). The rate limit bounds what each guest
+  asks, not the number of guests: with every guest at its limit, a
+  request can wait about one activation per guest.
 - **aarch64.** It has no TPM path yet.
 - **CRB buffer sizes.** trustd uses the buffer sizes from the CRB
   registers. Linux also clips them to the device's `_CRS` because some

@@ -30,6 +30,15 @@ if mkdir $r 2>/dev/null; then
 fi
 if [ -f /bin/cred ]; then
     echo "ATTEST: secret $(l4hctl attest activate /bin/cred)"
+    # The rate limit: the rest of the burst, refused, then one more after
+    # a pause.
+    n=1
+    while [ $n -lt 20 ] && l4hctl attest activate /bin/cred >/dev/null 2>/tmp/err; do
+        n=$((n + 1))
+    done
+    echo "ATTEST: limited after $n: $(cat /tmp/err)"
+    sleep 2
+    l4hctl attest activate /bin/cred >/dev/null && echo "ATTEST: activated after a pause"
 fi
 if [ -f /bin/vm.cpio.gz ]; then
     # Its console, printed once it is done: the host also copies it to the

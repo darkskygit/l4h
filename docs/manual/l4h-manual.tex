@@ -1254,7 +1254,9 @@ The guest prints \texttt{\$SECRET} back only if the TPM that holds the EK
 in the evidence's certificate also holds the AK. The verifier then pins the
 AK's name, as \cmd{verify} prints it, with \texttt{--ak-name}. The AK stays
 the same across reboots. \cmd{tpm2\_makecredential} writes the same
-credential format.
+credential format. Each guest may activate 5 credentials at once, then one
+a second; beyond that the call fails with \texttt{EAGAIN} (``Resource
+temporarily unavailable''): try again later.
 
 \paragraph{Choosing PCR values.} The host does not keep the firmware's event
 log yet, so the verifier compares PCR values with ones it trusts. Take them

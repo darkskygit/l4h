@@ -12,7 +12,9 @@
 //!
 //! Guests ask through their attestation device (l4h_attest_page): a kick,
 //! then the answer in the page and an event, so that a vCPU never waits
-//! for us.  We answer one request at a time.
+//! for us.  We answer one request at a time, and each guest's
+//! ActivateCredential calls are rate limited, so that no guest keeps the
+//! TPM busy for the others.
 
 #![no_std]
 #![no_main]
@@ -41,9 +43,16 @@ use sel4::cap_type;
 use crate::cbor::Enc;
 use crate::tpm::{Error, Tpm};
 
+const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
 const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
+
+/// ActivateCredential per guest: up to ACTIVATE_BURST at once, then one
+/// every ACTIVATE_INTERVAL_MS (about 80 ms of TPM time each, on a discrete
+/// TPM).  Beyond that, -EAGAIN without using the TPM.
+const ACTIVATE_BURST: u64 = 5;
+const ACTIVATE_INTERVAL_MS: u64 = 1000;
 
 /// PCRs in the quote: the static ones (SRTM), 0-15.
 const QUOTE_PCRS: u32 = 0xffff;
@@ -184,11 +193,30 @@ impl State {
 }
 
 /// Per guest id: the request last answered, and for which guest instance
-/// (a new guest with the same id starts again from seq 1).
+/// (a new guest with the same id starts again from seq 1, with a full
+/// ActivateCredential allowance).
 #[derive(Clone, Copy, Default)]
 struct Answered {
     instance: u64,
     seq: u32,
+    /// The activation rate limit (GCRA): when the allowance is next full,
+    /// in ticks; 0 when it is.
+    activate_tat: u64,
+}
+
+impl Answered {
+    /// May the guest use the TPM for an ActivateCredential now?  If so, it
+    /// is counted.
+    fn may_activate(&mut self, hz: u64) -> bool {
+        let interval = hz * ACTIVATE_INTERVAL_MS / 1000;
+        let now = host::ticks::now();
+        let tat = self.activate_tat.max(now);
+        if tat - now > interval * (ACTIVATE_BURST - 1) {
+            return false;
+        }
+        self.activate_tat = tat + interval;
+        true
+    }
 }
 
 fn page(id: usize) -> *mut abi::AttestPage {
@@ -196,7 +224,7 @@ fn page(id: usize) -> *mut abi::AttestPage {
 }
 
 /// The result of guest `id`'s request in its page, or -errno.
-fn execute(state: &mut Option<State>, id: usize, r: &GuestRecord) -> Result<Vec<u8>, i64> {
+fn execute(state: &mut Option<State>, id: usize, r: &GuestRecord, last: &mut Answered, hz: u64) -> Result<Vec<u8>, i64> {
     let p = page(id);
     let (op, in_len, blob_len) = unsafe {
         (addr_of!((*p).op).read_volatile(), addr_of!((*p).in_len).read_volatile() as usize, addr_of!((*p).blob_len).read_volatile() as usize)
@@ -215,11 +243,12 @@ fn execute(state: &mut Option<State>, id: usize, r: &GuestRecord) -> Result<Vec<
             Ok(s.report(id, r, &d))
         }
         abi::ATTEST_EVIDENCE => Ok(s.evidence.clone()),
-        abi::ATTEST_ACTIVATE if blob_len <= data.len() => s.activate(&data[..blob_len], &data[blob_len..]).map_err(|e| {
+        abi::ATTEST_ACTIVATE if blob_len > data.len() => Err(EINVAL),
+        abi::ATTEST_ACTIVATE if !last.may_activate(hz) => Err(EAGAIN),
+        abi::ATTEST_ACTIVATE => s.activate(&data[..blob_len], &data[blob_len..]).map_err(|e| {
             info!("l4h-trustd: guest {}: ActivateCredential failed: {}", id, e);
             EINVAL
         }),
-        abi::ATTEST_ACTIVATE => Err(EINVAL),
         _ => Err(ENOSYS),
     }
 }
@@ -252,7 +281,8 @@ fn answer(id: usize, seq: u32, result: Result<Vec<u8>, i64>) {
 
 fn main(info: &'static Info) -> ! {
     let cfg: &TrustdConfig = unsafe { info.config() };
-    let mut state = match init(cfg, info.header().tsc_hz) {
+    let hz = info.header().tsc_hz;
+    let mut state = match init(cfg, hz) {
         Ok(s) => Some(s),
         Err((what, e)) => {
             sel4::debug_println!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
@@ -273,12 +303,12 @@ fn main(info: &'static Info) -> ! {
             fence(Ordering::Acquire);
             let last = &mut answered[id];
             if last.instance != r.instance {
-                *last = Answered { instance: r.instance, seq: 0 };
+                *last = Answered { instance: r.instance, ..Default::default() };
             }
             if seq == last.seq {
                 continue;
             }
-            let result = execute(&mut state, id, &r);
+            let result = execute(&mut state, id, &r, last, hz);
             // Destroyed meanwhile (or replaced by another guest): nobody
             // waits for this answer.
             if record(id).is_none_or(|now| now.instance != r.instance) {

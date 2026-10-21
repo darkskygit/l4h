@@ -97,13 +97,16 @@ python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cr
 boot boot2 tpm-tis "$out/run/cred"
 log=$out/boot2.log
 grep -aq "ATTEST: secret $secret" "$log" || fail "credential not activated"
+# trustd's per-guest ActivateCredential limit: a burst of 5, then -EAGAIN.
+grep -aq "ATTEST: limited after 5: .*Resource temporarily unavailable" "$log" || fail "activation not rate limited"
+grep -aq "ATTEST: activated after a pause" "$log" || fail "activation not allowed again after a pause"
 field "$log" "ATTEST: dom0 report" "$out/run/dom0.report2"
 field "$log" "ATTEST: evidence" "$out/run/evidence2"
 python3 "$attest" verify "$out/run/dom0.report2" "$out/run/evidence2" --data "$nonce" --ak-name "$ak" \
     --ek-ca "$ca" > "$out/run/dom0.json2" || fail "second boot report"
 [ "$(json "$out/run/dom0.json2" 'd["host"]["key"]')" != "$(json "$out/run/dom0.json" 'd["host"]["key"]')" ] \
     || fail "same host key on both boots"
-echo "ATTESTTEST: TIS and the credential work"
+echo "ATTESTTEST: TIS, the credential and its rate limit work"
 
 for t in tpm2 ssdt; do
     iasl -p "$out/run/$t" "$root/tests/ftpm/$t.asl" >"$out/run/iasl.log" 2>&1 || fail "iasl $t.asl"
