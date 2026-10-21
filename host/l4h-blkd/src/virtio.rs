@@ -1,9 +1,8 @@
 //! virtio-blk PCI driver.  Each request is one indirect descriptor table:
 //! header, data pieces, status byte.
 
-use alloc::vec::Vec;
-
 use l4h_rt::host::blk::{self, BlkdConfig};
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_virtio::{DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Device, Dma, F_INDIRECT_DESC, F_VERSION_1, Mmio, Virtq};
 
 use crate::{DevInfo, Driver, MAX_PIECES, Seg};
@@ -27,8 +26,9 @@ struct Slot {
 
 pub struct VirtioBlk {
     vq: Virtq,
-    slots: Vec<Slot>,
-    free: Vec<u16>,
+    /// One per queue entry (the queue has at most blk::RING_SIZE).
+    slots: ArrayVec<Slot, { blk::RING_SIZE }>,
+    free: ArrayVec<u16, { blk::RING_SIZE }>,
     features: u64,
     capacity: u64,
     block_size: u32,
@@ -64,14 +64,16 @@ impl VirtioBlk {
         let vq = dev.setup_queue(&mut dma, 0, blk::RING_SIZE as u16, 0).expect("blkd: queue 0");
         let capacity = dev.device.r64(0);
         let block_size = if features & VIRTIO_BLK_F_BLK_SIZE != 0 { dev.device.r32(20).max(512) } else { 512 };
-        let mut slots = Vec::new();
-        for _ in 0..vq.num {
+        let (mut slots, mut free) = (ArrayVec::new(), ArrayVec::new());
+        for s in 0..vq.num {
             let (table_va, table_pa) = dma.alloc(SLOT_TABLE, 16);
             let (hdr_va, hdr_pa) = dma.alloc(32, 32);
-            slots.push(Slot { tag: 0, busy: false, table_va, table_pa, hdr_va, hdr_pa });
+            // setup_queue asked for at most blk::RING_SIZE entries.
+            let _ = slots.push(Slot { tag: 0, busy: false, table_va, table_pa, hdr_va, hdr_pa });
+            let _ = free.push(vq.num - 1 - s);
         }
         dev.driver_ok();
-        VirtioBlk { free: (0..vq.num).rev().collect(), vq, slots, features, capacity, block_size }
+        VirtioBlk { free, vq, slots, features, capacity, block_size }
     }
 }
 
@@ -141,7 +143,8 @@ impl Driver for VirtioBlk {
                 _ => blk::STATUS_IOERR,
             };
             done(slot.tag, status);
-            self.free.push(id as u16);
+            // Only busy slots come back, so there is room.
+            let _ = self.free.push(id as u16);
         }
     }
 }

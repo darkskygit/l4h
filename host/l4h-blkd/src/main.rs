@@ -9,19 +9,17 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
 mod nvme;
 mod scsi;
 mod virtio;
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host;
 use l4h_rt::host::blk::{self, BlkdConfig, Channel, Pool};
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
@@ -36,6 +34,10 @@ pub struct Seg {
 /// Pieces of one request: one per guest segment (the pool is physically
 /// contiguous).
 pub const MAX_PIECES: usize = blk::MAX_SEGS;
+
+/// Requests in flight on the controller: as many as the deepest queue
+/// (NVMe's) holds commands, which is more than the others.
+const MAX_INFLIGHT: usize = 256;
 
 #[derive(Clone, Copy)]
 pub struct DevInfo {
@@ -65,6 +67,35 @@ pub trait Driver {
     fn reap(&mut self, done: &mut dyn FnMut(u64, u32));
 }
 
+/// The controller's driver.
+enum Drv {
+    Nvme(nvme::Nvme),
+    Scsi(scsi::VirtioScsi),
+    Virtio(virtio::VirtioBlk),
+}
+
+impl Deref for Drv {
+    type Target = dyn Driver;
+
+    fn deref(&self) -> &(dyn Driver + 'static) {
+        match self {
+            Drv::Nvme(d) => d,
+            Drv::Scsi(d) => d,
+            Drv::Virtio(d) => d,
+        }
+    }
+}
+
+impl DerefMut for Drv {
+    fn deref_mut(&mut self) -> &mut (dyn Driver + 'static) {
+        match self {
+            Drv::Nvme(d) => d,
+            Drv::Scsi(d) => d,
+            Drv::Virtio(d) => d,
+        }
+    }
+}
+
 struct Client {
     chan: *mut Channel,
     unit: usize,
@@ -81,16 +112,19 @@ struct Pending {
     id: u64,
 }
 
+/// Client slots, in .bss: too large for the stack.
+static mut CLIENTS: [Option<Client>; blk::MAX_CLIENTS] = [const { None }; blk::MAX_CLIENTS];
+
 struct Blkd {
-    clients: Vec<Option<Client>>,
+    clients: &'static mut [Option<Client>; blk::MAX_CLIENTS],
     /// Indices of the attached clients, in attach order: the submit loop
     /// visits only these.
-    active: Vec<usize>,
+    active: ArrayVec<usize, { blk::MAX_CLIENTS }>,
     // Tags are allocated here, never taken from a client. Slots are not
     // reusable until the hardware has completed every command of a request.
-    pending: Vec<Option<Pending>>,
-    drv: Box<dyn Driver>,
-    dev: Vec<DevInfo>,
+    pending: [Option<Pending>; MAX_INFLIGHT],
+    drv: Drv,
+    dev: ArrayVec<DevInfo, { blk::MAX_UNITS }>,
     next: usize,
     ticks_per_sec: u64,
 }
@@ -107,12 +141,13 @@ impl Client {
         self.done.signal();
     }
 
-    fn prepare(&self, req: &blk::Req, block_size: u32, pieces: &mut Vec<Seg>) -> Result<u64, u32> {
+    fn prepare(&self, req: &blk::Req, block_size: u32, pieces: &mut ArrayVec<Seg, MAX_PIECES>) -> Result<u64, u32> {
         let sector = self.window.check_request(req, self.pool, block_size, self.read_only)?;
         pieces.clear();
         if req.op != blk::OP_FLUSH {
+            // check_request allows at most MAX_SEGS segments.
             for s in &req.segs[..req.nr_segs as usize] {
-                pieces.push(Seg { pa: self.pool.translate(s.gpa, s.len as u64).unwrap(), len: s.len });
+                let _ = pieces.push(Seg { pa: self.pool.translate(s.gpa, s.len as u64).unwrap(), len: s.len });
             }
         }
         Ok(sector)
@@ -121,28 +156,27 @@ impl Client {
 
 impl Blkd {
     fn reap(&mut self) -> bool {
-        let mut done = Vec::new();
-        self.drv.reap(&mut |tag, status| done.push((tag, status)));
+        let Blkd { drv, pending, clients, .. } = self;
         let mut provision = false;
-        for (tag, status) in done {
+        drv.reap(&mut |tag, status| {
             if tag == u64::MAX {
                 provision = true;
                 // Provisioning is serialized by l4h-root.
                 set_mr(1, status as u64);
-                continue;
+                return;
             }
-            if let Some(p) = self.pending.get_mut(tag as usize).and_then(|p| p.take()) {
-                if let Some(c) = self.clients[p.client].as_mut() {
+            if let Some(p) = pending.get_mut(tag as usize).and_then(|p| p.take()) {
+                if let Some(c) = clients[p.client].as_mut() {
                     c.outstanding -= 1;
                     c.respond(p.id, status);
                 }
             }
-        }
+        });
         provision
     }
 
     fn submit(&mut self) {
-        let mut pieces = Vec::with_capacity(MAX_PIECES);
+        let mut pieces = ArrayVec::new();
         let mut started = false;
         // Bounded work per client and round-robin starting point. A busy
         // ring cannot occupy every hardware slot before others get a turn.
@@ -240,19 +274,24 @@ fn set_mr(i: usize, v: u64) { sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] 
 fn main(info: &'static Info) -> ! {
     let cfg: &BlkdConfig = unsafe { info.config() };
     let id = info.header().id;
-    let drv: Box<dyn Driver> = match cfg.kind {
-        blk::BLKD_NVME => Box::new(nvme::Nvme::new(id, cfg)),
-        blk::BLKD_VIRTIO_SCSI => Box::new(scsi::VirtioScsi::new(id, cfg)),
-        _ => Box::new(virtio::VirtioBlk::new(id, cfg)),
+    let drv = match cfg.kind {
+        blk::BLKD_NVME => Drv::Nvme(nvme::Nvme::new(id, cfg)),
+        blk::BLKD_VIRTIO_SCSI => Drv::Scsi(scsi::VirtioScsi::new(id, cfg)),
+        _ => Drv::Virtio(virtio::VirtioBlk::new(id, cfg)),
     };
-    let dev: Vec<DevInfo> = (0..drv.units()).map(|u| drv.info(u)).collect();
+    // A driver has at most blk::MAX_UNITS units.
+    let mut dev = ArrayVec::new();
+    for u in 0..drv.units() {
+        let _ = dev.push(drv.info(u));
+    }
     for (u, d) in dev.iter().enumerate() {
         l4h_rt::info!("blkd {:#x}: shared controller, unit {}: {} sectors, {}-byte blocks", id, u, d.capacity, d.block_size);
     }
     let mut b = Blkd {
-        clients: (0..blk::MAX_CLIENTS).map(|_| None).collect(),
-        active: Vec::with_capacity(blk::MAX_CLIENTS),
-        pending: alloc::vec![None; 256],
+        // The only reference to CLIENTS.
+        clients: unsafe { &mut *addr_of_mut!(CLIENTS) },
+        active: ArrayVec::new(),
+        pending: [None; MAX_INFLIGHT],
         drv, dev, next: 0, ticks_per_sec: info.header().tsc_hz,
     };
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
@@ -295,7 +334,8 @@ fn main(info: &'static Info) -> ! {
                             .any(|c| c.unit == unit && window.conflicts(read_only, c.window, c.read_only)) => {
                             b.clients[i] = Some(Client { chan, unit, pool, window, read_only,
                                 done: cap::<cap_type::Notification>(blk::BLKD_SLOT_CLIENT_DONE + i as u64), outstanding: 0 });
-                            b.active.push(i);
+                            // Not attached yet, so not in active.
+                            let _ = b.active.push(i);
                             unsafe {
                                 addr_of_mut!((*chan).read_only).write_volatile(read_only as u32);
                                 addr_of_mut!((*chan).block_size).write_volatile(dev.block_size);
@@ -321,4 +361,4 @@ fn main(info: &'static Info) -> ! {
     }
 }
 
-l4h_rt::component!(main);
+l4h_rt::component!(main, no_heap);

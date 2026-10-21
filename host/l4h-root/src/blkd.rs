@@ -3,6 +3,9 @@
 //! presents it as virtio-l4h.
 
 use alloc::vec::Vec;
+use core::ops::Range;
+use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use sel4::{CapRights, VmAttributes, cap, cap_type};
 
@@ -12,7 +15,7 @@ use l4h_host::{self as host, blk};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
-use crate::mem::{Alloc, Arena, Dest};
+use crate::mem::{Alloc, Arena, Dest, Slot};
 use crate::pci::{self, Pci};
 use crate::vmm;
 use crate::vspace::FRAME_BP;
@@ -53,8 +56,9 @@ pub struct Controller {
     vector: u64,
     /// Frames of the BARs the driver uses, carved once.
     bars: Vec<(u8, Vec<cap::Granule>)>,
-    /// blkd's client channels, shared by the controller's disks.
-    pub clients: Vec<Option<Attachment>>,
+    /// blkd's client channels, shared by the controller's disks: this
+    /// controller's row of CLIENTS.
+    pub clients: &'static mut [Option<Attachment>; blk::MAX_CLIENTS],
     /// Reset, provisioning or drain failed: the device may still access
     /// its DMA targets, so it is quarantined until host reboot.
     pub failed: bool,
@@ -82,7 +86,15 @@ impl Disk {
     }
 }
 
+/// The client slots of every controller, in .bss: one controller's are
+/// 20 KiB, too much to pass by value on root's 64 KiB stack.  Controllers
+/// live until reboot, so each takes the next row, CLIENT_ROWS of them.
+static mut CLIENTS: [[Option<Attachment>; blk::MAX_CLIENTS]; pci::MAX_DISK_CTRLS] =
+    [const { [const { None }; blk::MAX_CLIENTS] }; pci::MAX_DISK_CTRLS];
+static CLIENT_ROWS: AtomicUsize = AtomicUsize::new(0);
+
 impl Controller {
+    /// At most pci::MAX_DISK_CTRLS controllers can be made.
     pub fn new(pci: pci::Device, vector: u64) -> Self {
         let kind = if is_nvme(&pci) {
             blk::BLKD_NVME
@@ -91,8 +103,11 @@ impl Controller {
         } else {
             blk::BLKD_VIRTIO
         };
-        Controller { pci, kind, vector, bars: Vec::new(), clients: (0..blk::MAX_CLIENTS).map(|_| None).collect(),
-            failed: false, io: None, driver: None }
+        let row = CLIENT_ROWS.fetch_add(1, Ordering::Relaxed);
+        assert!(row < pci::MAX_DISK_CTRLS, "more than {} disk controllers", pci::MAX_DISK_CTRLS);
+        // Each row is handed out once, so this is its only reference.
+        let clients = unsafe { &mut (*addr_of_mut!(CLIENTS))[row] };
+        Controller { pci, kind, vector, bars: Vec::new(), clients, failed: false, io: None, driver: None }
     }
 
     pub fn started(&self) -> bool {
@@ -187,7 +202,9 @@ pub struct Attachment {
 struct Blkd {
     comp: Component,
     arena: Arena,
-    staging: Vec<cap::Granule>,
+    /// Slots of the frames of the staging buffer (the end of the DMA
+    /// memory).
+    staging: Range<Slot>,
 }
 
 fn bdf(d: &pci::Device) -> u32 {
@@ -216,14 +233,15 @@ pub fn start(
         va: (bar_va(msix.table_bar) + msix.table_offset as usize) as u64,
         len: msix.table_size as u64 * 16,
     };
-    let (regions, mut bar_list) = if disk.kind == blk::BLKD_NVME {
-        (None, alloc::vec![0u8])
+    // The BARs to map, bit b for BAR b.
+    let (regions, bars) = if disk.kind == blk::BLKD_NVME {
+        (None, 1u8)
     } else if legacy_io.is_some() {
-        (None, Vec::new())
+        (None, 0)
     } else {
-        (Some(virtio_regions(d, bar_va)), virtio_bars(d))
+        (Some(virtio_regions(d, bar_va)), virtio_bar_mask(d))
     };
-    bar_list.push(msix.table_bar);
+    let bars = bars | 1 << msix.table_bar;
 
     let mut arena = alloc.arena(8 << 20).expect("blkd arena");
 
@@ -238,7 +256,8 @@ pub fn start(
         .expect("blkd DMA frames");
     arena.own(dma_slot, dma_paddr, DMA_BITS);
 
-    let mut cfg: alloc::boxed::Box<blk::BlkdConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
+    // Plain integers: all zeroes is a valid (empty) configuration.
+    let mut cfg: blk::BlkdConfig = unsafe { core::mem::zeroed() };
     cfg.kind = disk.kind;
     cfg.legacy_io = legacy_io.unwrap_or(0) as u32;
     cfg.bar0 = blk::PciRegion { va: bar_va(0) as u64, len: d.bars[0].size };
@@ -259,7 +278,7 @@ pub fn start(
     // Keep a 1 MiB scratch buffer beyond the driver's queue allocator.
     cfg.dma_size = (1 << DMA_BITS) - blk::STAGING_SIZE as u64;
     let cfg_bytes = unsafe {
-        core::slice::from_raw_parts(&*cfg as *const blk::BlkdConfig as *const u8, core::mem::size_of::<blk::BlkdConfig>())
+        core::slice::from_raw_parts(&cfg as *const blk::BlkdConfig as *const u8, core::mem::size_of::<blk::BlkdConfig>())
     };
 
     let args = SpawnArgs {
@@ -287,7 +306,7 @@ pub fn start(
     };
 
     // ---- Device BARs (uncached).
-    map_bars(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, &bar_list, bar_va, &mut keep_slot);
+    map_bar_mask(&comp, alloc, &mut arena, devmem, d, &mut disk.bars, bars, bar_va, &mut keep_slot);
     for i in 0..n_dma {
         let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap();
         comp.map_copy(alloc, &mut arena, &abs_of(f), host::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -309,8 +328,7 @@ pub fn start(
     pci.enable_msix(d);
     component::start(&comp);
 
-    let staging = (n_dma - blk::STAGING_SIZE / PAGE..n_dma)
-        .map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(dma_frames.start + i).cap()).collect();
+    let staging = dma_frames.start + n_dma - blk::STAGING_SIZE / PAGE..dma_frames.end;
     disk.driver = Some(Blkd { comp, arena, staging });
 }
 
@@ -392,8 +410,9 @@ pub fn write(ctrl: &mut Controller, index: usize, dk: &Disk, sector: u64, len: u
     }
     let disk = ctrl;
     let driver = disk.driver.as_ref().unwrap();
-    for (i, f) in driver.staging.iter().take(len.div_ceil(PAGE)).enumerate() {
-        win.with_frame(&abs_of(*f), |p| unsafe {
+    for (i, s) in driver.staging.clone().take(len.div_ceil(PAGE)).enumerate() {
+        let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
+        win.with_frame(&abs_of(f), |p| unsafe {
             if let Some(from) = from { core::ptr::copy_nonoverlapping(from.add(i * PAGE), p, PAGE); }
             else { core::ptr::write_bytes(p, 0, PAGE); }
         });
@@ -537,15 +556,19 @@ pub fn virtio_regions(d: &pci::Device, bar_va: impl Fn(u8) -> usize) -> VirtioRe
 
 /// BARs holding a virtio device's common, notify, ISR and device
 /// structures (types 1-4; PCI config access and shared memory are unused)
-/// and its MSI-X table.
-pub fn virtio_bars(d: &pci::Device) -> Vec<u8> {
-    let mut bars: Vec<u8> = d.virtio_caps.iter().filter(|c| (1..=4).contains(&c.cfg_type)).map(|c| c.bar).collect();
-    bars.extend(d.msix.map(|m| m.table_bar));
-    bars
+/// and its MSI-X table, bit b for BAR b.
+pub fn virtio_bar_mask(d: &pci::Device) -> u8 {
+    let caps = d.virtio_caps.iter().filter(|c| (1..=4).contains(&c.cfg_type));
+    caps.map(|c| c.bar).chain(d.msix.map(|m| m.table_bar)).fold(0, |m, b| m | 1 << b)
 }
 
-/// Map the BARs holding `d`'s virtio structures and MSI-X table into
-/// `comp`, uncached.  BAR frames are carved once and cached in `cache`.
+/// virtio_bar_mask as a list, for netd.rs until it takes the mask.
+pub fn virtio_bars(d: &pci::Device) -> Vec<u8> {
+    let m = virtio_bar_mask(d);
+    (0..6).filter(|b| m & 1 << b != 0).collect()
+}
+
+/// map_bar_mask for a list of BARs, for netd.rs until it takes the mask.
 #[allow(clippy::too_many_arguments)]
 pub fn map_bars(
     comp: &Component,
@@ -558,10 +581,25 @@ pub fn map_bars(
     bar_va: impl Fn(u8) -> usize,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
 ) {
-    let mut bars = bars.to_vec();
-    bars.sort();
-    bars.dedup();
-    for b in bars {
+    let mask = bars.iter().fold(0, |m, b| m | 1 << b);
+    map_bar_mask(comp, alloc, arena, devmem, d, cache, mask, bar_va, keep)
+}
+
+/// Map BARs `bars` (bit b for BAR b) of `d` into `comp`, uncached.  BAR
+/// frames are carved once and cached in `cache`.
+#[allow(clippy::too_many_arguments)]
+pub fn map_bar_mask(
+    comp: &Component,
+    alloc: &mut Alloc,
+    arena: &mut Arena,
+    devmem: &mut DevMem,
+    d: &pci::Device,
+    cache: &mut Vec<(u8, Vec<cap::Granule>)>,
+    bars: u8,
+    bar_va: impl Fn(u8) -> usize,
+    keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
+) {
+    for b in (0..6).filter(|b| bars & 1 << b != 0) {
         let frames = bar_frames(alloc, devmem, d, cache, b);
         for (i, f) in frames.iter().enumerate() {
             comp.map_copy(

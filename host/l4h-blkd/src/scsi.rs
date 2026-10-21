@@ -9,9 +9,8 @@
 //! READ/WRITE commands when it exceeds the device's segment or transfer
 //! limits.  Unit attentions and busy conditions are retried.
 
-use alloc::vec::Vec;
-
 use l4h_rt::host::blk::{self, BlkdConfig};
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::ioport::Ports;
 use l4h_rt::sel4;
 use l4h_virtio::{
@@ -169,11 +168,12 @@ pub struct VirtioScsi {
     t: Transport,
     vq: Virtq,
     indirect: bool,
-    slots: Vec<Slot>,
-    free: Vec<u16>,
-    reqs: Vec<Request>,
-    free_reqs: Vec<u16>,
-    units: Vec<Unit>,
+    slots: ArrayVec<Slot, MAX_SLOTS>,
+    free: ArrayVec<u16, MAX_SLOTS>,
+    /// By request id, below the number of slots.
+    reqs: [Request; MAX_SLOTS],
+    free_reqs: ArrayVec<u16, MAX_SLOTS>,
+    units: ArrayVec<Unit, { blk::MAX_UNITS }>,
     seg_max: usize,
     max_sectors: u64,
     max_cmds: usize,
@@ -259,12 +259,14 @@ impl VirtioScsi {
         // Without indirect descriptors, each slot owns MAX_DESCS ring entries.
         let nslots = if indirect { vq.num as usize } else { vq.num as usize / MAX_DESCS }.min(MAX_SLOTS);
         assert!(nslots > 0, "blkd {:#x}: virtio-scsi queue of {} entries too small", id, vq.num);
-        let mut slots = Vec::new();
+        let (mut slots, mut free, mut free_reqs) = (ArrayVec::new(), ArrayVec::new(), ArrayVec::new());
         for s in 0..nslots {
             let (table_va, table_pa) = if indirect { dma.alloc(MAX_DESCS * 16, 16) } else { (0, 0) };
             let (hdr_va, hdr_pa) = dma.alloc(HDR_BYTES + RESP_BYTES, 64);
             let head = if indirect { s } else { s * MAX_DESCS } as u16;
-            slots.push(Slot { req: 0, busy: false, retries: 0, head, table_va, table_pa, hdr_va, hdr_pa });
+            let _ = slots.push(Slot { req: 0, busy: false, retries: 0, head, table_va, table_pa, hdr_va, hdr_pa });
+            let _ = free.push((nslots - 1 - s) as u16);
+            let _ = free_reqs.push((nslots - 1 - s) as u16);
         }
         match &t {
             Transport::Modern(d) => d.driver_ok(),
@@ -274,11 +276,11 @@ impl VirtioScsi {
         let mut s = VirtioScsi {
             id, t, vq, indirect,
             io_errors: l4h_rt::ErrorLimit::new(),
-            free: (0..nslots as u16).rev().collect(),
+            free,
             slots,
-            reqs: alloc::vec![Request::default(); nslots],
-            free_reqs: (0..nslots as u16).rev().collect(),
-            units: Vec::new(),
+            reqs: [Request::default(); MAX_SLOTS],
+            free_reqs,
+            units: ArrayVec::new(),
             seg_max,
             max_sectors,
             max_cmds: MAX_PIECES.min(nslots),
@@ -306,7 +308,8 @@ impl VirtioScsi {
             if o.response != S_OK {
                 continue;
             }
-            let mut luns = Vec::new();
+            // At most (4096 - 8) / 8 entries fit the REPORT LUNS data.
+            let mut luns = ArrayVec::<u16, { (4096 - 8) / 8 }>::new();
             let mut cdb = [0u8; 12];
             cdb[0] = REPORT_LUNS;
             cdb[6..10].copy_from_slice(&4096u32.to_be_bytes());
@@ -320,23 +323,25 @@ impl VirtioScsi {
                         continue;
                     }
                     match byte(e) >> 6 {
-                        0 if byte(e) == 0 => luns.push(byte(e + 1) as u16),
-                        1 => luns.push(((byte(e) as u16 & 0x3f) << 8) | byte(e + 1) as u16),
+                        0 if byte(e) == 0 => { let _ = luns.push(byte(e + 1) as u16); }
+                        1 => { let _ = luns.push(((byte(e) as u16 & 0x3f) << 8) | byte(e + 1) as u16); }
                         _ => {}
                     }
                 }
+                // Sorted, then without the (now adjacent) duplicates.
                 luns.sort_unstable();
-                luns.dedup();
+                let mut prev = None;
+                luns.retain(|&l| prev.replace(l) != Some(l));
             } else {
-                luns.push(0);
+                let _ = luns.push(0);
             }
-            for lun in luns {
+            for &lun in luns.iter() {
                 if self.units.len() == blk::MAX_UNITS {
                     sel4::debug_println!("blkd {:#x}: more than {} disks, ignoring target {} LUN {}", self.id, blk::MAX_UNITS, target, lun);
                     return;
                 }
                 if let Some(u) = self.probe(target, lun, buf) {
-                    self.units.push(u);
+                    let _ = self.units.push(u);
                 }
             }
         }
@@ -423,7 +428,7 @@ impl VirtioScsi {
         let vq = &mut self.vq;
         spin_until("probe command", || matches!(vq.pop_used(), Some((id, _)) if id == head));
         self.slots[s as usize].busy = false;
-        self.free.push(s);
+        let _ = self.free.push(s);
         self.outcome(s)
     }
 
@@ -600,8 +605,8 @@ impl Driver for VirtioScsi {
         })();
         if let Err(e) = result {
             // Nothing was submitted: give the slots back.
-            self.free.extend_from_slice(&issued[..n_issued]);
-            self.free_reqs.push(r);
+            let _ = self.free.extend_from_slice(&issued[..n_issued]);
+            let _ = self.free_reqs.push(r);
             return Err(e);
         }
         self.reqs[r as usize] = Request { tag, pending: n_issued as u16, status: blk::STATUS_OK };
@@ -655,7 +660,7 @@ impl Driver for VirtioScsi {
                     self.id, o.response, o.status, o.sense_key, o.residual
                 );
             }
-            self.free.push(s as u16);
+            let _ = self.free.push(s as u16);
             let req = &mut self.reqs[r];
             if req.status == blk::STATUS_OK {
                 req.status = status;
@@ -663,7 +668,7 @@ impl Driver for VirtioScsi {
             req.pending -= 1;
             if req.pending == 0 {
                 done(req.tag, req.status);
-                self.free_reqs.push(r as u16);
+                let _ = self.free_reqs.push(r as u16);
             }
         }
         if resubmitted {

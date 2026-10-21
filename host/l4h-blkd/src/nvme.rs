@@ -4,10 +4,10 @@
 //! long as they fit one PRP list (every piece but the first starts on a
 //! page, every piece but the last ends on one).
 
-use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use l4h_rt::host::blk::{self, BlkdConfig};
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::sel4;
 use l4h_virtio::{dma_fence, Dma, Mmio};
 
@@ -122,12 +122,14 @@ pub struct Nvme {
     sq: Sq,
     cq: Cq,
     ident: (usize, u64),
-    /// Per command id: the request it belongs to, its PRP list page.
-    cmd_req: Vec<u16>,
-    prp: Vec<(usize, u64)>,
-    free_cids: Vec<u16>,
-    reqs: Vec<Request>,
-    free_reqs: Vec<u16>,
+    /// Per command id (below the queue depth): the request it belongs to,
+    /// its PRP list page, whether the device has it.
+    cmd_req: [u16; IO_DEPTH as usize],
+    prp: [(usize, u64); IO_DEPTH as usize],
+    cid_busy: [bool; IO_DEPTH as usize],
+    free_cids: ArrayVec<u16, { IO_DEPTH as usize }>,
+    reqs: [Request; IO_DEPTH as usize],
+    free_reqs: ArrayVec<u16, { IO_DEPTH as usize }>,
     lba_shift: u32,
     nsze: u64,
     max_bytes: u64,
@@ -178,7 +180,18 @@ impl Nvme {
         let (sq_va, sq_pa) = dma.alloc(64 * depth as usize, 4096);
         let (cq_va, cq_pa) = dma.alloc(16 * depth as usize, 4096);
         let ident = dma.alloc(4096, 4096);
-        let prp: Vec<_> = (0..depth).map(|_| dma.alloc(4096, 4096)).collect();
+        let mut prp = [(0, 0); IO_DEPTH as usize];
+        for p in &mut prp[..depth as usize] {
+            *p = dma.alloc(4096, 4096);
+        }
+        // One cid stays free: a full SQ has tail == head - 1.
+        let (mut free_cids, mut free_reqs) = (ArrayVec::new(), ArrayVec::new());
+        for i in (0..depth).rev() {
+            if i != depth - 1 {
+                let _ = free_cids.push(i);
+            }
+            let _ = free_reqs.push(i);
+        }
         let mut n = Nvme {
             id,
             io_errors: l4h_rt::ErrorLimit::new(),
@@ -187,12 +200,12 @@ impl Nvme {
             sq: Sq { va: sq_va, depth, tail: 0, doorbell: db(2) },
             cq: Cq { va: cq_va, depth, head: 0, phase: 1, doorbell: db(3) },
             ident,
-            cmd_req: alloc::vec![0; depth as usize],
+            cmd_req: [0; IO_DEPTH as usize],
             prp,
-            // One entry stays free: a full SQ has tail == head - 1.
-            free_cids: (0..depth - 1).rev().collect(),
-            reqs: alloc::vec![Request::default(); depth as usize],
-            free_reqs: (0..depth).rev().collect(),
+            cid_busy: [false; IO_DEPTH as usize],
+            free_cids,
+            reqs: [Request::default(); IO_DEPTH as usize],
+            free_reqs,
             lba_shift: 9,
             nsze: 0,
             max_bytes: (MAX_CMD_PAGES as u64 - 1) * PAGE,
@@ -293,6 +306,7 @@ impl Nvme {
             cdw12: nlb,
         });
         self.cmd_req[cid as usize] = req;
+        self.cid_busy[cid as usize] = true;
         self.reqs[req as usize].pending += 1;
         Ok(())
     }
@@ -363,7 +377,7 @@ impl Driver for Nvme {
         match result {
             Ok(()) => Ok(()),
             Err(e) if self.reqs[r as usize].pending == 0 => {
-                self.free_reqs.push(r);
+                let _ = self.free_reqs.push(r);
                 Err(e)
             }
             Err(e) => {
@@ -383,10 +397,14 @@ impl Driver for Nvme {
         let mut any = false;
         while let Some((cid, status)) = self.cq.pop() {
             any = true;
-            if cid as usize >= self.cmd_req.len() {
+            // Only a command the device has can complete: a cid it
+            // completes twice, or never had, would go on the free list
+            // twice and be issued for two commands at once.
+            if !self.cid_busy.get(cid as usize).is_some_and(|&b| b) {
                 continue;
             }
-            self.free_cids.push(cid);
+            self.cid_busy[cid as usize] = false;
+            let _ = self.free_cids.push(cid);
             let r = self.cmd_req[cid as usize] as usize;
             let req = &mut self.reqs[r];
             if status != 0 {
@@ -398,7 +416,7 @@ impl Driver for Nvme {
             req.pending -= 1;
             if req.pending == 0 {
                 done(req.tag, req.status);
-                self.free_reqs.push(r as u16);
+                let _ = self.free_reqs.push(r as u16);
             }
         }
         if any {
@@ -412,6 +430,7 @@ impl Nvme {
         let cid = self.free_cids.pop().ok_or(blk::STATUS_IOERR)?;
         self.sq.push(&Cmd { opcode: OP_FLUSH, cid, nsid: 1, ..Default::default() });
         self.cmd_req[cid as usize] = r;
+        self.cid_busy[cid as usize] = true;
         self.reqs[r as usize].pending += 1;
         Ok(())
     }
