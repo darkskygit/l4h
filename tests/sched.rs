@@ -127,9 +127,9 @@ fn repeated_steps_converge_on_smt_and_flat_hosts() {
             }
             let mut physical = vec![0usize; ids.len()];
             for v in &s {
-                physical[t.physical[v.cpu]] += 1;
+                physical[t.core(v.cpu)] += 1;
             }
-            let counts: Vec<_> = (0..ids.len()).filter(|&c| t.physical[c] == c).map(|c| physical[c]).collect();
+            let counts: Vec<_> = (0..ids.len()).filter(|&c| t.core(c) == c).map(|c| physical[c]).collect();
             assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1);
         }
     }

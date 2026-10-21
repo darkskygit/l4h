@@ -1,33 +1,58 @@
 //! Physical cores indexed by seL4 CPU number. CPU numbers and APIC IDs
 //! need not be contiguous or ordered by SMT sibling.
 
-use alloc::vec::Vec;
+/// CPUs a topology can describe: at least seL4's KernelMaxNumNodes in
+/// either configuration (sched.rs checks it).
+pub const MAX_CPUS: usize = 64;
 
 pub struct Topology {
+    cpus: usize,
     /// The first seL4 CPU belonging to each CPU's physical core.
-    pub physical: Vec<usize>,
+    physical: [u8; MAX_CPUS],
     /// One thread of every physical core, then the second threads, etc.
-    order: Vec<usize>,
+    order: [u8; MAX_CPUS],
 }
 
 impl Topology {
     pub fn flat(cpus: usize) -> Self {
-        Self { physical: (0..cpus).collect(), order: (0..cpus).collect() }
+        assert!(cpus <= MAX_CPUS, "{} CPUs, at most {}", cpus, MAX_CPUS);
+        let mut t = Self { cpus, physical: [0; MAX_CPUS], order: [0; MAX_CPUS] };
+        for cpu in 0..cpus {
+            t.physical[cpu] = cpu as u8;
+            t.order[cpu] = cpu as u8;
+        }
+        t
     }
 
     pub fn from_ids(ids: &[u32]) -> Self {
-        let physical: Vec<usize> = ids.iter().map(|id| ids.iter().position(|other| other == id).unwrap()).collect();
-        let mut order: Vec<usize> = (0..ids.len()).collect();
-        order.sort_by_key(|&cpu| (physical[..cpu].iter().filter(|&&p| p == physical[cpu]).count(), physical[cpu]));
-        Self { physical, order }
+        let mut t = Self::flat(ids.len());
+        for (cpu, id) in ids.iter().enumerate() {
+            t.physical[cpu] = ids.iter().position(|other| other == id).unwrap() as u8;
+        }
+        let physical = &t.physical[..t.cpus];
+        // The keys are distinct, so an unstable sort gives the one order.
+        t.order[..t.cpus].sort_unstable_by_key(|&cpu| {
+            let cpu = cpu as usize;
+            (physical[..cpu].iter().filter(|&&p| p == physical[cpu]).count(), physical[cpu])
+        });
+        t
+    }
+
+    /// Each CPU's physical core (its first seL4 CPU).
+    pub fn physical(&self) -> &[u8] {
+        &self.physical[..self.cpus]
+    }
+
+    pub fn core(&self, cpu: usize) -> usize {
+        self.physical[cpu] as usize
     }
 
     pub fn same_core(&self, a: usize, b: usize) -> bool {
-        self.physical[a] == self.physical[b]
+        self.core(a) == self.core(b)
     }
 
     pub fn placement(&self, n: usize) -> usize {
-        self.order[n % self.order.len()]
+        self.order[n % self.cpus] as usize
     }
 }
 
@@ -103,22 +128,24 @@ pub fn discover(bootinfo: &sel4::BootInfoPtr) -> Topology {
     if physical_id().is_none() {
         return Topology::flat(cpus);
     }
-    let mut ids = Vec::new();
-    let mut apics = Vec::new();
+    let mut ids = [0; MAX_CPUS];
+    let mut apics = [0; MAX_CPUS];
+    let mut n = 0;
     for cpu in 0..cpus {
         if move_to(cpu).is_err() {
             break;
         }
         let Some((apic, id)) = physical_id() else { break };
-        if apics.contains(&apic) {
+        if apics[..n].contains(&apic) {
             break;
         }
-        apics.push(apic);
-        ids.push(id);
+        apics[n] = apic;
+        ids[n] = id;
+        n += 1;
     }
     move_to(boot_cpu).expect("restore root CPU after topology discovery");
-    if ids.len() == cpus {
-        Topology::from_ids(&ids)
+    if n == cpus {
+        Topology::from_ids(&ids[..n])
     } else {
         sel4::debug_println!("l4h-root: CPU topology unavailable; using flat placement");
         Topology::flat(cpus)
@@ -145,7 +172,7 @@ mod tests {
     #[test]
     fn sparse_unordered_and_partial_sibling_sets() {
         let t = Topology::from_ids(&[42, 7, 42, 99, 7, 42]);
-        assert_eq!(t.physical, [0, 1, 0, 3, 1, 0]);
+        assert_eq!(t.physical(), [0, 1, 0, 3, 1, 0]);
         assert_eq!((0..6).map(|n| t.placement(n)).collect::<Vec<_>>(), [0, 1, 3, 2, 4, 5]);
         let flat = Topology::flat(4);
         assert_eq!((0..4).map(|n| flat.placement(n)).collect::<Vec<_>>(), [0, 1, 2, 3]);

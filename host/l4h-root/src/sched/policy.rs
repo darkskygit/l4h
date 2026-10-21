@@ -1,6 +1,12 @@
 //! Migration decisions independent of seL4, for host-side testing.
 
-use super::topology::Topology;
+use super::topology::{MAX_CPUS, Topology};
+
+/// Guests a sample may name (`Sample::guest` is below it); sched.rs checks
+/// it against the host's limit.
+pub const MAX_GUESTS: usize = 64;
+// A guest's CPUs and physical cores are bitmasks of one word each.
+const _: () = assert!(MAX_CPUS <= 64);
 
 const ACTIVE_PCT: u64 = 2;
 const LIGHT_PCT: u64 = 50;
@@ -28,9 +34,9 @@ pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64) -> Option
     if elapsed_us == 0 {
         return None;
     }
-    let cpus = topology.physical.len();
-    let mut load = alloc::vec![0u64; cpus];
-    let mut active = alloc::vec![0u64; cpus];
+    let cpus = topology.physical().len();
+    let mut load = [0u64; MAX_CPUS];
+    let mut active = [0u64; MAX_CPUS];
     for s in sample {
         load[s.cpu] += s.used;
         if s.used * 100 >= elapsed_us * ACTIVE_PCT {
@@ -39,17 +45,20 @@ pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64) -> Option
     }
     // Half a fair share still recognizes a starved vCPU on a crowded CPU.
     let is_busy = |s: &Sample| s.used * 100 >= elapsed_us * ACTIVE_PCT && s.used * active[s.cpu] * 2 >= elapsed_us;
-    let mut busy = alloc::vec![0i64; cpus];
-    let mut physical_busy = alloc::vec![0i64; cpus];
-    let mut physical_load = alloc::vec![0u64; cpus];
-    let guests = sample.iter().map(|s| s.guest + 1).max().unwrap_or(0);
-    let mut guest_cpu = alloc::vec![alloc::vec![0usize; cpus]; guests];
-    let mut guest_core = alloc::vec![alloc::vec![0usize; cpus]; guests];
+    let mut busy = [0i64; MAX_CPUS];
+    let mut physical_busy = [0i64; MAX_CPUS];
+    let mut physical_load = [0u64; MAX_CPUS];
+    // Per guest, the CPUs with one of its vCPUs, and the physical cores
+    // with at least one and at least two: all the choice below asks.
+    let mut guest_cpu = [0u64; MAX_GUESTS];
+    let mut guest_core = [0u64; MAX_GUESTS];
+    let mut guest_core2 = [0u64; MAX_GUESTS];
     for s in sample {
-        let p = topology.physical[s.cpu];
+        let p = topology.core(s.cpu);
         physical_load[p] += s.used;
-        guest_cpu[s.guest][s.cpu] += 1;
-        guest_core[s.guest][p] += 1;
+        guest_cpu[s.guest] |= 1 << s.cpu;
+        guest_core2[s.guest] |= guest_core[s.guest] & 1 << p;
+        guest_core[s.guest] |= 1 << p;
         if is_busy(s) {
             busy[s.cpu] += 1;
             physical_busy[p] += 1;
@@ -58,12 +67,12 @@ pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64) -> Option
     let mut best = None;
     for s in sample.iter().filter(|s| s.movable && is_busy(s)) {
         let src = s.cpu;
-        let ps = topology.physical[src];
+        let ps = topology.core(src);
         for dst in 0..cpus {
             if src == dst {
                 continue;
             }
-            let pd = topology.physical[dst];
+            let pd = topology.core(dst);
             let physical_gain = if ps == pd { 0 } else { physical_busy[ps] - physical_busy[pd] - 1 };
             let logical_gain = busy[src] - busy[dst] - 1;
             // Retain the lightly-loaded-target exception of the flat
@@ -72,8 +81,10 @@ pub fn choose(topology: &Topology, sample: &[Sample], elapsed_us: u64) -> Option
             if physical_gain < 0 || (physical_gain == 0 && (logical_gain < 0 || (logical_gain == 0 && !light))) {
                 continue;
             }
-            let guest_on_core = guest_core[s.guest][pd] > usize::from(topology.same_core(src, dst));
-            let guest_on_cpu = guest_cpu[s.guest][dst] != 0;
+            // On the same core, the moving vCPU itself does not count.
+            let on_core = if topology.same_core(src, dst) { guest_core2[s.guest] } else { guest_core[s.guest] };
+            let guest_on_core = on_core & 1 << pd != 0;
+            let guest_on_cpu = guest_cpu[s.guest] & 1 << dst != 0;
             let score = (
                 physical_gain,
                 logical_gain,

@@ -5,10 +5,13 @@
 //! live on one core until `SchedControl_Configure` on another core's
 //! SchedControl moves them.
 
-use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::Host;
-use crate::guest::State;
+use l4h_host::fixed::ArrayVec;
+
+use crate::guest::{State, Vcpu};
+use crate::{Host, HostInfo};
 
 mod policy;
 pub mod topology;
@@ -95,12 +98,10 @@ fn adapt_share(timeslice_us: u64, cap_pct: u32, k_share: u32, ck: u64, cu: u64, 
     Some((new_k * 1000).div_ceil(total) as u32)
 }
 
-/// (Re)configure vCPU `v` of guest `g` on `core` with the guest's cap.
-pub fn configure(h: &Host, gid: usize, v: usize, core: usize) -> bool {
-    let Some(g) = h.guest(gid) else { return false };
-    let vcpu = &g.vcpus[v];
-    let (period, budget_k, budget_u) = budgets(h.info.timeslice_us, g.cpu_cap_pct, vcpu.k_share);
-    let sc = h.info.sched_control(core);
+/// (Re)configure vCPU `v` of guest `gid` on `core` with cap `cap_pct`.
+pub fn configure(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, cap_pct: u32, core: usize) -> bool {
+    let (period, budget_k, budget_u) = budgets(info.timeslice_us, cap_pct, vcpu.k_share);
+    let sc = info.sched_control(core);
     let r = sc
         .sched_control_configure_flags(vcpu.sc_k, budget_k, period, EXTRA_REFILLS, 0, 0)
         .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, budget_u, period, EXTRA_REFILLS, 0, 0));
@@ -110,12 +111,49 @@ pub fn configure(h: &Host, gid: usize, v: usize, core: usize) -> bool {
     r.is_ok()
 }
 
+/// The CPUs of some vCPUs, printed as a list.
+pub struct Cores<'a>(pub &'a [Vcpu]);
+
+impl core::fmt::Debug for Cores<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.debug_list().entries(self.0.iter().map(|v| v.core)).finish()
+    }
+}
+
 /// Apply a new CPU cap to every vCPU of guest `gid`.
 pub fn set_cap(h: &mut Host, gid: usize, cap_pct: u32) -> bool {
     let Some(Some(g)) = h.guests.get_mut(gid) else { return false };
     g.cpu_cap_pct = cap_pct.min(100);
-    let cores: Vec<usize> = g.vcpus.iter().map(|v| v.core).collect();
-    cores.iter().enumerate().all(|(v, &c)| configure(h, gid, v, c))
+    g.vcpus.iter().enumerate().all(|(v, vcpu)| configure(&h.info, gid, v, vcpu, g.cpu_cap_pct, vcpu.core))
+}
+
+const _: () = assert!(crate::MAX_GUESTS <= policy::MAX_GUESTS);
+const _: () = assert!(sel4::sel4_cfg_usize!(MAX_NUM_NODES) <= topology::MAX_CPUS);
+
+/// The balancer's samples, one per vCPU: too large for root's stack
+/// (160 KiB), so in .bss.  `balance` is its only user, and the flag makes
+/// a second, nested use fail instead of aliasing it.
+static SAMPLES: Scratch<ArrayVec<policy::Sample, { crate::MAX_GUESTS * l4h_abi::MAX_VCPUS }>> = Scratch::new(ArrayVec::new());
+
+struct Scratch<T> {
+    busy: AtomicBool,
+    val: UnsafeCell<T>,
+}
+
+// The flag gives at most one user access at a time.
+unsafe impl<T> Sync for Scratch<T> {}
+
+impl<T> Scratch<T> {
+    const fn new(val: T) -> Self {
+        Scratch { busy: AtomicBool::new(false), val: UnsafeCell::new(val) }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        assert!(!self.busy.swap(true, Ordering::Acquire), "scratch in use");
+        let r = f(unsafe { &mut *self.val.get() });
+        self.busy.store(false, Ordering::Release);
+        r
+    }
 }
 
 /// One balancer step: sample consumption over the `elapsed_us` since the
@@ -130,53 +168,52 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
     if elapsed_us == 0 {
         return;
     }
-    let mut sample = Vec::new();
-    // Capped vCPUs whose budget split changed: (guest, vcpu, core).
-    let mut resplit = Vec::new();
     let tsc_mhz = (h.info.tsc_hz / 1_000_000).max(1);
     let timeslice_us = h.info.timeslice_us;
-    for g in h.guests.iter_mut().flatten() {
-        let event_pages: Vec<*mut l4h_abi::EventPage> = (0..g.vcpus.len()).map(|v| g.event_page(v)).collect();
-        for (v, vcpu) in g.vcpus.iter_mut().enumerate() {
-            let (ck, cu) = (consumed(vcpu.sc_k), consumed(vcpu.sc_u));
-            let c = ck + cu;
-            if g.state != State::Running {
-                continue;
-            }
-            if let Some(share) = adapt_share(timeslice_us, g.cpu_cap_pct, vcpu.k_share, ck, cu, elapsed_us) {
-                vcpu.k_share = share;
-                resplit.push((g.id, v, vcpu.core));
-            }
-            vcpu.cooldown = vcpu.cooldown.saturating_sub(1);
-            vcpu.usage = (c * 1000 / elapsed_us) as u32;
-            // Steal: time the vCPU existed minus what it ran minus what it
-            // spent idle (reported by the guest).
-            if vcpu.wall_ticks != 0 || c != 0 {
-                vcpu.wall_ticks += elapsed_us * tsc_mhz;
-                vcpu.run_ticks += c * tsc_mhz;
-                let idle = unsafe { core::ptr::addr_of!((*event_pages[v]).idle_ticks).read_volatile() };
-                let steal = vcpu.wall_ticks.saturating_sub(vcpu.run_ticks).saturating_sub(idle);
-                let ns = steal * 1000 / tsc_mhz;
-                if ns > vcpu.steal_ns {
-                    vcpu.steal_ns = ns;
-                    let page = event_pages[v];
-                    unsafe { core::ptr::addr_of_mut!((*page).steal_ns).write_volatile(ns) };
+    let migration = SAMPLES.with(|sample| {
+        sample.clear();
+        for g in h.guests.iter_mut().flatten() {
+            for v in 0..g.vcpus.len() {
+                let page = g.event_page(v);
+                let vcpu = &mut g.vcpus[v];
+                let (ck, cu) = (consumed(vcpu.sc_k), consumed(vcpu.sc_u));
+                let c = ck + cu;
+                if g.state != State::Running {
+                    continue;
                 }
+                // A capped vCPU whose budget split changed.
+                if let Some(share) = adapt_share(timeslice_us, g.cpu_cap_pct, vcpu.k_share, ck, cu, elapsed_us) {
+                    vcpu.k_share = share;
+                    configure(&h.info, g.id, v, vcpu, g.cpu_cap_pct, vcpu.core);
+                }
+                vcpu.cooldown = vcpu.cooldown.saturating_sub(1);
+                vcpu.usage = (c * 1000 / elapsed_us) as u32;
+                // Steal: time the vCPU existed minus what it ran minus what it
+                // spent idle (reported by the guest).
+                if vcpu.wall_ticks != 0 || c != 0 {
+                    vcpu.wall_ticks += elapsed_us * tsc_mhz;
+                    vcpu.run_ticks += c * tsc_mhz;
+                    let idle = unsafe { core::ptr::addr_of!((*page).idle_ticks).read_volatile() };
+                    let steal = vcpu.wall_ticks.saturating_sub(vcpu.run_ticks).saturating_sub(idle);
+                    let ns = steal * 1000 / tsc_mhz;
+                    if ns > vcpu.steal_ns {
+                        vcpu.steal_ns = ns;
+                        unsafe { core::ptr::addr_of_mut!((*page).steal_ns).write_volatile(ns) };
+                    }
+                }
+                // Guests are below MAX_GUESTS and have at most MAX_VCPUS
+                // vCPUs, so the samples fit.
+                let _ = sample.push(policy::Sample { guest: g.id, vcpu: v, cpu: vcpu.core, used: c, movable: vcpu.cooldown == 0 });
             }
-            sample.push(policy::Sample { guest: g.id, vcpu: v, cpu: vcpu.core, used: c, movable: vcpu.cooldown == 0 });
         }
-    }
-    for &(gid, v, core) in &resplit {
-        configure(h, gid, v, core);
-    }
-    if cores < 2 {
-        return;
-    }
-    let Some(policy::Migration { guest: gid, vcpu: v, src, dst }) = policy::choose(&h.info.topology, &sample, elapsed_us) else { return };
-    if configure(h, gid, v, dst) {
+        if cores < 2 { None } else { policy::choose(&h.info.topology, sample, elapsed_us) }
+    });
+    let Some(policy::Migration { guest: gid, vcpu: v, src, dst }) = migration else { return };
+    let Some(g) = h.guest(gid) else { return };
+    if configure(&h.info, gid, v, &g.vcpus[v], g.cpu_cap_pct, dst) {
         info!(
             "l4h-root: balancer: guest {} vCPU {}: core {} -> {} (physical {} -> {})",
-            gid, v, src, dst, h.info.topology.physical[src], h.info.topology.physical[dst]
+            gid, v, src, dst, h.info.topology.core(src), h.info.topology.core(dst)
         );
         let vcpu = &mut h.guests[gid].as_mut().unwrap().vcpus[v];
         vcpu.core = dst;

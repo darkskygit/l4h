@@ -957,13 +957,7 @@ pub fn create(
         "l4h-root: guest {} '{}' created: {} MiB RAM in {} blocks, {} vCPU(s), {} MiB I/O pool, {} KiB host objects",
         id, g.name, ram >> 20, nr_blocks, cfg.vcpus, g.pool.size >> 20, g.arena.bytes() >> 10
     );
-    if host::VERBOSE {
-        sel4::debug_print!("l4h-root: guest {} '{}' initial CPUs", id, g.name);
-        for v in &g.vcpus {
-            sel4::debug_print!(" {}", v.core);
-        }
-        sel4::debug_println!();
-    }
+    info!("l4h-root: guest {} '{}' initial CPUs {:?}", id, g.name, crate::sched::Cores(&g.vcpus));
     Ok(g)
 }
 

@@ -5,8 +5,6 @@
 //! restart-dom0.  The kernel keeps printing to the same port; we only take
 //! its receive side.
 
-use alloc::string::String;
-
 use sel4::cap_type;
 
 use crate::Host;
@@ -19,13 +17,18 @@ pub const MONITOR_BADGE: u64 = 1 << 41;
 #[cfg(target_arch = "x86_64")]
 const VECTOR: u64 = crate::pci::VECTOR_MONITOR;
 
+/// Longest input line; the rest of a longer one is dropped.
+const LINE_MAX: usize = 80;
+
 pub struct Monitor {
     port: u64,
     /// The UART's first I/O port (x86).
     #[cfg(target_arch = "x86_64")]
     base: u16,
     irq: sel4::cap::IrqHandler,
-    line: String,
+    /// The input line so far: printable ASCII.
+    line: [u8; LINE_MAX],
+    len: usize,
 }
 
 impl Monitor {
@@ -43,7 +46,7 @@ impl Monitor {
             .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), MONITOR_BADGE)
             .ok()?;
         irq.irq_handler_set_notification(sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap()).ok()?;
-        let m = Monitor { port: port as u64, base, irq, line: String::new() };
+        let m = Monitor { port: port as u64, base, irq, line: [0; LINE_MAX], len: 0 };
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
         m.out(1, 0x01);
         m.out(4, m.inb(4) | 0x08);
@@ -74,7 +77,7 @@ impl Monitor {
         }
         irq.irq_handler_ack().ok()?;
         info!("l4h-root: serial monitor on PL011 (type 'help')");
-        Some(Self { port: UART_VA as u64, irq, line: String::new() })
+        Some(Self { port: UART_VA as u64, irq, line: [0; LINE_MAX], len: 0 })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -105,15 +108,18 @@ impl Monitor {
             let c = m.inb(0);
             match c {
                 b'\r' | b'\n' => {
-                    let line = core::mem::take(&mut m.line);
-                    if !line.trim().is_empty() {
-                        run(h, line.trim());
+                    let (line, len) = (m.line, m.len);
+                    m.len = 0;
+                    let line = core::str::from_utf8(&line[..len]).unwrap_or("").trim();
+                    if !line.is_empty() {
+                        run(h, line);
                     }
                 }
-                0x08 | 0x7f => {
-                    m.line.pop();
+                0x08 | 0x7f => m.len = m.len.saturating_sub(1),
+                c if (0x20..0x7f).contains(&c) && m.len < LINE_MAX => {
+                    m.line[m.len] = c;
+                    m.len += 1;
                 }
-                c if (0x20..0x7f).contains(&c) && m.line.len() < 80 => m.line.push(c as char),
                 _ => {}
             }
         }

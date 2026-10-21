@@ -439,7 +439,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
     let topology = sched::topology::discover(bootinfo);
-    info!("l4h-root: CPU physical cores {:?}", topology.physical);
+    info!("l4h-root: CPU physical cores {:?}", topology.physical());
     let mut alloc = Alloc::new(Slots::new(bootinfo.empty().range()), bootinfo);
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
