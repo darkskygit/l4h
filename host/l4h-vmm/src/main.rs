@@ -5,16 +5,12 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
 mod blk;
 mod dev;
 mod guest;
 mod mem;
 mod net;
 mod virtq;
-
-use alloc::vec::Vec;
 
 use l4h_abi as abi;
 use l4h_rt::host::{self, VmmConfig};
@@ -117,14 +113,12 @@ fn main(info: &'static Info) -> ! {
         ntfn.wait();
     }
 
-    // Devices by guest boot info index.
-    let mut devs: Vec<Option<Dev>> = Vec::new();
-    let mut by_slot: Vec<usize> = Vec::new();
-    for d in cfg.devices[..cfg.nr_devices as usize].iter() {
+    // Devices by guest boot info index, which is also the device's bit in
+    // the notification badges.
+    let mut devs: [Option<Dev>; host::VMM_MAX_DEVICES] = [const { None }; host::VMM_MAX_DEVICES];
+    for d in devices.iter() {
         let idx = d.guest_index as usize;
-        if devs.len() <= idx {
-            devs.resize_with(idx + 1, || None);
-        }
+        assert!(idx < host::VMM_MAX_DEVICES, "l4h-vmm: device index {} out of range", idx);
         let dev = match d.kind {
             host::VDEV_BLK => Dev::Blk(Device::new(
                 d.page_va as usize,
@@ -147,7 +141,6 @@ fn main(info: &'static Info) -> ! {
             k => panic!("l4h-vmm: unsupported device kind {}", k),
         };
         devs[idx] = Some(dev);
-        by_slot.push(idx);
     }
 
     let mut console = Console {
@@ -167,7 +160,7 @@ fn main(info: &'static Info) -> ! {
     loop {
         if badge & host::VMM_BADGE_HYPERCALL == 0 {
             // Notification: device kicks and backend completions.
-            for &idx in by_slot.iter() {
+            for idx in devices.iter().map(|d| d.guest_index as usize) {
                 let Some(d) = devs[idx].as_mut() else { continue };
                 if badge & (1 << (host::VMM_BADGE_DONE_SHIFT as usize + idx)) != 0 {
                     d.complete(&mem, &vcpus);
@@ -218,4 +211,4 @@ fn main(info: &'static Info) -> ! {
     }
 }
 
-l4h_rt::component!(main);
+l4h_rt::component!(main, no_heap);

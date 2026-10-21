@@ -1873,7 +1873,9 @@ memory the guest can retype.
   `ACCESS_PLATFORM` fails `FEATURES_OK`; a queue outside the pool is
   refused, and `DRIVER_OK` then fails (status `DEVICE_NEEDS_RESET`) until
   the device is reset. Chains with any buffer or indirect table outside
-  the pool are returned unused.
+  the pool are returned unused, and so are chains longer than the queue
+  size, indirect descriptors included (virtio 1.x §2.7.5.3.1): a chain
+  is collected into a fixed array of that size.
 - **Request size.** A block request bounces entirely through the pool, and
   one that cannot fit even in an empty pool would be requeued forever. The
   VMM therefore offers `VIRTIO_BLK_F_SIZE_MAX` with `size_max` such that

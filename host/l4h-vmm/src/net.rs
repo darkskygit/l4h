@@ -2,10 +2,10 @@
 //! headers are copied between guest buffers and the port's slots; the
 //! offload metadata in the header (checksum, TSO) passes through.
 
-use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, Port};
 use l4h_rt::sel4;
 
@@ -29,16 +29,18 @@ const RX: usize = 0;
 const TX: usize = 1;
 const QUEUE_SIZE: u32 = 256;
 
+/// The buffers of one chain (see Queue::chain).
+type Chain = ArrayVec<Buf, { QUEUE_SIZE as usize }>;
+
 pub struct Net {
     chan: *mut Port,
     kick: sel4::cap::Notification,
     mac: [u8; 6],
-    bufs: Vec<Buf>,
 }
 
 impl Net {
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, mac: [u8; 6]) -> Self {
-        Net { chan: chan_va as *mut Port, kick, mac, bufs: Vec::new() }
+        Net { chan: chan_va as *mut Port, kick, mac }
     }
 
     fn tx_full(&self) -> bool {
@@ -57,7 +59,7 @@ impl Net {
                 break;
             }
             let Some(head) = q.pop(mem) else { break };
-            let mut bufs = core::mem::take(&mut self.bufs);
+            let mut bufs = Chain::new();
             if q.chain(mem, head, &mut bufs).is_ok() {
                 unsafe {
                     let h = addr_of!((*self.chan).tx.head).read_volatile();
@@ -93,7 +95,6 @@ impl Net {
                     }
                 }
             }
-            self.bufs = bufs;
             q.push(mem, head, 0);
             returned = true;
         }
@@ -112,7 +113,7 @@ impl Net {
             }
             let Some(chain) = q.pop(mem) else { break };
             fence(Ordering::Acquire);
-            let mut bufs = core::mem::take(&mut self.bufs);
+            let mut bufs = Chain::new();
             let mut written = 0usize;
             if q.chain(mem, chain, &mut bufs).is_ok() {
                 unsafe {
@@ -146,7 +147,6 @@ impl Net {
                     }
                 }
             }
-            self.bufs = bufs;
             unsafe {
                 fence(Ordering::Release);
                 addr_of_mut!((*self.chan).rx.tail).write_volatile(tail.wrapping_add(1));

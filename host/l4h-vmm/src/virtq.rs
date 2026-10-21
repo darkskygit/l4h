@@ -1,7 +1,8 @@
 //! Device side of a split virtqueue in guest memory.
 
-use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
+
+use l4h_rt::host::fixed::ArrayVec;
 
 use crate::guest::GuestMem;
 
@@ -32,7 +33,8 @@ pub struct Queue {
 #[derive(Debug)]
 pub enum ChainError {
     BadAddress,
-    Loop,
+    /// Longer than the queue size (which a loop always is).
+    TooLong,
 }
 
 impl Queue {
@@ -73,8 +75,11 @@ impl Queue {
         Some(head)
     }
 
-    /// Collect the buffers of the chain starting at `head`.
-    pub fn chain(&self, mem: &GuestMem, head: u16, out: &mut Vec<Buf>) -> Result<(), ChainError> {
+    /// Collect the buffers of the chain starting at `head`.  A driver must
+    /// not offer a chain longer than the queue size, indirect descriptors
+    /// included (virtio 1.x §2.7.5.3.1), so one that is longer, or longer
+    /// than `out` holds, is refused; this also ends a chain that loops.
+    pub fn chain<const N: usize>(&self, mem: &GuestMem, head: u16, out: &mut ArrayVec<Buf, N>) -> Result<(), ChainError> {
         out.clear();
         if head >= self.num {
             return Err(ChainError::BadAddress);
@@ -82,12 +87,8 @@ impl Queue {
         let (mut table, mut size) = (self.desc, self.num as u64);
         let mut i = head as u64;
         let mut indirect = false;
-        let mut steps = 0;
+        let max = (self.num as usize).min(N);
         loop {
-            steps += 1;
-            if steps > 1024 {
-                return Err(ChainError::Loop);
-            }
             let d = table + 16 * i;
             let addr = mem.read::<u64>(d);
             let len = mem.read::<u32>(d + 8);
@@ -106,7 +107,10 @@ impl Queue {
             if !mem.valid(addr, len as u64) {
                 return Err(ChainError::BadAddress);
             }
-            out.push(Buf { gpa: addr, len, write: flags & VIRTQ_DESC_F_WRITE != 0 });
+            if out.len() == max {
+                return Err(ChainError::TooLong);
+            }
+            let _ = out.push(Buf { gpa: addr, len, write: flags & VIRTQ_DESC_F_WRITE != 0 });
             if flags & VIRTQ_DESC_F_NEXT == 0 {
                 return Ok(());
             }

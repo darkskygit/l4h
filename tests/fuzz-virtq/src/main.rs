@@ -27,6 +27,11 @@ mod guest {
 #[path = "../../../host/l4h-vmm/src/virtq.rs"]
 mod virtq;
 
+/// The fixed-capacity containers virtq.rs and blk.rs use (as
+/// l4h_rt::host::fixed).
+#[path = "../../../host/l4h-host/src/fixed.rs"]
+pub mod host_fixed;
+
 #[path = "../../../host/l4h-netd/src/offload.rs"]
 mod offload;
 
@@ -38,6 +43,7 @@ extern crate self as l4h_rt;
 pub mod host_blk;
 pub mod host {
     pub use crate::host_blk as blk;
+    pub use crate::host_fixed as fixed;
 }
 
 pub mod sel4 {
@@ -78,6 +84,9 @@ mod blk;
 mod blkcheck;
 
 use guest::GuestMem;
+
+/// The longest chain a queue of 256 entries (the largest here) carries.
+type Chain = host_fixed::ArrayVec<virtq::Buf, 256>;
 
 /// xorshift64*
 struct Rng(u64);
@@ -125,7 +134,7 @@ fn main() {
     let size = 64 * 1024u64;
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let (mut chains, mut refused) = (0u64, 0u64);
-    let mut bufs = Vec::new();
+    let mut bufs = Chain::new();
     for _ in 0..iterations {
         let mut pool: Vec<u64> = (0..size / 8).map(|_| rng.next()).collect();
         let gpa = pool_gpa(&mut rng, size);
@@ -167,6 +176,8 @@ fn main() {
             let Some(head) = q.pop(&mem) else { break };
             if q.chain(&mem, head, &mut bufs).is_err() {
                 refused += 1;
+            } else {
+                assert!(bufs.len() <= num as usize, "chain longer than the queue");
             }
             for b in &bufs {
                 assert!(inside(gpa, size, b.gpa, b.len as u64), "chain buffer outside the I/O pool");
@@ -195,7 +206,7 @@ fn main() {
 fn edge_check(rng: &mut Rng, n: u64) -> u64 {
     use virtq::{VIRTQ_DESC_F_INDIRECT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     let size = 16 * 1024u64;
-    let mut bufs = Vec::new();
+    let mut bufs = Chain::new();
     let mut checked = 0;
     for _ in 0..n {
         let mut pool = vec![0u64; size as usize / 8];

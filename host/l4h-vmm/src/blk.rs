@@ -2,11 +2,11 @@
 //! to blkd by guest-physical address (they lie in the guest's I/O pool);
 //! nothing is copied here.
 
-use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_rt::host::blk::{self, Channel};
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::sel4;
 
 use crate::dev::{Backend, VIRTIO_RING_F_INDIRECT_DESC};
@@ -63,7 +63,6 @@ pub struct Blk {
     generation: u32,
     /// A chain popped from the queue that did not fit in the channel.
     stalled: Option<u16>,
-    bufs: Vec<Buf>,
 }
 
 impl Blk {
@@ -90,7 +89,6 @@ impl Blk {
             outstanding: 0,
             generation: 0,
             stalled: None,
-            bufs: Vec::new(),
         }
     }
 
@@ -129,11 +127,9 @@ impl Blk {
         if self.inflight.get(head as usize).is_some_and(|i| i.is_some()) {
             return true;
         }
-        let mut bufs = core::mem::take(&mut self.bufs);
+        let mut bufs = ArrayVec::<Buf, { QUEUE_SIZE as usize }>::new();
         let ok = q.chain(mem, head, &mut bufs).is_ok();
-        let r = self.submit_bufs(mem, q, head, ok, &bufs);
-        self.bufs = bufs;
-        r
+        self.submit_bufs(mem, q, head, ok, &bufs)
     }
 
     fn submit_bufs(&mut self, mem: &GuestMem, q: &mut Queue, head: u16, ok: bool, bufs: &[Buf]) -> bool {
