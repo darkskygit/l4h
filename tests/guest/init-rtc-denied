@@ -1,0 +1,8 @@
+#!/bin/sh
+mount -t devtmpfs dev /dev
+if [ -e /dev/l4hctl ] || l4hctl rtc-set 951827696; then
+    echo "RTCDENIED: FAIL"
+else
+    echo "RTCDENIED: PASS"
+fi
+poweroff -f

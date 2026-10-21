@@ -205,6 +205,7 @@ pub struct Host {
     pub dom0_initrd: &'static [u8],
     pub trustd: Option<trustd::Trustd>,
     pub reset: reset::Reset,
+    pub rtc: rtc::Rtc,
 }
 
 impl Host {
@@ -449,6 +450,13 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     });
     let kmods = module("guest-kmods").and_then(|m| kimage::Kmods::new(&mut alloc, m));
     let dom0_initrd = module("dom0-initrd").unwrap_or(&[]);
+    // ACPI table frames are shared by RTC discovery, reset and trustd.
+    #[cfg(target_arch = "x86_64")]
+    let mut acpi_frames = acpi::Frames::new();
+    #[allow(unused_mut)]
+    let mut rtc = rtc::Rtc::new(&mut alloc, &mut devmem);
+    #[cfg(target_arch = "x86_64")]
+    rtc.find_century(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
     let info = HostInfo {
         cores,
         topology,
@@ -457,7 +465,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         hyp_ep,
         sched_control_base: bootinfo.sched_control().range().start,
         timeslice_us: 5000,
-        epoch_ns: rtc::read_ns(&mut alloc, &mut devmem, &mut wins.a),
+        epoch_ns: rtc.read_ns(&mut wins.a),
         epoch_ticks: rdtsc(),
         placement: core::cell::Cell::new(0),
     };
@@ -516,10 +524,6 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         alloc.balloon = balloon::Balloon::new(&d, &pci, &mut alloc, &mut devmem, info.tsc_hz / 1000);
     }
     let mut asids = asids;
-    // ACPI table pages are carved once: the reset register's, then
-    // trustd's, from one map.
-    #[cfg(target_arch = "x86_64")]
-    let mut acpi_frames = acpi::Frames::new();
     #[cfg(target_arch = "x86_64")]
     let reset = reset::Reset::find(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
     #[cfg(not(target_arch = "x86_64"))]
@@ -551,6 +555,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         dom0_initrd,
         trustd,
         reset,
+        rtc,
     };
     h.scan_disks();
     h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq);

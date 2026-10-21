@@ -409,6 +409,11 @@ enum l4h_ctl_op {
 	 * keyboard controller); dom0 syncs its disks first.  Returns only if
 	 * the machine did not reset: -EIO; -ENOSYS on aarch64. */
 	L4H_CTL_HOST_REBOOT = 22,
+	/* args[0]: UTC seconds since the Unix epoch. Set the machine RTC;
+	 * does not change the host's boot-time clock anchor or guest clocks.
+	 * -EINVAL for an unrepresentable date, -ENOSYS if no RTC is available,
+	 * -EIO on hardware access failure. */
+	L4H_CTL_RTC_SET = 23,
 };
 
 #define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */

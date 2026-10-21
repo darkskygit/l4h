@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 use std::process::exit;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use l4hctl::*;
 
@@ -78,6 +78,8 @@ const USAGE: &str = "usage: l4hctl <command>
   info                         host resources
   host-reboot                  reset the machine (every guest stops; sync
                                dom0's disks first)
+  rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
+                               current time, e.g. after NTP synchronizes)
   disks                        host disks, owners, capacities and attachments
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
@@ -168,6 +170,15 @@ fn run(args: &[String]) -> Result<i32> {
         }
         "host-reboot" => {
             ctl.host_reboot()?;
+        }
+        "rtc-set" => {
+            let seconds = match &args[1..] {
+                [] => SystemTime::now().duration_since(UNIX_EPOCH)
+                    .map_err(|_| Error("dom0's clock is before the Unix epoch".into()))?.as_secs(),
+                [seconds] => parse_num(seconds)?,
+                _ => return err("rtc-set [UNIX_SECONDS]"),
+            };
+            ctl.rtc_set(seconds)?;
         }
         "disks" => {
             let n = ctl.call(CTL_HOST_INFO, &[], &[], &[])?.vals[3];

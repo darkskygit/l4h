@@ -36,6 +36,7 @@ pub const CTL_VM_SHUTDOWN: u32 = 19;
 pub const CTL_BLK_WRITE: u32 = 20;
 pub const CTL_BLK_INFO: u32 = 21;
 pub const CTL_HOST_REBOOT: u32 = 22;
+pub const CTL_RTC_SET: u32 = 23;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -123,7 +124,7 @@ pub fn errno_name(e: i64) -> &'static str {
     match e {
         1 => "operation not permitted",
         2 => "no such VM or device",
-        5 => "I/O error (the disk failed to reset)",
+        5 => "I/O error",
         12 => "out of memory",
         16 => "busy",
         22 => "invalid argument",
@@ -303,6 +304,13 @@ impl Ctl {
     /// not reset.
     pub fn host_reboot(&self) -> Result<()> {
         self.call(CTL_HOST_REBOOT, &[], &[], &[]).map(|_| ())
+    }
+
+    /// Set the machine RTC to UTC seconds since the Unix epoch (dom0
+    /// only). The host's boot-time clock anchor and guest clocks stay as
+    /// they were; the RTC supplies the time on the next host boot.
+    pub fn rtc_set(&self, seconds: u64) -> Result<()> {
+        self.call(CTL_RTC_SET, &[seconds], &[], &[]).map(|_| ())
     }
 
     /// Ask the guest to power off or reboot cleanly (POWER_OFF, POWER_REBOOT).

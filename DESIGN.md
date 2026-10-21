@@ -608,6 +608,13 @@ The clockevent is a per-vCPU one-shot deadline armed with
 `l4h-root` reads the CMOS RTC once at boot, and each VMM adds the TSC time
 since. Guests may correct it with NTP. Without an RTC it
 is 0, the epoch.
+dom0 can save its corrected time to the machine RTC with `l4hctl rtc-set`
+(`L4H_CTL_RTC_SET`, UTC epoch seconds). Root retains the RTC capability;
+on x86 it inhibits calendar updates while writing, preserves the data
+and hour modes, and writes a century register only if the FADT advertises
+one. AArch64 QEMU virt uses the PL031 load register. The write affects
+the RTC used on the next host boot; it does not replace the current host
+anchor or change running guests' clocks.
 
 **Signals.** The kernel builds the native x86 `rt_sigframe` in user memory
 through the direct map. It fetches FPU and XSAVE state with E2, then rewrites
@@ -1180,11 +1187,11 @@ dom0 runs no host hardware drivers; those stay in blkd and netd.
 
 **API surface.** Requests and responses are synchronous, fixed-layout,
 little-endian structs defined in `include/l4h/abi.h` and mirrored in
-`l4h-abi`. The control version is 1.
+`l4h-abi`. The control version is 2.
 
 | Area | Implemented operations |
 |------|------------------------|
-| Host | `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot` |
+| Host | `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `rtc_set`: machine RTC in UTC epoch seconds |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores for the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched` |
 | Block | `blk_attach`: disk, read-only flag and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports and counters), `nic_info` (PCI address, switch, MAC) |

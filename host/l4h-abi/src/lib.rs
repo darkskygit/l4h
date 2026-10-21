@@ -243,6 +243,7 @@ pub const CTL_VM_SHUTDOWN: u32 = 19;
 pub const CTL_BLK_WRITE: u32 = 20;
 pub const CTL_BLK_INFO: u32 = 21;
 pub const CTL_HOST_REBOOT: u32 = 22;
+pub const CTL_RTC_SET: u32 = 23;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 pub const NIC_ISOLATED: u64 = 1 << 1;
 

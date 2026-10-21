@@ -33,7 +33,8 @@ current status of each part.
 - **Control.** dom0, the first guest, controls the host through
   `/dev/l4hctl` and the `l4hctl` CLI: create, start (with an initramfs
   and a command line), shutdown and destroy VMs; console access; disks; switches; NICs; CPU caps. Destroying
-  a VM returns all its memory.
+  a VM returns all its memory. `l4hctl rtc-set` saves dom0's time to the
+  machine's real-time clock.
 - **Memory under QEMU/KVM.** Memory not given to guests is reported
   free through virtio-balloon free page reporting, so QEMU drops it.
 - **Boot.** Multiboot under QEMU, or l4h as one UEFI application
@@ -150,6 +151,7 @@ l4hctl console 1 --follow
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |
 | `tests/run-schedtest.sh` | host-side SMT topology, initial placement and migration policy tests |
+| `tests/run-rtctest.sh [--qemu]` | RTC calendar, BCD/binary and 12/24-hour modes, bounds and error recovery; with `--qemu`, dom0 writes verified against the emulated hardware |
 | `tests/run-smttest.sh` | QEMU boot with SMT: CPU discovery, initial placement and busy-vCPU migration |
 | `tests/run-captest.sh [cap%] [rounds]` | self-test and fork loops in a guest capped from boot |
 | `tests/run-capperf.sh [caps]` | fork/exec and CPU-bound timings, uncapped and under each cap (use a release seL4) |

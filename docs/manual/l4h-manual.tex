@@ -811,6 +811,25 @@ l4hctl send VM [--wait PATTERN [--timeout SECS]] TEXT...
 The console of every guest is also copied to the host's serial port, which
 helps when you debug a guest that dom0 cannot reach.
 
+\section{Setting the machine's real-time clock}
+
+After NTP has synchronized dom0's clock, save it to the machine's RTC:
+\begin{lstlisting}
+l4hctl rtc-set
+# Or supply UTC seconds since 1970-01-01:
+l4hctl rtc-set 1893456000
+\end{lstlisting}
+
+Only dom0 can set the RTC. This changes the time used on the next host
+boot; the host's current time anchor and guest Linux clocks keep their
+existing values. Run NTP in guests as usual. No automatic RTC write-back
+is performed.
+
+On x86\_64, dates from 1970 through 2099 are supported when firmware
+advertises a century register, and 2000 through 2099 otherwise. On
+AArch64 QEMU \texttt{virt}, the PL031 accepts seconds from 0 through
+4294967295 (2106-02-07 06:28:15 UTC). An out-of-range date is rejected.
+
 \section{Shutting down and destroying}
 
 \begin{lstlisting}
