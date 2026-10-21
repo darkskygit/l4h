@@ -239,11 +239,13 @@ static LOG: Log = Log;
 pub struct Start {
     interp: NoSendInterpreter<Hw>,
     dsm: AmlName,
-    /// The arguments of the start function, made once: each command
-    /// passes them again (a clone of the list is 4 counted references).
-    args: Vec<WrappedObject>,
 }
 
+/// The _DSM's arguments for `function`.  They are made afresh for each
+/// call, as the interpreter passes objects by reference: a _DSM that
+/// writes its Arg would otherwise change what the next command passes.
+/// That is a few small allocations per command, in the interpreter's
+/// heap (HEAP), whose use the firmware bounds.
 fn dsm_args(function: u64) -> Vec<WrappedObject> {
     let mut args = Vec::with_capacity(4);
     args.push(Object::Buffer(START_UUID.to_vec()).wrap());
@@ -360,7 +362,7 @@ impl Start {
             let supported = interp.evaluate_if_present(dsm.clone(), dsm_args(0)).ok().flatten();
             let has_start = supported.as_ref().and_then(|o| o.as_buffer().ok()).is_some_and(|b| b.first().is_some_and(|f| f & (1 << START_FUNCTION) != 0));
             if has_start {
-                return Ok(Start { interp, dsm, args: dsm_args(START_FUNCTION) });
+                return Ok(Start { interp, dsm });
             }
         }
         Err("no MSFT0101 device with the CRB start _DSM")
@@ -368,7 +370,7 @@ impl Start {
 
     /// Start the command in the CRB buffer.
     pub fn start(&self) -> Result<(), &'static str> {
-        let r = self.interp.evaluate(self.dsm.clone(), self.args.clone()).map_err(aml_err("_DSM start"))?;
+        let r = self.interp.evaluate(self.dsm.clone(), dsm_args(START_FUNCTION)).map_err(aml_err("_DSM start"))?;
         match r.as_integer() {
             Ok(0) => Ok(()),
             _ => Err("_DSM start failed"),
