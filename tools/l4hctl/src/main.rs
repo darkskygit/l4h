@@ -76,6 +76,8 @@ fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: O
 
 const USAGE: &str = "usage: l4hctl <command>
   info                         host resources
+  host-reboot                  flush the host's disks and reset the machine
+                               (every guest stops; sync dom0's disks first)
   disks                        host disks, owners, capacities and attachments
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
@@ -163,6 +165,9 @@ fn run(args: &[String]) -> Result<i32> {
             println!("memory: {} MiB free of {} MiB", r.vals[1] >> 20, r.vals[2] >> 20);
             println!("disks:  {}", r.vals[3]);
             println!("vms:    {}", r.vals[4]);
+        }
+        "host-reboot" => {
+            ctl.host_reboot()?;
         }
         "disks" => {
             let n = ctl.call(CTL_HOST_INFO, &[], &[], &[])?.vals[3];

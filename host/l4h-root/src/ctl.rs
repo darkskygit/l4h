@@ -322,6 +322,8 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             }
             Ok(())
         }
+        // dom0 only (the control page is dom0's): returns only on failure.
+        abi::CTL_HOST_REBOOT => Err(crate::reset::reboot(h)),
         _ => Err(ENOSYS),
     }
 }

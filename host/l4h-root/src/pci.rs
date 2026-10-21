@@ -144,6 +144,13 @@ impl Pci {
         Pci { port: s as u64 }
     }
 
+    /// A byte to one of the ports root holds, 0xcf8..0xcff, such as the
+    /// reset control register 0xcf9.
+    pub fn out8(&self, port: u16, v: u8) {
+        assert!((CONFIG_ADDRESS..CONFIG_DATA + 4).contains(&port));
+        sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X86_IOPort_Out8(self.port, port as u64, v as u64));
+    }
+
     fn addr(bus: u8, dev: u8, func: u8, off: u8) -> u64 {
         (1u64 << 31) | ((bus as u64) << 16) | ((dev as u64) << 11) | ((func as u64) << 8) | (off as u64 & 0xfc)
     }

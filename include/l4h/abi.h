@@ -405,6 +405,10 @@ enum l4h_ctl_op {
     L4H_CTL_BLK_WRITE = 20,
     /* disk, first attachment -> vals: next (0 = end), vm, start, sectors, read-only */
     L4H_CTL_BLK_INFO = 21,
+	/* Flush every disk the host drives and reset the machine (ACPI reset
+	 * register, then 0xcf9, then the keyboard controller).  Returns only
+	 * if the machine did not reset: -EIO; -ENOSYS on aarch64. */
+	L4H_CTL_HOST_REBOOT = 22,
 };
 
 #define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */

@@ -79,4 +79,9 @@ for d in 1 2 1 2; do
 done
 l4hctl disks
 echo "CTLTEST: PASS"
+# Last: the host reboot, which QEMU (-no-reboot) ends the run on.
+sync
+echo "CTLTEST: host reboot"
+l4hctl host-reboot
+echo "CTLTEST: FAIL: the host did not reset"
 poweroff -f

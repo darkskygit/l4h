@@ -35,6 +35,7 @@ pub const CTL_VM_STATS: u32 = 18;
 pub const CTL_VM_SHUTDOWN: u32 = 19;
 pub const CTL_BLK_WRITE: u32 = 20;
 pub const CTL_BLK_INFO: u32 = 21;
+pub const CTL_HOST_REBOOT: u32 = 22;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -296,6 +297,12 @@ impl Ctl {
 
     pub fn vm_destroy(&self, vm: u64) -> Result<()> {
         self.call(CTL_VM_DESTROY, &[vm], &[], &[]).map(|_| ())
+    }
+
+    /// Flush the host's disks and reset the machine (dom0 only).  Returns
+    /// only if it did not reset.
+    pub fn host_reboot(&self) -> Result<()> {
+        self.call(CTL_HOST_REBOOT, &[], &[], &[]).map(|_| ())
     }
 
     /// Ask the guest to power off or reboot cleanly (POWER_OFF, POWER_REBOOT).

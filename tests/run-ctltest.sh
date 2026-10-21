@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M4 gate: dom0 creates, talks to and destroys guests through the control
-# API, and passes a disk through to them.
+# API, and passes a disk through to them; last, it resets the host.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -31,3 +31,6 @@ L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-
     "$root/tools/run-dom0.sh" "$out/ctltest.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" ${CTLTEST_TIMEOUT:-$((600 * l4h_test_slow))} \
     | grep -E "CTLTEST|l4hctl|GUEST|vm [0-9]|disk [0-9]|^ *[0-9]+ |memory|l4h-root: guest|panic" || true
 grep -q "CTLTEST: PASS" "$root/build/qemu.log"
+grep -aq "l4h-root: host reboot (dom0)" "$root/build/qemu.log" || { echo "CTLTEST: no host reboot"; exit 1; }
+! grep -aq "the host did not reset\|host reboot failed" "$root/build/qemu.log" || { echo "CTLTEST: the host did not reset"; exit 1; }
+echo "CTLTEST: host reset"

@@ -184,13 +184,14 @@ pub fn spawn(
     win: &mut Window,
     asids: &mut AsidPools,
     info: &HostInfo,
+    frames: crate::acpi::Frames,
 ) -> Option<Trustd> {
     if TRUSTD_ELF.is_empty() {
         return None;
     }
     #[cfg(target_arch = "x86_64")]
     {
-        let mut frames = crate::acpi::Frames::new();
+        let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
         let l = find_tpm(bootinfo, &mut phys)?;
         // The pages of each range.
@@ -248,7 +249,7 @@ pub fn spawn(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (bootinfo, alloc, devmem, win, asids, info);
+        let _ = (bootinfo, alloc, devmem, win, asids, info, frames);
         None
     }
 }

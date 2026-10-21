@@ -35,6 +35,7 @@ mod mem;
 mod monitor;
 mod netd;
 mod pci;
+mod reset;
 mod rtc;
 mod sched;
 mod trustd;
@@ -202,6 +203,7 @@ pub struct Host {
     /// restarts.
     pub dom0_initrd: &'static [u8],
     pub trustd: Option<trustd::Trustd>,
+    pub reset: reset::Reset,
 }
 
 impl Host {
@@ -510,7 +512,14 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         alloc.balloon = balloon::Balloon::new(&d, &pci, &mut alloc, &mut devmem, info.tsc_hz / 1000);
     }
     let mut asids = asids;
-    let trustd = trustd::spawn(bootinfo, &mut alloc, &mut devmem, &mut wins.a, &mut asids, &info);
+    // ACPI table pages are carved once: the reset register's, then
+    // trustd's, from one map.
+    let mut acpi_frames = acpi::Frames::new();
+    #[cfg(target_arch = "x86_64")]
+    let reset = reset::Reset::find(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
+    #[cfg(not(target_arch = "x86_64"))]
+    let reset = reset::Reset::default();
+    let trustd = trustd::spawn(bootinfo, &mut alloc, &mut devmem, &mut wins.a, &mut asids, &info, acpi_frames);
     let netd = netd::spawn(nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
@@ -532,6 +541,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         kmods,
         dom0_initrd,
         trustd,
+        reset,
     };
     h.scan_disks();
     h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq);
