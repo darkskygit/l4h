@@ -30,6 +30,7 @@ mod elf;
 mod font;
 mod guest;
 mod kimage;
+mod layout;
 mod mem;
 mod memd;
 mod monitor;
@@ -426,6 +427,7 @@ impl Host {
 
 #[root_task(heap_size = 32 * 1024 * 1024)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
+    layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
     let topology = sched::topology::discover(bootinfo);
     info!("l4h-root: CPU physical cores {:?}", topology.physical);

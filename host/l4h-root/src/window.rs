@@ -4,10 +4,9 @@
 use sel4::init_thread::slot;
 use sel4::{CapRights, VmAttributes, cap_type};
 
+use crate::layout;
 use crate::mem::{Alloc, ObjCtx, Slot};
 use crate::vspace::map_frame;
-
-pub const WINDOW_VA: usize = 0x0000_7000_0000_0000;
 
 pub struct Window {
     slot: Slot,
@@ -17,7 +16,8 @@ pub struct Window {
 impl Window {
     /// Window `n` (0 or 1) of the two the root task uses.
     pub fn new(alloc: &mut Alloc, n: usize) -> Self {
-        let va = WINDOW_VA + n * 0x1000;
+        assert!(n < 2);
+        let va = layout::WINDOWS.base + n * 0x1000;
         let slot = alloc.slots.alloc();
         // Pre-create the paging structures for the window so that mapping
         // never has to allocate.

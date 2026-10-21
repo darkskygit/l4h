@@ -56,7 +56,7 @@ impl Monitor {
         use sel4::init_thread::slot;
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
-        const UART_VA: usize = 0x6000_0200_0000;
+        const UART_VA: usize = crate::layout::UART.base;
         let frames = devmem.frames(&mut alloc.slots, 0x0900_0000, 4096)?;
         crate::vspace::map_frame(&mut ObjCtx::global(alloc), slot::VSPACE.cap(), frames[0],
             UART_VA, CapRights::read_write(), VmAttributes::EXECUTE_NEVER);

@@ -125,8 +125,8 @@ fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut 
     use crate::mem::ObjCtx;
     use crate::vspace::map_frame;
 
-    /// Where the modules are mapped in the root task, one after another.
-    const MODULE_VA: usize = 0x0000_7300_0000_0000;
+    // Where the modules are mapped in the root task, one after another.
+    let region = &crate::layout::MODULES;
     // SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES: a count, then entries of
     // paddr, size and a 64-byte name (seL4_X86_BootModules_t).
     const BOOT_MODULES: u64 = 8;
@@ -135,7 +135,7 @@ fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut 
     let Some(c) = extra_chunk(bootinfo, BOOT_MODULES) else { return out };
     let word = |i: usize| u64::from_le_bytes(c[i..i + 8].try_into().unwrap()) as usize;
     let count = if c.len() >= 8 { word(0).min((c.len() - 8) / ENTRY) } else { 0 };
-    let mut va = MODULE_VA;
+    let mut va = region.base;
     for i in 0..count {
         let e = 8 + i * ENTRY;
         let (paddr, size) = (word(e), word(e + 8));
@@ -143,6 +143,10 @@ fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut 
         let raw = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
         let name: String = core::str::from_utf8(raw).unwrap_or("").split_whitespace().last().unwrap_or("").into();
         let pages = size.div_ceil(4096);
+        if va + pages * 4096 > region.end() {
+            sel4::debug_println!("l4h-root: boot module '{}' of {} MiB does not fit, ignored", name, size >> 20);
+            continue;
+        }
         let Some(frames) = alloc.slots.global(|slots| devmem.frames_range(slots, paddr, pages * 4096)) else {
             sel4::debug_println!("l4h-root: boot module '{}' at {:#x} is not device memory, ignored", name, paddr);
             continue;

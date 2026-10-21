@@ -26,6 +26,7 @@ use l4h_host as host;
 
 use crate::component::Component;
 use crate::kimage::Kernel;
+use crate::layout;
 use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot, UtPool, UtRegion};
 use crate::{memd, vmm};
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
@@ -54,15 +55,22 @@ pub fn hyp_badge_vcpu(b: u64) -> usize {
     ((b >> 16) & 0xff) as usize
 }
 
-/// Where l4h-root maps a guest's console and control pages for itself.
-const ROOT_GUEST_VA: usize = 0x0000_7100_0000_0000;
+/// Where l4h-root maps a guest's pages for itself (layout::GUEST_PAGES):
+/// its control page, its console page, then from these offsets its
+/// console ring and the event page of each vCPU.
 fn root_guest_va(id: usize) -> usize {
-    ROOT_GUEST_VA + id * 0x10_0000
+    assert!(id < crate::MAX_GUESTS);
+    layout::GUEST_PAGES.base + id * layout::GUEST_STRIDE
 }
+const GUEST_RING_OFF: usize = 0x1_0000;
+const GUEST_EVENTS_OFF: usize = 0x2_0000;
+const _: () = assert!(2 * PAGE <= GUEST_RING_OFF);
+const _: () = assert!(GUEST_RING_OFF + host::CONSOLE_RING_PAGES * PAGE <= GUEST_EVENTS_OFF);
+const _: () = assert!(GUEST_EVENTS_OFF + abi::MAX_VCPUS * PAGE <= layout::GUEST_STRIDE);
 /// Where l4h-root maps the control data area of a guest (dom0) for itself.
-const ROOT_CTL_DATA_VA: usize = 0x0000_7180_0000_0000;
 fn root_ctl_data_va(id: usize) -> usize {
-    ROOT_CTL_DATA_VA + id * abi::CTL_LOAD_MAX as usize
+    assert!(id < crate::MAX_GUESTS);
+    layout::CTL_DATA.base + id * abi::CTL_LOAD_MAX as usize
 }
 
 /// Default size of a guest's I/O pool, and its bounds (a power of two).
@@ -434,11 +442,11 @@ impl Guest {
 
     /// Event page of vCPU `v`, as mapped in the root task.
     pub fn event_page(&self, v: usize) -> *mut abi::EventPage {
-        (root_guest_va(self.id) + 0x2_0000 + v * PAGE) as *mut abi::EventPage
+        (root_guest_va(self.id) + GUEST_EVENTS_OFF + v * PAGE) as *mut abi::EventPage
     }
 
     pub fn console_ring(&self) -> *const host::ConsoleRing {
-        (root_guest_va(self.id) + 0x1_0000) as *const host::ConsoleRing
+        (root_guest_va(self.id) + GUEST_RING_OFF) as *const host::ConsoleRing
     }
 
     /// Write the boot info and give the guest its RAM: the boot blocks
@@ -868,7 +876,7 @@ pub fn create(
     // ---- Event pages in the root task too (steal time).
     for v in 0..g.vcpus.len() {
         let ev = g.vcpus[v].event;
-        g.map_in_root(alloc, ev, root_guest_va(id) + 0x2_0000 + v * PAGE);
+        g.map_in_root(alloc, ev, root_guest_va(id) + GUEST_EVENTS_OFF + v * PAGE);
     }
 
     // ---- Boot info frames (written at boot).
@@ -883,7 +891,7 @@ pub fn create(
     g.add_device(alloc, DevKind::Console).unwrap();
     for i in 0..host::CONSOLE_RING_PAGES {
         let f = g.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
-        let va = root_guest_va(id) + 0x1_0000 + i * PAGE;
+        let va = root_guest_va(id) + GUEST_RING_OFF + i * PAGE;
         g.map_in_root(alloc, f, va);
         g.console_ring.push(f);
     }

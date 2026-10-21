@@ -372,7 +372,7 @@ pub const fn msi_data(vector: u64) -> u32 {
 #[cfg(target_arch = "aarch64")]
 impl Pci {
     // QEMU virt, highmem-ecam=off: 16 MiB ECAM, buses 0..15.
-    const ECAM_VA: usize = 0x6000_0000_0000;
+    const ECAM_VA: usize = crate::layout::ECAM.base;
     pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem) -> Self {
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;

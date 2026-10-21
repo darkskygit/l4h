@@ -19,7 +19,7 @@ use crate::mem::{Alloc, ObjCtx};
 use crate::vspace::map_frame;
 
 /// Where the framebuffer is mapped in the root task.
-const FB_VA: usize = 0x0000_7200_0000_0000;
+const FB_VA: usize = crate::layout::FRAMEBUFFER.base;
 /// Refresh period in timer ticks of the balancer (100 ms).
 const REFRESH_TICKS: u32 = 10;
 
@@ -94,6 +94,10 @@ impl Dashboard {
         let frames = alloc.slots.global(|slots| devmem.frames(slots, base, size))?;
         let first = (addr - base) / 4096;
         let pages = (addr - base + len).div_ceil(4096) - first;
+        if pages * 4096 > crate::layout::FRAMEBUFFER.size {
+            info!("l4h-root: framebuffer of {} MiB is too large", len >> 20);
+            return None;
+        }
         let wc = VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining);
         alloc.global(|alloc| {
             for (i, f) in frames[first..first + pages].iter().enumerate() {

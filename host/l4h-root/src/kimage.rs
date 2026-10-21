@@ -18,7 +18,7 @@ use crate::vspace::{LARGE_PAGE_BP, map_large_page};
 const PAGE: usize = 4096;
 const LARGE_PAGE: usize = 2 << 20;
 /// Where the root task maps the module image, to fill it.
-const KMOD_ROOT_VA: usize = 0x0000_7600_0000_0000;
+const KMOD_ROOT_VA: usize = crate::layout::KMOD_IMAGE.base;
 
 pub struct Kernel {
     pub elf: Elf<'static>,

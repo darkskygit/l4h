@@ -24,9 +24,8 @@ use crate::{AsidPools, HostInfo};
 static MEMD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-memd.elf"));
 
 pub const MEMD_ID: u32 = 0x400;
-/// memd's status page in the root task, separate from kimage's module
-/// image at 0x0000_7600_0000_0000.
-const STATUS_VA: usize = 0x0000_7700_0000_0000;
+/// memd's status page in the root task.
+const STATUS_VA: usize = crate::layout::MEMD_STATUS.base;
 /// Mapping capabilities of the status page and the balloon's BARs and DMA.
 const KEEP_BITS: usize = 12;
 const PAGE: usize = 4096;

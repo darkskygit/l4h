@@ -30,7 +30,7 @@ static TRUSTD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-trustd.
 const PAGE: usize = 4096;
 pub const TRUSTD_ID: u32 = 0x300;
 /// The registry page in the root task.
-const REGISTRY_VA: usize = 0x0000_7500_0000_0000;
+const REGISTRY_VA: usize = crate::layout::TRUSTD_REGISTRY.base;
 /// Mapping capabilities trustd's ranges and AML pages can need.
 const KEEP_BITS: usize = 12;
 
