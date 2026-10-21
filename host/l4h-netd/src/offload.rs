@@ -235,7 +235,7 @@ fn pseudo(frame: &[u8], f: &TcpFrame, tcp_len: usize) -> u32 {
 /// Segments merge only where Linux's GRO would merge them, and a frame
 /// on its own passes unchanged.
 pub struct Gro {
-    buf: alloc::vec::Vec<u8>,
+    buf: [u8; 14 + 4 + GRO_MAX],
     len: usize,
     hdr: [u8; HDR_SIZE],
     f: Option<TcpFrame>,
@@ -250,8 +250,26 @@ pub struct Gro {
 const GRO_MAX: usize = 65535;
 
 impl Gro {
-    pub fn new() -> Self {
-        Gro { buf: alloc::vec![0; 14 + 4 + GRO_MAX], len: 0, hdr: [0; HDR_SIZE], f: None, segs: 0, mss: 0, next_seq: 0, closed: false }
+    /// For the host tests; netd makes its own with init().
+    #[allow(dead_code)]
+    pub const fn new() -> Self {
+        Gro { buf: [0; 14 + 4 + GRO_MAX], len: 0, hdr: [0; HDR_SIZE], f: None, segs: 0, mss: 0, next_seq: 0, closed: false }
+    }
+
+    /// new(), in place at `g`: a Gro is too large to build on the stack.
+    pub fn init(g: &mut core::mem::MaybeUninit<Gro>) -> &mut Gro {
+        let p = g.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*p).buf).write_bytes(0, 1);
+            core::ptr::addr_of_mut!((*p).len).write(0);
+            core::ptr::addr_of_mut!((*p).hdr).write([0; HDR_SIZE]);
+            core::ptr::addr_of_mut!((*p).f).write(None);
+            core::ptr::addr_of_mut!((*p).segs).write(0);
+            core::ptr::addr_of_mut!((*p).mss).write(0);
+            core::ptr::addr_of_mut!((*p).next_seq).write(0);
+            core::ptr::addr_of_mut!((*p).closed).write(false);
+            g.assume_init_mut()
+        }
     }
 
     /// A segment that may merge: TCP with payload, only ACK/PSH set, no IP

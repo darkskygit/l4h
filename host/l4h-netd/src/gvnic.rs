@@ -16,15 +16,17 @@
 //! vector.  A DQO block masks itself when it fires and is re-armed
 //! through its doorbell.
 
-use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
 
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::{self, net::{self, NicConfig}};
 use l4h_rt::sel4;
 use l4h_virtio::{Dma, Mmio, dma_fence};
 
+use crate::nic::Partial;
 use crate::offload;
+use crate::pool::Frame;
 
 const HDR: usize = net::HDR_SIZE;
 
@@ -190,7 +192,7 @@ pub struct Gvnic {
     adminq_prod: u32,
     /// Interrupt doorbell index of each notification block.
     irq_db: [u32; 2],
-    ptypes: Vec<(u8, u8)>,
+    ptypes: [(u8, u8); NUM_PTYPES],
 
     tx_ring: usize,
     tx_mask: u32,
@@ -202,9 +204,9 @@ pub struct Gvnic {
     tx_compl_head: u32,
     tx_compl_gen: u16,
     tx_db: u32,
-    tx_bufs: Vec<(usize, u64)>,
-    tx_state: Vec<TxBuf>,
-    tx_free: Vec<u16>,
+    tx_bufs: ArrayVec<(usize, u64), TX_BUFS>,
+    tx_state: ArrayVec<TxBuf, TX_BUFS>,
+    tx_free: ArrayVec<u16, TX_BUFS>,
     tx_kick: bool,
 
     rx_bufq: usize,
@@ -214,14 +216,14 @@ pub struct Gvnic {
     rx_compl_head: u32,
     rx_compl_gen: u16,
     rx_db: u32,
-    rx_bufs: Vec<(usize, u64)>,
+    rx_bufs: ArrayVec<(usize, u64), { RX_BUFS as usize }>,
     /// A frame that spans buffers, while its completions arrive.
-    rx_partial: Vec<u8>,
+    rx_partial: &'static mut Partial,
     rx_partial_bad: bool,
 }
 
 impl Gvnic {
-    pub fn new(n: usize, c: &NicConfig, tsc_hz: u64) -> Self {
+    pub fn new(n: usize, c: &NicConfig, tsc_hz: u64, rx_partial: &'static mut Partial) -> Self {
         let mut dma = Dma::new(net::nic_dma_va(n), c.dma_paddr, c.dma_size as usize);
         let regs = Mmio(c.regs.va as usize);
         let doorbells = Mmio(c.doorbells.va as usize);
@@ -249,7 +251,7 @@ impl Gvnic {
             adminq: dma.alloc(ADMINQ_SIZE, 4096),
             adminq_prod: 0,
             irq_db: [0; 2],
-            ptypes: Vec::new(),
+            ptypes: [(0, 0); NUM_PTYPES],
             tx_ring: 0,
             tx_mask: 0,
             tx_tail: 0,
@@ -259,9 +261,9 @@ impl Gvnic {
             tx_compl_head: 0,
             tx_compl_gen: 0,
             tx_db: 0,
-            tx_bufs: Vec::new(),
-            tx_state: Vec::new(),
-            tx_free: Vec::new(),
+            tx_bufs: ArrayVec::new(),
+            tx_state: ArrayVec::new(),
+            tx_free: ArrayVec::new(),
             tx_kick: false,
             rx_bufq: 0,
             rx_mask: 0,
@@ -270,8 +272,8 @@ impl Gvnic {
             rx_compl_head: 0,
             rx_compl_gen: 0,
             rx_db: 0,
-            rx_bufs: Vec::new(),
-            rx_partial: Vec::new(),
+            rx_bufs: ArrayVec::new(),
+            rx_partial,
             rx_partial_bad: false,
         };
         for &b in b"GVE-l4h\n" {
@@ -309,7 +311,7 @@ impl Gvnic {
             "describe device",
             Cmd::new(AQ_DESCRIBE_DEVICE).u64(0, desc_pa).u32(8, DEVICE_DESCRIPTOR_VERSION).u32(12, 4096),
         );
-        let d: Vec<u8> = (0..4096).map(|i| rd8(desc_va + i)).collect();
+        let d: [u8; 4096] = core::array::from_fn(|i| rd8(desc_va + i));
         let tx_entries = be16(&d, 10) as u32;
         let rx_entries = be16(&d, 12) as u32;
         let mtu = be16(&d, 16);
@@ -358,7 +360,7 @@ impl Gvnic {
         // Packet types: which received frames had their checksums checked.
         let (ptype_va, ptype_pa) = dma.alloc(NUM_PTYPES * 2, 4096);
         g.exec("get ptype map", Cmd::new(AQ_GET_PTYPE_MAP).u64(0, (NUM_PTYPES * 2) as u64).u64(8, ptype_pa));
-        g.ptypes = (0..NUM_PTYPES).map(|i| (rd8(ptype_va + 2 * i), rd8(ptype_va + 2 * i + 1))).collect();
+        g.ptypes = core::array::from_fn(|i| (rd8(ptype_va + 2 * i), rd8(ptype_va + 2 * i + 1)));
 
         // TX queue.
         let (tx_ring, tx_ring_pa) = dma.alloc(tx_entries as usize * TX_DESC, 4096);
@@ -368,9 +370,11 @@ impl Gvnic {
         // there is a descriptor completion per MIN_RE_INTERVAL descriptors:
         // the completion queue cannot overflow.
         let bufs = TX_BUFS.min((tx_entries - tx_entries / MIN_RE_INTERVAL) as usize / 2);
-        g.tx_bufs = (0..bufs).map(|_| dma.alloc(net::MAX_FRAME, 64)).collect();
-        g.tx_state = alloc::vec![TxBuf::Free; bufs];
-        g.tx_free = (0..bufs as u16).rev().collect();
+        for i in 0..bufs {
+            let _ = g.tx_bufs.push(dma.alloc(net::MAX_FRAME, 64));
+            let _ = g.tx_state.push(TxBuf::Free);
+            let _ = g.tx_free.push((bufs - 1 - i) as u16);
+        }
         (g.tx_ring, g.tx_compl, g.tx_mask) = (tx_ring, tx_compl, tx_entries - 1);
         g.exec(
             "create TX queue",
@@ -390,7 +394,9 @@ impl Gvnic {
         let (rx_bufq, rx_bufq_pa) = dma.alloc(rx_entries as usize * RX_DESC, 4096);
         let (rx_compl, rx_compl_pa) = dma.alloc(rx_entries as usize * RX_COMPL, 4096);
         let (rx_res, rx_res_pa) = dma.alloc(64, 64);
-        g.rx_bufs = (0..RX_BUFS.min(rx_entries - 1)).map(|_| dma.alloc(RX_BUF, 64)).collect();
+        for _ in 0..RX_BUFS.min(rx_entries - 1) {
+            let _ = g.rx_bufs.push(dma.alloc(RX_BUF, 64));
+        }
         (g.rx_bufq, g.rx_compl, g.rx_mask) = (rx_bufq, rx_compl, rx_entries - 1);
         g.exec(
             "create RX queue",
@@ -406,7 +412,6 @@ impl Gvnic {
                 .u16(48, rx_entries as u16),
         );
         g.rx_db = u32::from_be(unsafe { read_volatile(rx_res as *const u32) });
-        g.rx_partial = Vec::with_capacity(net::MAX_FRAME);
         for id in 0..g.rx_bufs.len() as u16 {
             g.post_rx(id);
         }
@@ -581,14 +586,12 @@ impl Gvnic {
                 out[..n].copy_from_slice(&data[..n]);
                 (!error && n == len).then_some(n)
             } else {
-                if self.rx_partial.len() + len <= self.rx_partial.capacity() {
-                    self.rx_partial.extend_from_slice(data);
-                } else {
+                if self.rx_partial.extend_from_slice(data).is_err() {
                     self.rx_partial_bad = true;
                 }
                 self.rx_partial_bad |= error;
                 if eop {
-                    let p = &self.rx_partial;
+                    let p = &*self.rx_partial;
                     let ok = !core::mem::take(&mut self.rx_partial_bad) && p.len() <= out.len();
                     let n = ok.then(|| {
                         out[..p.len()].copy_from_slice(p);
@@ -649,7 +652,7 @@ impl Gvnic {
         let Some(s) = self.tx_state.get_mut(tag as usize) else { return };
         if core::mem::discriminant(s) == core::mem::discriminant(&from) {
             *s = TxBuf::Free;
-            self.tx_free.push(tag);
+            let _ = self.tx_free.push(tag);
         }
     }
 
@@ -666,7 +669,7 @@ impl Gvnic {
             if let TxBuf::Missed(t) = *s {
                 if now.wrapping_sub(t) > MISS_TIMEOUT_SECS * self.tsc_hz {
                     *s = TxBuf::Free;
-                    self.tx_free.push(i as u16);
+                    let _ = self.tx_free.push(i as u16);
                 }
             }
         }
@@ -696,7 +699,7 @@ impl Gvnic {
         self.tx_tail = (self.tx_tail + 1) & self.tx_mask;
     }
 
-    pub fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+    pub fn transmit(&mut self, frame: &(impl Frame + ?Sized), hdr: &[u8; HDR]) -> bool {
         let get16 = |off: usize| u16::from_le_bytes([hdr[off], hdr[off + 1]]) as usize;
         let gso = offload::is_gso(hdr);
         let descs = 1 + gso as u32 + frame.len().div_ceil(TX_MAX_BUF) as u32;
@@ -715,7 +718,7 @@ impl Gvnic {
         self.tx_state[tag as usize] = TxBuf::Sent;
         let (va, pa) = self.tx_bufs[tag as usize];
         let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, frame.len()) };
-        buf.copy_from_slice(frame);
+        frame.copy_to(buf);
         let csum = hdr[0] & offload::F_NEEDS_CSUM != 0;
         if gso {
             // The device wants the TCP pseudo-header checksum without the

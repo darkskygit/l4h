@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
+use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
 use crate::blkd::{VirtioRegions, is_legacy_virtio, map_bars, virtio_regions};
@@ -81,8 +82,9 @@ pub struct Netd {
     comp: Component,
     #[allow(dead_code)]
     arena: Arena,
-    pub nics: Vec<Nic>,
-    pub ports: Vec<Option<PortInfo>>,
+    pub nics: ArrayVec<Nic, { net::MAX_NICS }>,
+    pub ports: [Option<PortInfo>; net::MAX_PORTS],
+    /// Switches 0..switches exist (they are never deleted).
     pub switches: u32,
 }
 
@@ -108,12 +110,13 @@ pub fn spawn(
     asids: &mut AsidPools,
     info: &HostInfo,
 ) -> Netd {
-    let nics: Vec<_> = nics.into_iter().take(net::MAX_NICS).collect();
+    let nr_nics = nics.len().min(net::MAX_NICS);
     let mut arena = alloc.arena(16 << 20).expect("netd arena");
-    let mut cfg: alloc::boxed::Box<net::NetdConfig> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
-    cfg.nr_nics = nics.len() as u32;
-    let mut dma = Vec::new();
-    for (n, d) in nics.iter().enumerate() {
+    // Plain integers: all zeros is a valid (empty) configuration.
+    let mut cfg: net::NetdConfig = unsafe { core::mem::zeroed() };
+    cfg.nr_nics = nr_nics as u32;
+    let mut dma = ArrayVec::<_, { net::MAX_NICS }>::new();
+    for (n, d) in nics[..nr_nics].iter().enumerate() {
         let bar_va = |b: u8| net::nic_bar_va(n, b as usize);
         let bar_region = |b: u8| l4h_host::blk::PciRegion { va: bar_va(b) as u64, len: d.bars[b as usize].size };
         let none = l4h_host::blk::PciRegion { va: 0, len: 0 };
@@ -142,7 +145,7 @@ pub fn spawn(
         region
             .retype(&FRAME_BP, frames.len(), Dest::root(frames.start))
             .expect("NIC DMA frames");
-        dma.push(frames);
+        let _ = dma.push(frames);
         cfg.nics[n] = net::NicConfig {
             kind: if gvnic {
                 net::NIC_GVNIC
@@ -169,7 +172,7 @@ pub fn spawn(
         };
     }
     let cfg_bytes = unsafe {
-        core::slice::from_raw_parts(&*cfg as *const net::NetdConfig as *const u8, core::mem::size_of::<net::NetdConfig>())
+        core::slice::from_raw_parts(&cfg as *const net::NetdConfig as *const u8, core::mem::size_of::<net::NetdConfig>())
     };
     let args = SpawnArgs {
         id: NETD_ID,
@@ -197,17 +200,19 @@ pub fn spawn(
         keep_next += 1;
         s
     };
-    let mut nic_list = Vec::new();
-    for (n, d) in nics.into_iter().enumerate() {
+    let mut nic_list = ArrayVec::new();
+    for (n, d) in nics.into_iter().take(nr_nics).enumerate() {
         let mut bars = Vec::new();
-        let used = if is_gvnic(&d) {
-            alloc::vec![0, 2, d.msix.unwrap().table_bar]
+        let virtio;
+        let used: &[u8] = if is_gvnic(&d) {
+            &[0, 2, d.msix.unwrap().table_bar]
         } else if is_ixgbe(&d) {
-            alloc::vec![0, d.msix.unwrap().table_bar]
+            &[0, d.msix.unwrap().table_bar]
         } else {
-            crate::blkd::virtio_bars(&d)
+            virtio = crate::blkd::virtio_bars(&d);
+            &virtio
         };
-        map_bars(&comp, alloc, &mut arena, devmem, &d, &mut bars, &used, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bars(&comp, alloc, &mut arena, devmem, &d, &mut bars, used, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());
@@ -234,16 +239,26 @@ pub fn spawn(
         comp.give(net::NETD_SLOT_IRQ_BASE + n as u64, irq, CapRights::all());
         pci.enable(&d);
         pci.enable_msix(&d);
-        nic_list.push(Nic { pci: d, switch: None });
+        let _ = nic_list.push(Nic { pci: d, switch: None });
     }
     component::start(&comp);
-    Netd { comp, arena, nics: nic_list, ports: (0..net::MAX_PORTS).map(|_| None).collect(), switches: 0 }
+    Netd { comp, arena, nics: nic_list, ports: [const { None }; net::MAX_PORTS], switches: 0 }
 }
 
 impl Netd {
-    pub fn create_switch(&mut self) -> u32 {
+    /// A new switch; ENOSPC once there are MAX_SWITCHES, the size of
+    /// netd's table of them.
+    pub fn try_create_switch(&mut self) -> Result<u32, i64> {
+        if self.switches as usize >= net::MAX_SWITCHES {
+            return Err(ctl::ENOSPC);
+        }
         self.switches += 1;
-        self.switches - 1
+        Ok(self.switches - 1)
+    }
+
+    /// A switch of the boot configuration.
+    pub fn create_switch(&mut self) -> u32 {
+        self.try_create_switch().expect("l4h-root: more switches than MAX_SWITCHES")
     }
 
     pub fn attach_uplink(&mut self, switch: u32, nic: usize) -> Result<(), i64> {

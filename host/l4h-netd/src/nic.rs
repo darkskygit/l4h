@@ -1,19 +1,26 @@
 //! Uplink NICs: a virtio-net, gVNIC or Intel X550 device, and the frames waiting for
 //! one of its TX buffers.
 
-use alloc::collections::VecDeque;
-use alloc::vec::Vec;
+use core::ptr::addr_of_mut;
 
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, NicConfig};
 
 use crate::gvnic::Gvnic;
 use crate::ixgbe::Ixgbe;
+use crate::pool::{Fifo, Pool};
 use crate::virtio_net::VirtioNet;
 
 const HDR: usize = net::HDR_SIZE;
-/// Frames waiting for a TX buffer (rather than dropped), and their bytes.
+/// Frames waiting for a TX buffer (rather than dropped), and the pool
+/// chunks they may take: the guests' backlogs take from the same pool.
 const TX_BACKLOG_FRAMES: usize = 512;
-const TX_BACKLOG_BYTES: usize = 4 << 20;
+const TX_BACKLOG_CHUNKS: usize = (4 << 20) / crate::pool::CHUNK;
+
+/// A frame that spans receive buffers, while they arrive (gVNIC, X550):
+/// one per NIC, too large for the stack.
+pub type Partial = ArrayVec<u8, { net::MAX_FRAME }>;
+static mut RX_PARTIAL: [Partial; net::MAX_NICS] = [const { Partial::new() }; net::MAX_NICS];
 
 enum Dev {
     Virtio(VirtioNet),
@@ -39,21 +46,22 @@ pub struct Nic {
     pub csum: bool,
     pub tso: bool,
     dev: Dev,
-    tx_backlog: VecDeque<(Vec<u8>, [u8; HDR])>,
-    tx_backlog_bytes: usize,
+    tx_backlog: Fifo,
     pub tx_drops: u64,
 }
 
 impl Nic {
+    /// NIC `n` (< MAX_NICS), made once.
     pub fn new(n: usize, c: &NicConfig, tsc_hz: u64) -> Self {
+        let partial = unsafe { &mut *addr_of_mut!(RX_PARTIAL[n]) };
         let (dev, mac, csum, tso) = match c.kind {
             net::NIC_GVNIC => {
-                let g = Gvnic::new(n, c, tsc_hz);
+                let g = Gvnic::new(n, c, tsc_hz, partial);
                 let (mac, csum, tso) = (g.mac, g.csum, g.tso);
                 (Dev::Gvnic(g), mac, csum, tso)
             }
             net::NIC_IXGBE => {
-                let x = Ixgbe::new(n, c, tsc_hz);
+                let x = Ixgbe::new(n, c, tsc_hz, partial);
                 let (mac, csum, tso) = (x.mac, x.csum, x.tso);
                 (Dev::Ixgbe(x), mac, csum, tso)
             }
@@ -63,7 +71,7 @@ impl Nic {
                 (Dev::Virtio(v), mac, csum, tso)
             }
         };
-        Nic { switch: None, mac, csum, tso, dev, tx_backlog: VecDeque::new(), tx_backlog_bytes: 0, tx_drops: 0 }
+        Nic { switch: None, mac, csum, tso, dev, tx_backlog: Fifo::EMPTY, tx_drops: 0 }
     }
 
     /// Whether the device takes this GSO frame whole.
@@ -93,9 +101,9 @@ impl Nic {
         dev!(self, d => d.receive(out, hdr))
     }
 
-    /// Send a frame, or hold it until a TX buffer is free: a dropped frame
-    /// costs TCP a retransmission timeout.
-    pub fn send(&mut self, frame: &[u8], hdr: &[u8; HDR]) {
+    /// Send a frame, or hold it in `pool` until a TX buffer is free: a
+    /// dropped frame costs TCP a retransmission timeout.
+    pub fn send(&mut self, frame: &[u8], hdr: &[u8; HDR], pool: &mut Pool) {
         if frame.len() > net::MAX_FRAME {
             self.tx_drops += 1;
             return;
@@ -103,25 +111,22 @@ impl Nic {
         if self.tx_backlog.is_empty() && dev!(self, d => d.transmit(frame, hdr)) {
             return;
         }
-        if self.tx_backlog.len() >= TX_BACKLOG_FRAMES || self.tx_backlog_bytes + frame.len() > TX_BACKLOG_BYTES {
+        if !pool.push(&mut self.tx_backlog, frame, hdr, TX_BACKLOG_FRAMES, TX_BACKLOG_CHUNKS) {
             self.tx_drops += 1;
             return;
         }
-        self.tx_backlog.push_back((frame.to_vec(), *hdr));
-        self.tx_backlog_bytes += frame.len();
-        self.flush_tx();
+        self.flush_tx(pool);
     }
 
     /// Send held frames while TX buffers are free.  While some remain,
     /// the device interrupts when it returns buffers.
-    pub fn flush_tx(&mut self) {
+    pub fn flush_tx(&mut self, pool: &mut Pool) {
         loop {
-            while let Some((frame, hdr)) = self.tx_backlog.pop_front() {
-                if !dev!(self, d => d.transmit(&frame, &hdr)) {
-                    self.tx_backlog.push_front((frame, hdr));
+            while let Some(f) = pool.front(&self.tx_backlog) {
+                if !dev!(self, d => d.transmit(&f, &f.hdr)) {
                     break;
                 }
-                self.tx_backlog_bytes -= frame.len();
+                pool.pop(&mut self.tx_backlog);
             }
             let waiting = !self.tx_backlog.is_empty();
             // Buffers returned before the interrupt was on: send again.

@@ -63,6 +63,10 @@ pub const MAX_PORTS: usize = 48;
 /// Uplink NICs; NIC n interrupts with badge bit NETD_BADGE_IRQ_SHIFT + n.
 pub const MAX_NICS: usize = 4;
 pub const NETD_BADGE_IRQ_SHIFT: u32 = 48;
+/// Switches: one per port and NIC is the most that can carry traffic at
+/// once.  Root refuses to create more, so netd keeps a fixed table of them
+/// indexed by switch number.
+pub const MAX_SWITCHES: usize = MAX_PORTS + MAX_NICS;
 
 /// netd address space: port p at port_va(p); NIC n's BARs and DMA memory.
 pub const fn port_va(p: usize) -> usize {

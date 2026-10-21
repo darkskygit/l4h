@@ -254,7 +254,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             Ok(())
         }
         abi::CTL_SWITCH_CREATE => {
-            resp.vals[0] = h.netd.create_switch() as u64;
+            resp.vals[0] = h.netd.try_create_switch()? as u64;
             Ok(())
         }
         abi::CTL_SWITCH_ATTACH_UPLINK => h.netd.attach_uplink(a[0] as u32, a[1] as usize),

@@ -10,15 +10,15 @@
 //! so the two causes are masked and unmasked separately (EIMS/EIMC bits 0
 //! and 1) while sharing the interrupt.
 
-use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::Ordering;
 
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::{self, net::{self, NicConfig}};
 use l4h_virtio::{Dma, Mmio, dma_fence};
 
 use crate::offload;
+use crate::pool::Frame;
 
 const HDR: usize = net::HDR_SIZE;
 
@@ -198,28 +198,28 @@ pub struct Ixgbe {
     regs: Mmio,
 
     rx_ring: usize,
-    rx_bufs: Vec<(usize, u64)>,
+    rx_bufs: [(usize, u64); RX_BUFS],
     /// Next descriptor the device completes.
     rx_next: usize,
     /// Descriptors given back since the last tail write.
     rx_kick: bool,
     /// Pieces of a frame that spans several buffers.
-    rx_partial: Vec<u8>,
+    rx_partial: &'static mut ArrayVec<u8, { net::MAX_FRAME }>,
     rx_partial_bad: bool,
 
     tx_ring: usize,
     tx_tail: usize,
     /// First descriptor not yet known to be done.
     tx_clean: usize,
-    tx_bufs: Vec<(usize, u64)>,
-    tx_free: Vec<u16>,
-    /// Packets in flight: (last descriptor, buffer).
-    tx_sent: VecDeque<(usize, u16)>,
+    tx_bufs: [(usize, u64); TX_BUFS],
+    tx_free: ArrayVec<u16, TX_BUFS>,
+    /// Packets in flight, oldest first: (last descriptor, buffer).
+    tx_sent: ArrayVec<(usize, u16), TX_BUFS>,
     tx_kick: bool,
 }
 
 impl Ixgbe {
-    pub fn new(n: usize, c: &NicConfig, tsc_hz: u64) -> Self {
+    pub fn new(n: usize, c: &NicConfig, tsc_hz: u64, rx_partial: &'static mut ArrayVec<u8, { net::MAX_FRAME }>) -> Self {
         let regs = Mmio(c.regs.va as usize);
         let wait_us = |us: u64| {
             let end = host::ticks::now() + us * tsc_hz / 1_000_000;
@@ -293,7 +293,7 @@ impl Ixgbe {
         regs.w32(MRQC, 0);
 
         let (rx_ring, rx_ring_pa) = dma.alloc(RX_BUFS * RX_DESC, 4096);
-        let rx_bufs: Vec<_> = (0..RX_BUFS).map(|_| dma.alloc(RX_BUF, 128)).collect();
+        let rx_bufs: [_; RX_BUFS] = core::array::from_fn(|_| dma.alloc(RX_BUF, 128));
         for (i, &(_, pa)) in rx_bufs.iter().enumerate() {
             wr64(rx_ring + i * RX_DESC, pa);
             wr64(rx_ring + i * RX_DESC + 8, 0);
@@ -318,7 +318,7 @@ impl Ixgbe {
 
         // Transmit: the DMA engine before the queue (82599 and later).
         let (tx_ring, tx_ring_pa) = dma.alloc(TX_RING * TX_DESC, 4096);
-        let tx_bufs: Vec<_> = (0..TX_BUFS).map(|_| dma.alloc(TX_BUF, 128)).collect();
+        let tx_bufs: [_; TX_BUFS] = core::array::from_fn(|_| dma.alloc(TX_BUF, 128));
         regs.w32(DMATXCTL, regs.r32(DMATXCTL) | DMATXCTL_TE);
         regs.w32(txdctl(0), 0);
         regs.w32(tdbal(0), tx_ring_pa as u32);
@@ -375,14 +375,20 @@ impl Ixgbe {
             rx_bufs,
             rx_next: 0,
             rx_kick: false,
-            rx_partial: Vec::with_capacity(net::MAX_FRAME),
+            rx_partial,
             rx_partial_bad: false,
             tx_ring,
             tx_tail: 0,
             tx_clean: 0,
             tx_bufs,
-            tx_free: (0..TX_BUFS as u16).rev().collect(),
-            tx_sent: VecDeque::new(),
+            tx_free: {
+                let mut f = ArrayVec::new();
+                for i in (0..TX_BUFS as u16).rev() {
+                    let _ = f.push(i);
+                }
+                f
+            },
+            tx_sent: ArrayVec::new(),
             tx_kick: false,
         }
     }
@@ -441,14 +447,12 @@ impl Ixgbe {
                 out[..n].copy_from_slice(&data[..n]);
                 (!error && n == len).then_some(n)
             } else {
-                if self.rx_partial.len() + len <= self.rx_partial.capacity() {
-                    self.rx_partial.extend_from_slice(data);
-                } else {
+                if self.rx_partial.extend_from_slice(data).is_err() {
                     self.rx_partial_bad = true;
                 }
                 self.rx_partial_bad |= error;
                 if eop {
-                    let p = &self.rx_partial;
+                    let p = &*self.rx_partial;
                     let ok = !core::mem::take(&mut self.rx_partial_bad) && p.len() <= out.len();
                     let n = ok.then(|| {
                         out[..p.len()].copy_from_slice(p);
@@ -485,12 +489,12 @@ impl Ixgbe {
     }
 
     fn reap_tx(&mut self) {
-        while let Some(&(last, buf)) = self.tx_sent.front() {
+        while let Some(&(last, buf)) = self.tx_sent.first() {
             if rd32(self.tx_ring + last * TX_DESC + 12) & TXD_STAT_DD == 0 {
                 break;
             }
-            self.tx_sent.pop_front();
-            self.tx_free.push(buf);
+            self.tx_sent.remove(0);
+            let _ = self.tx_free.push(buf);
             self.tx_clean = (last + 1) % TX_RING;
         }
     }
@@ -501,7 +505,7 @@ impl Ixgbe {
 
     pub fn tx_interrupts(&mut self, on: bool) -> bool {
         self.regs.w32(if on { EIMS } else { EIMC }, CAUSE_TX);
-        self.tx_sent.front().is_some_and(|&(last, _)| rd32(self.tx_ring + last * TX_DESC + 12) & TXD_STAT_DD != 0)
+        self.tx_sent.first().is_some_and(|&(last, _)| rd32(self.tx_ring + last * TX_DESC + 12) & TXD_STAT_DD != 0)
     }
 
     fn put_desc(&mut self, lo: u64, hi: u64) {
@@ -568,7 +572,7 @@ impl Ixgbe {
         Some((macip as u64, ctx_hi, popts, hdr_len))
     }
 
-    pub fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+    pub fn transmit(&mut self, frame: &(impl Frame + ?Sized), hdr: &[u8; HDR]) -> bool {
         let need = 1 + frame.len().div_ceil(TX_MAX_DATA);
         if self.tx_free.is_empty() || self.tx_room() < need {
             self.reap_tx();
@@ -581,7 +585,7 @@ impl Ixgbe {
         let tag = self.tx_free.pop().unwrap();
         let (va, pa) = self.tx_bufs[tag as usize];
         let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, frame.len()) };
-        buf.copy_from_slice(frame);
+        frame.copy_to(buf);
         let mut popts = 0;
         let mut paylen = frame.len();
         let mut tse = 0;
@@ -614,7 +618,8 @@ impl Ixgbe {
             self.put_desc(pa + off as u64, cmd as u64 | (olinfo as u64) << 32);
             off += len;
         }
-        self.tx_sent.push_back(((self.tx_tail + TX_RING - 1) % TX_RING, tag));
+        // One entry per buffer in flight: there is room.
+        let _ = self.tx_sent.push(((self.tx_tail + TX_RING - 1) % TX_RING, tag));
         self.tx_kick = true;
         true
     }

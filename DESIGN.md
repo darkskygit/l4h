@@ -971,7 +971,8 @@ NAT, DHCP and firewalling belong in a VM.
 - **Multiple vNICs.** Each vNIC is on one switch and appears as a separate
   `ethN`. It shares the guest's limit of 16 devices with the console,
   disks and, in dom0, control device. There are 48 guest ports in all.
-- **Switches and uplinks.** The API creates switches dynamically. Each is
+- **Switches and uplinks.** The API creates switches dynamically, up to
+  52 (one per guest port and NIC; switches are not deleted). Each is
   an L2 broadcast domain with its own learned MAC table. A physical NIC
   can be the uplink of one switch; a switch without an uplink is internal.
   A single netd serves all switches. VLANs, jumbo MTUs, static MAC entries
@@ -990,10 +991,12 @@ NAT, DHCP and firewalling belong in a VM.
   checksummed in software. Guest vNICs have one RX/TX queue pair.
 - **Full rings hold, not drop.** A guest's RX ring has 24 slots, fewer
   than one TCP burst. Frames for a full ring wait in a per-port backlog
-  (at most 512 frames and 2 MiB per port, 16 MiB in all) and are
+  (at most 512 frames and 2 MiB per port) and are
   delivered in order; netd sets `rx_wanted` in the port and the VMM kicks
   netd when it frees RX slots. Likewise frames for an uplink NIC without a
-  free TX buffer wait in a per-NIC backlog (512 frames, 4 MiB). Only
+  free TX buffer wait in a per-NIC backlog (512 frames, 4 MiB). All
+  backlogs share one pool of 2 KiB chunks, 16 MiB, fixed in netd's
+  image; a frame takes whole chunks. Only
   beyond those bounds is a frame dropped, so a guest that stops reading
   costs nobody else. Dropping instead cost a TCP retransmission timeout
   per burst: downloads over the QEMU uplink ran at about 3.5 MB/s, now

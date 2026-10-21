@@ -31,6 +31,9 @@ mod ixgbe;
 #[allow(dead_code)]
 #[path = "../../../host/l4h-netd/src/offload.rs"]
 mod offload;
+#[allow(dead_code)]
+#[path = "../../../host/l4h-netd/src/pool.rs"]
+mod pool;
 
 use std::ffi::CString;
 use std::net::Ipv4Addr;
@@ -463,7 +466,7 @@ fn main() {
         ..Default::default()
     };
     let t0 = Instant::now();
-    let mut nic = ixgbe::Ixgbe::new(0, &cfg, hz);
+    let mut nic = ixgbe::Ixgbe::new(0, &cfg, hz, Box::leak(Box::default()));
     println!("init took {:?}", t0.elapsed());
     if offload {
         nic.csum = true;

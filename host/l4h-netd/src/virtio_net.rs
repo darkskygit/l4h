@@ -2,13 +2,14 @@
 //! on N2 GCE instances) devices.  Frames are copied between the switch and
 //! DMA buffers owned by this driver.
 
-use alloc::vec::Vec;
-
+use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, NicConfig};
 use l4h_rt::ioport::Ports;
 use l4h_virtio::{
     DESC_F_WRITE, Device, Dma, F_VERSION_1, Mmio, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy,
 };
+
+use crate::pool::Frame;
 
 const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
 const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
@@ -30,6 +31,7 @@ const RX_BUF: usize = 4096;
 const TX_BUF: usize = HDR + net::MAX_FRAME;
 const RX_QUEUE: u16 = 256;
 const TX_BUFS: u16 = 24;
+const _: () = assert!(TX_BUFS <= u32::BITS as u16);
 
 pub struct VirtioNet {
     pub mac: [u8; 6],
@@ -44,9 +46,11 @@ pub struct VirtioNet {
     hdr_len: usize,
     rxq: Virtq,
     txq: Virtq,
-    rx_bufs: Vec<(usize, u64)>,
-    tx_bufs: Vec<(usize, u64)>,
-    tx_free: Vec<u16>,
+    rx_bufs: ArrayVec<(usize, u64), { RX_QUEUE as usize }>,
+    tx_bufs: ArrayVec<(usize, u64), { TX_BUFS as usize }>,
+    tx_free: ArrayVec<u16, { TX_BUFS as usize }>,
+    /// TX buffers with the device: only these come back to tx_free.
+    tx_busy: u32,
     /// Buffers were given to the device, which has not been notified.
     rx_kick: bool,
     tx_kick: bool,
@@ -123,8 +127,14 @@ impl VirtioNet {
             (rxq, txq, want, mac, None, HDR)
         };
         // A legacy queue has the device's size: post at most RX_QUEUE.
-        let rx_bufs: Vec<_> = (0..rxq.num.min(RX_QUEUE)).map(|_| dma.alloc(RX_BUF, 64)).collect();
-        let tx_bufs: Vec<_> = (0..TX_BUFS.min(txq.num)).map(|_| dma.alloc(TX_BUF, 64)).collect();
+        let (mut rx_bufs, mut tx_bufs, mut tx_free) = (ArrayVec::new(), ArrayVec::new(), ArrayVec::new());
+        for _ in 0..rxq.num.min(RX_QUEUE) {
+            let _ = rx_bufs.push(dma.alloc(RX_BUF, 64));
+        }
+        for i in 0..TX_BUFS.min(txq.num) {
+            let _ = tx_bufs.push(dma.alloc(TX_BUF, 64));
+            let _ = tx_free.push(TX_BUFS.min(txq.num) - 1 - i);
+        }
         for (i, &(_, pa)) in rx_bufs.iter().enumerate() {
             rxq.set_desc(i as u16, pa, RX_BUF as u32, DESC_F_WRITE, 0);
             rxq.submit(i as u16);
@@ -139,8 +149,9 @@ impl VirtioNet {
             rxq,
             txq,
             rx_bufs,
-            tx_free: (0..tx_bufs.len() as u16).rev().collect(),
             tx_bufs,
+            tx_free,
+            tx_busy: 0,
             rx_kick: false,
             tx_kick: false,
         };
@@ -231,7 +242,12 @@ impl VirtioNet {
 
     fn reap_tx(&mut self) {
         while let Some((id, _)) = self.txq.pop_used() {
-            self.tx_free.push(id as u16);
+            // A buffer the device returns twice, or one it never had, is
+            // not freed again.
+            if id < TX_BUFS as u32 && self.tx_busy & 1 << id != 0 {
+                self.tx_busy &= !(1 << id);
+                let _ = self.tx_free.push(id as u16);
+            }
         }
     }
 
@@ -240,7 +256,7 @@ impl VirtioNet {
         self.txq.has_used()
     }
 
-    pub fn transmit(&mut self, frame: &[u8], hdr: &[u8; HDR]) -> bool {
+    pub fn transmit(&mut self, frame: &(impl Frame + ?Sized), hdr: &[u8; HDR]) -> bool {
         let hl = self.hdr_len;
         if self.tx_free.is_empty() {
             self.reap_tx();
@@ -250,6 +266,7 @@ impl VirtioNet {
             self.kick_tx();
         }
         let Some(i) = self.tx_free.pop() else { return false };
+        self.tx_busy |= 1 << i;
         let (va, pa) = self.tx_bufs[i as usize];
         unsafe {
             core::ptr::copy_nonoverlapping(hdr.as_ptr(), va as *mut u8, hl);
@@ -257,7 +274,7 @@ impl VirtioNet {
                 // num_buffers is only meaningful on receive.
                 core::ptr::write_bytes((va + 10) as *mut u8, 0, 2);
             }
-            core::ptr::copy_nonoverlapping(frame.as_ptr(), (va + hl) as *mut u8, frame.len());
+            frame.copy_to(core::slice::from_raw_parts_mut((va + hl) as *mut u8, frame.len()));
         }
         self.txq.set_desc(i, pa, (hl + frame.len()) as u32, 0, 0);
         self.txq.submit(i);
