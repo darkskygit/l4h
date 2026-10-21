@@ -1,7 +1,8 @@
-//! Host reboot, for dom0's L4H_CTL_HOST_REBOOT (DESIGN.md §9.1): flush
-//! every disk the host drives, then reset the machine, as Linux does: the
-//! FADT's reset register, then the PCI reset control register (0xcf9), then
-//! the keyboard controller.
+//! Host reboot, for dom0's L4H_CTL_HOST_REBOOT (DESIGN.md §9.1): reset the
+//! machine as Linux does: the FADT's reset register, then the PCI reset
+//! control register (0xcf9), then the keyboard controller.  Nothing is
+//! flushed: a guest's flush reaches the disk before it completes, so what
+//! dom0 synced is safe, and the other guests stop with the host anyway.
 
 #[cfg(target_arch = "x86_64")]
 use sel4::cap;
@@ -72,23 +73,13 @@ impl Reset {
     }
 }
 
-/// Flush the disks and reset the machine.  Returns only if every method
-/// failed: -EIO (-ENOSYS on aarch64, which has none yet).
+/// Reset the machine.  Returns only if every method failed: -EIO
+/// (-ENOSYS on aarch64, which has none yet).
 pub fn reboot(h: &mut Host) -> i64 {
     if cfg!(not(target_arch = "x86_64")) {
         return crate::ctl::ENOSYS;
     }
     sel4::debug_println!("l4h-root: host reboot (dom0)");
-    // Every disk whose blkd runs: a reset loses what a write cache holds.
-    for i in 0..h.disks.len() {
-        let c = h.disks[i].ctrl;
-        if !h.ctrls[c].started() || h.ctrls[c].failed || h.disks[i].read_only {
-            continue;
-        }
-        if crate::blkd::write(&mut h.ctrls[c], i, &h.disks[i], 0, 0, None, &h.pci, &mut h.wins.a).is_err() {
-            sel4::debug_println!("l4h-root: host reboot: disk {} did not flush", i);
-        }
-    }
     reset(h);
     sel4::debug_println!("l4h-root: host reboot failed: the machine did not reset");
     crate::ctl::EIO

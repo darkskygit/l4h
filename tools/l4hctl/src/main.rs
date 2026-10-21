@@ -76,8 +76,8 @@ fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: O
 
 const USAGE: &str = "usage: l4hctl <command>
   info                         host resources
-  host-reboot                  flush the host's disks and reset the machine
-                               (every guest stops; sync dom0's disks first)
+  host-reboot                  reset the machine (every guest stops; sync
+                               dom0's disks first)
   disks                        host disks, owners, capacities and attachments
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush

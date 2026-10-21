@@ -1210,14 +1210,16 @@ external orchestration can run in dom0.
   not stop a user thread that holds SC_U.
 - `host_reboot` (`l4hctl host-reboot`) resets the machine, so that dom0
   can boot a new l4h or dom0 it wrote to the EFI partition without a way
-  in from outside. `l4h-root` first flushes every disk whose blkd runs, so
-  that no write cache loses what dom0 synced, then resets as Linux does:
+  in from outside. `l4h-root` resets as Linux does:
   the FADT's reset register (`RESET_REG_SUP`; system I/O, memory or PCI
   configuration space, prepared at boot), the PCI reset control register
   at 0xcf9 (through root's PCI configuration ports, 0xcf8-0xcff), and the
   keyboard controller. It returns `EIO` only if the machine did not reset;
   aarch64 has no reset yet (`ENOSYS`). Every guest stops without notice:
-  dom0 shuts them down first if they matter.
+  dom0 shuts them down first if they matter. Root flushes nothing: a
+  guest's flush reaches the disk before it completes, so dom0 syncs what it
+  wrote first, and root's serve loop does not block on disks while the
+  machine is about to go down.
 - Console output goes into a per-guest ring that `l4h-vmm` writes and
   `l4h-root` reads for `console_read`. It is also copied to the serial port
   with a `[vmN]` line prefix. Console input is a ring in the guest's

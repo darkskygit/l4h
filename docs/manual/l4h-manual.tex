@@ -826,8 +826,8 @@ filesystems. The command returns at once; the VM's state becomes
 \texttt{stopped} when it is done. A guest that reboots also stops: create it
 again to restart it. Only running VMs accept \cmd{shutdown}.
 
-\cmd{host-reboot} restarts the whole machine: the host flushes its disks
-and resets it (the ACPI reset register, then the PCI reset port 0xcf9, then
+\cmd{host-reboot} restarts the whole machine: the host resets it (the
+ACPI reset register, then the PCI reset port 0xcf9, then
 the keyboard controller), and the firmware boots again, the EFI system
 partition's l4h included. Every guest stops without notice. Run
 \cmd{sync} in dom0 first; the command returns only if the reset failed.

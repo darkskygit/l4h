@@ -299,8 +299,8 @@ impl Ctl {
         self.call(CTL_VM_DESTROY, &[vm], &[], &[]).map(|_| ())
     }
 
-    /// Flush the host's disks and reset the machine (dom0 only).  Returns
-    /// only if it did not reset.
+    /// Reset the machine (dom0 only; sync first).  Returns only if it did
+    /// not reset.
     pub fn host_reboot(&self) -> Result<()> {
         self.call(CTL_HOST_REBOOT, &[], &[], &[]).map(|_| ())
     }
