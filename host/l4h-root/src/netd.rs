@@ -182,6 +182,7 @@ pub fn spawn(
         config: cfg_bytes,
         ntfn: None,
         service_ep: None,
+        cnode_bits: None,
     };
     let comp = component::create(&args, alloc, &mut arena, win, asids, info);
 

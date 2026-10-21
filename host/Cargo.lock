@@ -320,6 +320,14 @@ name = "l4h-host"
 version = "0.1.0"
 
 [[package]]
+name = "l4h-memd"
+version = "0.1.0"
+dependencies = [
+ "l4h-rt",
+ "l4h-virtio",
+]
+
+[[package]]
 name = "l4h-netd"
 version = "0.1.0"
 dependencies = [

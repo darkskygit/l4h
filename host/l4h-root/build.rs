@@ -1,8 +1,7 @@
 // Embeds the host components ($L4H_VMM_ELF, $L4H_BLKD_ELF, $L4H_NETD_ELF,
-// $L4H_TRUSTD_ELF; built by tools/build-host.sh), empty placeholders when
-// unset.  dom0 is
-// not built in: it comes as boot modules, or appended to the built ELF by
-// tools/add-modules.py.  The other variables are the settings' defaults
+// $L4H_TRUSTD_ELF, $L4H_MEMD_ELF; built by tools/build-host.sh), empty
+// placeholders when unset.  dom0 is not built in: it comes as boot
+// modules, or appended to the built ELF by tools/add-modules.py.  The other variables are the settings' defaults
 // (src/config.rs).
 use std::{env, fs, path::PathBuf};
 
@@ -13,6 +12,7 @@ fn main() {
         ("L4H_BLKD_ELF", "l4h-blkd.elf"),
         ("L4H_NETD_ELF", "l4h-netd.elf"),
         ("L4H_TRUSTD_ELF", "l4h-trustd.elf"),
+        ("L4H_MEMD_ELF", "l4h-memd.elf"),
     ] {
         println!("cargo:rerun-if-env-changed={var}");
         let data = match env::var(var) {

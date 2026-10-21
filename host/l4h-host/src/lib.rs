@@ -1,10 +1,11 @@
 //! Definitions shared by l4h-root and the host components it spawns
-//! (l4h-vmm, blkd, netd, trustd): the component address-space and CSpace layout,
+//! (l4h-vmm, blkd, netd, trustd, memd): the component address-space and CSpace layout,
 //! the component info page, and the inter-component queue formats.
 
 #![no_std]
 
 pub mod blk;
+pub mod memd;
 pub mod net;
 pub mod trust;
 
@@ -59,6 +60,7 @@ pub const KIND_VMM: u32 = 1;
 pub const KIND_BLKD: u32 = 2;
 pub const KIND_NETD: u32 = 3;
 pub const KIND_TRUSTD: u32 = 4;
+pub const KIND_MEMD: u32 = 5;
 
 /// Driver address-space layout: the device structures, then DMA memory.
 pub const fn blkd_chan_va() -> usize {

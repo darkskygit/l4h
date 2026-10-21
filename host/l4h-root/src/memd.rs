@@ -1,0 +1,267 @@
+//! l4h-memd (DESIGN.md §16), the owner of the host's free memory and of
+//! every guest's RAM: spawning it and handing it the free memory, the free
+//! page reporting device it drives, and the calls l4h-root makes to it.
+//!
+//! memd runs before any guest.  The root task's own objects come from
+//! grants of memd's (mem.rs).  A guest's RAM is taken by memd at create;
+//! l4h-root gets copies of the blocks it fills with frames for the image
+//! (the boot blocks), memd gives the guest copies of the others at boot,
+//! and revokes all of them at destroy.
+
+use l4h_abi as abi;
+use l4h_host as host;
+use l4h_host::memd::{self, BalloonConfig, MemdConfig, Status};
+use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
+
+use crate::component::{self, Component, SpawnArgs, abs_of};
+use crate::devmem::DevMem;
+use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
+use crate::pci::{self, Pci};
+use crate::vspace::{FRAME_BP, map_frame};
+use crate::window::Window;
+use crate::{AsidPools, HostInfo};
+
+static MEMD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-memd.elf"));
+
+pub const MEMD_ID: u32 = 0x400;
+/// memd's status page in the root task.
+const STATUS_VA: usize = 0x0000_7600_0000_0000;
+/// Mapping capabilities of the status page and the balloon's BARs and DMA.
+const KEEP_BITS: usize = 12;
+const PAGE: usize = 4096;
+
+const VIRTIO_VENDOR: u16 = 0x1af4;
+const DEVICE_MODERN: u16 = 0x1045;
+const DEVICE_TRANSITIONAL: u16 = 0x1002;
+const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
+    sel4::init_thread::Slot::<T>::from_index(s).cap()
+}
+
+fn mr(i: usize) -> u64 {
+    sel4::with_ipc_buffer(|b| b.msg_regs()[i])
+}
+
+fn set_mr(i: usize, v: u64) {
+    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
+}
+
+/// What the allocator needs of memd: its endpoint, its CNode (for the
+/// exchange slots) and its status page.
+#[derive(Clone, Copy)]
+pub struct MemdLink {
+    ep: cap::Endpoint,
+    cnode: cap::CNode,
+    cnode_bits: usize,
+}
+
+impl MemdLink {
+    fn slot(&self, i: u64) -> sel4::AbsoluteCPtr {
+        self.cnode.absolute_cptr_from_bits_with_depth(i, self.cnode_bits)
+    }
+
+    fn xchg(&self, i: usize) -> sel4::AbsoluteCPtr {
+        self.slot(memd::SLOT_XCHG + i as u64)
+    }
+
+    fn call(&self, label: u64, args: &[u64]) -> u64 {
+        for (i, &a) in args.iter().enumerate() {
+            set_mr(i, a);
+        }
+        self.ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
+        mr(0)
+    }
+
+    pub fn status(&self) -> Status {
+        unsafe { (STATUS_VA as *const Status).read_volatile() }
+    }
+
+    /// An untouched Untyped of 2^bits bytes, into root slot `slot`: its
+    /// physical address.
+    pub fn alloc(&self, bits: usize, slot: Slot) -> Option<usize> {
+        if self.call(memd::MEMD_ALLOC, &[bits as u64, 1]) != 0 {
+            return None;
+        }
+        let paddr = mr(1) as usize;
+        abs_of(root_cap::<cap_type::Null>(slot)).move_(&self.xchg(0)).expect("memd: take grant");
+        Some(paddr)
+    }
+
+    /// Return untouched Untypeds (at most XCHG_SLOTS): (capability,
+    /// physical address, size bits).  Their slots are left empty.
+    pub fn free(&self, blocks: &[(cap::Untyped, usize, usize)]) {
+        assert!(blocks.len() <= memd::XCHG_SLOTS);
+        let mut args = alloc::vec![blocks.len() as u64];
+        for (i, &(ut, paddr, bits)) in blocks.iter().enumerate() {
+            self.xchg(i).move_(&abs_of(ut)).expect("memd: return block");
+            args.extend([paddr as u64, bits as u64]);
+        }
+        assert_eq!(self.call(memd::MEMD_FREE, &args), 0, "memd: free");
+    }
+}
+
+fn link(alloc: &Alloc) -> MemdLink {
+    alloc.memd.expect("memd is not running")
+}
+
+/// Take the RAM of guest `g`: `blocks` 2 MiB blocks.  `block_cn` is its
+/// block CNode, of radix `radix`, into which memd gives the guest its
+/// blocks at boot.
+pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, block_cn: cap::CNode, radix: usize) -> bool {
+    let m = link(alloc);
+    m.slot(memd::SLOT_GUEST_BCN + g as u64).copy(&abs_of(block_cn), CapRights::all()).expect("memd: give block CNode");
+    m.call(memd::MEMD_GUEST_CREATE, &[g as u64, blocks as u64, radix as u64]) == 0
+}
+
+/// A copy of block `b` of guest `g`, into root slot `slot`: its physical
+/// address.
+pub fn guest_copy(alloc: &Alloc, g: usize, b: usize, slot: Slot) -> usize {
+    let m = link(alloc);
+    assert_eq!(m.call(memd::MEMD_GUEST_COPY, &[g as u64, b as u64]), 0, "memd: copy of a guest block");
+    let paddr = mr(1) as usize;
+    abs_of(root_cap::<cap_type::Null>(slot)).move_(&m.xchg(0)).expect("memd: take block copy");
+    paddr
+}
+
+/// Give guest `g` its blocks from `first` on.
+pub fn guest_give(alloc: &Alloc, g: usize, first: usize) -> bool {
+    link(alloc).call(memd::MEMD_GUEST_GIVE, &[g as u64, first as u64]) == 0
+}
+
+/// Revoke and free all the RAM of guest `g`.
+pub fn guest_destroy(alloc: &Alloc, g: usize) {
+    if let Some(m) = alloc.memd {
+        m.call(memd::MEMD_GUEST_DESTROY, &[g as u64]);
+    }
+}
+
+/// memd, as l4h-root keeps it.
+pub struct Memd {
+    comp: Component,
+    arena: Arena,
+    keep: cap::CNode,
+    keep_next: u64,
+}
+
+impl Memd {
+    fn keep_slot(&mut self) -> sel4::AbsoluteCPtr {
+        self.keep_next += 1;
+        self.keep.absolute_cptr_from_bits_with_depth(self.keep_next - 1, KEEP_BITS)
+    }
+
+    /// Have memd report free memory through `d`, a virtio-balloon: map its
+    /// BARs and DMA pages into memd, and enable it.
+    pub fn attach_balloon(&mut self, d: &pci::Device, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem) {
+        let cap = |t: u8| d.virtio_caps.iter().find(|c| c.cfg_type == t).copied();
+        let (Some(common), Some(notify), Some(device)) =
+            (cap(VIRTIO_PCI_CAP_COMMON_CFG), cap(VIRTIO_PCI_CAP_NOTIFY_CFG), cap(VIRTIO_PCI_CAP_DEVICE_CFG))
+        else {
+            return;
+        };
+        let mut mapped = alloc::vec::Vec::new();
+        for c in [common, notify, device] {
+            if mapped.contains(&c.bar) {
+                continue;
+            }
+            let bar = d.bars[c.bar as usize];
+            if bar.is_io || bar.size == 0 || bar.size as usize > memd::BAR_STRIDE {
+                return;
+            }
+            let Some(frames) = alloc.slots.global(|s| devmem.frames(s, bar.addr as usize, bar.size as usize)) else {
+                return;
+            };
+            for (i, f) in frames.into_iter().enumerate() {
+                let va = memd::BALLOON_VA + c.bar as usize * memd::BAR_STRIDE + i * PAGE;
+                let keep = self.keep_slot();
+                self.comp.map_copy(alloc, &mut self.arena, &abs_of(f), va, CapRights::read_write(), crate::blkd::DEVICE_ATTRS, keep);
+            }
+            mapped.push(c.bar);
+        }
+        let frames = alloc.slots.global(|s| s.alloc_range(memd::DMA_PAGES));
+        let Some(paddr) = self.arena.retype(alloc, &FRAME_BP, memd::DMA_PAGES, Dest::root(frames.start)) else {
+            return;
+        };
+        for (i, s) in frames.enumerate() {
+            let keep = self.keep_slot();
+            let f = abs_of(root_cap::<cap_type::Granule>(s));
+            self.comp.map_copy(alloc, &mut self.arena, &f, memd::DMA_VA + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep);
+        }
+        let packed = |c: pci::VirtioCap| ((c.bar as u64) << 32) | c.offset as u64;
+        let cfg = BalloonConfig {
+            common: packed(common),
+            notify: packed(notify),
+            device: packed(device),
+            notify_mult: notify.notify_off_multiplier as u64,
+            dma_paddr: paddr as u64,
+        };
+        pci.enable(d);
+        if link(alloc).call(memd::MEMD_BALLOON, &cfg.to_mrs()) != 0 {
+            pci.disable(d);
+        }
+    }
+}
+
+pub fn is_balloon(d: &pci::Device) -> bool {
+    d.vendor == VIRTIO_VENDOR
+        && (d.device == DEVICE_MODERN || d.device == DEVICE_TRANSITIONAL)
+        && d.virtio_caps.iter().any(|c| c.cfg_type == VIRTIO_PCI_CAP_COMMON_CFG)
+}
+
+/// Radix of memd's CNode for a host with `bytes` of free memory: room for
+/// every 2 MiB block as guest RAM, free or a parent, and for what root
+/// splits smaller.
+fn cnode_bits(bytes: usize) -> usize {
+    let need = 3 * (bytes >> memd::BLOCK_BITS) + memd::SLOT_DYN_BASE as usize + 4096;
+    (need.next_power_of_two().trailing_zeros() as usize).max(14)
+}
+
+/// Spawn memd and hand it all free memory.
+pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo) -> Memd {
+    let bits = cnode_bits(alloc.free_bytes());
+    let cfg = MemdConfig { cnode_bits: bits as u64 };
+    let cfg_bytes = unsafe {
+        core::slice::from_raw_parts(&cfg as *const MemdConfig as *const u8, core::mem::size_of::<MemdConfig>())
+    };
+    // Its CNode, image (with an 8 MiB heap) and paging structures.
+    let mut arena = alloc.arena((32 << bits) + (10 << 20)).expect("memory for memd");
+    let args = SpawnArgs {
+        id: MEMD_ID,
+        kind: host::KIND_MEMD,
+        elf: MEMD_ELF,
+        core: 0,
+        // Above every guest: l4h-root waits for it.
+        prio: abi::PRIO_KERNEL + 2,
+        budget_us: info.timeslice_us,
+        period_us: info.timeslice_us,
+        config: cfg_bytes,
+        ntfn: None,
+        service_ep: None,
+        cnode_bits: Some(bits),
+    };
+    let comp = component::create(&args, alloc, &mut arena, win, asids, info);
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
+    let mut m = Memd { comp, arena, keep, keep_next: 0 };
+
+    // The status page: memd writes it, l4h-root reads it.
+    let status = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
+    alloc.global(|alloc| {
+        let copy = alloc.slots.alloc();
+        abs_of(root_cap::<cap_type::Null>(copy)).copy(&abs_of(status), CapRights::all()).expect("status copy");
+        map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), root_cap::<cap_type::Granule>(copy),
+            STATUS_VA, CapRights::read_only(), VmAttributes::DEFAULT);
+    });
+    let keep = m.keep_slot();
+    m.comp.map_copy(alloc, &mut m.arena, &abs_of(status), memd::STATUS_VA, CapRights::read_write(), VmAttributes::DEFAULT, keep);
+
+    component::start(&m.comp);
+    let link = MemdLink { ep: m.comp.service_ep, cnode: m.comp.cnode, cnode_bits: bits };
+    alloc.hand_over(link);
+    info!(
+        "l4h-root: memd holds {} MiB, {} KiB of CNode",
+        link.status().free_bytes >> 20, (32usize << bits) >> 10
+    );
+    m
+}

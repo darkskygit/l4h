@@ -1,6 +1,6 @@
-//! l4h-root: the l4h root task.  Owns all memory and devices, creates and
-//! destroys guests with their host components, and serves the control API
-//! for dom0.  See DESIGN.md §9.
+//! l4h-root: the l4h root task.  Owns the devices, creates and destroys
+//! guests with their host components, and serves the control API for dom0.
+//! Memory is l4h-memd's once it runs (memd.rs).  See DESIGN.md §9.
 
 #![no_std]
 #![no_main]
@@ -19,7 +19,6 @@ macro_rules! info {
 
 #[cfg(target_arch = "x86_64")]
 mod acpi;
-mod balloon;
 mod blkd;
 mod bootmod;
 mod component;
@@ -32,6 +31,7 @@ mod font;
 mod guest;
 mod kimage;
 mod mem;
+mod memd;
 mod monitor;
 mod netd;
 mod pci;
@@ -204,6 +204,7 @@ pub struct Host {
     /// restarts.
     pub dom0_initrd: &'static [u8],
     pub trustd: Option<trustd::Trustd>,
+    pub memd: memd::Memd,
     pub reset: reset::Reset,
     pub rtc: rtc::Rtc,
 }
@@ -469,7 +470,9 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         epoch_ticks: rdtsc(),
         placement: core::cell::Cell::new(0),
     };
-    let asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
+    let mut asids = AsidPools { pools: ::alloc::vec![(slot::ASID_POOL.cap(), 1)], in_use: 1 };
+    // From here on, memory comes from memd.
+    let mut memd = memd::spawn(&mut alloc, &mut wins.a, &mut asids, &info);
 
     // PCI devices: disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
@@ -506,7 +509,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         } else if netd::is_uplink(&d) {
             pci.disable(&d);
             nics.push(d);
-        } else if balloon::is_balloon(&d) && balloon.is_none() {
+        } else if memd::is_balloon(&d) && balloon.is_none() {
             balloon = Some(d);
         }
     }
@@ -521,9 +524,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         }
     }
     if let Some(d) = balloon {
-        alloc.balloon = balloon::Balloon::new(&d, &pci, &mut alloc, &mut devmem, info.tsc_hz / 1000);
+        memd.attach_balloon(&d, &pci, &mut alloc, &mut devmem);
     }
-    let mut asids = asids;
     #[cfg(target_arch = "x86_64")]
     let reset = reset::Reset::find(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
     #[cfg(not(target_arch = "x86_64"))]
@@ -554,6 +556,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         kmods,
         dom0_initrd,
         trustd,
+        memd,
         reset,
         rtc,
     };
@@ -715,7 +718,6 @@ fn serve(h: &mut Host, mut reply: cap::Reply) -> ! {
             let now = rdtsc();
             sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
             last_balance = now;
-            h.alloc.report_free(now, h.info.tsc_hz * balloon::REPORT_DELAY_MS / 1000);
             dashboard::Dashboard::tick(h);
             if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                 watchdog_dump(h);

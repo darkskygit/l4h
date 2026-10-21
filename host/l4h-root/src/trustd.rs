@@ -282,6 +282,7 @@ fn create(
         config: cfg_bytes,
         ntfn: None,
         service_ep: None,
+        cnode_bits: None,
     };
     let comp = component::create(&args, alloc, &mut arena, win, asids, info);
     let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });

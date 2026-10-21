@@ -1,4 +1,4 @@
-//! Spawning host components (l4h-vmm, blkd, netd, trustd) as separate seL4
+//! Spawning host components (l4h-vmm, blkd, netd, trustd, memd) as separate seL4
 //! processes with the layout defined in `l4h-host`.
 
 use alloc::collections::BTreeMap;
@@ -45,12 +45,14 @@ pub struct Component {
     pub ntfn: cap::Notification,
     pub service_ep: cap::Endpoint,
     pub sc: cap::SchedContext,
+    /// Radix of its CNode.
+    pub cnode_bits: usize,
 }
 
 impl Component {
     /// Destination for a capability in the component's CNode.
     pub fn slot(&self, idx: u64) -> sel4::AbsoluteCPtr {
-        self.cnode.absolute_cptr_from_bits_with_depth(idx, host::CNODE_BITS)
+        self.cnode.absolute_cptr_from_bits_with_depth(idx, self.cnode_bits)
     }
 
     pub fn give(&self, idx: u64, src: impl sel4::HasCPtrWithDepth, rights: CapRights) {
@@ -100,6 +102,9 @@ pub struct SpawnArgs<'a> {
     /// Pre-made bound notification / service endpoint (created if None).
     pub ntfn: Option<cap::Notification>,
     pub service_ep: Option<cap::Endpoint>,
+    /// Radix of its CNode, if not host::CNODE_BITS (memd's holds every
+    /// Untyped).
+    pub cnode_bits: Option<usize>,
 }
 
 /// Create a component, without starting it.  Objects come from `arena`.
@@ -116,7 +121,8 @@ pub fn create(
 
 
     let vspace = ctx.cap::<cap_type::VSpace>(PML4_BP);
-    let cnode = ctx.cap::<cap_type::CNode>(ObjectBlueprint::CNode { size_bits: host::CNODE_BITS });
+    let cnode_bits = args.cnode_bits.unwrap_or(host::CNODE_BITS);
+    let cnode = ctx.cap::<cap_type::CNode>(ObjectBlueprint::CNode { size_bits: cnode_bits });
     let tcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
     let ntfn = args.ntfn.unwrap_or_else(|| ctx.cap::<cap_type::Notification>(ObjectBlueprint::Notification));
     let service_ep = args.service_ep.unwrap_or_else(|| ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint));
@@ -128,7 +134,7 @@ pub fn create(
     drop(ctx);
     asids.assign(alloc, vspace);
 
-    let c = Component { id: args.id, tcb, cnode, vspace, ntfn, service_ep, sc };
+    let c = Component { id: args.id, tcb, cnode, vspace, ntfn, service_ep, sc, cnode_bits };
 
     // ---- Load the ELF image, one fresh frame per page; pages are writable
     // only if a writable segment covers them.
@@ -201,7 +207,7 @@ pub fn create(
     );
 
     // ---- CSpace.
-    let guard = CNodeCapData::new(0, 64 - host::CNODE_BITS);
+    let guard = CNodeCapData::new(0, 64 - cnode_bits);
     c.give_badged(host::SLOT_CNODE, cnode, CapRights::all(), guard.into_word());
     c.give(host::SLOT_VSPACE, vspace, CapRights::all());
     c.give(host::SLOT_TCB, tcb, CapRights::all());
@@ -216,7 +222,7 @@ pub fn create(
     c.give(host::SLOT_REPLY, reply, CapRights::all());
 
     // ---- Thread.
-    tcb.tcb_configure(cnode, CNodeCapData::new(0, 64 - host::CNODE_BITS), vspace, host::IPCBUF_VA as u64, ipcbuf)
+    tcb.tcb_configure(cnode, CNodeCapData::new(0, 64 - cnode_bits), vspace, host::IPCBUF_VA as u64, ipcbuf)
         .expect("component TCB configure");
     host_info
         .sched_control(args.core)

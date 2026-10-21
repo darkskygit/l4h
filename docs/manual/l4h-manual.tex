@@ -141,9 +141,12 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \item[seL4] with fourteen l4h patches (\file{kernel/patches}): trapping guest
     system calls, FPU state access, per-thread deadline timers and a few
     fixes.
-  \item[l4h-root] is the root task. It owns all memory and devices, creates
-    and destroys guests, executes control-API requests, balances vCPUs across
+  \item[l4h-root] is the root task. It owns the devices, creates and
+    destroys guests, executes control-API requests, balances vCPUs across
     cores, and runs the serial monitor.
+  \item[l4h-memd] owns the free memory and every guest's RAM. The root task
+    gets the memory for its own objects from it, and it reports free
+    memory to the hypervisor when l4h runs in a VM.
   \item[l4h-vmm] runs once per guest. It serves the guest's hypercalls and
     virtio devices. It maps only its own guest's I/O pool (below), never its
     RAM, so a compromised VMM can harm only that guest.
@@ -153,8 +156,8 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \item[l4h-netd] holds every switch and drives the uplink NICs.
 \end{description}
 
-\paragraph{Trust.} The seL4 kernel, \texttt{l4h-root}, \texttt{l4h-blkd} and
-\texttt{l4h-netd} are trusted by everyone. dom0 is trusted to decide what
+\paragraph{Trust.} The seL4 kernel, \texttt{l4h-root}, \texttt{l4h-memd},
+\texttt{l4h-blkd} and \texttt{l4h-netd} are trusted by everyone. dom0 is trusted to decide what
 runs, and nothing more. Guest kernels are untrusted, and capabilities confine
 them. The host does not rely on an IOMMU: the trusted drivers validate every
 DMA address, and guests never touch device registers.

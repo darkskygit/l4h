@@ -7,11 +7,11 @@
 //! `destroy` reclaims everything by revoking the arena.
 //!
 //! Guest RAM is a list of 2 MiB blocks, each its own Untyped from any free
-//! 2 MiB of host memory (DESIGN.md §15.2).  l4h-root keeps the original
-//! Untyped of every block; the guest gets a copy of those it may retype
-//! (all but the boot blocks, which l4h-root fills with frames for the
-//! image).  Revoking the originals at destroy deletes whatever the guest
-//! made of them.
+//! 2 MiB of host memory (DESIGN.md §15.2).  l4h-memd keeps the original
+//! Untyped of every block (memd.rs); the guest gets a copy of those it may
+//! retype (all but the boot blocks, of which l4h-root gets a copy to fill
+//! with frames for the image).  memd revokes the originals at destroy,
+//! which deletes whatever the guest and l4h-root made of them.
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -27,7 +27,7 @@ use l4h_host as host;
 use crate::component::Component;
 use crate::kimage::Kernel;
 use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot, UtPool, UtRegion};
-use crate::vmm;
+use crate::{memd, vmm};
 use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
@@ -104,11 +104,8 @@ pub fn dev_event(d: usize) -> u32 {
     16 + d as u32
 }
 
-/// A 2 MiB block of guest RAM.
+/// A 2 MiB block of guest RAM (memd holds its Untyped).
 pub struct Block {
-    /// Root slot of the original Untyped.
-    ut: Slot,
-    pub paddr: usize,
     /// A block l4h-root filled with frames (a boot block): its level-2 RAM
     /// CNode.
     frames: Option<cap::CNode>,
@@ -177,8 +174,6 @@ pub struct Guest {
     pub blocks: Vec<Block>,
     /// Level-1 RAM CNodes, one per GiB of guest-physical space.
     ram_l1: Vec<cap::CNode>,
-    /// The guest's copies of the blocks' Untypeds.
-    block_cn: (cap::CNode, usize),
     /// Blocks [0, boot_blocks) are host frames; set at boot.
     pub boot_blocks: usize,
     pub pool: IoPool,
@@ -279,7 +274,9 @@ impl Guest {
             .absolute_cptr_from_bits_with_depth((b & ((1 << abi::RAM_L2_BITS) - 1)) as u64, abi::RAM_L2_BITS)
             .copy(&abs(l2), CapRights::all())
             .expect("level-2 RAM CNode");
-        let Block { ut, paddr, .. } = self.blocks[b];
+        // A copy of the block's Untyped, which memd revokes at destroy.
+        let ut = alloc.slots.alloc();
+        let paddr = memd::guest_copy(alloc, self.id, b, ut);
         let region = UtRegion::fresh(root_cap::<cap_type::Untyped>(ut), paddr, abi::BLOCK_SHIFT);
         UtPool { regions: ::alloc::vec![region] }
             .retype(&FRAME_BP, BLOCK_FRAMES, Dest { cnode: abs(l2), offset: 0 })
@@ -483,15 +480,8 @@ impl Guest {
         for b in 0..boot {
             self.block_frames(alloc, b);
         }
-        let (block_cn, radix) = self.block_cn;
-        for b in boot..self.blocks.len() {
-            // A block without children: its copy is a sibling Untyped
-            // that the guest can retype and revoke, and revoking the
-            // original still deletes everything made from either.
-            block_cn
-                .absolute_cptr_from_bits_with_depth(b as u64, radix)
-                .copy(&abs(root_cap::<cap_type::Untyped>(self.blocks[b].ut)), CapRights::all())
-                .expect("block Untyped copy");
+        if !memd::guest_give(alloc, self.id, boot) {
+            return false;
         }
         self.boot_blocks = boot;
         let mut bi: alloc::boxed::Box<abi::BootInfo> = unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
@@ -619,8 +609,15 @@ impl Guest {
     /// good.  Guest RAM is never a DMA target, so it is always reused.
     pub fn destroy(mut self, alloc: &mut Alloc, pin_pool: bool) {
         self.stop();
+        // The arena first: it holds the VSpace roots, and once they are
+        // gone, deleting the guest's frames unmaps nothing.  The other way
+        // round, every frame is unmapped (and the TLBs of every core
+        // flushed) one by one, which made destroy five times slower.
         let pool = self.pool.paddr;
         let pinned = alloc.reclaim_pinning(self.arena, |p| pin_pool && p == pool);
+        // Then guest RAM: memd's revocation deletes all that was made of
+        // it, the guest's objects and l4h-root's frames of boot blocks.
+        memd::guest_destroy(alloc, self.id);
         if pinned != 0 {
             info!("l4h-root: guest {}: {} MiB of I/O pool kept out of use", self.id, pinned >> 20);
         }
@@ -708,7 +705,6 @@ pub fn create(
         ram_base,
         blocks: Vec::new(),
         ram_l1: Vec::new(),
-        block_cn: (cap::CNode::from_bits(0), 0),
         boot_blocks: 0,
         pool: IoPool { gpa: pool_gpa, paddr: 0, size: 0, frames: cap::CNode::from_bits(0), radix: 0 },
         ctl_data: false,
@@ -759,16 +755,10 @@ pub fn create(
     let block_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: block_radix });
     let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix).into_word();
     g.give_badged(abi::SLOT_BLOCKS, block_cn, CapRights::all(), guard);
-    g.block_cn = (block_cn, block_radix);
-    for _ in 0..nr_blocks {
-        let ut = alloc.slots.alloc();
-        let Some(region) = alloc.split(abi::BLOCK_SHIFT, ut) else {
-            alloc.slots.free(ut);
-            return Err(Some(g));
-        };
-        g.arena.own(ut, region.paddr, abi::BLOCK_SHIFT);
-        g.blocks.push(Block { ut, paddr: region.paddr, frames: None });
+    if !memd::guest_create(alloc, id, nr_blocks, block_cn, block_radix) {
+        return Err(Some(g));
     }
+    g.blocks.extend((0..nr_blocks).map(|_| Block { frames: None }));
     let tmp = alloc.slots.alloc();
 
     // ---- I/O pool: one physically contiguous Untyped retyped into frames,

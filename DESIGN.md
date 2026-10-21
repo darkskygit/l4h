@@ -12,7 +12,8 @@ block and network I/O, dom0 control, CPU caps and balancing, and GCE N2
 bring-up. AArch64 runs the host and native Linux guests on QEMU `virt`,
 including SMP and PCI block/network drivers, with virtualization disabled (§11). The original
 review decisions are recorded in §14. Future work is identified below;
-§15 records the implemented guest-owned memory design.
+§15 records the implemented guest-owned memory design, and §16 the
+memory owner, `l4h-memd`.
 
 ---
 
@@ -91,8 +92,8 @@ Each `l4h-blkd` drives one attached disk. `l4h-netd` combines all switches
 and uplink NIC drivers in one component. The drivers are Rust: virtio-net,
 and gVNIC after Linux `gve`.
 
-Trust: the seL4 kernel, `l4h-root`, `l4h-blkd`, `l4h-netd` and, with a
-TPM, `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
+Trust: the seL4 kernel, `l4h-root`, `l4h-memd`, `l4h-blkd`, `l4h-netd`
+and, with a TPM, `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
 read other guests' memory. Each `l4h-vmm` is trusted only by its own
 guest: it maps that guest's I/O pool and host-owned device, event and
 queue pages, and never its RAM (§15), so a compromised VMM can harm only
@@ -491,8 +492,8 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   be named by a 64-bit CPtr, because seL4 keeps resolving through it.
   Capabilities that must be named, such as the root CNode itself and user
   threads' CSpaces, live in a "meta" CNode in root slot 1 (see `abi.h`).
-- **Guest RAM.** `l4h-root` allocates 2 MiB blocks from anywhere in free
-  host memory. The guest receives frame caps for the boot blocks and
+- **Guest RAM.** `l4h-memd` allocates 2 MiB blocks from anywhere in free
+  host memory (§16). The guest receives frame caps for the boot blocks and
   Untyped copies for the rest, which it retypes into frames or its own
   kernel objects (§15). There is no separate object quota or DMA RAM
   chunk table: devices see only the host-owned I/O pool. Running out of
@@ -1092,11 +1093,12 @@ the host keeps that dynamic plumbing simple.
 
 | Component | Instances | Role |
 |-----------|-----------|------|
-| `l4h-root` | 1 | Allocates guest RAM blocks, I/O pools, host objects and vCPU scheduling contexts. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's images (modules) and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
+| `l4h-root` | 1 | Allocates I/O pools, host objects and vCPU scheduling contexts, from memory it gets from memd. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's images (modules) and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
 | `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC and X550 uplink drivers. |
 | `l4h-trustd` | 0 or 1 | With a TPM: has the TPM quote its signing key, and signs guests' reports with it (§9.2). |
+| `l4h-memd` | 1 | Owns the free memory and every guest's RAM blocks; gives root memory for host objects; reports free memory to the hypervisor (§16). |
 
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
 protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
@@ -2101,15 +2103,16 @@ memory the guest can retype.
 When l4h runs in a VM (QEMU/KVM for development and tests), memory it has
 not given to a guest should not occupy the hypervisor's RAM.
 
-- **Device.** `l4h-root` drives a virtio-balloon PCI device that offers
+- **Device.** `l4h-memd` (§16) drives a virtio-balloon PCI device that offers
   free page reporting (`VIRTIO_BALLOON_F_REPORTING`; QEMU
   `-device virtio-balloon-pci,free-page-reporting=on`, which
   `tools/run-qemu.sh`, `run-uefi.sh` and `run-image-aarch64.sh` add unless
   `L4H_BALLOON=0`). Only the reporting queue is used: no inflation or
   deflation, no statistics. QEMU numbers its queues by the features it
   offers, so the reporting queue is 2, plus one for the statistics queue
-  and one for free page hinting if offered. The device has no interrupt:
-  the root task's 100 ms timer polls it (`balloon.rs`).
+  and one for free page hinting if offered. `l4h-root` finds it on PCI,
+  enables it and maps its BARs and three DMA pages into memd. The device
+  has no interrupt: memd's 100 ms timer polls it (`l4h-memd/src/balloon.rs`).
 - **What is reported.** The allocator's free blocks (§15.2) of 2 MiB or
   more, once free for 2 s (as Linux does), so that memory freed and
   allocated again soon is not reported. A report is one chain of
@@ -2140,5 +2143,67 @@ not given to a guest should not occupy the hypervisor's RAM.
 - **Not covered.** Memory a guest holds but does not use stays backed
   once the guest has written it: guests have no balloon, and their free
   pages are not reported. A guest's `page_reporting` device passing GPAs
-  through the VMM to `l4h-root`, which would translate them to physical
-  addresses and report them, is the natural next step.
+  through the VMM to `l4h-memd`, which holds the guest's blocks and can
+  translate them to physical addresses and report them, is the natural
+  next step.
+
+---
+
+## 16. l4h-memd: the owner of memory
+
+Phase 1 of the memory hotplug design (draft 2, "l4h memory hotplug and
+l4h-memd"): one component owns all free RAM and all guest RAM, so that
+guest memory can later grow and shrink without going through `l4h-root`.
+Behaviour is unchanged.
+
+- **Boot.** Root starts with every boot Untyped, as before, and allocates
+  from them until memd runs: its own first objects, the module copies and
+  memd itself (`memd::spawn`, right after the host facts are known). It
+  then moves every free block to memd (`Alloc::hand_over`), keeping the
+  parents of blocks it had split: memd cannot merge those with their
+  buddies, which concerns only the blocks root split at boot. Device
+  Untypeds stay with root.
+- **memd's CSpace** is one CNode (`SpawnArgs::cnode_bits`) with room for
+  three slots per 2 MiB of host memory, so that every block can be guest
+  RAM, free or a parent (512 KiB of CNode for a 4 GiB host). Root holds
+  its capability, and passes Untypeds by moving them into memd's exchange
+  slots (`l4h_host::memd`); memd never calls root, and l4h-root calls it
+  synchronously.
+- **Root's memory** comes in *grants*: when root's free blocks cannot
+  meet a request, it takes an untouched Untyped of 16 MiB (or exactly the
+  request, if larger) from memd (`MEMD_ALLOC`) and splits it as before.
+  Grants are never merged with each other. When a destroy or a failed
+  create leaves root more than 48 MiB of free blocks, it merges them and
+  returns whole grants (`MEMD_FREE`) beyond 32 MiB (`Alloc::trim`).
+  Merging after every destroy instead made creates a fifth slower: the
+  next retype of a merged block clears all its halves used (§15.2). Host objects, arenas, I/O pools and ASID pools come
+  from root's blocks, as before.
+- **Guest RAM is memd's** (`MEMD_GUEST_*`). At create, root gives memd a
+  copy of the guest's block CNode capability, and memd takes the guest's
+  2 MiB blocks. When an image is loaded into a block, memd gives root a
+  copy of its Untyped, which root fills with frames as before (a boot
+  block). At boot, memd copies the Untypeds of the other blocks into the
+  block CNode. At destroy, once root has reclaimed its arena, memd revokes
+  every original: that deletes the guest's copies, everything the guest
+  made of them, and root's copies of boot blocks with their frames. The
+  order matters: with the VSpace roots (in the arena) gone first,
+  deleting the guest's frames unmaps nothing; the other way round, each
+  frame was unmapped with a TLB shootdown, and destroying a stopped
+  128 MiB guest took 585 ms instead of about 120. Root no longer holds a
+  slot per guest RAM block.
+- **Free page reporting** (§15.4) moved with the free memory: memd keeps
+  the reported, reporting and free states of its blocks and drives the
+  device. Root's cache (at most 32 MiB beyond what is in use) is not
+  reported.
+- **Free memory** for `host_info`, the monitor and the dashboard is root's
+  free blocks plus memd's, which memd publishes in a status page mapped
+  read-only into root (`l4h_host::memd::Status`).
+- **Trust.** memd joins the host TCB. It cannot read memory: every
+  Untyped it has handed out has a child, so it cannot retype it, and
+  revoking it first makes seL4 clear the memory before it is used again.
+  It can revoke what it handed out, including root's grants, and if it
+  faults, root's next call to it never returns: the host stops.
+- **Scheduling.** memd runs on core 0 at `PRIO_KERNEL + 2`, above every
+  guest, with a full budget: root waits for it.
+- **Limits.** memd's heap is 8 MiB, about 50 bytes per 2 MiB block of
+  host memory: enough for hosts of about 300 GiB.

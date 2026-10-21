@@ -110,6 +110,7 @@ pub fn spawn(
         config: cfg_bytes,
         ntfn: Some(g.vmm_ntfn),
         service_ep: Some(g.vmm_ep),
+        cnode_bits: None,
     };
     let comp = component::create(&args, alloc, &mut g.arena, win, asids, host_info);
 

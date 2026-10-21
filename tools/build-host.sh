@@ -7,10 +7,10 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root/host"
-cargo build -q --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd
+cargo build -q --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd
 out=$root/host/target/x86_64-sel4/debug
 mkdir -p "$out/stripped"
-for c in vmm blkd netd trustd; do
+for c in vmm blkd netd trustd memd; do
     # Replace the copy only when it changes: root rebuilds when it does.
     objcopy --strip-debug "$out/l4h-$c.elf" "$out/stripped/l4h-$c.elf.new"
     cmp -s "$out/stripped/l4h-$c.elf.new" "$out/stripped/l4h-$c.elf" \
