@@ -454,6 +454,8 @@ Each tagged release on GitHub carries, for x86\_64:
   \item \file{l4h-debug-x86\_64.tar.xz}: the same build with debug
         information, to turn fault addresses into source lines with
         \cmd{addr2line};
+  \item \file{l4h-attest.py}, which verifies attestation reports
+        (Section~\ref{sec:attest});
   \item \file{SHA256SUMS}.
 \end{itemize}
 
@@ -1141,6 +1143,82 @@ guest kernel accepts:
     processes.
 \end{description}
 
+\section{Attestation}
+\label{sec:attest}
+
+On a host with a TPM~2.0, any guest can prove to a remote party, the
+verifier, what it booted and on which host:
+\begin{itemize}
+  \item the firmware measures the l4h application, with seL4 and every
+        host component in it, into PCR~4. GRUB measures dom0's kernel,
+        initramfs and \file{l4h.conf} into PCR~9;
+  \item at boot, the host generates a signing key and has the TPM quote it,
+        together with the PCRs, using the TPM's attestation key (AK). That
+        quote is the \emph{host evidence};
+  \item the host signs \emph{reports} about each guest with that key. A
+        report carries 64 bytes of the guest's choosing, such as the
+        verifier's nonce or a hash of the guest's own key. It also carries
+        the guest's \emph{launch digest}, a hash of the kernel, initramfs
+        and command line it booted with.
+\end{itemize}
+A guest can tell that its host offers attestation when
+\file{/dev/l4h-attest} exists. In a guest:
+\begin{lstlisting}[language=bash]
+l4hctl attest report $NONCE -o report     # NONCE: up to 64 bytes, in hex
+l4hctl attest evidence -o evidence
+\end{lstlisting}
+Without \texttt{-o}, the commands print hex. Standard tools can also get
+both from configfs-tsm: create a directory under
+\file{/sys/kernel/config/tsm/report}, write the data to \file{inblob}, and
+read the report from \file{outblob} and the evidence from \file{auxblob}.
+The provider is \texttt{l4h}.
+
+The verifier checks both with \cmd{tools/l4h-attest.py}, which is also a
+release file and needs Python's \texttt{cryptography} package:
+\begin{lstlisting}[language=bash]
+tools/l4h-attest.py measure vmlinux --initrd initrd --cmdline "console=hvc0"
+tools/l4h-attest.py verify report evidence --data $NONCE --launch $DIGEST \
+    --ak-name $AK --pcr 4=$PCR4 --ek-ca manufacturer-ca.pem
+\end{lstlisting}
+\cmd{measure} prints the launch digest a guest gets from those files. With
+\cmd{l4hctl create}, the command line is the one given with
+\texttt{--cmdline}; for dom0, it is \texttt{dom0\_cmdline}. \cmd{verify}
+fails unless every check holds:
+\begin{itemize}
+  \item the quote is the TPM's, over the host key that signed the report;
+  \item the report carries the nonce and launch digest given;
+  \item each PCR has the value given with \texttt{--pcr};
+  \item the EK certificate chains to the CA given with \texttt{--ek-ca}.
+\end{itemize}
+It then prints the claims as JSON: the guest's id, memory, vCPUs and
+whether it is dom0, the PCRs, and the TPM's reset count.
+
+\paragraph{Enrolling the AK.} The quote proves nothing until the verifier
+knows that the AK belongs to a real TPM. Enroll each host once:
+\begin{lstlisting}[language=bash]
+tools/l4h-attest.py make-credential evidence $SECRET -o cred   # verifier
+l4hctl attest activate cred                                     # guest
+\end{lstlisting}
+The guest prints \texttt{\$SECRET} back only if the TPM that holds the EK
+in the evidence's certificate also holds the AK. The verifier then pins the
+AK's name, as \cmd{verify} prints it, with \texttt{--ak-name}. The AK stays
+the same across reboots. \cmd{tpm2\_makecredential} writes the same
+credential format.
+
+\paragraph{Choosing PCR values.} The host does not keep the firmware's event
+log yet, so the verifier compares PCR values with ones it trusts. Take them
+from a known-good boot of the same l4h application on the same kind of
+machine. PCR~4 changes with the application and with the firmware's boot
+path; PCRs~8 and~9 change with dom0's files and \file{l4h.conf}.
+
+\begin{caveat}
+A report is only as trustworthy as the host: seL4, the host components and
+the hardware. There is no IOMMU, so a malicious device could change any
+memory. On a cloud VM, the provider's hypervisor and virtual TPM are
+trusted as well. Disks and networks are dom0's choice and are not measured.
+Hosts without a TPM, and aarch64 hosts, offer no attestation.
+\end{caveat}
+
 %======================================================================
 \chapter{Troubleshooting}
 \label{ch:trouble}
@@ -1254,6 +1332,9 @@ Test & What it checks \\
 \cmd{run-monitor.sh} & the serial monitor \\
 \cmd{run-uefitest.sh} & the UEFI image with NVMe boot disk and virtio-net,
   as on GCE \\
+\cmd{run-attesttest.sh} & attestation with a software TPM (swtpm): reports
+  on dom0 and a guest verify against the host evidence, and the AK's
+  credential round trip works \\
 \cmd{run-debian.sh}, \cmd{run-workload.sh} & Debian with systemd, fio
   verification, a parallel build, fsck, data surviving a reboot \\
 \cmd{run-bench.sh} & micro-benchmarks \\
@@ -1354,5 +1435,8 @@ then \texttt{VM\_START}. Devices and images can only be added before the VM
 starts. The host never parses guest images: the client loads the kernel's
 segments to their addresses relative to the RAM base it passed to
 \texttt{VM\_CREATE}, and names the entry point in \texttt{VM\_START}.
+Everything loaded must lie in the kernel image, below its end, or in the
+initrd: that is what the launch digest covers (Section~\ref{sec:attest}).
+\texttt{VM\_START} fails with \texttt{EINVAL} otherwise.
 
 \end{document}

@@ -463,3 +463,83 @@ impl Ctl {
         Ok(())
     }
 }
+
+/// Attestation by the host (DESIGN.md §9.2) on /dev/l4h-attest, in any
+/// guest of a host with a TPM.
+pub mod attest {
+    use super::*;
+
+    const REPORT: u32 = 1;
+    const EVIDENCE: u32 = 2;
+    const ACTIVATE: u32 = 3;
+    pub const DATA_SIZE: usize = 64;
+
+    #[repr(C)]
+    struct Ioc {
+        op: u32,
+        blob_len: u32,
+        secret_len: u32,
+        out_len: u32,
+        data: u64,
+        out: u64,
+    }
+
+    // _IOWR('L', 2, struct l4h_attest_ioc)
+    const IOC: u64 = (3 << 30) | ((std::mem::size_of::<Ioc>() as u64) << 16) | ((b'L' as u64) << 8) | 2;
+
+    fn call(op: u32, data: &[u8], blob_len: usize) -> Result<Vec<u8>> {
+        let dev = File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/l4h-attest")
+            .map_err(|e| Error(format!("/dev/l4h-attest: {e} (does the host have a TPM?)")))?;
+        let mut out = vec![0u8; 64 << 10];
+        let mut c = Ioc {
+            op,
+            blob_len: blob_len as u32,
+            secret_len: (data.len() - blob_len) as u32,
+            out_len: out.len() as u32,
+            data: data.as_ptr() as u64,
+            out: out.as_mut_ptr() as u64,
+        };
+        if unsafe { ioctl(dev.as_raw_fd(), IOC, &mut c as *mut Ioc) } < 0 {
+            return err(format!("attestation request {op} failed: {}", io::Error::last_os_error()));
+        }
+        out.truncate(c.out_len as usize);
+        Ok(out)
+    }
+
+    /// A report (COSE_Sign1) on this guest with `data` (a verifier's nonce,
+    /// a hash of a key; at most DATA_SIZE bytes, zero padded).
+    pub fn report(data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() > DATA_SIZE {
+            return err(format!("report data is at most {DATA_SIZE} bytes"));
+        }
+        let mut d = [0u8; DATA_SIZE];
+        d[..data.len()].copy_from_slice(data);
+        call(REPORT, &d, 0)
+    }
+
+    /// The host evidence (CBOR): the TPM quote over the host's signing key.
+    pub fn evidence() -> Result<Vec<u8>> {
+        call(EVIDENCE, &[], 0)
+    }
+
+    /// TPM2_ActivateCredential of a credential made for the host's
+    /// attestation key, in the format of tpm2_makecredential (and
+    /// tools/l4h-attest.py make-credential): magic 0xbadcc0de, version 1,
+    /// TPM2B_ID_OBJECT, TPM2B_ENCRYPTED_SECRET.  Returns the secret.
+    pub fn activate(file: &[u8]) -> Result<Vec<u8>> {
+        let bad = || Error("not a credential file (tpm2_makecredential format)".into());
+        if file.get(..8) != Some(&[0xba, 0xdc, 0xc0, 0xde, 0, 0, 0, 1]) {
+            return Err(bad());
+        }
+        let tpm2b = |at: usize| -> Result<&[u8]> {
+            let n = u16::from_be_bytes(file.get(at..at + 2).ok_or_else(bad)?.try_into().unwrap()) as usize;
+            file.get(at + 2..at + 2 + n).ok_or_else(bad)
+        };
+        let blob = tpm2b(8)?;
+        let secret = tpm2b(10 + blob.len())?;
+        call(ACTIVATE, &[blob, secret].concat(), blob.len())
+    }
+}

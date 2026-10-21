@@ -17,6 +17,8 @@ macro_rules! info {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
+mod acpi;
 mod balloon;
 mod blkd;
 mod bootmod;
@@ -34,6 +36,7 @@ mod netd;
 mod pci;
 mod rtc;
 mod sched;
+mod trustd;
 mod vmm;
 mod vspace;
 mod window;
@@ -199,6 +202,7 @@ pub struct Host {
     pub dashboard: Option<dashboard::Dashboard>,
     pub cfg: config::Config,
     pub dom0: Dom0Images,
+    pub trustd: Option<trustd::Trustd>,
 }
 
 impl Host {
@@ -244,6 +248,9 @@ impl Host {
             Ok(mut g) => {
                 g.slots = slots;
                 g.asids = self.asids.in_use - asids;
+                if let Some(t) = &self.trustd {
+                    t.give(&mut g);
+                }
                 self.guests[id] = Some(g);
                 Some(id)
             }
@@ -350,6 +357,9 @@ impl Host {
             if g.state != State::Created || g.vmm.is_some() {
                 return Err(ctl::EBUSY);
             }
+            if let Some(t) = &mut h.trustd {
+                t.register(g);
+            }
             let v = vmm::spawn(g, &mut h.alloc, &mut h.wins.a, &mut h.asids, &h.info);
             component::start(&v);
             g.vmm = Some(v);
@@ -385,6 +395,9 @@ impl Host {
     pub fn destroy_guest(&mut self, id: usize) -> Result<(), i64> {
         let mut g = self.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
         g.stop();
+        if let Some(t) = &mut self.trustd {
+            t.unregister(id);
+        }
         for &p in &g.ports {
             self.netd.remove_port(p);
         }
@@ -489,6 +502,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         alloc.balloon = balloon::Balloon::new(&d, &pci, &mut alloc, &mut devmem, info.tsc_hz / 1000);
     }
     let mut asids = asids;
+    let trustd = trustd::spawn(bootinfo, &mut alloc, &mut devmem, &mut wins.a, &mut asids, &info);
     let netd = netd::spawn(nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
@@ -507,6 +521,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         dashboard: None,
         cfg,
         dom0,
+        trustd,
     };
     h.scan_disks();
     h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq);

@@ -65,6 +65,8 @@ typedef int64_t l4h_s64;
 #define L4H_SLOT_VSPACE         2   /* guest-kernel VSpace root */
 #define L4H_SLOT_HYP_EP         3   /* Call: hypercalls served by l4h-vmm */
 #define L4H_SLOT_ASID_POOL      4   /* reserved */
+/* Call: attestation, served by l4h-trustd (only with L4H_BOOT_ATTEST) */
+#define L4H_SLOT_ATTEST_EP      5
 
 
 /* Per-vCPU objects: root slots L4H_SLOT_VCPU(v) + L4H_VCPU_* */
@@ -231,6 +233,8 @@ struct l4h_bootinfo {
 };
 
 #define L4H_BOOT_DOM0           (1ull << 0)
+/* The host has a TPM, and the guest an L4H_SLOT_ATTEST_EP (see below). */
+#define L4H_BOOT_ATTEST         (1ull << 1)
 
 /* ------------------------------------------------------------------------
  * virtio-l4h: the shared device page of an L4H_DEV_VIRTIO device.
@@ -341,7 +345,9 @@ enum l4h_ctl_op {
 	/* args: vm, dst gpa, src offset in the control data area, len
 	 * (<= L4H_CTL_LOAD_MAX) */
 	L4H_CTL_VM_LOAD = 3,
-	/* args: vm, entry, kernel_end gpa, initrd gpa, initrd size; data: cmdline */
+	/* args: vm, entry, kernel_end gpa, initrd gpa, initrd size; data:
+	 * cmdline.  Everything VM_LOAD wrote must lie in [0, kernel_end) or
+	 * in the initrd, the memory the launch digest covers (DESIGN.md §9.2). */
 	L4H_CTL_VM_START = 4,
 	/* args: vm */
 	L4H_CTL_VM_DESTROY = 5,
@@ -433,6 +439,39 @@ enum l4h_hypercall {
 	L4H_HC_CTL = 7,             /* dom0: execute the request in the control device page */
 };
 #define L4H_HC_CONSOLE_MAX_WORDS 32
+
+/* ------------------------------------------------------------------------
+ * Attestation: seL4_Call(L4H_SLOT_ATTEST_EP) with the label below.  The
+ * host proves what it booted with a TPM quote over its signing key, and
+ * signs reports about the guest with that key (DESIGN.md §9.2):
+ *
+ * - L4H_ATTEST_REPORT: MR0..MR7 = 64 bytes of the guest's own data (a
+ *   verifier's nonce, a hash of a key), MR8 = offset.  Returns the report,
+ *   a COSE_Sign1 (RFC 9052, ES256) over a CBOR map of claims.  The same
+ *   data gives the same report, so it can be read in pieces.
+ * - L4H_ATTEST_EVIDENCE: MR0 = offset.  Returns the host evidence, a CBOR
+ *   map: the signing key, the TPM quote over it with the PCRs, the TPM's
+ *   attestation key and its EK certificate.  It is the same for every
+ *   guest until the host reboots.
+ * - L4H_ATTEST_ACTIVATE: MR0 = credential blob length, MR1 = encrypted
+ *   secret length, MR2.. = both, packed (the contents of the
+ *   TPM2B_ID_OBJECT and TPM2B_ENCRYPTED_SECRET that TPM2_MakeCredential
+ *   made for the attestation key).  Returns the decrypted credential,
+ *   which proves to a verifier that the attestation key is in the TPM
+ *   with that EK.
+ *
+ * Replies: MR0 = 0 or -errno, MR1 = total length of the result, MR2 =
+ * bytes in this reply (at most L4H_ATTEST_CHUNK, from the offset), MR3.. =
+ * the bytes.  A call made while the host sets up its TPM (well under a
+ * second, at boot) waits for it; -EIO: the TPM failed.
+ */
+enum l4h_attest_call {
+	L4H_ATTEST_REPORT = 1,
+	L4H_ATTEST_EVIDENCE = 2,
+	L4H_ATTEST_ACTIVATE = 3,
+};
+#define L4H_ATTEST_DATA_SIZE    64
+#define L4H_ATTEST_CHUNK        (8 * (120 - 3))
 
 enum l4h_power {
 	L4H_POWER_OFF = 0,

@@ -23,6 +23,7 @@ pub const CNODE_CPTR: u64 = cptr2(SLOT_META, 0);
 pub const ROOT_DEPTH: usize = ROOT_GUARD_BITS + ROOT_CNODE_BITS;
 pub const SLOT_VSPACE: usize = 2;
 pub const SLOT_HYP_EP: usize = 3;
+pub const SLOT_ATTEST_EP: usize = 5;
 
 
 pub const SLOT_VCPU_BASE: usize = 64;
@@ -137,6 +138,7 @@ pub struct BootInfo {
 }
 
 pub const BOOT_DOM0: u64 = 1 << 0;
+pub const BOOT_ATTEST: u64 = 1 << 1;
 
 pub const VIRTIO_MAGIC: u32 = 0x7634_686c;
 pub const VIRTIO_MAX_QUEUES: usize = 16;
@@ -274,6 +276,12 @@ pub const HC_SET_IRQ_AFFINITY: u64 = 5;
 pub const HC_GET_TIME: u64 = 6;
 pub const HC_CTL: u64 = 7;
 pub const HC_CONSOLE_MAX_WORDS: usize = 32;
+
+pub const ATTEST_REPORT: u64 = 1;
+pub const ATTEST_EVIDENCE: u64 = 2;
+pub const ATTEST_ACTIVATE: u64 = 3;
+pub const ATTEST_DATA_SIZE: usize = 64;
+pub const ATTEST_CHUNK: usize = 8 * (120 - 3);
 
 pub const POWER_OFF: u64 = 0;
 pub const POWER_REBOOT: u64 = 1;

@@ -1,11 +1,12 @@
 //! Definitions shared by l4h-root and the host components it spawns
-//! (l4h-vmm, blkd, netd): the component address-space and CSpace layout,
+//! (l4h-vmm, blkd, netd, trustd): the component address-space and CSpace layout,
 //! the component info page, and the inter-component queue formats.
 
 #![no_std]
 
 pub mod blk;
 pub mod net;
+pub mod trust;
 
 /// Whether host components print informational messages.  Every print is a
 /// synchronous serial write by the seL4 kernel, which stalls the core for
@@ -57,6 +58,7 @@ pub const INFO_MAGIC: u64 = 0x4f464e4948344c00; // "\0L4HINFO"
 pub const KIND_VMM: u32 = 1;
 pub const KIND_BLKD: u32 = 2;
 pub const KIND_NETD: u32 = 3;
+pub const KIND_TRUSTD: u32 = 4;
 
 /// Driver address-space layout: the device structures, then DMA memory.
 pub const fn blkd_chan_va() -> usize {

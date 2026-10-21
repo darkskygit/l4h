@@ -102,13 +102,61 @@ const USAGE: &str = "usage: l4hctl <command>
                                print the VM's console output
   send VM [--wait PAT [--timeout SECS]] TEXT
                                type TEXT (plus newline) on the VM's console;
-                               with --wait, print the time until PAT appears";
+                               with --wait, print the time until PAT appears
+In any guest of a host with a TPM:
+  attest report [HEX] [-o F]   report on this guest with HEX (up to 64
+                               bytes) as its data; hex, or binary to F
+  attest evidence [-o F]       the host evidence; hex, or binary to F
+  attest activate F            decrypt the credential F (tpm2_makecredential
+                               format) for the host's attestation key";
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return err(format!("bad hex: {s}"));
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error(format!("bad hex: {s}")))).collect()
+}
+
+/// `attest ...`: these need no /dev/l4hctl.
+fn cmd_attest(args: &[String]) -> Result<i32> {
+    let (mut out, mut pos) = (None, Vec::new());
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "-o" {
+            out = Some(it.next().ok_or(Error("-o: missing file".into()))?.clone());
+        } else {
+            pos.push(a.as_str());
+        }
+    }
+    let result = match (args.first().map(|s| s.as_str()), pos.as_slice()) {
+        (Some("report"), []) => attest::report(&[])?,
+        (Some("report"), [data]) => attest::report(&unhex(data)?)?,
+        (Some("evidence"), []) => attest::evidence()?,
+        (Some("activate"), [file]) => attest::activate(&read_file(file)?)?,
+        _ => {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    };
+    match out {
+        Some(f) => std::fs::write(&f, &result).map_err(|e| Error(format!("{f}: {e}")))?,
+        None => println!("{}", hex(&result)),
+    }
+    Ok(0)
+}
 
 fn run(args: &[String]) -> Result<i32> {
     let Some(cmd) = args.first() else {
         eprintln!("{USAGE}");
         return Ok(2);
     };
+    if cmd == "attest" {
+        return cmd_attest(&args[1..]);
+    }
     let ctl = Ctl::open()?;
     match cmd.as_str() {
         "info" => {

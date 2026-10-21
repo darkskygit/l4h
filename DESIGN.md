@@ -91,8 +91,8 @@ Each `l4h-blkd` drives one attached disk. `l4h-netd` combines all switches
 and uplink NIC drivers in one component. The drivers are Rust: virtio-net,
 and gVNIC after Linux `gve`.
 
-Trust: the seL4 kernel, `l4h-root`, `l4h-blkd` and `l4h-netd` form
-the host TCB. dom0 is trusted for control-plane decisions (§9.1) but cannot
+Trust: the seL4 kernel, `l4h-root`, `l4h-blkd`, `l4h-netd` and, with a
+TPM, `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
 read other guests' memory. Each `l4h-vmm` is trusted only by its own
 guest: it maps that guest's I/O pool and host-owned device, event and
 queue pages, and never its RAM (§15), so a compromised VMM can harm only
@@ -626,7 +626,8 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
 - Map and Unmap;
 - TCB, SchedContext Bind and Unbind;
 - Signal;
-- Call to its VMM endpoint for device configuration, power-off and reboot.
+- Call to its VMM endpoint for device configuration, power-off and reboot;
+- Call to trustd's endpoint for attestation, on hosts with a TPM (§9.2).
 
 **Direct seL4 invocations rely on capability checks.** The CSpace that
 `l4h-root` hands the guest contains:
@@ -1039,6 +1040,7 @@ the host keeps that dynamic plumbing simple.
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
 | `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC and X550 uplink drivers. |
+| `l4h-trustd` | 0 or 1 | With a TPM: has the TPM quote its signing key, and signs guests' reports with it (§9.2). |
 
 The shared crates are `l4h-abi` (guest ABI), `l4h-host` (host component
 protocols), `l4h-rt` (component runtime) and `l4h-virtio` (PCI transport).
@@ -1118,7 +1120,8 @@ and keeps the defaults. The user manual lists the settings.
 dom0 can rewrite the EFI partition when it holds the boot disk, so a
 compromised dom0 persists across reboots. That is within dom0's trust
 (it decides what runs), and nothing verifies the files: Secure Boot is
-off.
+off. GRUB measures them into the TPM, though, so a host's attestation
+shows what dom0 booted (§9.2).
 
 dom0 is guest #0 and receives a host-owned `l4hctl` device page. Its VMM
 has a control forwarding capability to root. Other guests' VMMs do not.
@@ -1221,6 +1224,103 @@ external orchestration can run in dom0.
   `destroy`, `restart-dom0`) stays available on COM1, which is the GCE serial
   console.
 
+### 9.2 Attestation
+
+A guest can prove to a remote verifier what it booted, and on which host.
+The chain has four links.
+
+1. **Measured boot.** The firmware measures the UEFI application into
+   PCR 4. The application holds seL4, `l4h-root` and every host component
+   (§10), so one digest covers the whole host. GRUB's `tpm` module measures
+   dom0's kernel, initramfs and `l4h.conf` into PCR 9, and its commands
+   into PCR 8. Secure Boot is not needed: nothing is checked at boot, the
+   verifier checks afterwards.
+2. **The host key.** `l4h-trustd` is the only component that maps the
+   TPM. Root finds the TPM in the ACPI `TPM2` table; trustd polls its FIFO
+   or CRB registers at locality 0. At start, trustd:
+   - generates a P-256 key K in software, from TPM randomness;
+   - creates the attestation key (AK), a restricted ECDSA P-256 signing
+     key. It is a primary key of the endorsement hierarchy, so the same
+     template gives the same key on every boot;
+   - quotes PCRs 0–15 with the AK, with `SHA-256("l4h-trustd-key-v1" ‖ K)`
+     as qualifying data;
+   - extends PCR 15 with that same value.
+
+   The quote shows PCR 15 as zero, which only a quote taken before the
+   extension can. So K is the only key trustd issued since the TPM was last
+   reset. After start, the TPM is only used for ActivateCredential. With
+   swtpm, start takes about 0.4 s; a guest that calls before then waits.
+3. **Reports on guests.** Root measures each guest as it boots it, dom0
+   included. The launch digest is `SHA-256("l4h-launch-v1" ‖ ram_base_va ‖
+   entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
+   length ‖ cmdline)`, with u64 little-endian integers.
+   - Root reads the image back from guest RAM before the guest starts.
+     `vm_start` fails if anything was loaded outside the kernel image and
+     the initramfs.
+   - Root writes {instance, RAM, vCPUs, dom0, digest} into a registry page
+     that trustd maps read-only. Root never calls trustd, whose TPM commands
+     can take seconds.
+   - Each guest gets an endpoint to trustd in `L4H_SLOT_ATTEST_EP`, badged
+     with its id, and `L4H_BOOT_ATTEST` in its boot info. trustd only
+     answers a guest about itself.
+   - `L4H_ATTEST_REPORT`, with 64 bytes of the guest's data, returns a
+     COSE_Sign1 (ES256) signed by K. It carries a CBOR map: `v`, `ram`,
+     `data`, `dom0`, `host` (SHA-256 of K), `guest`, `vcpus`, `launch` and
+     `instance` (unique per guest started since boot).
+   - `L4H_ATTEST_EVIDENCE` returns the host evidence, a CBOR map: K as a
+     COSE_Key, the AK's `TPMT_PUBLIC`, the quote (`TPMS_ATTEST`) and its
+     signature, the quoted PCR values, and the EK certificate if the TPM
+     has one in NV.
+   - Results longer than one message come in pieces. A report is
+     deterministic, so its pieces fit together.
+   - Linux exposes both as configfs-tsm reports (provider `l4h`: `inblob`,
+     `outblob`, and the evidence as `auxblob`) and through `/dev/l4h-attest`
+     (`l4hctl attest`).
+4. **Verification.** `tools/l4h-attest.py verify` checks that:
+   - the AK is a fixedTPM restricted signing key, and the quote verifies
+     under it;
+   - the quote's qualifying data is K's hash;
+   - the PCR values match the quote's digest, and PCR 15 is zero;
+   - the PCRs have the expected values (`--pcr`);
+   - the EK certificate chains to the manufacturer's CA (`--ek-ca`);
+   - the report verifies under K and carries the verifier's nonce and the
+     expected launch digest. `measure` computes the digest from the kernel,
+     initramfs and command line.
+
+   **AK enrollment.** A quote only proves something if the AK is in a real
+   TPM. `make-credential` encrypts a secret to the EK (from its certificate)
+   and binds it to the AK's name (TPM2_MakeCredential). A guest decrypts it
+   with `l4hctl attest activate`. That runs TPM2_ActivateCredential, using a
+   PolicySecret(endorsement) session for the EK, and only the TPM that holds
+   both keys can do it. The verifier then pins the AK's name (`--ak-name`),
+   which stays the same across boots.
+
+**Trust.** A report is worth what the host TCB is worth: seL4, root,
+trustd, blkd, netd and the guest's VMM (§3), all identified by PCR 4.
+dom0 decides what runs but cannot forge a report, because root computes
+the launch digests and trustd answers each guest only about itself. What
+this does not cover:
+
+- **The event log.** GRUB's multiboot2 path exits boot services without
+  fetching the firmware's event log, and seL4 hands boot-services memory to
+  root as RAM, so the log is lost. A verifier therefore pins PCR values
+  taken from a known-good boot of the same application on the same kind of
+  machine. Those values also depend on the firmware (PCRs 0–7) and on
+  dom0's files and settings (PCRs 8–9). A small EFI shim in front of GRUB
+  could save the log.
+- **DMA.** There is no IOMMU (§8.2), so a malicious device can DMA
+  anywhere.
+- **The cloud provider.** On a cloud VM, the provider's hypervisor and
+  vTPM are trusted too, and nothing is encrypted.
+- **Disks and networks.** They are dom0's choice and not measured, as for
+  confidential VMs.
+- **ActivateCredential.** It creates the EK on first use. An RSA EK takes
+  a hardware TPM seconds to create, and the calling vCPU waits.
+- **aarch64.** It has no TPM path yet.
+
+`tests/run-attesttest.sh` boots under OVMF with swtpm, over CRB and then
+FIFO, and checks the whole chain, the credential included.
+
 ---
 
 ## 10. Boot and deployment
@@ -1248,7 +1348,8 @@ external orchestration can run in dom0.
     an example `l4h.conf`, for a dom0 of any distribution;
   - `l4h-debug-x86_64.tar.xz`: the applications' build unstripped (root,
     components, each variant's kernel), for `addr2line` on fault
-    addresses. The components are packed into root without debug
+    addresses;
+  - `l4h-attest.py`, the attestation verifier (§9.2). The components are packed into root without debug
     information, which was about 20 MiB of each application, loaded and
     kept in root's memory for nothing.
 
@@ -1484,10 +1585,10 @@ l4h/
   DESIGN.md
   kernel/            seL4 (git submodule, pinned) + patches/ (E1–E3) + configs
   guest/linux/       arch/l4h sources, patches/ for anything outside arch/, defconfig (Linux 6.18 LTS)
-  host/              Rust workspace: l4h-abi, l4h-host, l4h-rt, l4h-root, l4h-vmm, l4h-blkd, l4h-netd, l4h-virtio
+  host/              Rust workspace: l4h-abi, l4h-host, l4h-rt, l4h-root, l4h-vmm, l4h-blkd, l4h-netd, l4h-trustd, l4h-virtio
   tools/l4hctl/      dom0 userspace CLI and library for the control API
   third_party/sddf/  submodule (design reference; no linked C drivers)
-  tools/             build-kernel.sh, build-linux.sh, build-host.sh, mkefi.sh (UEFI application), build-efi.sh (its variants), add-modules.py (dom0 into a built root), mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh
+  tools/             build-kernel.sh, build-linux.sh, build-host.sh, mkefi.sh (UEFI application), build-efi.sh (its variants), add-modules.py (dom0 into a built root), mkimage.sh (UEFI disk), run-qemu.sh, mkinitramfs.sh, l4h-attest.py (attestation verifier), swtpm.sh (a software TPM for QEMU)
   tests/             host-level integration tests driven by QEMU + expect-style console scripting
 ```
 

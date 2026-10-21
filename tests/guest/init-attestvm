@@ -1,0 +1,9 @@
+#!/bin/sh
+# Init of the guest tests/guest/init-attest starts: print a report on it.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+nonce=$(sed -n 's/.*attest_nonce=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
+echo "ATTESTVM: report $(l4hctl attest report "$nonce")"
+echo "ATTESTVM: done"
+poweroff -f

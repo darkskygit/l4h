@@ -207,6 +207,13 @@ pub struct Guest {
     pub ports: Vec<usize>,
     /// ASIDs held by its VSpaces (its own, its processes', its components').
     pub asids: usize,
+    /// It has a capability to trustd (L4H_BOOT_ATTEST).
+    pub attest: bool,
+    /// Guest RAM ranges loaded before boot: the image, which must lie in
+    /// what the launch digest covers.
+    loaded: Vec<(usize, usize)>,
+    /// The launch digest, set at boot (DESIGN.md §9.2).
+    pub launch: Option<[u8; 32]>,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -238,7 +245,7 @@ impl Guest {
             .unwrap_or_else(|e| panic!("guest slot {} copy failed: {:?}", idx, e));
     }
 
-    fn give_badged(&self, idx: usize, src: impl sel4::HasCPtrWithDepth, rights: CapRights, badge: u64) {
+    pub(crate) fn give_badged(&self, idx: usize, src: impl sel4::HasCPtrWithDepth, rights: CapRights, badge: u64) {
         self.guest_slot(idx)
             .mint(&abs(src), rights, badge)
             .unwrap_or_else(|e| panic!("guest slot {} mint failed: {:?}", idx, e));
@@ -312,6 +319,9 @@ impl Guest {
     pub fn load_ram(&mut self, alloc: &mut Alloc, win: &mut Window, gpa: usize, from: *const u8, len: usize) -> bool {
         if !self.prepare_ram(alloc, gpa, len) {
             return false;
+        }
+        if len != 0 {
+            self.loaded.push((gpa, len));
         }
         let mut off = 0;
         while off < len {
@@ -440,6 +450,12 @@ impl Guest {
         if self.boot_blocks != 0 {
             return false;
         }
+        // Everything loaded must be measured: the kernel image or the
+        // initramfs.
+        let within = |(gpa, len): (usize, usize), (lo, n): (usize, usize)| gpa >= lo && gpa + len <= lo + n;
+        if !self.loaded.iter().all(|&r| within(r, (0, kernel_end)) || within(r, initrd)) {
+            return false;
+        }
         // Boot blocks: a prefix of RAM up to the image (and anything else
         // loaded), plus slack.  The guest needs at least one block of its
         // own for seL4 objects.
@@ -481,7 +497,7 @@ impl Guest {
         bi.boot_blocks = self.boot_blocks as u64;
         bi.nr_vspaces = self.vspaces as u64;
 
-        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
+        bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 } | if self.attest { abi::BOOT_ATTEST } else { 0 };
         bi.io_pool_gpa = self.pool.gpa as u64;
         bi.io_pool_size = self.pool.size as u64;
         bi.nr_devices = self.devices.len() as u64;
@@ -508,6 +524,9 @@ impl Guest {
         }
         let n = cmdline.iter().position(|&c| c == 0).unwrap_or(cmdline.len()).min(abi::CMDLINE_SIZE - 1);
         bi.cmdline[..n].copy_from_slice(&cmdline[..n]);
+        if self.attest {
+            self.launch = Some(self.measure(win, entry, kernel_end, initrd, &cmdline[..n]));
+        }
 
         let bi_bytes = unsafe {
             core::slice::from_raw_parts(&*bi as *const abi::BootInfo as *const u8, core::mem::size_of::<abi::BootInfo>())
@@ -523,6 +542,33 @@ impl Guest {
         }
         self.entry = entry;
         true
+    }
+
+    /// The launch digest (DESIGN.md §9.2): SHA-256 over the image as it is
+    /// in guest RAM, the boot parameters that locate it, and the command
+    /// line.
+    fn measure(&self, win: &mut Window, entry: u64, kernel_end: usize, initrd: (usize, usize), cmdline: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"l4h-launch-v1");
+        h.update((self.ram_base as u64).to_le_bytes());
+        h.update(entry.to_le_bytes());
+        h.update((kernel_end as u64).to_le_bytes());
+        let mut range = |h: &mut Sha256, gpa: usize, len: usize| {
+            let mut at = gpa;
+            while at < gpa + len {
+                let page = at & !(PAGE - 1);
+                let n = (page + PAGE).min(gpa + len) - at;
+                win.with_frame(&self.ram_frame(page), |p| h.update(unsafe { core::slice::from_raw_parts(p.add(at - page), n) }));
+                at += n;
+            }
+        };
+        range(&mut h, 0, kernel_end);
+        h.update((initrd.1 as u64).to_le_bytes());
+        range(&mut h, initrd.0, initrd.1);
+        h.update((cmdline.len() as u64).to_le_bytes());
+        h.update(cmdline);
+        h.finalize().into()
     }
 
     /// Start vCPU 0 at the kernel entry point.
@@ -663,6 +709,9 @@ pub fn create(
         disks: Vec::new(),
         ports: Vec::new(),
         asids: 0,
+        attest: false,
+        loaded: Vec::new(),
+        launch: None,
     };
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();

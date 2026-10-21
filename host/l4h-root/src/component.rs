@@ -1,4 +1,4 @@
-//! Spawning host components (l4h-vmm, blkd, netd) as separate seL4
+//! Spawning host components (l4h-vmm, blkd, netd, trustd) as separate seL4
 //! processes with the layout defined in `l4h-host`.
 
 use alloc::collections::BTreeMap;

@@ -8,7 +8,10 @@
 # GRUB passes the three files to l4h-root as boot modules.  The partition
 # is the one the application was loaded from or, when GRUB cannot tell, the
 # first with /l4h/dom0/vmlinux (or /l4h/l4h.conf).  Without a dom0
-# kernel there, root boots the dom0 built into it, if any.
+# kernel there, root starts no dom0.
+# Measured boot: the firmware measures this application, with seL4 and
+# root in it, into PCR 4; GRUB's tpm module measures what it reads (the
+# files above) into PCR 9 and its commands into PCR 8 (DESIGN.md §9.2).
 # Usage: mkefi.sh <out.efi> [l4h-root.elf] [kernel.elf]
 # L4H_SERIAL_PORT (default 0x3f8) and L4H_FB_CONSOLE=1 set the defaults of
 # the serial_port and fb_console settings, which l4h.conf overrides.
@@ -57,7 +60,7 @@ CFG
 # seL4 loads only the segments: drop the debug information.
 objcopy --strip-debug "$rootserver" "$work/l4h-root.elf"
 grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
-    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo efi_gop video video_fb" \
+    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo efi_gop video video_fb tpm" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
     "boot/kernel.elf=$kernel" \

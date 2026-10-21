@@ -128,6 +128,15 @@ config L4H_CTL
 	help
 	  Expose the l4h host control API to dom0 userspace as /dev/l4hctl.
 
+config L4H_ATTEST
+	bool "Attestation by the l4h host"
+	default y
+	select TSM_REPORTS if VIRT_DRIVERS
+	help
+	  Reports about this guest signed by a host key that the host's TPM
+	  attests, as configfs-tsm reports (with VIRT_DRIVERS) and through
+	  /dev/l4h-attest.  Hosts without a TPM offer none.
+
 endmenu
 
 config ARCH_SUSPEND_POSSIBLE

@@ -3,7 +3,8 @@
 # - l4h-debug-x86_64.tar.xz, the same build unstripped, for decoding fault
 #   addresses;
 # - l4h-dom0-x86_64.tar.xz, the dom0 kernel and userspace tools
-#   (tools/build-dom0.sh).
+#   (tools/build-dom0.sh);
+# - l4h-attest.py, the verifier of attestation reports.
 # A pushed v* tag also publishes them, with their checksums, as a GitHub
 # release.  aarch64 has no shipped artifacts yet (DESIGN.md §10).
 name: release
@@ -65,13 +66,15 @@ jobs:
         run: |
           L4H_RELEASE=1 tools/build-efi.sh
           tools/build-dom0.sh
-          cd build/efi && sha256sum l4h-*.efi l4h-*.tar.xz > SHA256SUMS && cat SHA256SUMS
+          cp tools/l4h-attest.py build/efi/
+          cd build/efi && sha256sum l4h-*.efi l4h-*.tar.xz l4h-attest.py > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: l4h-x86_64
           path: |
             build/efi/l4h-*.efi
             build/efi/l4h-*.tar.xz
+            build/efi/l4h-attest.py
             build/efi/SHA256SUMS
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/')
@@ -83,7 +86,7 @@ jobs:
               --title "l4h $GITHUB_REF_NAME" --generate-notes \
               build/efi/l4h-generic.efi build/efi/l4h-xapic-nopcid.efi \
               build/efi/l4h-dom0-x86_64.tar.xz build/efi/l4h-debug-x86_64.tar.xz \
-              build/efi/SHA256SUMS
+              build/efi/l4h-attest.py build/efi/SHA256SUMS
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

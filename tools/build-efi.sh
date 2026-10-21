@@ -32,7 +32,7 @@ debug=$(mktemp -d)
 trap 'rm -rf "$debug"' EXIT
 mkdir "$debug/l4h-debug-x86_64"
 cp "$root/host/target/x86_64-sel4-roottask/debug/l4h-root.elf" \
-    "$root"/host/target/x86_64-sel4/debug/l4h-{vmm,blkd,netd}.elf "$debug/l4h-debug-x86_64/"
+    "$root"/host/target/x86_64-sel4/debug/l4h-{vmm,blkd,netd,trustd}.elf "$debug/l4h-debug-x86_64/"
 for v in "${variants[@]}"; do
     read -r name _ <<<"$v"
     "$root/tools/mkefi.sh" "$out/l4h-$name.efi" \

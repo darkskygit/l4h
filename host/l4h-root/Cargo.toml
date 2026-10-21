@@ -10,3 +10,4 @@ sel4-root-task.workspace = true
 l4h-abi.workspace = true
 l4h-host = { path = "../l4h-host" }
 l4h-virtio = { path = "../l4h-virtio" }
+sha2.workspace = true

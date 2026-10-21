@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["l4h-abi", "l4h-host", "l4h-rt", "l4h-root", "l4h-vmm", "l4h-blkd", "l4h-netd", "l4h-virtio"]
+members = ["l4h-abi", "l4h-host", "l4h-rt", "l4h-root", "l4h-vmm", "l4h-blkd", "l4h-netd", "l4h-trustd", "l4h-virtio"]
 default-members = ["l4h-root"]
 
 [workspace.package]
@@ -12,10 +12,20 @@ version = "0.1.0"
 sel4 = { path = "../third_party/rust-sel4/crates/sel4" }
 sel4-root-task = { path = "../third_party/rust-sel4/crates/sel4-root-task" }
 l4h-abi = { path = "l4h-abi" }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 [profile.dev]
 panic = "abort"
 opt-level = 1
+
+# Hashing guest images (root) and signing reports (trustd) at full speed.
+[profile.dev.package]
+sha2.opt-level = 3
+p256.opt-level = 3
+primeorder.opt-level = 3
+elliptic-curve.opt-level = 3
+crypto-bigint.opt-level = 3
+ecdsa.opt-level = 3
 
 [profile.release]
 panic = "abort"

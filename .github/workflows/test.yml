@@ -89,6 +89,8 @@ jobs:
         run: tests/run-monitor.sh
       - name: UEFI boot image
         run: tests/run-uefitest.sh
+      - name: Attestation (software TPM)
+        run: tests/run-attesttest.sh
       - name: Virtqueue fuzzing
         run: tests/run-fuzz.sh
       - name: Upload logs
