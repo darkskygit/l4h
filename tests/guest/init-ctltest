@@ -78,6 +78,17 @@ for d in 1 2 1 2; do
     echo "CTLTEST: disk $d destroyed under I/O, no stale DMA"
 done
 l4hctl disks
+if [ "$(uname -m)" = aarch64 ]; then
+    # The host reset API is x86-only. Check its error on AArch64, then
+    # stop dom0 so the runner can finish normally.
+    if l4hctl host-reboot >/tmp/reboot-error 2>&1; then
+        fail "host reboot unexpectedly succeeded"
+    fi
+    grep -q 'not supported' /tmp/reboot-error || { cat /tmp/reboot-error; fail "host reboot error"; }
+    echo "CTLTEST: host reboot not supported"
+    echo "CTLTEST: PASS"
+    poweroff -f
+fi
 echo "CTLTEST: PASS"
 # Last: the host reboot, which QEMU (-no-reboot) ends the run on.
 sync

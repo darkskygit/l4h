@@ -10,10 +10,19 @@ out=$root/build/abitest
 rm -rf "$out" && mkdir -p "$out/tree" "$out/mod"
 "$root/tools/build-kmods.sh" >/dev/null
 fsck.erofs --extract="$out/tree" "$l4h_linux_out/kmods.erofs" >/dev/null
+kbuild=$out/tree/$(cat "$l4h_linux_out/include/config/kernel.release")/build
 cross=()
-[ "${L4H_ARCH:-x86_64}" = aarch64 ] && cross=(CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}")
+if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then
+    cross=(CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}")
+    # install-extmod-build makes these tools native to the guest. This
+    # test cross-compiles on the build host, so use its matching helpers
+    # in the extracted copy; the shipped image keeps the guest binaries.
+    for helper in basic/fixdep mod/modpost; do
+        cp "$l4h_linux_out/scripts/$helper" "$kbuild/scripts/$helper"
+    done
+fi
 cp "$root"/tests/guest/abitest/* "$out/mod/"
-make -s -C "$out/tree"/*/build M="$out/mod" "${cross[@]}" modules >"$out/build.log" 2>&1 \
+make -s -C "$kbuild" M="$out/mod" "${cross[@]}" modules >"$out/build.log" 2>&1 \
     || { cat "$out/build.log"; exit 1; }
 "$root/tools/mkinitramfs.sh" "$out/abitest.cpio.gz" "$root/tests/guest/init-abitest" \
     "$out/mod/l4h_abitest.ko" >/dev/null

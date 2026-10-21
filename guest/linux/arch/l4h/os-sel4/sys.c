@@ -281,7 +281,16 @@ void __assert_fail(const char *assertion, const char *file, int line, const char
 #ifdef __aarch64__
 void l4h_flush_icache(unsigned long start, unsigned long end)
 {
-	if (start < end)
-		l4h_BUG_ON(seL4_ARM_VSpace_Unify_Instruction(L4H_CPTR(L4H_SLOT_VSPACE), start, end));
+	/* seL4's VSpace flush may not cross a page boundary. Module text
+	 * can span many pages, with an unaligned start or end. */
+	while (start < end) {
+		unsigned long len = (1UL << seL4_PageBits) -
+			(start & ((1UL << seL4_PageBits) - 1));
+
+		if (len > end - start)
+			len = end - start;
+		l4h_BUG_ON(seL4_ARM_VSpace_Unify_Instruction(L4H_CPTR(L4H_SLOT_VSPACE), start, start + len));
+		start += len;
+	}
 }
 #endif
