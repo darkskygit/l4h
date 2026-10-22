@@ -688,8 +688,8 @@ impl Alloc {
 }
 
 /// An arena grows by at least this much (2^bits bytes) when it runs out,
-/// and by an eighth of its size once that is more, so that its regions
-/// stay few.
+/// preferring an eighth of its size once that is more, so that its
+/// regions stay few.  Smaller blocks can still serve it under fragmentation.
 const ARENA_GROW_BITS: usize = 20;
 /// Regions of an arena, and the Untypeds it owns besides (the I/O pool,
 /// netd ports: at most one per device).
@@ -731,13 +731,17 @@ impl Arena {
         }
         let need = count << bp.physical_size_bits();
         let eighth = (self.bytes() / 8).max(1).ilog2() as usize;
-        let bits = (need.next_power_of_two().trailing_zeros() as usize).max(ARENA_GROW_BITS).max(eighth);
+        let minimum = (need.next_power_of_two().trailing_zeros() as usize).max(ARENA_GROW_BITS);
+        let preferred = minimum.max(eighth);
         let slot = alloc.slots.alloc();
-        let Some(region) = alloc.split(bits, slot) else {
+        // The preferred growth size may be unavailable even when a
+        // smaller block can satisfy the request.  Keep the request's size
+        // as the lower bound, and take the largest block that fits.
+        let Some(region) = (minimum..=preferred).rev().find_map(|bits| alloc.split(bits, slot)) else {
             alloc.slots.free(slot);
             return None;
         };
-        self.owned.must_push((slot, region.paddr, bits));
+        self.owned.must_push((slot, region.paddr, region.size_bits));
         let _ = self.pool.add(region);
         self.pool.retype(bp, count, dest)
     }

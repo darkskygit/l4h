@@ -138,6 +138,7 @@ l4hctl console 1 --follow
 
 | Test | What it checks |
 |------|----------------|
+| `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim and fixed-container panic safety |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
 | `tests/run-objtest.sh [vcpus]` | object memory growth under fragmentation, block conversion, SMP memory stress, OOM recovery |

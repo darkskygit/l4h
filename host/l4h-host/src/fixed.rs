@@ -84,15 +84,44 @@ impl<T, const N: usize> ArrayVec<T, N> {
 
     /// Keep only the elements for which `f` is true, in order.
     pub fn retain(&mut self, mut f: impl FnMut(&T) -> bool) {
-        let mut kept = 0;
-        for i in 0..self.len {
-            let v = unsafe { self.buf[i].assume_init_read() };
-            if f(&v) {
-                self.buf[kept].write(v);
-                kept += 1;
+        // During compaction the initialized elements are a kept prefix
+        // and an unprocessed tail.  Restore one contiguous slice even if
+        // the predicate or an element's destructor panics.
+        struct Backshift<'a, T, const N: usize> {
+            vec: &'a mut ArrayVec<T, N>,
+            len: usize,
+            processed: usize,
+            kept: usize,
+        }
+
+        impl<T, const N: usize> Drop for Backshift<'_, T, N> {
+            fn drop(&mut self) {
+                let tail = self.len - self.processed;
+                if self.processed != self.kept {
+                    let p = self.vec.buf.as_mut_ptr();
+                    unsafe { core::ptr::copy(p.add(self.processed), p.add(self.kept), tail) };
+                }
+                self.vec.len = self.kept + tail;
             }
         }
-        self.len = kept;
+
+        let len = core::mem::replace(&mut self.len, 0);
+        let mut g = Backshift { vec: self, len, processed: 0, kept: 0 };
+        while g.processed < len {
+            let p = g.vec.buf.as_mut_ptr();
+            if f(unsafe { &*p.add(g.processed).cast::<T>() }) {
+                if g.processed != g.kept {
+                    unsafe { core::ptr::copy_nonoverlapping(p.add(g.processed), p.add(g.kept), 1) };
+                }
+                g.kept += 1;
+                g.processed += 1;
+            } else {
+                let i = g.processed;
+                // Exclude it from the tail before Drop can panic.
+                g.processed += 1;
+                unsafe { core::ptr::drop_in_place(p.add(i).cast::<T>()) };
+            }
+        }
     }
 
     pub fn clear(&mut self) {
@@ -318,7 +347,68 @@ impl<T> Scratch<T> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use core::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
+
+    struct Tracked<'a> {
+        id: usize,
+        drops: &'a [Cell<usize>],
+        panic_on_drop: bool,
+    }
+
+    impl Drop for Tracked<'_> {
+        fn drop(&mut self) {
+            let n = self.drops[self.id].get();
+            self.drops[self.id].set(n + 1);
+            if self.panic_on_drop && n == 0 {
+                panic!("element destructor");
+            }
+        }
+    }
+
+    #[test]
+    fn retain_predicate_panic_preserves_remaining_elements() {
+        // Panic at every position, then also finish normally.
+        for panic_at in 0..=6 {
+            let drops = [const { Cell::new(0) }; 6];
+            let mut v = ArrayVec::<_, 6>::new();
+            for id in 0..6 {
+                v.must_push(Tracked { id, drops: &drops, panic_on_drop: false });
+            }
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                v.retain(|x| {
+                    assert_ne!(x.id, panic_at, "predicate");
+                    x.id % 2 == 1
+                });
+            }));
+            assert_eq!(result.is_err(), panic_at < 6);
+            let expected = (0..6).filter(|&i| i >= panic_at || i % 2 == 1);
+            assert!(v.iter().map(|x| x.id).eq(expected));
+            for (id, count) in drops.iter().enumerate() {
+                assert_eq!(count.get(), usize::from(id < panic_at && id % 2 == 0));
+            }
+            drop(v);
+            assert!(drops.iter().all(|n| n.get() == 1));
+        }
+    }
+
+    #[test]
+    fn retain_destructor_panic_does_not_drop_rejected_element_again() {
+        let drops = [const { Cell::new(0) }; 6];
+        let mut v = ArrayVec::<_, 6>::new();
+        for id in 0..6 {
+            v.must_push(Tracked { id, drops: &drops, panic_on_drop: id == 3 });
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| v.retain(|x| x.id % 2 == 0)));
+        assert!(result.is_err());
+        assert!(v.iter().map(|x| x.id).eq([0, 2, 4, 5]));
+        drop(v);
+        assert!(drops.iter().all(|n| n.get() == 1));
+    }
 
     #[test]
     fn array_vec() {
