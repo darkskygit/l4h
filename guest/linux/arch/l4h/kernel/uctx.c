@@ -121,17 +121,23 @@ static int uctx_create(struct task_struct *t)
 	err = l4h_obj_alloc(L4H_OBJ_REPLY, 0, &th->reply_obj);
 	if (err)
 		goto fail_tcb;
+	/* The fault endpoint's slot is taken here, where running out can
+	 * wait or go to the OOM killer; prepare_user() only refills it. */
+	u->fault_ep = l4h_slot_alloc();
+	if (!u->fault_ep) {
+		err = -ENOMEM;
+		goto fail_reply;
+	}
 	u->tcb = th->utcb_obj.cptr;
 	u->reply = th->reply_obj.cptr;
 	u->badge = L4H_EP_BADGE_TASK | atomic64_inc_return(&uctx_ids);
 	xa_store(&uctx_by_badge, u->badge & ~L4H_EP_BADGE_TASK, t, GFP_ATOMIC);
-	u->fault_ep = 0;
 	u->fault_ep_vcpu = -1;
 	u->sc_vcpu = -1;
 	u->vspace = 0;
 	err = l4h_tcb_set_flags(u->tcb, 1 /* fpuDisabled */, 2 /* trapSyscalls */);
 	if (err)
-		goto fail_reply;
+		goto fail_slot;
 	u->state = L4H_UCTX_FRESH;
 	u->regs_valid = 1;
 	if (u->fp_state != L4H_FP_DIRTY) {
@@ -140,6 +146,9 @@ static int uctx_create(struct task_struct *t)
 	}
 	return 0;
 
+fail_slot:
+	l4h_slot_free(u->fault_ep);
+	u->fault_ep = 0;
 fail_reply:
 	l4h_obj_free(&th->reply_obj);
 fail_tcb:
@@ -243,12 +252,11 @@ static void prepare_user(struct task_struct *t)
 		panic("l4h: out of seL4 objects creating a user context\n");
 
 	if (u->fault_ep_vcpu != cpu) {
-		if (u->fault_ep)
-			l4h_slot_delete(u->fault_ep);
-		u->fault_ep = l4h_cap_mint_root(L4H_SLOT_VCPU(cpu) + L4H_VCPU_EP,
-						L4H_RIGHTS_ALL, u->badge);
-		if (!u->fault_ep)
-			panic("l4h: out of capability slots\n");
+		if (u->fault_ep_vcpu >= 0)
+			WARN_ON(l4h_cnode_delete(u->fault_ep, 64));
+		if (l4h_cnode_mint(u->fault_ep, 64, L4H_SLOT_VCPU(cpu) + L4H_VCPU_EP,
+				   L4H_ROOT_DEPTH, L4H_RIGHTS_ALL, u->badge))
+			panic("l4h: cannot mint a fault endpoint\n");
 		u->fault_ep_vcpu = cpu;
 		/* Force SC_U (and with it the fault endpoint) to be rebound. */
 		if (u->sc_vcpu >= 0)
