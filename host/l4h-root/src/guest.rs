@@ -242,6 +242,8 @@ pub struct Guest {
     /// Host side of each virtio device, by device index.
     pub backends: ArrayVec<(usize, vmm::Backend), MAX_GUEST_DEVICES>,
     pub console_ring: ArrayVec<cap::Granule, { host::CONSOLE_RING_PAGES }>,
+    /// Large VMM objects reserved at creation, before VM_LOAD uses the arena.
+    pub vmm_cnodes: Option<vmm::Cnodes>,
     pub vmm: Option<Component>,
     /// CPU cap per vCPU in percent of a core (0 = none).
     pub cpu_cap_pct: u32,
@@ -834,6 +836,7 @@ pub fn create(
         devices: ArrayVec::new(),
         backends: ArrayVec::new(),
         console_ring: ArrayVec::new(),
+        vmm_cnodes: None,
         vmm: None,
         cpu_cap_pct: 0,
         disks: ArrayVec::new(),
@@ -844,6 +847,11 @@ pub fn create(
         launch: None,
         kmod_size: 0,
     };
+
+    let Some(cnodes) = vmm::Cnodes::new(&mut g.arena, alloc, cfg.io_pool) else {
+        return Err(Some(g));
+    };
+    g.vmm_cnodes = Some(cnodes);
 
     let guard34 = CNodeCapData::new(0, abi::ROOT_GUARD_BITS).into_word();
     let guard6 = CNodeCapData::new(0, abi::L2_INDEX_BITS - abi::ROOT_CNODE_BITS).into_word();

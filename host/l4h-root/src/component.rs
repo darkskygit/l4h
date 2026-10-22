@@ -101,6 +101,8 @@ pub struct SpawnArgs<'a> {
     /// Pre-made bound notification / service endpoint (created if None).
     pub ntfn: Option<cap::Notification>,
     pub service_ep: Option<cap::Endpoint>,
+    /// A CNode allocated in advance (the VMM's); otherwise made here.
+    pub cnode: Option<cap::CNode>,
     /// Radix of its CNode, if not host::CNODE_BITS (memd's holds every
     /// Untyped).
     pub cnode_bits: Option<usize>,
@@ -121,7 +123,7 @@ pub fn create(
 
     let vspace = ctx.cap::<cap_type::VSpace>(PML4_BP);
     let cnode_bits = args.cnode_bits.unwrap_or(host::CNODE_BITS);
-    let cnode = ctx.cap::<cap_type::CNode>(ObjectBlueprint::CNode { size_bits: cnode_bits });
+    let cnode = args.cnode.unwrap_or_else(|| ctx.cap::<cap_type::CNode>(ObjectBlueprint::CNode { size_bits: cnode_bits }));
     let tcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
     let ntfn = args.ntfn.unwrap_or_else(|| ctx.cap::<cap_type::Notification>(ObjectBlueprint::Notification));
     let service_ep = args.service_ep.unwrap_or_else(|| ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint));

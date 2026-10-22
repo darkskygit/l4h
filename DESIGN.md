@@ -1945,8 +1945,12 @@ memory the guest can retype.
   the host up to 32 KiB (its level-2 CNode and a page table, with the
   alignment between them) and three root slots: before it fills any,
   `VM_START` checks that the host can afford the blocks not yet filled
-  (`Guest::boot_cost`) and grows the guest's arena by that much
-  (`Arena::reserve`), and fails with `ENOMEM` otherwise. `VM_LOAD` likewise
+  (`Guest::boot_cost`) and reserves room in the guest's arena for them
+  and the VMM's remaining objects (`Arena::reserve`), and fails with
+  `ENOMEM` otherwise. The VMM's three large CNodes (its CSpace and the
+  CNodes keeping its mappings) are made at guest creation, before loads
+  can fill or fragment the arena; the remaining startup objects are small
+  enough for that reservation's guarantee. `VM_LOAD` likewise
   checks and reserves the overhead of its unfilled blocks before loading,
   so a full arena table returns `ENOMEM` even when host RAM remains free.
   Deviation: the design counted two slack blocks as boot blocks

@@ -244,6 +244,7 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
         config: cfg_bytes,
         ntfn: None,
         service_ep: None,
+        cnode: None,
         cnode_bits: Some(bits),
     };
     let comp = component::create(&args, alloc, &mut arena, win, asids, info);

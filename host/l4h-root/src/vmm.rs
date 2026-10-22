@@ -12,7 +12,7 @@ use l4h_host::fixed::{ArrayVec, Scratch};
 
 use crate::component::{self, Component, SpawnArgs};
 use crate::guest::{Guest, dev_event};
-use crate::mem::{Alloc, Slot};
+use crate::mem::{Alloc, Arena, Slot};
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
 
@@ -20,14 +20,39 @@ static VMM_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-vmm.elf"))
 
 const PAGE: usize = 4096;
 
-/// Untyped memory a guest's arena is expected to need for its l4h-vmm (the
-/// arena grows if it needs more).
+/// The VMM's large objects, made at guest creation before loading RAM can
+/// fragment or fill the arena.  Everything allocated at start is then
+/// small enough for Arena::reserve's guarantee.
+pub struct Cnodes {
+    cspace: cap::CNode,
+    pool: cap::CNode,
+    small: cap::CNode,
+}
+
+impl Cnodes {
+    pub fn new(arena: &mut Arena, alloc: &mut Alloc, io_pool: usize) -> Option<Self> {
+        let mut make = |bits| {
+            let s = arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: bits })?;
+            Some(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
+        };
+        Some(Self {
+            cspace: make(host::CNODE_BITS)?,
+            pool: make((io_pool / PAGE).trailing_zeros() as usize)?,
+            small: make(host::CNODE_BITS)?,
+        })
+    }
+}
+
+/// Bytes needed at start, besides the CNodes made at guest creation:
+/// page tables for the I/O pool, the VMM image and stack, and mappings of
+/// event pages, device pages and backend channels (including alignment).
+pub fn start_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
+    io_pool / 512 + (3 << 19) + (vcpus + devices * 16) * 2 * PAGE
+}
+
+/// Untyped memory a guest's arena is expected to need for its l4h-vmm.
 pub fn arena_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
-    // Mapping caps (32 bytes per frame) and page tables for the I/O pool
-    // (the VMM maps nothing else of the guest's memory), the VMM image
-    // (no heap) and its 512 KiB stack, its CNode, and the mappings of
-    // event pages, device pages and backend channels.
-    io_pool / 128 + io_pool / 512 + (3 << 19) + (32 << host::CNODE_BITS) + (vcpus + devices * 16) * 2 * PAGE
+    start_bytes(io_pool, vcpus, devices) + io_pool / 128 + 2 * (32 << host::CNODE_BITS)
 }
 
 /// A device's host-side backend.
@@ -132,6 +157,7 @@ fn create(
         config: cfg_bytes,
         ntfn: Some(g.vmm_ntfn),
         service_ep: Some(g.vmm_ep),
+        cnode: Some(g.vmm_cnodes.as_ref().expect("VMM CNodes").cspace),
         cnode_bits: None,
     };
     component::create(&args, alloc, &mut g.arena, win, asids, host_info)
@@ -143,7 +169,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     // The mapping capabilities are kept in a CNode of the guest's arena.
     let pages = g.pool.pages();
     let radix = (pages.trailing_zeros() as usize).max(1);
-    let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: radix });
+    let keep = g.vmm_cnodes.as_ref().expect("VMM CNodes").pool;
     let attrs = VmAttributes::DEFAULT;
     for i in 0..pages {
         let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, radix);
@@ -152,7 +178,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     }
 
     // ---- Event pages, notifications and device pages.
-    let small = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: 12 });
+    let small = g.vmm_cnodes.as_ref().expect("VMM CNodes").small;
     let mut small_next = 0u64;
     let mut keep_slot = || {
         let s = small.absolute_cptr_from_bits_with_depth(small_next, 12);

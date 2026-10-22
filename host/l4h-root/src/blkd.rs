@@ -293,6 +293,7 @@ pub fn start(
         config: cfg_bytes,
         ntfn: None,
         service_ep: None,
+        cnode: None,
         cnode_bits: None,
     };
     let comp = component::create(&args, alloc, &mut arena, win, asids, host_info);

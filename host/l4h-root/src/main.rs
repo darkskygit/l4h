@@ -369,6 +369,9 @@ impl Host {
             if g.state != State::Created || g.vmm.is_some() {
                 return Err(ctl::EBUSY);
             }
+            if !g.reserve(&mut h.alloc, vmm::start_bytes(g.pool.size, g.vcpus.len(), g.devices.len())) {
+                return Err(ctl::ENOMEM);
+            }
             if let Some(t) = &mut h.trustd {
                 t.register(g);
             }

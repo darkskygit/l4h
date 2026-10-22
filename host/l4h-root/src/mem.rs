@@ -784,11 +784,20 @@ impl Arena {
         self.pool.regions.iter().map(|r| r.size()).sum()
     }
 
-    pub fn object(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> Slot {
+    /// Allocate one object, or leave its slot free if it cannot fit.
+    pub fn try_object(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> Option<Slot> {
         let s = alloc.slots.alloc();
-        self.retype(alloc, &bp, 1, Dest::root(s))
-            .unwrap_or_else(|| panic!("out of host memory allocating {:?}", bp.ty()));
-        s
+        if self.retype(alloc, &bp, 1, Dest::root(s)).is_none() {
+            alloc.slots.free(s);
+            return None;
+        }
+        Some(s)
+    }
+
+    pub fn object(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> Slot {
+        let ty = bp.ty();
+        self.try_object(alloc, bp)
+            .unwrap_or_else(|| panic!("out of host memory allocating {:?}", ty))
     }
 
     pub fn object_cap<T: sel4::CapType>(&mut self, alloc: &mut Alloc, bp: ObjectBlueprint) -> sel4::Cap<T> {

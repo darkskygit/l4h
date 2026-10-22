@@ -23,6 +23,14 @@ for i in 1 2 3; do
     if [ -n "$free0" ] && [ "$free" != "$free0" ]; then fail "memory leak: $free0 -> $free MiB"; fi
     free0=$free
 done
+# The largest I/O pool needs a 2 MiB VMM mapping CNode. Its CNodes are
+# allocated at VM_CREATE and must survive loading, start, and reclaim.
+id=$(l4hctl create largepool --initrd /bin/vm.cpio.gz --mem 128 --io-pool 256) || fail "create large I/O pool"
+l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null || fail "large I/O pool boot"
+l4hctl destroy "$id" || fail "destroy large I/O pool"
+free=$(l4hctl info | sed -n 's/memory: \([0-9]*\) MiB free.*/\1/p')
+[ "$free" = "$free0" ] || fail "large I/O pool memory leak: $free0 -> $free MiB"
+echo "CTLTEST: large I/O pool started and reclaimed"
 # Disk pass-through to a guest, twice: the second sees the first's write.
 for i in 1 2; do
     id=$(l4hctl create disk$i --initrd /bin/vm.cpio.gz --mem 128 --disk 0) || fail "create disk$i"
