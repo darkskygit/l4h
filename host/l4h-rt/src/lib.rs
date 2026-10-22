@@ -85,7 +85,79 @@ pub fn init() -> &'static Info {
         sel4::set_ipc_buffer((IPCBUF_VA as *mut sel4::IpcBuffer).as_mut().unwrap());
     }
     assert_eq!(INFO.header().magic, INFO_MAGIC, "bad component info page");
+    if host::has_keeper(INFO.header().kind) {
+        start_keeper();
+    }
     &INFO
+}
+
+const KEEPER_STACK: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+struct KeeperStack([u8; KEEPER_STACK]);
+
+static mut KEEPER_STACK_MEM: KeeperStack = KeeperStack([0; KEEPER_STACK]);
+
+#[repr(align(64))]
+struct KeeperTlsAlign;
+
+static KEEPER_TLS: sel4_initialize_tls::StaticTlsAllocation<4096, KeeperTlsAlign> =
+    sel4_initialize_tls::StaticTlsAllocation::new();
+
+/// Start the keeper (host::SLOT_KEEPER) on its own stack, TLS and IPC
+/// buffer: it shares nothing with this thread.
+fn start_keeper() {
+    let phdr = sel4_phdrs::locate_phdrs()
+        .ok()
+        .and_then(|p| p.find_by_type(sel4_phdrs::PT_TLS))
+        .expect("keeper: no TLS image");
+    let image = sel4_initialize_tls::UncheckedTlsImage {
+        vaddr: phdr.p_vaddr,
+        filesz: phdr.p_filesz,
+        memsz: phdr.p_memsz,
+        align: phdr.p_align,
+    }
+    .check()
+    .expect("keeper: bad TLS image");
+    let tp = unsafe { image.initialize_inexact_reservation_region(&KEEPER_TLS.region()) }.expect("keeper TLS space");
+    let k = cap::<sel4::cap_type::Tcb>(host::SLOT_KEEPER);
+    let top = core::ptr::addr_of_mut!(KEEPER_STACK_MEM) as usize + KEEPER_STACK;
+    let mut regs = sel4::UserContext::default();
+    *regs.pc_mut() = keeper as *const () as u64;
+    // As if called: x86-64 expects a return address pushed.
+    *regs.sp_mut() = (if cfg!(target_arch = "x86_64") { top - 8 } else { top }) as u64;
+    k.tcb_write_all_registers(false, &mut regs).expect("keeper registers");
+    // After the registers, which include the TLS base.
+    k.tcb_set_tls_base(tp as u64).expect("keeper TLS");
+    k.tcb_resume().expect("keeper start");
+}
+
+/// The keeper: wait for the main thread to fault (its fault is never
+/// answered), and answer for it.
+extern "C" fn keeper() -> ! {
+    unsafe {
+        sel4::set_ipc_buffer((host::KEEPER_IPCBUF_VA as *mut sel4::IpcBuffer).as_mut().unwrap());
+    }
+    let reply = cap::<sel4::cap_type::Reply>(host::SLOT_KEEPER_REPLY);
+    let (info, _) = cap::<sel4::cap_type::Endpoint>(host::SLOT_FAULT_EP).recv(reply);
+    let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
+    sel4::debug_println!("l4h-rt: component {:#x} fault: {:x?}", INFO.header().id, fault);
+    answer_failed()
+}
+
+/// Answer l4h-root as a failed component: u64::MAX and zeros to every
+/// call, the one this thread's reply object holds (if any) first.
+fn answer_failed() -> ! {
+    let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
+    let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
+    loop {
+        sel4::with_ipc_buffer_mut(|b| {
+            let m = b.msg_regs_mut();
+            m[0] = u64::MAX;
+            m[1..8].fill(0);
+        });
+        ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 8), reply);
+    }
 }
 
 pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
@@ -94,23 +166,13 @@ pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
 
 /// Where an aborted component ends.  l4h-root calls blkd, netd and memd
 /// synchronously and could not wait for their faults to be reported: one
-/// that has failed keeps answering on its service endpoint, the call it
-/// was serving first, with u64::MAX and zeros (a failed device to root).
-/// Any other component faults, which root handles.
+/// that has failed keeps answering on its service endpoint (a fault, its
+/// keeper does).  Any other component faults, which root handles.
 #[doc(hidden)]
 pub fn abort_trap() -> ! {
     let h = INFO.header();
-    if h.magic == INFO_MAGIC && matches!(h.kind, host::KIND_BLKD | host::KIND_NETD | host::KIND_MEMD) {
-        let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
-        let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
-        loop {
-            sel4::with_ipc_buffer_mut(|b| {
-                let m = b.msg_regs_mut();
-                m[0] = u64::MAX;
-                m[1..8].fill(0);
-            });
-            ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 8), reply);
-        }
+    if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
+        answer_failed();
     }
     loop {
         unsafe {

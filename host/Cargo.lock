@@ -355,8 +355,10 @@ dependencies = [
  "one-shot-mutex",
  "sel4",
  "sel4-dlmalloc",
+ "sel4-initialize-tls",
  "sel4-panicking",
  "sel4-panicking-env",
+ "sel4-phdrs",
  "sel4-runtime-common",
 ]
 

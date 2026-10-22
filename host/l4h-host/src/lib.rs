@@ -24,6 +24,8 @@ pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
 pub const INFO_VA: usize = 0x1000_0000;
 pub const INFO_SIZE: usize = 0x4000;
 pub const IPCBUF_VA: usize = 0x1001_0000;
+/// The keeper's (has_keeper kinds).
+pub const KEEPER_IPCBUF_VA: usize = IPCBUF_VA + 0x1000;
 pub const STACK_TOP: usize = 0x1100_0000;
 pub const STACK_SIZE: usize = 512 * 1024;
 /// Shared regions (device pages, queues, buffers) are mapped from here.
@@ -53,6 +55,13 @@ pub const SLOT_NTFN: u64 = 5;
 pub const SLOT_SERVICE_EP: u64 = 6;
 /// Reply object for receiving on SLOT_SERVICE_EP.
 pub const SLOT_REPLY: u64 = 7;
+/// A keeper's thread (has_keeper kinds): it waits on SLOT_FAULT_EP, the
+/// main thread's fault endpoint, and once the main thread has faulted
+/// answers SLOT_SERVICE_EP for it.
+pub const SLOT_KEEPER: u64 = 8;
+pub const SLOT_FAULT_EP: u64 = 9;
+/// The keeper's reply object for SLOT_FAULT_EP (never answered).
+pub const SLOT_KEEPER_REPLY: u64 = 10;
 /// First component-specific slot.
 pub const SLOT_FIRST_FREE: u64 = 16;
 
@@ -63,6 +72,13 @@ pub const KIND_BLKD: u32 = 2;
 pub const KIND_NETD: u32 = 3;
 pub const KIND_TRUSTD: u32 = 4;
 pub const KIND_MEMD: u32 = 5;
+
+/// The kinds l4h-root calls synchronously (blkd, netd, memd): root could
+/// not wait for their faults to be reported, so a keeper thread answers
+/// for a failed one.
+pub const fn has_keeper(kind: u32) -> bool {
+    matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD)
+}
 
 /// Driver address-space layout: the device structures, then DMA memory.
 pub const fn blkd_chan_va() -> usize {

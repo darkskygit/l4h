@@ -132,6 +132,19 @@ pub fn create(
         size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
     });
     let ipcbuf = ctx.cap::<cap_type::Granule>(FRAME_BP);
+    // A keeper: its thread, scheduling context, the endpoint and reply
+    // object it takes the main thread's faults with, and IPC buffer.
+    let keeper = host::has_keeper(args.kind).then(|| {
+        (
+            ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb),
+            ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
+                size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
+            }),
+            ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint),
+            ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply),
+            ctx.cap::<cap_type::Granule>(FRAME_BP),
+        )
+    });
     drop(ctx);
     asids.assign(alloc, vspace);
 
@@ -210,6 +223,17 @@ pub fn create(
         VmAttributes::DEFAULT,
     );
 
+    if let Some((.., kipcbuf)) = keeper {
+        map_frame(
+            &mut ObjCtx::arena(alloc, &mut *arena),
+            vspace,
+            kipcbuf,
+            host::KEEPER_IPCBUF_VA,
+            CapRights::read_write(),
+            VmAttributes::DEFAULT,
+        );
+    }
+
     // ---- CSpace.
     let guard = CNodeCapData::new(0, 64 - cnode_bits);
     c.give_badged(host::SLOT_CNODE, cnode, CapRights::all(), guard.into_word());
@@ -236,7 +260,24 @@ pub fn create(
     abs(root_cap::<cap_type::Null>(fault_slot))
         .mint(&abs(host_info.hyp_ep), CapRights::all(), component_badge(args.id) | crate::guest::HYP_BADGE_FAULT)
         .expect("component fault ep");
-    tcb.tcb_set_sched_params(slot::TCB.cap(), args.prio, args.prio, sc, root_cap::<cap_type::Endpoint>(fault_slot))
+    let root_fault = root_cap::<cap_type::Endpoint>(fault_slot);
+    // The keeper is left suspended: the main thread starts it, on its own
+    // stack and TLS (l4h_rt::init).
+    if let Some((ktcb, ksc, kep, kreply, kipcbuf)) = keeper {
+        c.give(host::SLOT_KEEPER, ktcb, CapRights::all());
+        c.give(host::SLOT_FAULT_EP, kep, CapRights::all());
+        c.give(host::SLOT_KEEPER_REPLY, kreply, CapRights::all());
+        ktcb.tcb_configure(cnode, CNodeCapData::new(0, 64 - cnode_bits), vspace, host::KEEPER_IPCBUF_VA as u64, kipcbuf)
+            .expect("keeper TCB configure");
+        host_info
+            .sched_control(args.core)
+            .sched_control_configure_flags(ksc, args.budget_us, args.period_us, 0, 0, 0)
+            .expect("keeper SC");
+        ktcb.tcb_set_sched_params(slot::TCB.cap(), args.prio, args.prio, ksc, root_fault)
+            .expect("keeper sched params");
+    }
+    let fault_ep = keeper.map_or(root_fault, |(_, _, kep, ..)| kep);
+    tcb.tcb_set_sched_params(slot::TCB.cap(), args.prio, args.prio, sc, fault_ep)
         .expect("component sched params");
     tcb.tcb_bind_notification(ntfn).expect("component bind notification");
     let mut regs = sel4::UserContext::default();

@@ -9,7 +9,9 @@ sel4.workspace = true
 l4h-host = { path = "../l4h-host" }
 one-shot-mutex = "0.2.1"
 sel4-dlmalloc = { path = "../../third_party/rust-sel4/crates/sel4-dlmalloc" }
+sel4-initialize-tls = { path = "../../third_party/rust-sel4/crates/sel4-initialize-tls" }
 sel4-panicking-env = { path = "../../third_party/rust-sel4/crates/sel4-panicking/env" }
+sel4-phdrs = { path = "../../third_party/rust-sel4/crates/sel4-phdrs" }
 sel4-runtime-common = { path = "../../third_party/rust-sel4/crates/sel4-runtime-common", features = ["sel4"] }
 
 [dependencies.sel4-panicking]
