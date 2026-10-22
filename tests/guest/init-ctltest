@@ -80,7 +80,9 @@ for d in 1 2 1 2; do
     l4hctl destroy "$id" || fail "destroy dmaload $d"
     id=$(l4hctl create dmacheck --initrd /bin/vm.cpio.gz --mem 128 \
         --cmdline "console=hvc0 l4htest=dmacheck") || fail "create dmacheck"
-    l4hctl console "$id" --until "GUEST: stale bytes" --timeout "$((90 * slow))" > /tmp/out || fail "dmacheck"
+    # Console reads can split the count from its prefix. Wait for the
+    # following marker so /tmp/out contains the entire result.
+    l4hctl console "$id" --until "GUEST: dma check done" --timeout "$((90 * slow))" > /tmp/out || fail "dmacheck"
     grep -q "GUEST: stale bytes 0" /tmp/out || { cat /tmp/out; fail "disk $d DMA into reused memory"; }
     l4hctl destroy "$id" || fail "destroy dmacheck"
     echo "CTLTEST: disk $d destroyed under I/O, no stale DMA"

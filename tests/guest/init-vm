@@ -30,6 +30,7 @@ case " $(cat /proc/cmdline) " in
         [ "$n" = 0 ] || break
     done
     echo "GUEST: stale bytes $n"
+    echo "GUEST: dma check done"
     while :; do sleep 10; done ;;
 esac
 if [ -b /dev/vda ]; then
