@@ -591,11 +591,18 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 
 pub fn boot_dom0(h: &mut Host) {
     let ram_base = h.kernel.as_ref().expect("guest kernel").ram_base;
+    // By default, room for full receive rings on all of dom0's vNICs (one
+    // per uplink switch it is given, one per internal switch).
+    let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches;
+    let io_pool = match h.cfg.dom0_io_pool_mb {
+        0 => l4h_host::iopool::for_nics(nics, guest::IO_POOL_DEFAULT).min(guest::IO_POOL_MAX),
+        mb => mb << 20,
+    };
     let cfg = GuestConfig {
         name: "dom0",
         ram: h.cfg.dom0_mem_mb << 20,
         vcpus: h.cfg.dom0_vcpus,
-        io_pool: h.cfg.dom0_io_pool_mb << 20,
+        io_pool,
         vspaces: 64,
         ram_base,
         dom0: true,

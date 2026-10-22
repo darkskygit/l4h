@@ -116,6 +116,9 @@ fn main(info: &'static Info) -> ! {
     // Devices by guest boot info index, which is also the device's bit in
     // the notification badges.
     let mut devs: [Option<Dev>; host::VMM_MAX_DEVICES] = [const { None }; host::VMM_MAX_DEVICES];
+    // Receive rings that leave room in the I/O pool for disk requests.
+    let nics = devices.iter().filter(|d| d.kind == host::VDEV_NET).count();
+    let rx_queue = host::iopool::rx_queue_size(cfg.io_pool_size as usize, nics);
     for d in devices.iter() {
         let idx = d.guest_index as usize;
         assert!(idx < host::VMM_MAX_DEVICES, "l4h-vmm: device index {} out of range", idx);
@@ -136,6 +139,7 @@ fn main(info: &'static Info) -> ! {
                     d.chan_va as usize,
                     cap::<cap_type::Notification>(d.chan_kick_slot),
                     d.mac[..6].try_into().unwrap(),
+                    rx_queue,
                 ),
             )),
             k => panic!("l4h-vmm: unsupported device kind {}", k),

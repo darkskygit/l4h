@@ -1857,7 +1857,8 @@ memory the guest can retype.
 - **The pool.** At create time `l4h-root` allocates the guest's I/O pool as
   one physically contiguous Untyped of `io_pool` bytes (default 4 MiB; a
   power of two from 1 to 256 MiB; `l4hctl create --io-pool`, dom0 with
-  `L4H_DOM0_IO_POOL_MB`). It retypes it into frames and maps them into the
+  `dom0_io_pool_mb` or `L4H_DOM0_IO_POOL_MB`, whose default is sized from
+  its vNICs, see "Receive buffers" below). It retypes it into frames and maps them into the
   guest kernel's VSpace at `ram_base_va + io_pool_gpa`, where
   `io_pool_gpa` is RAM rounded up to 2 MiB (boot info `io_pool_gpa`,
   `io_pool_size`), and into the guest's `l4h-vmm`. The guest gets these
@@ -1890,6 +1891,23 @@ memory the guest can retype.
   VMM therefore offers `VIRTIO_BLK_F_SIZE_MAX` with `size_max` such that
   `seg_max * size_max` is at most a quarter of the pool (72 KiB segments,
   about 1 MiB per request, with 4 MiB; 16 KiB with 1 MiB).
+- **Receive buffers.** A virtio-net driver keeps its receive ring full, so
+  its buffers hold pool memory all the time. The VMM offers
+  `GUEST_TSO4/6` without `MRG_RXBUF` or indirect descriptors, so Linux
+  posts "big" buffers of 18 pages in 19 descriptors: a 256-entry ring
+  holds 13, 936 KiB. dom0 with three vNICs (two uplinks and the sandbox
+  switch) held 2.8 MiB of a 4 MiB pool in page-sized pieces, and under a
+  burst of writes a disk request (segments of 36 contiguous 2 KiB slots)
+  found no room, was requeued for ever, and dom0's disk stopped with no
+  request in flight anywhere below the guest (seen on a Latitude.sh node,
+  2026-10-22). So the VMM sizes each receive queue
+  (`host::iopool::rx_queue_size`): the largest power of two from 32 to
+  256 whose full rings, for all the guest's NICs together, hold at most
+  half the pool, which leaves a quarter beyond the largest request. A
+  4 MiB pool keeps 256-entry rings for one NIC and 128 for three. dom0's
+  default pool (`dom0_io_pool_mb` 0) is the smallest power of two, at
+  least 4 MiB, with full rings for its vNICs (`host::iopool::for_nics`):
+  8 MiB for three.
 - **blk-mux.** blkd's client data region is the pool: every segment must
   lie in it and is translated with one offset (`host::blk::Pool`). The
   RAM chunk tables of blkd and the VMM are gone.

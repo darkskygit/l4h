@@ -36,11 +36,13 @@ pub struct Net {
     chan: *mut Port,
     kick: sel4::cap::Notification,
     mac: [u8; 6],
+    /// The receive queue's size (host::iopool::rx_queue_size).
+    rx_queue: u32,
 }
 
 impl Net {
-    pub fn new(chan_va: usize, kick: sel4::cap::Notification, mac: [u8; 6]) -> Self {
-        Net { chan: chan_va as *mut Port, kick, mac }
+    pub fn new(chan_va: usize, kick: sel4::cap::Notification, mac: [u8; 6], rx_queue: u32) -> Self {
+        Net { chan: chan_va as *mut Port, kick, mac, rx_queue: rx_queue.min(QUEUE_SIZE) }
     }
 
     fn tx_full(&self) -> bool {
@@ -186,8 +188,8 @@ impl Backend for Net {
         2
     }
 
-    fn queue_max(&self, _q: usize) -> u32 {
-        QUEUE_SIZE
+    fn queue_max(&self, q: usize) -> u32 {
+        if q == RX { self.rx_queue } else { QUEUE_SIZE }
     }
 
     fn init_config(&self, config: &mut [u8]) {

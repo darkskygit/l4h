@@ -6,6 +6,7 @@
 
 pub mod blk;
 pub mod fixed;
+pub mod iopool;
 pub mod memd;
 pub mod net;
 pub mod trust;

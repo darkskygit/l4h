@@ -4,7 +4,6 @@
 //! §10).  GRUB sources the same file, so it is also valid GRUB script: no
 //! spaces around `=`, and values with spaces in double quotes.
 
-use crate::guest;
 
 /// A decimal number, or hexadecimal after "0x".
 const fn try_parse_usize(s: &str) -> Option<usize> {
@@ -96,7 +95,9 @@ const fn parse_bdf(s: Option<&str>) -> Option<u32> {
 pub struct Config {
     pub dom0_mem_mb: usize,
     pub dom0_vcpus: usize,
-    /// dom0's I/O pool (a power of two, 1-256 MiB).
+    /// dom0's I/O pool (a power of two, 1-256 MiB); 0, the default: room
+    /// for full receive rings on its vNICs (host::iopool::for_nics), at
+    /// least 4 MiB.
     pub dom0_io_pool_mb: usize,
     /// Disks passed to dom0 at boot (the first n); the rest are free for
     /// the control API.
@@ -136,7 +137,7 @@ impl Config {
         let mut c = Config {
             dom0_mem_mb: parse_usize(option_env!("L4H_DOM0_MEM_MB"), 256),
             dom0_vcpus: parse_usize(option_env!("L4H_DOM0_VCPUS"), 1),
-            dom0_io_pool_mb: parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), guest::IO_POOL_DEFAULT >> 20),
+            dom0_io_pool_mb: parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), 0),
             dom0_disks: parse_usize(option_env!("L4H_DOM0_DISKS"), 64),
             dom0_nics: parse_usize(option_env!("L4H_DOM0_NICS"), 1),
             dom0_internal_switches: parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0),
