@@ -29,7 +29,7 @@
  * never wait for that: the reserve covers them while the worker converts
  * more.  Callers that may sleep wait for the worker when even the reserve
  * is gone (l4h_objmem_wait()), and call the OOM killer if no 2 MiB range can be
- * found (l4h_objmem_oom()).
+ * found, or no capability slot is left (l4h_objmem_oom()).
  *
  * Slots live in second-level CNodes (radix 12, guard 6) that we create in
  * root slots [L4H_SLOT_DYN_BASE, 4096).  A slot is named by
@@ -436,6 +436,19 @@ static unsigned long __slot_alloc(void)
 		if (l2_add())
 			return 0;
 	}
+}
+
+/* Is a slot free, or room left for another L2 CNode? */
+static bool __slots_left(void)
+{
+	unsigned int i;
+
+	if (nr_l2 < NR_L2)
+		return true;
+	for (i = 0; i < nr_l2; i++)
+		if (l2[i]->free)
+			return true;
+	return false;
 }
 
 static void __slot_free(unsigned long cptr)
@@ -888,7 +901,8 @@ static void objmem_work_fn(struct work_struct *w)
  * l4h_objmem_wait() - make room for seL4 objects, waiting if needed
  *
  * For callers that may sleep, after an allocation failed with -ENOMEM:
- * converts blocks now.  Returns true if a free object block is left.
+ * converts blocks now.  Returns true if a free object block is left and a
+ * capability slot: memory alone does not help once the slots are gone.
  */
 bool l4h_objmem_wait(void)
 {
@@ -898,7 +912,7 @@ bool l4h_objmem_wait(void)
 	might_sleep();
 	objmem_balance();
 	raw_spin_lock_irqsave(&caps_lock, flags);
-	ok = nr_reserve || nr_spare;
+	ok = (nr_reserve || nr_spare) && __slots_left();
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	return ok;
 }
@@ -906,9 +920,10 @@ bool l4h_objmem_wait(void)
 /**
  * l4h_objmem_oom() - no memory for seL4 objects could be found
  *
- * Guest-local OOM: no 2 MiB range could be made free for an object block.
- * Like a failed page-table allocation, this calls the OOM killer, whose
- * victim frees its objects (and pages) when it exits.
+ * Guest-local OOM: no 2 MiB range could be made free for an object block,
+ * or no capability slot is left.  Like a failed page-table allocation,
+ * this calls the OOM killer, whose victim frees its objects, slots and
+ * pages when it exits.
  */
 void l4h_objmem_oom(void)
 {
@@ -920,7 +935,7 @@ void l4h_objmem_oom(void)
 		.order = 0,
 	};
 
-	pr_warn_ratelimited("l4h: out of memory for seL4 objects (no free 2 MiB block)\n");
+	pr_warn_ratelimited("l4h: out of memory for seL4 objects (no free 2 MiB block or capability slot)\n");
 	if (fatal_signal_pending(current))
 		return;
 	if (mutex_lock_killable(&oom_lock))
