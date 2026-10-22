@@ -362,14 +362,24 @@ impl Gvnic {
         g.exec("get ptype map", Cmd::new(AQ_GET_PTYPE_MAP).u64(0, (NUM_PTYPES * 2) as u64).u64(8, ptype_pa));
         g.ptypes = core::array::from_fn(|i| (rd8(ptype_va + 2 * i), rd8(ptype_va + 2 * i + 1)));
 
+        // The queues' rings grow with the sizes the device asks for: all
+        // they and the buffers take (with alignment) must fit.  Each TX
+        // packet has at most two completions (miss, reinjection) and there
+        // is a descriptor completion per MIN_RE_INTERVAL descriptors: the
+        // completion queue cannot overflow.
+        let bufs = TX_BUFS.min((tx_entries - tx_entries / MIN_RE_INTERVAL) as usize / 2);
+        let rx_bufs = RX_BUFS.min(rx_entries - 1) as usize;
+        let rings = tx_entries as usize * (TX_DESC + TX_COMPL) + rx_entries as usize * (RX_DESC + RX_COMPL);
+        let need = rings + 4 * 4096 + 2 * 128 + bufs * (net::MAX_FRAME + 64) + rx_bufs * (RX_BUF + 64);
+        if need > dma.remaining() {
+            panic!("netd: NIC {}: gVNIC ring sizes tx {} rx {} need {} KiB of DMA memory, {} KiB left",
+                n, tx_entries, rx_entries, need >> 10, dma.remaining() >> 10);
+        }
+
         // TX queue.
         let (tx_ring, tx_ring_pa) = dma.alloc(tx_entries as usize * TX_DESC, 4096);
         let (tx_compl, tx_compl_pa) = dma.alloc(tx_entries as usize * TX_COMPL, 4096);
         let (tx_res, tx_res_pa) = dma.alloc(64, 64);
-        // Each packet has at most two completions (miss, reinjection) and
-        // there is a descriptor completion per MIN_RE_INTERVAL descriptors:
-        // the completion queue cannot overflow.
-        let bufs = TX_BUFS.min((tx_entries - tx_entries / MIN_RE_INTERVAL) as usize / 2);
         for i in 0..bufs {
             let _ = g.tx_bufs.push(dma.alloc(net::MAX_FRAME, 64));
             let _ = g.tx_state.push(TxBuf::Free);
@@ -394,7 +404,7 @@ impl Gvnic {
         let (rx_bufq, rx_bufq_pa) = dma.alloc(rx_entries as usize * RX_DESC, 4096);
         let (rx_compl, rx_compl_pa) = dma.alloc(rx_entries as usize * RX_COMPL, 4096);
         let (rx_res, rx_res_pa) = dma.alloc(64, 64);
-        for _ in 0..RX_BUFS.min(rx_entries - 1) {
+        for _ in 0..rx_bufs {
             let _ = g.rx_bufs.push(dma.alloc(RX_BUF, 64));
         }
         (g.rx_bufq, g.rx_compl, g.rx_mask) = (rx_bufq, rx_compl, rx_entries - 1);

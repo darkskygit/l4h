@@ -115,6 +115,11 @@ impl Dma {
         Dma { va, paddr, size, used: 0 }
     }
 
+    /// Bytes not yet allocated.
+    pub fn remaining(&self) -> usize {
+        self.size - self.used
+    }
+
     /// Zeroed memory: (virtual address, physical address).
     pub fn alloc(&mut self, size: usize, align: usize) -> (usize, u64) {
         let off = (self.used + align - 1) & !(align - 1);
