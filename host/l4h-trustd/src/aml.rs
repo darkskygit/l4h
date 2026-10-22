@@ -39,10 +39,12 @@ const START_FUNCTION: u64 = 1;
 /// otherwise).  It holds the namespace the firmware's AML builds at start,
 /// where each method keeps a copy of its bytecode and each named object
 /// takes a node of about a hundred bytes, and, for each command, what the
-/// _DSM's evaluation takes and gives back.  What bounds it is the
-/// firmware, never a guest: the tables root gives us, which we take only
-/// up to AML_LIMIT, a quarter of the heap.  A typical DSDT and its SSDTs
-/// are 100-300 KiB.
+/// _DSM's evaluation takes and gives back.  What it needs is up to the
+/// firmware, never a guest, and only roughly bounded by the tables' size
+/// (AML_LIMIT, a quarter of the heap): a few bytes of AML can declare a
+/// buffer of megabytes.  AML that exhausts the heap makes trustd panic,
+/// which root contains (trustd::fault): the host runs on without
+/// attestation.  A typical DSDT and its SSDTs are 100-300 KiB.
 pub const HEAP: usize = 2 << 20;
 const AML_LIMIT: usize = HEAP / 4;
 /// The deepest TPM device whose parents' _INI we run.
