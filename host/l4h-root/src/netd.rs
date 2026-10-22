@@ -12,7 +12,7 @@ use crate::blkd::{VirtioRegions, is_legacy_virtio, map_bar_mask, virtio_bar_mask
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
-use crate::mem::{Alloc, Arena, Dest};
+use crate::mem::{Alloc, Arena, Dest, Slot, UtRegion};
 use crate::pci::{self, Pci};
 use crate::vmm;
 use crate::vspace::FRAME_BP;
@@ -273,25 +273,44 @@ impl Netd {
         Ok(())
     }
 
-    /// Connect guest device `d` of `g` to `switch`.  Returns the port and
-    /// the backend for the guest's l4h-vmm.
+    /// The port a new port on `switch` would be.
+    pub fn free_port(&self, switch: u32) -> Result<usize, i64> {
+        if switch >= self.switches {
+            return Err(ctl::ENOENT);
+        }
+        self.ports.iter().position(|p| p.is_none()).ok_or(ctl::ENOSPC)
+    }
+
+    /// A port's memory, in its own root slot: taken before the guest's
+    /// device, so that running out leaves nothing behind.
+    pub fn port_memory(alloc: &mut Alloc) -> Result<(Slot, UtRegion), i64> {
+        let s = alloc.slots.alloc();
+        match alloc.split(PORT_BITS, s) {
+            Some(region) => Ok((s, region)),
+            None => {
+                alloc.slots.free(s);
+                Err(ctl::ENOMEM)
+            }
+        }
+    }
+
+    /// Connect guest device `d` of `g` to `switch` as port `p` (free_port),
+    /// using `memory` (port_memory).  Returns the backend for the guest's
+    /// l4h-vmm.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_port(
         &mut self,
         g: &mut Guest,
         d: usize,
+        p: usize,
         switch: u32,
         mac: u64,
         lock: bool,
         isolated: bool,
+        (s, region): (Slot, UtRegion),
         alloc: &mut Alloc,
-    ) -> Result<(usize, vmm::Backend), i64> {
-        if switch >= self.switches {
-            return Err(ctl::ENOENT);
-        }
-        let p = self.ports.iter().position(|p| p.is_none()).ok_or(ctl::ENOSPC)?;
+    ) -> vmm::Backend {
         // Port memory comes from the guest: it is reclaimed with it.
-        let s = alloc.slots.alloc();
-        let region = alloc.split(PORT_BITS, s).ok_or(ctl::ENOMEM)?;
         g.arena.own(s, region.paddr, PORT_BITS);
         let mut pool = region;
         let frames = alloc.slots.alloc_range(net::PORT_PAGES);
@@ -327,7 +346,7 @@ impl Netd {
         call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]);
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
         let mac_bytes = mac.to_be_bytes();
-        Ok((p, vmm::Backend::Net { chan: chan_slots, kick, mac: mac_bytes[2..8].try_into().unwrap(), keep: vmm_keep }))
+        vmm::Backend::Net { chan: chan_slots, kick, mac: mac_bytes[2..8].try_into().unwrap(), keep: vmm_keep }
     }
 
     /// Disconnect port `p`; netd stops using its memory.

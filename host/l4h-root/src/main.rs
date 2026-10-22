@@ -393,18 +393,19 @@ impl Host {
             if g.state != State::Created || g.vmm.is_some() {
                 return Err(ctl::EBUSY);
             }
-            // Check what can be checked before the device is added: it
-            // stays with the guest until it is destroyed.
-            if switch >= h.netd.switches {
-                return Err(ctl::ENOENT);
+            // Everything that can fail comes before the device is added:
+            // it stays with the guest until it is destroyed.
+            if g.devices.len() >= guest::MAX_GUEST_DEVICES {
+                return Err(ctl::ENOSPC);
             }
-            let next = h.netd.ports.iter().position(|p| p.is_none()).ok_or(ctl::ENOSPC)? as u64;
-            let mac = if mac == 0 { 0x02_4c_34_00_00_00 | ((id as u64) << 8) | next } else { mac & 0xffff_ffff_ffff };
+            let p = h.netd.free_port(switch)?;
+            let mac = if mac == 0 { 0x02_4c_34_00_00_00 | ((id as u64) << 8) | p as u64 } else { mac & 0xffff_ffff_ffff };
             if mac >> 40 & 1 != 0 {
                 return Err(ctl::EINVAL);
             }
-            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(1)).ok_or(ctl::ENOSPC)?;
-            let (p, backend) = h.netd.add_port(g, d, switch, mac, lock, isolated, &mut h.alloc)?;
+            let memory = netd::Netd::port_memory(&mut h.alloc)?;
+            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(1)).expect("guest device room checked");
+            let backend = h.netd.add_port(g, d, p, switch, mac, lock, isolated, memory, &mut h.alloc);
             g.backends.must_push((d, backend));
             g.ports.must_push(p);
             Ok(mac)
