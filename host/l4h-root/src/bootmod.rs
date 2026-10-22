@@ -159,7 +159,9 @@ fn loader_modules(bootinfo: &sel4::BootInfoPtr, alloc: &mut Alloc, devmem: &mut 
         let raw = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
         let name = core::str::from_utf8(raw).unwrap_or("").split_whitespace().last().unwrap_or("");
         let pages = size.div_ceil(4096);
-        if va + pages * 4096 > region.end() {
+        // Each page keeps a root slot: the modules may take at most half
+        // of the root CNode, the rest is for guests and components.
+        if va + pages * 4096 > region.end() || alloc.slots.available() < pages + crate::mem::ROOT_SLOTS / 2 {
             sel4::debug_println!("l4h-root: boot module '{}' of {} MiB does not fit, ignored", name, size >> 20);
             continue;
         }
