@@ -393,12 +393,17 @@ impl Host {
             if g.state != State::Created || g.vmm.is_some() {
                 return Err(ctl::EBUSY);
             }
-            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(1)).ok_or(ctl::ENOSPC)?;
-            let next = h.netd.ports.iter().position(|p| p.is_none()).unwrap_or(0) as u64;
+            // Check what can be checked before the device is added: it
+            // stays with the guest until it is destroyed.
+            if switch >= h.netd.switches {
+                return Err(ctl::ENOENT);
+            }
+            let next = h.netd.ports.iter().position(|p| p.is_none()).ok_or(ctl::ENOSPC)? as u64;
             let mac = if mac == 0 { 0x02_4c_34_00_00_00 | ((id as u64) << 8) | next } else { mac & 0xffff_ffff_ffff };
             if mac >> 40 & 1 != 0 {
                 return Err(ctl::EINVAL);
             }
+            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(1)).ok_or(ctl::ENOSPC)?;
             let (p, backend) = h.netd.add_port(g, d, switch, mac, lock, isolated, &mut h.alloc)?;
             g.backends.must_push((d, backend));
             g.ports.must_push(p);
