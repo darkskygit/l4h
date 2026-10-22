@@ -461,5 +461,14 @@ fn gro_check(rng: &mut Rng, n: u64) -> u64 {
             gro.flush(|_, _| {});
         }
     }
+    // The largest IPv6 segment (a payload length of 65535) is longer than
+    // a run may grow: it does not start one, and passes unchanged.
+    let (mut big, _) = tcp_frame(rng, true, true, 65535 - 20, 1000);
+    let t = offload::parse_tcp(&big).unwrap();
+    big[t.ip + 4..t.ip + 6].copy_from_slice(&65535u16.to_be_bytes());
+    big[t.tcp + 13] = 0x10;
+    let mut rx = [0u8; 12];
+    rx[0] = offload::F_DATA_VALID;
+    assert!(!gro.add(&big, &rx), "oversized IPv6 segment taken into a run");
     merged
 }

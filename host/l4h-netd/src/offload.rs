@@ -296,7 +296,9 @@ impl Gro {
             return None;
         }
         let end = if f.v6 { frame.len() } else { f.ip + u16::from_be_bytes([frame[f.ip + 2], frame[f.ip + 3]]) as usize };
-        if end <= f.hdrs || !csum_ok(&frame[..end], hdr, &f) {
+        // An IPv6 datagram can be 40 bytes longer than a run may grow
+        // (its payload length leaves out the header): it passes alone.
+        if end <= f.hdrs || end > f.ip + GRO_MAX || !csum_ok(&frame[..end], hdr, &f) {
             return None;
         }
         Some((f, end))
