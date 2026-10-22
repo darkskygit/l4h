@@ -8,7 +8,7 @@ use l4h_abi as abi;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::{self as host, net};
 
-use crate::blkd::{VirtioRegions, is_legacy_virtio, map_bar_mask, virtio_bar_mask, virtio_regions};
+use crate::blkd::{VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar_mask, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
@@ -97,6 +97,17 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
     }
     ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
     mr(0)
+}
+
+/// The BARs netd maps of NIC `d`, bit b for BAR b.
+fn used_bars(d: &pci::Device) -> u8 {
+    if is_gvnic(d) {
+        1 | 1 << 2 | 1 << d.msix.unwrap().table_bar
+    } else if is_ixgbe(d) {
+        1 | 1 << d.msix.unwrap().table_bar
+    } else {
+        virtio_bar_mask(d)
+    }
 }
 
 /// Start netd with the uplink NICs `nics`.
@@ -190,28 +201,19 @@ pub fn spawn(
     let comp = component::create(&args, alloc, &mut arena, win, asids, info);
 
     // Mapping caps of every NIC page: DMA buffers and BARs.
-    const KEEP_BITS: usize = 13;
-    const _: () = assert!(net::MAX_NICS * ((1 << NIC_DMA_BITS) / PAGE + 1024) <= 1 << KEEP_BITS);
-    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: KEEP_BITS });
+    let pages = nics[..nr_nics].iter().map(|d| (1 << NIC_DMA_BITS) / PAGE + bar_pages(d, used_bars(d))).sum();
+    let keep_bits = keep_bits(pages);
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
-        assert!(keep_next < 1 << KEEP_BITS, "netd: too many NIC pages");
-        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, KEEP_BITS);
+        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, keep_bits);
         keep_next += 1;
         s
     };
     let mut nic_list = ArrayVec::new();
     for (n, d) in nics.into_iter().take(nr_nics).enumerate() {
         let mut bars = [const { None }; 6];
-        // BARs used, bit b for BAR b.
-        let used = if is_gvnic(&d) {
-            1 | 1 << 2 | 1 << d.msix.unwrap().table_bar
-        } else if is_ixgbe(&d) {
-            1 | 1 << d.msix.unwrap().table_bar
-        } else {
-            virtio_bar_mask(&d)
-        };
-        map_bar_mask(&comp, alloc, &mut arena, devmem, &d, &mut bars, used, |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
+        map_bar_mask(&comp, alloc, &mut arena, devmem, &d, &mut bars, used_bars(&d), |b| net::nic_bar_va(n, b as usize), &mut keep_slot);
         for (i, s) in dma[n].clone().enumerate() {
             let f = sel4::init_thread::Slot::<cap_type::Granule>::from_index(s).cap();
             comp.map_copy(alloc, &mut arena, &abs_of(f), net::nic_dma_va(n) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep_slot());

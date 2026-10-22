@@ -298,11 +298,12 @@ pub fn start(
     };
     let comp = component::create(&args, alloc, &mut arena, win, asids, host_info);
 
-    // Mapping caps are kept in a CNode of the arena.
-    let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 12 });
+    // Mapping caps are kept in a CNode of the arena, sized for the BARs.
+    let keep_bits = keep_bits(n_dma + bar_pages(d, bars));
+    let keep = arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: keep_bits });
     let mut keep_next = 0u64;
     let mut keep_slot = || {
-        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, 12);
+        let s = keep.absolute_cptr_from_bits_with_depth(keep_next, keep_bits);
         keep_next += 1;
         s
     };
@@ -573,6 +574,16 @@ pub fn virtio_regions(d: &pci::Device, bar_va: impl Fn(u8) -> usize) -> VirtioRe
 pub fn virtio_bar_mask(d: &pci::Device) -> u8 {
     let caps = d.virtio_caps.iter().filter(|c| (1..=4).contains(&c.cfg_type));
     caps.map(|c| c.bar).chain(d.msix.map(|m| m.table_bar)).fold(0, |m, b| m | 1 << b)
+}
+
+/// Pages of BARs `bars` (bit b for BAR b) of `d`: what map_bar_mask maps.
+pub fn bar_pages(d: &pci::Device, bars: u8) -> usize {
+    (0..6).filter(|b| bars & 1 << b != 0).map(|b| (d.bars[b].size as usize).div_ceil(PAGE)).sum()
+}
+
+/// Radix of a CNode keeping the mapping caps of `pages` pages.
+pub fn keep_bits(pages: usize) -> usize {
+    pages.next_power_of_two().trailing_zeros().max(1) as usize
 }
 
 /// The frames of a device's BARs, carved on first use: their slots, by
