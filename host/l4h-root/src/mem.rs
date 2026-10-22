@@ -762,6 +762,8 @@ impl Arena {
     /// up to ARENA_TAIL bytes adding up to `bytes` (each counted with its
     /// alignment) cannot run out.  False if the host has too little
     /// memory, or it is too fragmented; what was added stays the arena's.
+    /// Like `retype`, it prefers to grow by an eighth of the arena, so
+    /// that many small reservations (VM_LOAD) do not fill its regions.
     pub fn reserve(&mut self, alloc: &mut Alloc, bytes: usize) -> bool {
         loop {
             let usable = self.pool.free_bytes().saturating_sub(self.pool.regions.len() * ARENA_TAIL);
@@ -770,7 +772,8 @@ impl Arena {
             };
             // Room for the tail of the new region too.
             let bits = (short + ARENA_TAIL).next_power_of_two().trailing_zeros() as usize;
-            if !self.grow(alloc, ARENA_GROW_BITS, bits) {
+            let eighth = (self.bytes() / 8).max(1).ilog2() as usize;
+            if !self.grow(alloc, ARENA_GROW_BITS, bits.max(eighth)) {
                 return false;
             }
         }

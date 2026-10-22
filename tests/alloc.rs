@@ -201,4 +201,19 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     assert_eq!(alloc.slots.available(), slots);
     alloc.reclaim(arena);
     assert_eq!(alloc.free_bytes(), 512 << 20);
+
+    // On whole memory, the same reservations grow the arena by an eighth
+    // at a time, so its regions stay few: thousands of loads (several
+    // GiB of guest RAM) fit, where 1 MiB regions filled the table.
+    let boot = BootInfo(vec![Desc { paddr: 1 << 30, bits: 29 }]);
+    let mut alloc = mem::Alloc::new(alloc.slots, &boot);
+    let mut arena = alloc.arena(4 << 20).unwrap();
+    for _ in 0..4000 {
+        assert!(arena.reserve(&mut alloc, load_bytes));
+        arena.object(&mut alloc, ObjectBlueprint::CNode { size_bits: 9 });
+        arena.object(&mut alloc, ObjectBlueprint::Frame);
+    }
+    assert!(arena.pool.regions.len() < 48);
+    alloc.reclaim(arena);
+    assert_eq!(alloc.free_bytes(), 512 << 20);
 }
