@@ -941,7 +941,9 @@ thin provisioning or copy-on-write.
   PCI order, then target and LUN. Root starts every controller's blkd at
   boot and learns the virtio-scsi units there; each needs 4 MiB of
   physically contiguous DMA memory, and the host fails to boot without
-  it, so a disk never lacks its driver later. blkd clients and quarantine are per controller: a drain
+  it, so a disk never lacks its driver later. A controller whose reset
+  failed also halts boot, before its bus mastering can be enabled again.
+  blkd clients and quarantine are per controller: a drain
   timeout fails every disk of it. Requests become
   READ/WRITE(10 or 16) and SYNCHRONIZE CACHE commands, split when they
   exceed the device's `seg_max` or `max_sectors`. Write protection and the
@@ -1943,7 +1945,10 @@ memory the guest can retype.
   alignment between them) and three root slots: before it fills any,
   `VM_START` checks that the host can afford the blocks not yet filled
   (`Guest::boot_cost`) and grows the guest's arena by that much
-  (`Arena::reserve`), and fails with `ENOMEM` otherwise. Deviation: the design counted two slack blocks as boot blocks
+  (`Arena::reserve`), and fails with `ENOMEM` otherwise. `VM_LOAD` likewise
+  checks and reserves the overhead of its unfilled blocks before loading,
+  so a full arena table returns `ENOMEM` even when host RAM remains free.
+  Deviation: the design counted two slack blocks as boot blocks
   *and* as the guest's first object pool, which cannot both hold (the
   guest has no Untyped for a boot block); here the slack block is frames
   for early `memblock` allocations, and object blocks come from the

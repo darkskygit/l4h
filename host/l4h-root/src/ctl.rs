@@ -132,14 +132,15 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if src.checked_add(len).is_none_or(|end| end > abi::CTL_LOAD_MAX as usize) {
                 return Err(EINVAL);
             }
-            // The blocks it fills with frames: their RAM CNodes, page
-            // tables and slots.
-            if !h.can_afford(1 << 20, 0, 0) {
-                return Err(ENOMEM);
-            }
             h.with_guest(id, |h, g| {
                 if g.state != State::Created || g.vmm.is_some() {
                     return Err(EBUSY);
+                }
+                // Check the arena's fixed tables as well as host memory
+                // before block_frames makes any objects.
+                let (bytes, slots) = g.load_cost(dst, len).ok_or(EINVAL)?;
+                if !h.can_afford(bytes, 0, slots) || !g.reserve(&mut h.alloc, bytes) {
+                    return Err(ENOMEM);
                 }
                 // dom0 may change the bytes meanwhile: it only corrupts the
                 // image it loads.

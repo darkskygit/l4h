@@ -207,7 +207,7 @@ fn bdf(d: &pci::Device) -> u32 {
 }
 
 /// Start one persistent driver for the physical controller, at boot: the
-/// host fails to boot without the memory for it.
+/// host fails to boot if its reset failed or there is no memory for it.
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     id: u32,
@@ -219,6 +219,11 @@ pub fn start(
     asids: &mut AsidPools,
     host_info: &HostInfo,
 ) {
+    assert!(
+        !disk.failed,
+        "l4h-root: cannot start disk {:02x}:{:02x}.{}: reset failed",
+        disk.pci.bus, disk.pci.dev, disk.pci.func
+    );
     let io = disk.io_cap(alloc);
     let legacy_io = disk.legacy_io();
     let d = &disk.pci;

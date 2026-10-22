@@ -5,10 +5,7 @@
 //! live on one core until `SchedControl_Configure` on another core's
 //! SchedControl moves them.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
-
-use l4h_host::fixed::ArrayVec;
+use l4h_host::fixed::{ArrayVec, Scratch};
 
 use crate::guest::{State, Vcpu};
 use crate::{Host, HostInfo};
@@ -134,27 +131,6 @@ const _: () = assert!(sel4::sel4_cfg_usize!(MAX_NUM_NODES) <= topology::MAX_CPUS
 /// (160 KiB), so in .bss.  `balance` is its only user, and the flag makes
 /// a second, nested use fail instead of aliasing it.
 static SAMPLES: Scratch<ArrayVec<policy::Sample, { crate::MAX_GUESTS * l4h_abi::MAX_VCPUS }>> = Scratch::new(ArrayVec::new());
-
-struct Scratch<T> {
-    busy: AtomicBool,
-    val: UnsafeCell<T>,
-}
-
-// The flag gives at most one user access at a time.
-unsafe impl<T> Sync for Scratch<T> {}
-
-impl<T> Scratch<T> {
-    const fn new(val: T) -> Self {
-        Scratch { busy: AtomicBool::new(false), val: UnsafeCell::new(val) }
-    }
-
-    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        assert!(!self.busy.swap(true, Ordering::Acquire), "scratch in use");
-        let r = f(unsafe { &mut *self.val.get() });
-        self.busy.store(false, Ordering::Release);
-        r
-    }
-}
 
 /// One balancer step: sample consumption over the `elapsed_us` since the
 /// last step, move at most one vCPU.

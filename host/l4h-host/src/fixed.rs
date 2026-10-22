@@ -304,8 +304,9 @@ pub struct StaticCell<T> {
     value: core::cell::UnsafeCell<T>,
 }
 
-// Only one `&mut` is ever handed out (`take`).
-unsafe impl<T> Sync for StaticCell<T> {}
+// Only one `&mut` is ever handed out (`take`). It may be handed to a
+// different thread, which requires T: Send.
+unsafe impl<T: Send> Sync for StaticCell<T> {}
 
 impl<T> StaticCell<T> {
     pub const fn new(value: T) -> Self {
@@ -327,8 +328,9 @@ pub struct Scratch<T> {
     value: core::cell::UnsafeCell<T>,
 }
 
-// Only one `&mut` is lent at a time (`with`).
-unsafe impl<T> Sync for Scratch<T> {}
+// Only one `&mut` is lent at a time (`with`). Successive calls may run on
+// different threads, which requires T: Send.
+unsafe impl<T: Send> Sync for Scratch<T> {}
 
 impl<T> Scratch<T> {
     pub const fn new(value: T) -> Self {
@@ -353,6 +355,26 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
+
+    #[test]
+    fn storage_cells_require_send_for_sync() {
+        fn assert_sync<T: Sync>() {}
+        // Cell is Send but not Sync: exclusive access is sufficient.
+        assert_sync::<StaticCell<Cell<usize>>>();
+        assert_sync::<Scratch<Cell<usize>>>();
+
+        // If either type becomes Sync for a non-Send value, inference
+        // becomes ambiguous between the two implementations and this
+        // test no longer compiles.
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        struct IsSync;
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+        let _ = <StaticCell<std::rc::Rc<Cell<usize>>> as AmbiguousIfSync<_>>::check;
+        let _ = <Scratch<std::rc::Rc<Cell<usize>>> as AmbiguousIfSync<_>>::check;
+    }
 
     struct Tracked<'a> {
         id: usize,

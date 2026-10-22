@@ -179,4 +179,26 @@ fn arena_growth_on_fragmented_memory_and_reclaim() {
     assert_eq!(alloc.slots.available(), slots);
     alloc.reclaim(arena);
     assert_eq!(alloc.free_bytes(), 96 << 20);
+
+    // Reuse the singleton slot tables for a larger fragmented fixture.
+    // VM_LOAD reserves one block's CNode and paging overhead before
+    // making objects: a full arena must refuse despite free host RAM.
+    let boot = BootInfo((0..256).map(|i| Desc { paddr: (64 << 20) + i * (4 << 20), bits: 21 }).collect());
+    let mut alloc = mem::Alloc::new(alloc.slots, &boot);
+    let mut arena = alloc.arena(4 << 20).unwrap();
+    let load_bytes = (32 << 10) + 2 * 4096;
+    let mut loads = 0;
+    while arena.reserve(&mut alloc, load_bytes) {
+        arena.object(&mut alloc, ObjectBlueprint::CNode { size_bits: 9 });
+        arena.object(&mut alloc, ObjectBlueprint::Frame);
+        loads += 1;
+        assert!(loads < 13000, "arena table never filled");
+    }
+    assert!(loads > 0);
+    assert!(alloc.free_bytes() > 32 << 20);
+    let slots = alloc.slots.available();
+    assert!(!arena.reserve(&mut alloc, load_bytes));
+    assert_eq!(alloc.slots.available(), slots);
+    alloc.reclaim(arena);
+    assert_eq!(alloc.free_bytes(), 512 << 20);
 }

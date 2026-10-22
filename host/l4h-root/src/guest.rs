@@ -496,6 +496,30 @@ impl Guest {
         (root_guest_va(self.id) + GUEST_RING_OFF) as *const host::ConsoleRing
     }
 
+    /// Host memory and root slots filling these blocks with frames can
+    /// need. Already filled blocks take nothing; page directories and a
+    /// PDPT are counted conservatively even if they are already present.
+    fn block_frames_cost(&self, blocks: core::ops::Range<usize>) -> (usize, usize) {
+        let n = blocks.clone().filter(|&b| !self.is_filled(b)).count();
+        if n == 0 {
+            return (0, 0);
+        }
+        let dirs = blocks.end.div_ceil(512) - blocks.start / 512 + 1;
+        (n * BLOCK_FRAMES_BYTES + dirs * PAGE, n * BLOCK_FRAMES_SLOTS + dirs)
+    }
+
+    /// What loading [gpa, gpa + len) costs before any block is filled.
+    /// None for a range or state that load_ram refuses.
+    pub fn load_cost(&self, gpa: usize, len: usize) -> Option<(usize, usize)> {
+        if !self.valid_gpa(gpa, len) || self.state != State::Created || self.boot_blocks != 0 {
+            return None;
+        }
+        if len == 0 {
+            return Some((0, 0));
+        }
+        Some(self.block_frames_cost(gpa / BLOCK..(gpa + len).div_ceil(BLOCK)))
+    }
+
     /// The boot blocks for an image ending at `kernel_end` and `initrd`: a
     /// prefix of RAM up to the image (and anything else loaded), plus
     /// slack.  None if the guest would have no block of its own left for
@@ -516,9 +540,7 @@ impl Guest {
     /// covered by the guest's arena estimate.
     pub fn boot_cost(&self, kernel_end: usize, initrd: (usize, usize)) -> Option<(usize, usize)> {
         let boot = self.boot_prefix(kernel_end, initrd)?;
-        let n = (0..boot).filter(|&b| !self.is_filled(b)).count();
-        let dirs = boot.div_ceil(512) + 1;
-        Some((n * BLOCK_FRAMES_BYTES + dirs * PAGE, n * BLOCK_FRAMES_SLOTS + dirs))
+        Some(self.block_frames_cost(0..boot))
     }
 
     /// Grow the guest's arena to hold `bytes` more objects.
