@@ -629,16 +629,25 @@ pub fn boot_dom0(h: &mut Host) {
             }
         };
         if let Some(nic) = nic {
-            h.netd.attach_uplink(sw, nic).expect("uplink");
+            if let Err(e) = h.netd.attach_uplink(sw, nic) {
+                sel4::debug_println!("l4h-root: no uplink on switch {}: error {}", sw, e);
+            }
         }
     }
+    // Like a disk, a vNIC dom0 cannot have (netd has failed: EIO) is left
+    // out.
+    let add_nic = |h: &mut Host, sw: u32, mac: u64| {
+        if let Err(e) = h.create_nic(id, sw, mac, true, false) {
+            sel4::debug_println!("l4h-root: cannot give dom0 a NIC on switch {}: error {}", sw, e);
+        }
+    };
     // dom0's first vNIC takes the uplink NIC's MAC address: networks
     // like GCE's only deliver frames for the instance's own address, so
     // dom0 is then the host's router (DESIGN.md §8.3).
     let uplink = h.netd.nics.iter().position(|n| n.switch == Some(sw));
     for i in 0..h.cfg.dom0_nics {
         let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };
-        h.create_nic(id, sw, mac, true, false).expect("dom0 NIC");
+        add_nic(h, sw, mac);
     }
     // The second uplink NIC, if any, on switch 1, then the internal
     // switches. dom0 finds its vNICs by MAC, not by their order.
@@ -652,17 +661,19 @@ pub fn boot_dom0(h: &mut Host) {
     if let Some(nic) = uplink2 {
         if h.netd.switches == 1 {
             h.netd.create_switch();
-            h.netd.attach_uplink(1, nic).expect("second uplink");
+            if let Err(e) = h.netd.attach_uplink(1, nic) {
+                sel4::debug_println!("l4h-root: no uplink on switch 1: error {}", e);
+            }
         }
         let mac = h.netd.nic_mac(nic).unwrap_or(0);
-        h.create_nic(id, 1, mac, true, false).expect("dom0 NIC");
+        add_nic(h, 1, mac);
     }
     let first = 1 + uplink2.is_some() as usize;
     while (h.netd.switches as usize) < first + h.cfg.dom0_internal_switches {
         h.netd.create_switch();
     }
     for i in first..first + h.cfg.dom0_internal_switches {
-        h.create_nic(id, i as u32, 0, true, false).expect("dom0 internal NIC");
+        add_nic(h, i as u32, 0);
     }
     let cmdline = h.cfg.dom0_cmdline;
     h.with_guest(id, |h, g| {

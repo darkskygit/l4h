@@ -270,8 +270,11 @@ impl Netd {
         if n.switch.is_some() {
             return Err(ctl::EBUSY);
         }
+        // Root's arguments are valid: u64::MAX is a failed netd.
+        if call(self.comp.service_ep, net::NETD_ATTACH_UPLINK, &[nic as u64, switch as u64]) == u64::MAX {
+            return Err(ctl::EIO);
+        }
         n.switch = Some(switch);
-        call(self.comp.service_ep, net::NETD_ATTACH_UPLINK, &[nic as u64, switch as u64]);
         Ok(())
     }
 
@@ -280,7 +283,13 @@ impl Netd {
         if switch >= self.switches {
             return Err(ctl::ENOENT);
         }
-        self.ports.iter().position(|p| p.is_none()).ok_or(ctl::ENOSPC)
+        let p = self.ports.iter().position(|p| p.is_none()).ok_or(ctl::ENOSPC)?;
+        // Removing a free port does nothing, unless netd has failed: then
+        // it answers u64::MAX, and a new port could not work.
+        if call(self.comp.service_ep, net::NETD_REMOVE_PORT, &[p as u64]) == u64::MAX {
+            return Err(ctl::EIO);
+        }
+        Ok(p)
     }
 
     /// A port's memory, in its own root slot: taken before the guest's
@@ -345,7 +354,11 @@ impl Netd {
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
         abs_of(kick).mint(&abs_of(self.comp.ntfn), CapRights::write_only(), 1 << p).expect("port kick");
         let flags = if lock { net::NETD_PORT_MAC_LOCK } else { 0 } | if isolated { net::NETD_PORT_ISOLATED } else { 0 };
-        call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]);
+        // netd answered free_port: a failure now is a fault since, which
+        // leaves this port (reclaimed with the guest) as dead as the rest.
+        if call(self.comp.service_ep, net::NETD_ADD_PORT, &[p as u64, switch as u64, mac, flags]) == u64::MAX {
+            sel4::debug_println!("l4h-root: netd failed adding port {}", p);
+        }
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
         let mac_bytes = mac.to_be_bytes();
         vmm::Backend::Net { chan: chan_slots, kick, mac: mac_bytes[2..8].try_into().unwrap(), keep: vmm_keep }
@@ -359,7 +372,6 @@ impl Netd {
         }
     }
 
-    /// (rx frames, tx frames, drops) of port `p`.
     /// CPU time netd used since the last call, in timer ticks.
     pub fn consumed(&self) -> u64 {
         crate::sched::consumed(self.comp.sc)
@@ -371,8 +383,9 @@ impl Netd {
         (m != u64::MAX).then_some(m)
     }
 
-    pub fn port_stats(&self, p: usize) -> (u64, u64, u64) {
+    /// (rx frames, tx frames, drops) of port `p`, None if netd has failed.
+    pub fn port_stats(&self, p: usize) -> Option<(u64, u64, u64)> {
         let rx = call(self.comp.service_ep, net::NETD_PORT_STATS, &[p as u64]);
-        (rx, mr(1), mr(2))
+        (rx != u64::MAX).then(|| (rx, mr(1), mr(2)))
     }
 }

@@ -288,7 +288,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 if info.switch != sw || (n + 1) * sz > abi::CTL_DATA_MAX {
                     continue;
                 }
-                let (rx_frames, tx_frames, drops) = h.netd.port_stats(p);
+                let (rx_frames, tx_frames, drops) = h.netd.port_stats(p).ok_or(EIO)?;
                 let e = abi::CtlPort { vm: info.vm as u32, port: p as u32, mac: info.mac, rx_frames, tx_frames, drops };
                 unsafe {
                     core::ptr::copy_nonoverlapping(&e as *const abi::CtlPort as *const u8, resp.data.as_mut_ptr().add(n * sz), sz);

@@ -340,7 +340,7 @@ impl Dashboard {
             let mut ports = 0;
             for (p, i) in h.netd.ports.iter().enumerate() {
                 let Some(i) = i.as_ref().filter(|i| i.switch == sw) else { continue };
-                let (rx, tx, _) = h.netd.port_stats(p);
+                let (rx, tx, _) = h.netd.port_stats(p).unwrap_or_default();
                 let _ = write!(w, "{}vm {} ({}/{})", if ports == 0 { "" } else { "  " }, i.vm, rx, tx);
                 ports += 1;
             }
