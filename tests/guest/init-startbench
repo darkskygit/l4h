@@ -1,0 +1,26 @@
+#!/bin/sh
+# dom0 init for tests/run-startbench.sh: create and boot latency of
+# sandbox-sized guests (STB_MEM MiB, 2 vCPUs, a 7 MB initramfs).
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "STARTBENCH: FAIL: $*"; poweroff -f; }
+N=$(sed -n 's/.*STB_N=\([0-9]*\).*/\1/p' /proc/cmdline)
+MEM=$(sed -n 's/.*STB_MEM=\([0-9]*\).*/\1/p' /proc/cmdline)
+stats() { sort -n "$1" | awk '{ v[NR] = $1 } END { printf "min %d  median %d  max %d ms (n=%d)", v[1], v[int((NR + 1) / 2)], v[NR], NR }'; }
+: > /tmp/create; : > /tmp/boot
+for i in $(seq 1 "$N"); do
+    t0=$(mstime)
+    id=$(l4hctl create s$i --initrd /bin/big.cpio.gz --mem "$MEM" --vcpus 2 --cmdline "console=hvc0 quiet") || fail "create $i"
+    t1=$(mstime)
+    l4hctl console "$id" --until "GUEST: ready" --timeout 120 >/dev/null || fail "guest $i did not boot"
+    t2=$(mstime)
+    echo "STARTBENCH: guest $i: create $((t1 - t0)) ms, ready $((t2 - t0)) ms"
+    echo $((t1 - t0)) >> /tmp/create; echo $((t2 - t0)) >> /tmp/boot
+    l4hctl destroy "$id" || fail "destroy $id"
+done
+echo "STARTBENCH: create (call returns):      $(stats /tmp/create)"
+echo "STARTBENCH: create to guest init ready: $(stats /tmp/boot)"
+echo "STARTBENCH: done"
+poweroff -f
