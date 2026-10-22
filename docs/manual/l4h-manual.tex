@@ -402,6 +402,8 @@ Variable & Meaning & Default \\
 \texttt{L4H\_DOM0\_VCPUS} & dom0's vCPUs & 1 \\
 \texttt{L4H\_DOM0\_DISKS} & attach the first $n$ host disks to dom0; the rest stay
   free for other guests & 64 (all) \\
+\texttt{L4H\_DOM0\_DISK0\_MB} & of host disk 0, give dom0 only the first $n$ MiB &
+  0 (all) \\
 \texttt{L4H\_DOM0\_NICS} & number of dom0 vNICs on switch 0 & 1 \\
 \texttt{L4H\_WATCHDOG\_SECS} & print every guest's vCPU state every $n$ seconds
   (debugging); 0 disables & 0 \\
@@ -424,6 +426,9 @@ Variable & Meaning & Default \\
 \texttt{dom0\_vcpus} & dom0's vCPUs & 1 \\
 \texttt{dom0\_io\_pool\_mb} & dom0's I/O pool in MiB, a power of two up to 256 & 4 \\
 \texttt{dom0\_disks} & attach the first $n$ host disks to dom0 & 64 (all) \\
+\texttt{dom0\_disk0\_mb} & of host disk 0, dom0 gets only the first $n$ MiB, as
+  a window; the rest stays free for other guests' windows. 0, or more than
+  the disk: all of it & 0 \\
 \texttt{dom0\_nics} & dom0's vNICs on switch 0 & 1 \\
 \texttt{dom0\_internal\_switches} & internal switches created at boot, each
   with one dom0 vNIC & 0 \\
@@ -906,12 +911,16 @@ disk) or from the partition table:
       --cmdline "console=hvc0 root=/dev/vda ro"
 \end{lstlisting}
 
-\paragraph{Ownership.} A disk, including one attached as a window or
-read-only, has one owner at a time. \cmd{l4hctl disks} shows the owner.
-Attaching an owned disk fails with \texttt{busy}. A disk becomes free when its
-owner is destroyed. Disks that dom0 received at boot stay dom0's: to make
+\paragraph{Ownership.} Several guests can have windows of one disk. A
+writable window may overlap no other window of its disk, and read-only
+windows may overlap each other; attaching one that breaks this fails with
+\texttt{busy}. \cmd{l4hctl disks} shows the first guest attached as the
+owner, and the number of attachments. A guest's windows are released when it
+is destroyed. Disks that dom0 received at boot stay dom0's: to make
 disks available for other guests, build the host with
-\texttt{L4H\_DOM0\_DISKS} set to the number dom0 should keep.
+\texttt{L4H\_DOM0\_DISKS} set to the number dom0 should keep. To share the
+boot disk instead, set \texttt{dom0\_disk0\_mb}: dom0 then has only a window
+at its start, and other guests' windows can take the rest.
 
 \paragraph{Failed disks.}\label{sec:disk-failed} When its owner is
 destroyed, a disk is reset before it becomes free. If the device does not

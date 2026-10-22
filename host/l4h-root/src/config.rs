@@ -102,6 +102,10 @@ pub struct Config {
     /// Disks passed to dom0 at boot (the first n); the rest are free for
     /// the control API.
     pub dom0_disks: usize,
+    /// Of host disk 0 (the boot disk), dom0 gets only the first n MiB; the
+    /// rest is free for the control API, as windows (§8.2).  0, or more than
+    /// the disk: all of it.
+    pub dom0_disk0_mb: usize,
     /// vNICs of dom0 on switch 0, which has the first NIC as its uplink.
     pub dom0_nics: usize,
     /// Internal switches, after switch 0 and the second uplink's (1..=n, or
@@ -139,6 +143,7 @@ impl Config {
             dom0_vcpus: parse_usize(option_env!("L4H_DOM0_VCPUS"), 1),
             dom0_io_pool_mb: parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), 0),
             dom0_disks: parse_usize(option_env!("L4H_DOM0_DISKS"), 64),
+            dom0_disk0_mb: parse_usize(option_env!("L4H_DOM0_DISK0_MB"), 0),
             dom0_nics: parse_usize(option_env!("L4H_DOM0_NICS"), 1),
             dom0_internal_switches: parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0),
             dom0_cmdline: option_env!("L4H_DOM0_CMDLINE").unwrap_or("console=hvc0"),
@@ -179,6 +184,7 @@ impl Config {
             "dom0_vcpus" => num(&mut self.dom0_vcpus),
             "dom0_io_pool_mb" => num(&mut self.dom0_io_pool_mb),
             "dom0_disks" => num(&mut self.dom0_disks),
+            "dom0_disk0_mb" => num(&mut self.dom0_disk0_mb),
             "dom0_nics" => num(&mut self.dom0_nics),
             "dom0_internal_switches" => num(&mut self.dom0_internal_switches),
             "dom0_cmdline" => {

@@ -2,7 +2,8 @@
 # Native block windows: concurrent clients, isolation, provisioning, reuse
 # and destroy during I/O. SHARED_BLK_DEV=nvme or scsi, SHARED_BLK_LBA=4096
 # also tested; scsi-luns puts both disks on one virtio-scsi controller, as
-# LUNs 0 and 5 of target 1 behind a CD-ROM at target 0.
+# LUNs 0 and 5 of target 1 behind a CD-ROM at target 0.  SHARED_BLK_DOM0=1
+# gives dom0 the first MiB of disk 0 (dom0_disk0_mb), next to the windows.
 # L4H_TEST_KERNEL may name an already-built compatible guest kernel.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -22,7 +23,8 @@ fi
 "$root/tools/mkinitramfs.sh" "$out/dom0.cpio.gz" "$root/tests/guest/init-sharedblk" \
     "$root/tools/l4hctl/target/release/l4hctl" "$out/sharedvm.cpio.gz" >/dev/null
 export L4H_GUEST_KERNEL="$out/vmlinux" L4H_DOM0_INITRD="$out/dom0.cpio.gz"
-L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=256 L4H_WATCHDOG_SECS=0 "$root/tools/build-host.sh" > "$out/host-build.log" 2>&1
+if [ "${SHARED_BLK_DOM0:-}" = 1 ]; then dom0_disks=(L4H_DOM0_DISKS=1 L4H_DOM0_DISK0_MB=1); else dom0_disks=(L4H_DOM0_DISKS=0); fi
+env "${dom0_disks[@]}" L4H_DOM0_MEM_MB=256 L4H_WATCHDOG_SECS=0 "$root/tools/build-host.sh" > "$out/host-build.log" 2>&1
 truncate -s 64M "$out/disk.raw"
 truncate -s 64M "$out/slow.raw"
 case "${SHARED_BLK_DEV:-virtio}" in

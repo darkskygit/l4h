@@ -1191,7 +1191,8 @@ named modules (`guest-kernel`, `guest-kmods`, `dom0-initrd`,
 Boot loader modules win over appended ones of the same name. Without a
 `guest-kernel`, root starts no guests and serves only the serial monitor.
 
-The settings (dom0's memory, vCPUs, I/O pool, disks, NICs, internal
+The settings (dom0's memory, vCPUs, I/O pool, disks and its window of
+disk 0, NICs, internal
 switches and command line; the uplink NICs, the boot disk, the serial port
 and IRQ, the framebuffer console and the watchdog) default to the
 `L4H_*` variables root was built with. `l4h.conf` overrides them: one

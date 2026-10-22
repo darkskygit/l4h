@@ -609,7 +609,13 @@ pub fn boot_dom0(h: &mut Host) {
     };
     let id = h.create_guest(&cfg).expect("cannot create dom0");
     for d in 0..h.disks.len().min(h.cfg.dom0_disks) {
-        if let Err(e) = h.attach_disk(id, d, false, 0, 0) {
+        // Of disk 0, only the first dom0_disk0_mb MiB if the disk is larger.
+        let mut sectors = 0;
+        if d == 0 && h.cfg.dom0_disk0_mb > 0 && h.ensure_disk(d).is_ok() {
+            let n = (h.cfg.dom0_disk0_mb as u64) << 11;
+            if n < h.disks[d].capacity { sectors = n; }
+        }
+        if let Err(e) = h.attach_disk(id, d, false, 0, sectors) {
             sel4::debug_println!("l4h-root: cannot give disk {} to dom0: error {}", d, e);
         }
     }

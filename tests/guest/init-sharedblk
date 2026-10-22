@@ -12,6 +12,18 @@ waitfor() {
 }
 echo "SHAREDBLK: start"
 l4hctl disks
+# dom0's own window of disk 0 (SHARED_BLK_DOM0=1): its first MiB.
+mine=0
+if [ -e /sys/block/vda ]; then
+    mine=1
+    [ "$(cat /sys/block/vda/size)" = 2048 ] || fail "dom0 window $(cat /sys/block/vda/size) sectors"
+    head -c 4096 /dev/zero | tr '\000' D | dd of=/dev/vda bs=4096 seek=255 conv=fsync 2>/dev/null || fail dom0-write
+    [ "$(dd if=/dev/vda bs=4096 skip=255 count=1 2>/dev/null | tr -d D | wc -c)" = 0 ] || fail dom0-read
+    if create over-dom0 0,start=0,sectors=2048 A > /tmp/id 2>/tmp/err; then fail over-dom0; fi
+    grep -q busy /tmp/err || { cat /tmp/err; fail over-dom0-error; }
+    if l4hctl disk-zero 0 2040 16 2>/tmp/err; then fail provision-over-dom0; fi
+    echo "SHAREDBLK: dom0 has its window of disk 0; overlapping it refused"
+fi
 head -c 4096 /dev/zero | tr '\000' A > /tmp/a
 head -c 4096 /dev/zero | tr '\000' B > /tmp/b
 l4hctl disk-zero 0 2048 32768 || fail zero
@@ -68,11 +80,11 @@ for i in 1 2 3 4 5; do
     many="$many $id"
 done
 l4hctl disks > /tmp/disks
-grep -q '^disk 0:.*attachments 72$' /tmp/disks || { cat /tmp/disks; fail attachment-count; }
+grep -q "^disk 0:.*attachments $((72 + mine))\$" /tmp/disks || { cat /tmp/disks; fail attachment-count; }
 for id in $many; do waitfor "$id" 'SHAREDVM: readonly ok'; done
 for id in $many "$r1" "$r2"; do l4hctl destroy "$id" || fail destroy-many; done
 l4hctl disks > /tmp/disks
-grep -q '^disk 0:.*attachments 0$' /tmp/disks || { cat /tmp/disks; fail attachments-released; }
+grep -q "^disk 0:.*attachments $mine\$" /tmp/disks || { cat /tmp/disks; fail attachments-released; }
 echo "SHAREDBLK: 72 attachments of one disk"
 # Slow hardware retains more than five seconds of DMA work at destroy.
 # The controller must be quarantined and its I/O pool kept out of use.

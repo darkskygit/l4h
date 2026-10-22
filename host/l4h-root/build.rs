@@ -30,6 +30,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=L4H_DOM0_IO_POOL_MB");
     println!("cargo:rerun-if-env-changed=L4H_WATCHDOG_SECS");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_DISKS");
+    println!("cargo:rerun-if-env-changed=L4H_DOM0_DISK0_MB");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_NICS");
     println!("cargo:rerun-if-env-changed=L4H_DOM0_INTERNAL_SWITCHES");
     println!("cargo:rerun-if-env-changed=L4H_UPLINK_NIC");
