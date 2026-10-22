@@ -298,7 +298,10 @@ impl Host {
     /// Start every controller's blkd and number the host disks: one per
     /// unit of each controller, in PCI order.  The host fails to boot if
     /// it cannot start them all (each needs 4 MiB of physically
-    /// contiguous DMA memory), so no disk is ever missing its driver.
+    /// contiguous DMA memory), so no disk is ever missing its driver.  A
+    /// controller that did not reset stays disabled: its disk (virtio-blk
+    /// and NVMe have one) keeps its number and fails with EIO, and a
+    /// virtio-scsi one has no units to report.
     fn scan_disks(&mut self) {
         let add = |disks: &mut ArrayVec<Disk, MAX_DISKS>, d: Disk| {
             let (unit, ctrl) = (d.unit, d.ctrl);
@@ -307,10 +310,16 @@ impl Host {
             }
         };
         for c in 0..self.ctrls.len() {
-            blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci,
-                &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+            let failed = self.ctrls[c].failed;
+            if !failed {
+                blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci,
+                    &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
+            }
             if self.ctrls[c].kind != l4h_host::blk::BLKD_VIRTIO_SCSI {
                 add(self.disks, Disk::new(c, 0));
+                continue;
+            }
+            if failed {
                 continue;
             }
             let units = self.ctrls[c].info(0).1;

@@ -942,7 +942,8 @@ thin provisioning or copy-on-write.
   boot and learns the virtio-scsi units there; each needs 4 MiB of
   physically contiguous DMA memory, and the host fails to boot without
   it, so a disk never lacks its driver later. A controller whose reset
-  failed also halts boot, before its bus mastering can be enabled again.
+  failed is not started and stays disabled (bus mastering off): its
+  disks fail with `EIO`, and the host boots without them.
   blkd clients and quarantine are per controller: a drain
   timeout fails every disk of it. Requests become
   READ/WRITE(10 or 16) and SYNCHRONIZE CACHE commands, split when they

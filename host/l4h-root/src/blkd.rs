@@ -207,7 +207,8 @@ fn bdf(d: &pci::Device) -> u32 {
 }
 
 /// Start one persistent driver for the physical controller, at boot: the
-/// host fails to boot if its reset failed or there is no memory for it.
+/// host fails to boot if there is no memory for it.  Never for a
+/// controller whose reset failed: it must stay disabled.
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     id: u32,
