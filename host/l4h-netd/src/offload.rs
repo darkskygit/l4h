@@ -28,15 +28,20 @@ pub struct TcpFrame {
     pub hdrs: usize,
 }
 
+/// A frame's EtherType after at most one 802.1Q tag, and where its
+/// network header starts; None if the frame is too short for either.
+pub fn ethertype(frame: &[u8]) -> Option<(u16, usize)> {
+    let ethertype = u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]);
+    if ethertype != 0x8100 {
+        return Some((ethertype, 14));
+    }
+    Some((u16::from_be_bytes([*frame.get(16)?, *frame.get(17)?]), 18))
+}
+
 /// Parse Ethernet (optionally one 802.1Q tag) + IPv4/IPv6 + TCP, without
 /// IP options beyond the header length or IPv6 extension headers.
 pub fn parse_tcp(frame: &[u8]) -> Option<TcpFrame> {
-    let mut ip = 14;
-    let mut ethertype = u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]);
-    if ethertype == 0x8100 {
-        ethertype = u16::from_be_bytes([*frame.get(16)?, *frame.get(17)?]);
-        ip = 18;
-    }
+    let (ethertype, ip) = ethertype(frame)?;
     let (v6, tcp) = match ethertype {
         0x0800 => {
             let ihl = (*frame.get(ip)? & 0x0f) as usize * 4;

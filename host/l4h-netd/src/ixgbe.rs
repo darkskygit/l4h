@@ -521,12 +521,7 @@ impl Ixgbe {
     fn offload(&self, buf: &mut [u8], hdr: &[u8; HDR]) -> Option<(u64, u64, u32, usize)> {
         let get16 = |off: usize| u16::from_le_bytes([hdr[off], hdr[off + 1]]) as usize;
         let (start, off) = (get16(6), get16(8));
-        let mut ip = 14;
-        let mut ethertype = u16::from_be_bytes([buf[12], buf[13]]);
-        if ethertype == 0x8100 {
-            ethertype = u16::from_be_bytes([buf[16], buf[17]]);
-            ip = 18;
-        }
+        let (ethertype, ip) = offload::ethertype(buf)?;
         let v4 = match ethertype {
             0x0800 => true,
             0x86dd => false,
