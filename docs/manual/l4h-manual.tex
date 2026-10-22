@@ -322,8 +322,9 @@ namespaces and cgroups (enough for systemd and containers), BPF, netfilter
 with NAT and nftables, bridges and veth, and paravirtual steal-time
 accounting, all built in. It also has what l4h-sandbox needs for its dom0 (a
 router with a firewall, tagged VLANs, XFS and FAT) and its sandboxes
-(EROFS, dm-crypt, Docker through \texttt{iptables-nft}, the NFS client), so
-that the shipped kernel serves both.
+(EROFS, dm-crypt, dm-verity with SHA-256, Docker through
+\texttt{iptables-nft}, the NFS client), so that the shipped kernel serves
+both.
 
 Every guest runs this kernel: the one in the host's UEFI application
 (Chapter~\ref{ch:dom0}), or the one appended to \texttt{l4h-root} under

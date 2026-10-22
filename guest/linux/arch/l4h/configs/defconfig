@@ -105,6 +105,9 @@ CONFIG_CRYPTO_XTS=y
 CONFIG_CRYPTO_AES_NI_INTEL=y
 CONFIG_CRYPTO_AES_ARM64_CE_BLK=y
 CONFIG_CRYPTO_AES_ARM64_BS=y
+# Verified read-only disks.
+CONFIG_DM_VERITY=y
+CONFIG_CRYPTO_SHA256=y
 # Attestation reports from the host (arch/l4h/drivers/attest.c) at
 # /sys/kernel/config/tsm/report.
 CONFIG_VIRT_DRIVERS=y
