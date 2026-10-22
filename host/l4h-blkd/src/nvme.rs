@@ -151,7 +151,6 @@ impl Nvme {
         let regs = Mmio(cfg.bar0.va as usize);
         let mut dma = Dma::new(cfg.dma_va as usize, cfg.dma_paddr, cfg.dma_size as usize);
         let cap = regs.r64(REG_CAP);
-        let mqes = (cap & 0xffff) as u16 + 1;
         let stride = 4usize << ((cap >> 32) & 0xf);
         let db = |i: usize| Mmio(regs.0 + 0x1000 + i * stride);
 
@@ -176,7 +175,8 @@ impl Nvme {
         msix.w32(8, cfg.msi_data);
         msix.w32(12, 0);
 
-        let depth = IO_DEPTH.min(mqes);
+        // CAP.MQES is zero-based: 0xffff means 65536 entries.
+        let depth = (IO_DEPTH as u64).min((cap & 0xffff) + 1) as u16;
         let (sq_va, sq_pa) = dma.alloc(64 * depth as usize, 4096);
         let (cq_va, cq_pa) = dma.alloc(16 * depth as usize, 4096);
         let ident = dma.alloc(4096, 4096);
@@ -352,8 +352,9 @@ impl Driver for Nvme {
                 while len > 0 {
                     let joins = n == 0 || (pa % PAGE == 0 && (cmd[n - 1].pa + cmd[n - 1].len as u64) % PAGE == 0);
                     // Room left in the command, by bytes and by PRP entries;
-                    // a partial piece must end on a page.
-                    let room = (self.max_bytes - bytes).min((MAX_CMD_PAGES as u64 - pages) * PAGE - pa % PAGE);
+                    // a partial piece must end on a page.  With every PRP
+                    // entry used there is none: the piece starts a command.
+                    let room = (self.max_bytes - bytes).min(((MAX_CMD_PAGES as u64 - pages) * PAGE).saturating_sub(pa % PAGE));
                     let mut take = len.min(room);
                     if take < len {
                         take = ((pa + take) & !(PAGE - 1)).saturating_sub(pa);
