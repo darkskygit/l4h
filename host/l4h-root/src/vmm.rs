@@ -25,7 +25,10 @@ const PAGE: usize = 4096;
 /// small enough for Arena::reserve's guarantee.
 pub struct Cnodes {
     cspace: cap::CNode,
+    /// Keeps the I/O pool's mappings: slot i = page i (radix `pool_radix`).
     pool: cap::CNode,
+    pool_radix: usize,
+    /// Keeps the other mappings (radix host::CNODE_BITS).
     small: cap::CNode,
 }
 
@@ -35,9 +38,11 @@ impl Cnodes {
             let s = arena.try_object(alloc, ObjectBlueprint::CNode { size_bits: bits })?;
             Some(sel4::init_thread::Slot::<cap_type::CNode>::from_index(s).cap())
         };
+        let pool_radix = ((io_pool / PAGE).trailing_zeros() as usize).max(1);
         Some(Self {
             cspace: make(host::CNODE_BITS)?,
-            pool: make((io_pool / PAGE).trailing_zeros() as usize)?,
+            pool: make(pool_radix)?,
+            pool_radix,
             small: make(host::CNODE_BITS)?,
         })
     }
@@ -168,8 +173,8 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     // ---- The I/O pool at IO_POOL_VA, the only guest memory the VMM maps.
     // The mapping capabilities are kept in a CNode of the guest's arena.
     let pages = g.pool.pages();
-    let radix = (pages.trailing_zeros() as usize).max(1);
-    let keep = g.vmm_cnodes.as_ref().expect("VMM CNodes").pool;
+    let cnodes = g.vmm_cnodes.as_ref().expect("VMM CNodes");
+    let (keep, radix, small) = (cnodes.pool, cnodes.pool_radix, cnodes.small);
     let attrs = VmAttributes::DEFAULT;
     for i in 0..pages {
         let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, radix);
@@ -178,10 +183,9 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     }
 
     // ---- Event pages, notifications and device pages.
-    let small = g.vmm_cnodes.as_ref().expect("VMM CNodes").small;
     let mut small_next = 0u64;
     let mut keep_slot = || {
-        let s = small.absolute_cptr_from_bits_with_depth(small_next, 12);
+        let s = small.absolute_cptr_from_bits_with_depth(small_next, host::CNODE_BITS);
         small_next += 1;
         s
     };
