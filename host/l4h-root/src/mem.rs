@@ -694,6 +694,10 @@ const ARENA_GROW_BITS: usize = 20;
 /// Regions of an arena, and the Untypeds it owns besides (the I/O pool,
 /// netd ports: at most one per device).
 const ARENA_REGIONS: usize = 96;
+/// What alignment may leave unusable at the end of a region, for
+/// Arena::reserve: the largest object allocated in quantity (a 16 KiB RAM
+/// CNode) and the space before it.
+const ARENA_TAIL: usize = 32 << 10;
 const ARENA_OWNED: usize = ARENA_REGIONS + 1 + crate::guest::MAX_GUEST_DEVICES;
 
 /// Untyped memory dedicated to one guest (or host component).
@@ -726,24 +730,50 @@ impl Arena {
         if let Some(p) = self.pool.retype(bp, count, dest) {
             return Some(p);
         }
-        if self.pool.regions.is_full() || self.owned.is_full() {
-            return None;
-        }
         let need = count << bp.physical_size_bits();
         let eighth = (self.bytes() / 8).max(1).ilog2() as usize;
-        let minimum = (need.next_power_of_two().trailing_zeros() as usize).max(ARENA_GROW_BITS);
-        let preferred = minimum.max(eighth);
-        let slot = alloc.slots.alloc();
-        // The preferred growth size may be unavailable even when a
-        // smaller block can satisfy the request.  Keep the request's size
-        // as the lower bound, and take the largest block that fits.
-        let Some(region) = (minimum..=preferred).rev().find_map(|bits| alloc.split(bits, slot)) else {
-            alloc.slots.free(slot);
+        if !self.grow(alloc, need.next_power_of_two().trailing_zeros() as usize, eighth) {
             return None;
+        }
+        self.pool.retype(bp, count, dest)
+    }
+
+    /// Add a region of 2^bits bytes, preferably `preferred` bits, at
+    /// least `minimum` (and ARENA_GROW_BITS): the preferred size may be
+    /// unavailable even when a smaller block can satisfy the request, so
+    /// take the largest block that fits.
+    fn grow(&mut self, alloc: &mut Alloc, minimum: usize, preferred: usize) -> bool {
+        if self.pool.regions.is_full() || self.owned.is_full() {
+            return false;
+        }
+        let minimum = minimum.max(ARENA_GROW_BITS);
+        let slot = alloc.slots.alloc();
+        let Some(region) = (minimum..=preferred.max(minimum)).rev().find_map(|bits| alloc.split(bits, slot)) else {
+            alloc.slots.free(slot);
+            return false;
         };
         self.owned.must_push((slot, region.paddr, region.size_bits));
         let _ = self.pool.add(region);
-        self.pool.retype(bp, count, dest)
+        true
+    }
+
+    /// Grow until the arena has `bytes` free beyond what alignment may
+    /// waste at the end of each region (ARENA_TAIL), so that objects of
+    /// up to ARENA_TAIL bytes adding up to `bytes` (each counted with its
+    /// alignment) cannot run out.  False if the host has too little
+    /// memory, or it is too fragmented; what was added stays the arena's.
+    pub fn reserve(&mut self, alloc: &mut Alloc, bytes: usize) -> bool {
+        loop {
+            let usable = self.pool.free_bytes().saturating_sub(self.pool.regions.len() * ARENA_TAIL);
+            let Some(short) = bytes.checked_sub(usable).filter(|&n| n > 0) else {
+                return true;
+            };
+            // Room for the tail of the new region too.
+            let bits = (short + ARENA_TAIL).next_power_of_two().trailing_zeros() as usize;
+            if !self.grow(alloc, ARENA_GROW_BITS, bits) {
+                return false;
+            }
+        }
     }
 
     /// Bytes this arena holds (its own regions, not the I/O pool).

@@ -38,6 +38,12 @@ const BLOCK_FRAMES: usize = BLOCK / PAGE;
 /// Blocks of host frames after the image: the guest kernel's memory until
 /// it has mapped the rest of its RAM.
 pub const BOOT_SLACK: usize = 1;
+/// Host memory and root slots filling a block with frames takes: its
+/// level-2 RAM CNode and a page table of the direct map, and slots for
+/// them and for its Untyped (block_frames).  The bytes count the
+/// alignment: a 16 KiB CNode after a page table skips 12 KiB.
+const BLOCK_FRAMES_BYTES: usize = 2 * (32 << abi::RAM_L2_BITS);
+const BLOCK_FRAMES_SLOTS: usize = 3;
 /// Devices a guest can have (console, control, virtio).
 pub const MAX_GUEST_DEVICES: usize = 16;
 
@@ -490,6 +496,36 @@ impl Guest {
         (root_guest_va(self.id) + GUEST_RING_OFF) as *const host::ConsoleRing
     }
 
+    /// The boot blocks for an image ending at `kernel_end` and `initrd`: a
+    /// prefix of RAM up to the image (and anything else loaded), plus
+    /// slack.  None if the guest would have no block of its own left for
+    /// seL4 objects.
+    fn boot_prefix(&self, kernel_end: usize, initrd: (usize, usize)) -> Option<usize> {
+        // An empty initrd has no end: its address must not grow the prefix.
+        let image_end = if initrd.1 != 0 { kernel_end.max(initrd.0.checked_add(initrd.1)?) } else { kernel_end };
+        let loaded = (0..self.nr_blocks).rev().find(|&b| self.is_filled(b)).map_or(0, |b| b + 1);
+        let boot = image_end.div_ceil(BLOCK).max(loaded) + BOOT_SLACK;
+        (boot < self.nr_blocks).then_some(boot)
+    }
+
+    /// What booting with `kernel_end` and `initrd` costs the host, in bytes
+    /// and root slots: filling the boot blocks that have no frames yet,
+    /// and a page directory for every GiB of them.  dom0 chooses the
+    /// prefix, which can be most of the guest's RAM, so it is checked
+    /// before booting (and the bytes reserved, `reserve`) rather than
+    /// covered by the guest's arena estimate.
+    pub fn boot_cost(&self, kernel_end: usize, initrd: (usize, usize)) -> Option<(usize, usize)> {
+        let boot = self.boot_prefix(kernel_end, initrd)?;
+        let n = (0..boot).filter(|&b| !self.is_filled(b)).count();
+        let dirs = boot.div_ceil(512) + 1;
+        Some((n * BLOCK_FRAMES_BYTES + dirs * PAGE, n * BLOCK_FRAMES_SLOTS + dirs))
+    }
+
+    /// Grow the guest's arena to hold `bytes` more objects.
+    pub fn reserve(&mut self, alloc: &mut Alloc, bytes: usize) -> bool {
+        self.arena.reserve(alloc, bytes)
+    }
+
     /// Write the boot info and give the guest its RAM: the boot blocks
     /// (image, initrd and BOOT_SLACK more) as host frames, the others as
     /// Untyped copies.  Validates the boot parameters.
@@ -517,15 +553,9 @@ impl Guest {
         if !self.loaded.iter().all(|r| within(r, (0, kernel_end)) || within(r, initrd)) {
             return false;
         }
-        // Boot blocks: a prefix of RAM up to the image (and anything else
-        // loaded), plus slack.  The guest needs at least one block of its
-        // own for seL4 objects.
-        let image_end = kernel_end.max(initrd.0 + initrd.1);
-        let loaded = (0..self.nr_blocks).rev().find(|&b| self.is_filled(b)).map_or(0, |b| b + 1);
-        let boot = image_end.div_ceil(BLOCK).max(loaded) + BOOT_SLACK;
-        if boot >= self.nr_blocks {
+        let Some(boot) = self.boot_prefix(kernel_end, initrd) else {
             return false;
-        }
+        };
         for b in 0..boot {
             self.block_frames(alloc, b);
         }

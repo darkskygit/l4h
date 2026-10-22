@@ -241,16 +241,16 @@ impl Host {
 
     /// Resources a guest operation may need, checked before starting it so
     /// that requests fail cleanly instead of exhausting the root task.
-    pub fn can_afford(&self, bytes: usize, asids: usize) -> bool {
+    pub fn can_afford(&self, bytes: usize, asids: usize, slots: usize) -> bool {
         bytes.checked_add(RESERVE_BYTES).is_some_and(|b| self.alloc.free_bytes() >= b)
             && self.asids.available() >= asids
-            && self.alloc.slots.available() >= RESERVE_SLOTS
+            && self.alloc.slots.available() >= RESERVE_SLOTS + slots
             && self.alloc.slots.largest_range() >= RESERVE_RANGE
     }
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
         let bytes = cfg.ram.checked_add(cfg.io_pool)?;
-        if !self.can_afford(bytes, cfg.vspaces + 4) {
+        if !self.can_afford(bytes, cfg.vspaces + 4, 0) {
             return None;
         }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
@@ -288,7 +288,7 @@ impl Host {
         let ctrl = &self.ctrls[c];
         if ctrl.failed { return Err(ctl::EIO); }
         if ctrl.started() { return Ok(()); }
-        if !self.can_afford(16 << 20, 2) { return Err(ctl::ENOMEM); }
+        if !self.can_afford(16 << 20, 2, 0) { return Err(ctl::ENOMEM); }
         blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci,
             &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
         Ok(())
@@ -350,7 +350,7 @@ impl Host {
             return Err(ctl::EBUSY);
         }
         if ctrl.clients.iter().all(Option::is_some) { return Err(ctl::ENOSPC); }
-        if !self.can_afford(1 << 20, 0) { return Err(ctl::ENOMEM); }
+        if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
         self.with_guest(id, |h, g| {
             if g.state != State::Created {
                 return Err(ctl::EBUSY);
@@ -386,7 +386,7 @@ impl Host {
     /// Give guest `id` (before it starts) a virtio-net device on `switch`.
     /// Returns the MAC.
     pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, i64> {
-        if !self.can_afford(8 << 20, 0) {
+        if !self.can_afford(8 << 20, 0, 0) {
             return Err(ctl::ENOMEM);
         }
         self.with_guest(id, |h, g| {

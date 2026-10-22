@@ -134,7 +134,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             }
             // The blocks it fills with frames: their RAM CNodes, page
             // tables and slots.
-            if !h.can_afford(1 << 20, 0) {
+            if !h.can_afford(1 << 20, 0, 0) {
                 return Err(ENOMEM);
             }
             h.with_guest(id, |h, g| {
@@ -153,22 +153,22 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             if id == caller {
                 return Err(EINVAL);
             }
-            // The boot blocks it fills with frames and its l4h-vmm.
-            if !h.can_afford(8 << 20, 1) {
-                return Err(ENOMEM);
-            }
+            let initrd = (a[1] as usize, a[2] as usize);
             let cmdline = cstr(&req.data);
-            let ok = h
-                .with_guest(id, |h, g| {
-                    let kernel = h.kernel.as_ref().expect("guests run the host's kernel");
-                    g.state == State::Created
-                        && g.vmm.is_none()
-                        && crate::guest::boot(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, (a[1] as usize, a[2] as usize), cmdline)
-                })
-                .ok_or(ENOENT)?;
-            if !ok {
-                return Err(EINVAL);
-            }
+            h.with_guest(id, |h, g| {
+                let kernel = h.kernel.as_ref().expect("guests run the host's kernel");
+                if g.state != State::Created || g.vmm.is_some() {
+                    return Err(EINVAL);
+                }
+                // The boot blocks it fills with frames (as many as dom0
+                // asks for) and its l4h-vmm.
+                let (bytes, slots) = g.boot_cost(kernel.end, initrd).ok_or(EINVAL)?;
+                if !h.can_afford(bytes + (8 << 20), 1, slots) || !g.reserve(&mut h.alloc, bytes) {
+                    return Err(ENOMEM);
+                }
+                if crate::guest::boot(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, initrd, cmdline) { Ok(()) } else { Err(EINVAL) }
+            })
+            .ok_or(ENOENT)??;
             h.start_guest(id)
         }
         abi::CTL_VM_DESTROY => {

@@ -1933,10 +1933,16 @@ memory the guest can retype.
 - **Boot blocks.** `l4h-root` turns a block into host frames (a level-2 RAM
   CNode, 512 frames, mapped in the direct map) when an image is loaded into
   it (the kernel, or an initramfs). At `VM_START` the boot blocks
-  are the prefix of RAM up to the end of the kernel, the initrd and
-  anything loaded, plus `BOOT_SLACK` (one) block for the guest kernel's
-  memory until it has mapped the rest; at least one block must be left for
-  the guest. Deviation: the design counted two slack blocks as boot blocks
+  are the prefix of RAM up to the end of the kernel, the initrd (if it is
+  not empty) and anything loaded, plus `BOOT_SLACK` (one) block for the
+  guest kernel's memory until it has mapped the rest; at least one block
+  must be left for the guest. dom0 chooses the initrd's address, so the
+  prefix can be nearly all of the guest's RAM, and each boot block costs
+  the host up to 32 KiB (its level-2 CNode and a page table, with the
+  alignment between them) and three root slots: before it fills any,
+  `VM_START` checks that the host can afford the blocks not yet filled
+  (`Guest::boot_cost`) and grows the guest's arena by that much
+  (`Arena::reserve`), and fails with `ENOMEM` otherwise. Deviation: the design counted two slack blocks as boot blocks
   *and* as the guest's first object pool, which cannot both hold (the
   guest has no Untyped for a boot block); here the slack block is frames
   for early `memblock` allocations, and object blocks come from the
