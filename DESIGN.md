@@ -938,9 +938,10 @@ thin provisioning or copy-on-write.
   GCE), has a host disk per direct-access logical unit (up to 16): blkd
   lists each target's LUNs with REPORT LUNS (LUN 0 alone if that fails)
   and skips other device types. Host disks are numbered by controller in
-  PCI order, then target and LUN, so root starts virtio-scsi controllers
-  at boot to learn their units; other controllers have one disk and start
-  on first use. blkd clients and quarantine are per controller: a drain
+  PCI order, then target and LUN. Root starts every controller's blkd at
+  boot and learns the virtio-scsi units there; each needs 4 MiB of
+  physically contiguous DMA memory, and the host fails to boot without
+  it, so a disk never lacks its driver later. blkd clients and quarantine are per controller: a drain
   timeout fails every disk of it. Requests become
   READ/WRITE(10 or 16) and SYNCHRONIZE CACHE commands, split when they
   exceed the device's `seg_max` or `max_sectors`. Write protection and the

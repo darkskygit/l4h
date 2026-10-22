@@ -283,21 +283,11 @@ impl Host {
         }
     }
 
-    /// Probe and start a controller once, independent of its clients.
-    fn ensure_ctrl(&mut self, c: usize) -> Result<(), i64> {
-        let ctrl = &self.ctrls[c];
-        if ctrl.failed { return Err(ctl::EIO); }
-        if ctrl.started() { return Ok(()); }
-        if !self.can_afford(16 << 20, 2, 0) { return Err(ctl::ENOMEM); }
-        blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci,
-            &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
-        Ok(())
-    }
-
-    /// Start the controller of host disk `disk` and learn its geometry.
+    /// Learn the geometry of host disk `disk` if its controller could
+    /// not tell at boot.
     pub fn ensure_disk(&mut self, disk: usize) -> Result<(), i64> {
         let (c, unit) = self.disks.get(disk).map(|d| (d.ctrl, d.unit)).ok_or(ctl::ENOENT)?;
-        self.ensure_ctrl(c)?;
+        if self.ctrls[c].failed { return Err(ctl::EIO); }
         if self.disks[disk].capacity == 0 {
             let d = self.ctrls[c].info(unit).0.ok_or(ctl::EIO)?;
             self.disks[disk] = Disk { ctrl: c, ..d };
@@ -305,9 +295,10 @@ impl Host {
         Ok(())
     }
 
-    /// Number the host disks: one per unit of each controller, in PCI
-    /// order.  virtio-scsi controllers start now, to find their logical
-    /// units; the others have one unit and start when first used.
+    /// Start every controller's blkd and number the host disks: one per
+    /// unit of each controller, in PCI order.  The host fails to boot if
+    /// it cannot start them all (each needs 4 MiB of physically
+    /// contiguous DMA memory), so no disk is ever missing its driver.
     fn scan_disks(&mut self) {
         let add = |disks: &mut ArrayVec<Disk, MAX_DISKS>, d: Disk| {
             let (unit, ctrl) = (d.unit, d.ctrl);
@@ -316,13 +307,10 @@ impl Host {
             }
         };
         for c in 0..self.ctrls.len() {
+            blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci,
+                &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
             if self.ctrls[c].kind != l4h_host::blk::BLKD_VIRTIO_SCSI {
                 add(self.disks, Disk::new(c, 0));
-                continue;
-            }
-            if let Err(e) = self.ensure_ctrl(c) {
-                let p = &self.ctrls[c].pci;
-                sel4::debug_println!("l4h-root: disk controller {:02x}:{:02x}.{} unusable: error {}", p.bus, p.dev, p.func, e);
                 continue;
             }
             let units = self.ctrls[c].info(0).1;

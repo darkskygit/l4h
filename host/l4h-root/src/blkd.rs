@@ -109,10 +109,6 @@ impl Controller {
         Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None }
     }
 
-    pub fn started(&self) -> bool {
-        self.driver.is_some()
-    }
-
     /// The attachments of disk `disk`, with their client indices.
     pub fn attachments(&self, disk: usize) -> impl Iterator<Item = (usize, &Attachment)> {
         self.clients.iter().enumerate().filter_map(move |(i, a)| a.as_ref().filter(|a| a.disk == disk).map(|a| (i, a)))
@@ -210,7 +206,8 @@ fn bdf(d: &pci::Device) -> u32 {
     ((d.bus as u32) << 8) | ((d.dev as u32) << 3) | d.func as u32
 }
 
-/// Start one persistent driver for the physical controller.
+/// Start one persistent driver for the physical controller, at boot: the
+/// host fails to boot without the memory for it.
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     id: u32,
@@ -222,7 +219,6 @@ pub fn start(
     asids: &mut AsidPools,
     host_info: &HostInfo,
 ) {
-    if disk.driver.is_some() { return; }
     let io = disk.io_cap(alloc);
     let legacy_io = disk.legacy_io();
     let d = &disk.pci;
