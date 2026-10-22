@@ -354,11 +354,11 @@ impl Host {
             }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
             let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, read_only, &mut h.alloc);
-            blkd::activate(&h.ctrls[c], unit, client, g, &backend, &mut h.wins.a);
+            let active = blkd::activate(&mut h.ctrls[c], unit, client, g, &backend, &mut h.wins.a, &h.pci);
             // One each per device, of which add_device allows no more.
             g.backends.must_push((d, backend));
             g.disks.must_push((c, client));
-            Ok(())
+            active
         })
         .ok_or(ctl::ENOENT)?
     }

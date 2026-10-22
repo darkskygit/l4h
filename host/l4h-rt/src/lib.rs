@@ -92,6 +92,36 @@ pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
     sel4::Cap::from_bits(slot)
 }
 
+/// Where an aborted component ends.  l4h-root calls blkd, netd and memd
+/// synchronously and could not wait for their faults to be reported: one
+/// that has failed keeps answering on its service endpoint, the call it
+/// was serving first, with u64::MAX and zeros (a failed device to root).
+/// Any other component faults, which root handles.
+#[doc(hidden)]
+pub fn abort_trap() -> ! {
+    let h = INFO.header();
+    if h.magic == INFO_MAGIC && matches!(h.kind, host::KIND_BLKD | host::KIND_NETD | host::KIND_MEMD) {
+        let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
+        let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
+        loop {
+            sel4::with_ipc_buffer_mut(|b| {
+                let m = b.msg_regs_mut();
+                m[0] = u64::MAX;
+                m[1..8].fill(0);
+            });
+            ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 8), reply);
+        }
+    }
+    loop {
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("ud2");
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("udf #0");
+        }
+    }
+}
+
 /// The allocator of a component without a heap (`component!(main,
 /// no_heap)`): every allocation fails, which aborts.  The component
 /// itself cannot allocate, since it does not link `alloc`; this only
@@ -111,6 +141,7 @@ unsafe impl core::alloc::GlobalAlloc for NoHeap {
 macro_rules! component {
     (@entry $main:path) => {
         $crate::sel4_panicking_env::register_debug_put_char!($crate::sel4::debug_put_char);
+        $crate::sel4_panicking_env::register_abort_trap!($crate::abort_trap);
 
         $crate::sel4_runtime_common::declare_stack!(256 * 1024);
         $crate::sel4_runtime_common::declare_entrypoint_with_stack_init!();

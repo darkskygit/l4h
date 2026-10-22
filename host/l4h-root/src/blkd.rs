@@ -334,6 +334,7 @@ pub fn start(
     disk.driver = Some(Blkd { comp, arena, staging });
 }
 
+/// A call to blkd.  One that has failed answers u64::MAX (l4h_rt::abort_trap).
 fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
     for (i, &v) in args.iter().enumerate() { crate::set_mr(i, v); }
     ep.call(sel4::MessageInfo::new(label, 0, 0, args.len()));
@@ -365,7 +366,9 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index:
 }
 
 /// Publish root-owned client configuration, then activate the channel.
-pub fn activate(ctrl: &Controller, unit: u64, i: usize, client: &Guest, backend: &vmm::Backend, win: &mut Window) {
+/// EIO if blkd has failed (the controller is then quarantined).
+pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &Guest, backend: &vmm::Backend, win: &mut Window,
+    pci: &Pci) -> Result<(), i64> {
     let vmm::Backend::Blk { chan, .. } = backend else { unreachable!() };
     let a = ctrl.clients[i].as_ref().unwrap();
     let read_only = a.read_only;
@@ -378,7 +381,19 @@ pub fn activate(ctrl: &Controller, unit: u64, i: usize, client: &Guest, backend:
             gpa: client.pool.gpa as u64, paddr: client.pool.paddr as u64, size: client.pool.size as u64,
         });
     });
-    assert_eq!(call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit]), 0, "blkd add");
+    if call(ctrl.driver.as_ref().unwrap().comp.service_ep, blk::BLKD_ADD, &[i as u64, unit]) != 0 {
+        quarantine(ctrl, pci);
+        return Err(crate::ctl::EIO);
+    }
+    Ok(())
+}
+
+/// Stop using controller `disk` until host reboot: its blkd is suspended
+/// and the device can no longer reach memory.
+fn quarantine(disk: &mut Controller, pci: &Pci) {
+    disk.failed = true;
+    let _ = disk.driver.as_ref().unwrap().comp.tcb.tcb_suspend();
+    pci.disable(&disk.pci);
 }
 
 /// Drain this client before its memory is reused. A timeout quarantines
@@ -387,11 +402,9 @@ pub fn remove(disk: &mut Controller, i: usize, pci: &Pci) -> bool {
     let driver = disk.driver.as_ref().unwrap();
     let quiet = !disk.failed && call(driver.comp.service_ep, blk::BLKD_REMOVE, &[i as u64]) == 0;
     if !quiet {
-        disk.failed = true;
-        let _ = driver.comp.tcb.tcb_suspend();
-        pci.disable(&disk.pci);
+        quarantine(disk, pci);
     }
-    let _ = driver.comp.slot(blk::BLKD_SLOT_CLIENT_DONE + i as u64).delete();
+    let _ = disk.driver.as_ref().unwrap().comp.slot(blk::BLKD_SLOT_CLIENT_DONE + i as u64).delete();
     disk.clients[i] = None;
     quiet
 }
@@ -426,9 +439,7 @@ pub fn write(ctrl: &mut Controller, index: usize, dk: &Disk, sector: u64, len: u
     };
     if status == 0 { return Ok(()); }
     if status == u64::MAX {
-        disk.failed = true;
-        let _ = driver.comp.tcb.tcb_suspend();
-        pci.disable(&disk.pci);
+        quarantine(disk, pci);
     }
     Err(crate::ctl::EIO)
 }
