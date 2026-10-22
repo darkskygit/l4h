@@ -90,7 +90,11 @@ impl DevMem {
         }
         let n = size / 4096;
         let s = slots.alloc_range(n);
-        r.cap.untyped_retype(&FRAME_BP, &Dest::root(s.start).cnode, s.start, n).expect("device frames");
+        // The kernel caps fan-out per call (a framebuffer can be larger).
+        for at in (0..n).step_by(crate::RETYPE_FAN_OUT) {
+            let k = (n - at).min(crate::RETYPE_FAN_OUT);
+            r.cap.untyped_retype(&FRAME_BP, &Dest::root(s.start).cnode, s.start + at, k).expect("device frames");
+        }
         Some(s)
     }
 

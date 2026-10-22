@@ -142,13 +142,13 @@ impl Dashboard {
             size *= 2;
         }
         let base = addr & !(size - 1);
-        let frames = alloc.slots.global(|slots| devmem.frames(slots, base, size))?;
         let first = (addr - base) / 4096;
         let pages = (addr - base + len).div_ceil(4096) - first;
         if pages * 4096 > crate::layout::FRAMEBUFFER.size {
             info!("l4h-root: framebuffer of {} MiB is too large", len >> 20);
             return None;
         }
+        let frames = alloc.slots.global(|slots| devmem.frames(slots, base, size))?;
         let wc = VmAttributes::from_inner(sel4::sys::seL4_X86_VMAttributes::seL4_X86_WriteCombining);
         alloc.global(|alloc| {
             for (i, s) in (frames.start + first..frames.start + first + pages).enumerate() {
