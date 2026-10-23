@@ -23,11 +23,12 @@ void arch_exit_mmap(struct mm_struct *mm)
 	/* The last user is gone.  Lazy active_mm references held by idle
 	 * kernel threads (or the OOM victim's signal struct) can outlive
 	 * waitpid(), but must not keep the seL4 page tables allocated. */
-	l4h_mm_release(mm);
+	l4h_mm_release(mm, true);
 }
 
 void destroy_context(struct mm_struct *mm)
 {
-	/* Also handles context initialization failures before exit_mmap(). */
-	l4h_mm_release(mm);
+	/* Also handles context initialization failures before exit_mmap().
+	 * __mmdrop() may run in atomic context. */
+	l4h_mm_release(mm, false);
 }

@@ -221,13 +221,22 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 	}
 }
 
-/* Remove every mapping and page table, leaving an empty VSpace root. */
-static void as_reset(struct l4h_as *as)
+/* Remove every mapping and page table, leaving an empty VSpace root.  With
+ * `may_sleep`, gives the CPU away now and then: that can be a million
+ * seL4 deletes. */
+static void as_reset(struct l4h_as *as, bool may_sleep)
 {
 	struct table *t, *n;
+	unsigned long vpn;
+	void *e;
 
 	/* Unmapping invalidates each translation, deferred or not. */
-	as_unmap_range(as, 0, ~0ul);
+	xa_for_each(&as->pages, vpn, e) {
+		xa_erase(&as->pages, vpn);
+		l4h_slot_delete(entry_slot(e));
+		if (!(--as->nr_pages % 1024) && may_sleep)
+			cond_resched();
+	}
 	as->flush_pending = false;
 	list_for_each_entry_safe(t, n, &as->tables, link) {
 		list_del(&t->link);
@@ -391,11 +400,11 @@ static void vs_detach(struct vs_slot *s)
  * and page table, so it runs without vs_lock and with interrupts as the
  * caller has them: every vCPU that returns to user mode takes vs_lock.
  */
-static void vs_reset_free(struct vs_slot *s)
+static void vs_reset_free(struct vs_slot *s, bool may_sleep)
 {
 	unsigned long flags;
 
-	as_reset(&s->as);
+	as_reset(&s->as, may_sleep);
 	raw_spin_lock_irqsave(&vs_lock, flags);
 	nr_resetting--;
 	list_add(&s->lru, &vs_free);
@@ -448,7 +457,7 @@ static struct vs_slot *vs_take_wait(unsigned long *flags)
 			return s;
 		raw_spin_unlock_irqrestore(&vs_lock, *flags);
 		if (victim)
-			vs_reset_free(victim);
+			vs_reset_free(victim, false);
 		else
 			cpu_relax();
 	}
@@ -477,7 +486,7 @@ unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 			break;
 		raw_spin_unlock_irqrestore(&vs_lock, flags);
 		if (victim)
-			vs_reset_free(victim);
+			vs_reset_free(victim, false);
 		else
 			cpu_relax();
 	}
@@ -493,7 +502,7 @@ out:
 	return s->as.root;
 }
 
-void l4h_mm_release(struct mm_struct *mm)
+void l4h_mm_release(struct mm_struct *mm, bool may_sleep)
 {
 	struct l4h_mm *m = mm_l4h(mm);
 	struct vs_slot *s = NULL;
@@ -509,7 +518,7 @@ void l4h_mm_release(struct mm_struct *mm)
 	raw_spin_unlock_irqrestore(&vs_lock, flags);
 	/* The mm's pages are freed after this returns: empty it now. */
 	if (s)
-		vs_reset_free(s);
+		vs_reset_free(s, may_sleep);
 }
 
 /*
