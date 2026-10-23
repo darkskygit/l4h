@@ -6,7 +6,8 @@ struct mm_struct;
 
 void l4h_mm_init(struct mm_struct *mm);
 unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen);
-void l4h_mm_release(struct mm_struct *mm);
+/* Give up mm's VSpace; `may_sleep` if the caller can schedule. */
+void l4h_mm_release(struct mm_struct *mm, bool may_sleep);
 int l4h_map_fault(struct mm_struct *mm, unsigned long address);
 void l4h_mm_flush_deferred(struct mm_struct *mm);
 void l4h_vspace_init(void);

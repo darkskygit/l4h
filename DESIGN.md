@@ -501,6 +501,10 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   preemptible kernel operations, and let faults repopulate it. In `fork`, both
   parent and child refault their working sets lazily, so fork followed by exec
   stays cheap.
+  *Implemented:* a VSpace that leaves its mm (exit, or eviction from the
+  pool) is emptied one mapping at a time, as one seL4 delete each. That
+  runs after the entry is detached, outside the pool lock and with
+  interrupts as the caller has them, so other vCPUs keep running.
 - **TLB coherence** across cores is seL4's job: unmap shoots down the ASID's
   TLB entries. With several vCPUs, `flush_tlb_*` syncs synchronously, so a
   page is never freed while another vCPU can still reach it. The fault-path
@@ -611,6 +615,12 @@ attaches that object to the faulting task, and refills the pool.
   console included, with no lockup report: `shrink_dcache_parent` spun
   in `d_walk` on dentries that another task had on its shrink list, which
   Docker's container setup and teardown hit within seconds.
+- **Interrupted context.** Events delivered at a polling point interrupted
+  the kernel, and their handlers see kernel-mode registers. Only the
+  events that stopped a uTCB interrupted user mode and see the task's user
+  registers. The task's registers say "user" during the whole syscall,
+  so using them everywhere made every tick a user tick: RCU then took a
+  quiescent state inside read-side critical sections.
 - **Future backstop.** The proposed upcall injection for a kTCB that runs
   too long without polling is not implemented. It would require suspending
   the kTCB and changing its registers to enter an interrupt handler, with
@@ -643,6 +653,10 @@ would need that page remapped per namespace. The aarch64 vDSO has no time
 functions yet; glibc falls back to the syscall there. `l4h-root` passes the TSC frequency, taken from seL4 bootinfo.
 The clockevent is a per-vCPU one-shot deadline armed with
 `seL4_TCB_SetTimer(kTCB, deadline, L4H_BADGE_TIMER)`, which signals `N_v`.
+seL4 fires a timer up to its precision (1 µs on x86) early and then
+forgets it, so the guest takes the timer badge as the expiry, not only a
+`rdtsc` past the deadline: otherwise an early signal left the vCPU with no
+timer armed.
 
 *Revised (v1):* the wall clock at boot comes from `L4H_HC_GET_TIME`:
 `l4h-root` reads the CMOS RTC once at boot, and each VMM adds the TSC time
@@ -659,8 +673,14 @@ anchor or change running guests' clocks.
 **Signals.** The kernel builds the native x86 `rt_sigframe` in user memory
 through the direct map. It fetches FPU and XSAVE state with E2, then rewrites
 the uTCB's registers with `WriteRegisters`. `rt_sigreturn` reverses this.
+As on x86, the handler starts with DF, TF and RF clear and the initial FPU
+state, and a handler without `SA_RESTORER`, or a frame that cannot be
+written, gets SIGSEGV.
 
 **ptrace and coredump** use ReadRegisters/WriteRegisters and E2.
+seL4 clears TF in user flags and l4h builds it without the hardware debug
+API, so `PTRACE_SINGLESTEP` and enabling debug-register breakpoints fail
+with EIO; debuggers use software breakpoints (`int3`).
 `PTRACE_ARCH_PRCTL`, and the fs/gs base in `PEEKUSER`/`POKEUSER` and
 `GETREGS`/`SETREGS`, act on the tracee: its fs/gs base is read back from
 its TCB (user code may have changed it with `wrfsbase`), and a new value
@@ -2050,7 +2070,12 @@ memory the guest can retype.
   `smp_mm_stress` exhausted 32 MiB of objects and slowed down sevenfold.
   A chunk resets as soon as its own objects are gone; a block is free
   when all its chunks are, and then forgets them. Slot CNodes (128 KiB)
-  come straight from a block, since a chunk needs a slot. In this phase
+  come straight from a block, since a chunk needs a slot. An empty one is
+  deleted, and its block can become free, once a CNode's worth of slots is
+  free in the others. Each mapping takes a slot, so a process with many
+  mappings of the zero page costs memory without RSS: its mappings and
+  seL4 page tables count in its page-table bytes, which the OOM killer
+  ranks by. In this phase
   the object blocks are fixed at boot, 4 MiB plus RAM/32 out of the
   guest's own RAM (the old default quota, 16 MiB plus RAM/16, left a
   128 MiB guest too little RAM for ctltest's 80 MiB tmpfs); §15.3 makes
