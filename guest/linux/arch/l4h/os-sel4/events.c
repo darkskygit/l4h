@@ -73,9 +73,10 @@ int l4h_collect_events(int *timer, unsigned long *ipi, unsigned long *events)
 
 	*timer = 0;
 	dl = v->timer_deadline;
-	/* seL4 fires a timer up to its precision (1 us on x86) before the
-	 * deadline and then forgets it, so its badge counts as the expiry:
-	 * the clockevent handler copes with being early and re-arms. */
+	/* seL4 signals a timer once, when its deadline has passed on the core
+	 * holding it; a vCPU that migrated may read a TSC slightly behind
+	 * that core's.  So the badge counts as the expiry: the clockevent
+	 * handler copes with being early and re-arms. */
 	if (dl && ((word & L4H_BADGE_TIMER) || l4h_rdtsc() >= dl)) {
 		v->timer_deadline = 0;
 		*timer = 1;

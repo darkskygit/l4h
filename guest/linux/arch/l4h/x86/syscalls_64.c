@@ -24,6 +24,14 @@ long arch_prctl(struct task_struct *task, int option,
 	l4h_sync_seg(task);
 	switch (option) {
 	case ARCH_SET_FS:
+	case ARCH_SET_GS:
+		/* As on x86; seL4 would make a non-canonical base 0. */
+		if ((unsigned long) arg2 >= TASK_SIZE_MAX)
+			return -EPERM;
+		break;
+	}
+	switch (option) {
+	case ARCH_SET_FS:
 		gp[FS_BASE / sizeof(unsigned long)] = (unsigned long) arg2;
 		l4h_seg_dirty(task);
 		ret = 0;

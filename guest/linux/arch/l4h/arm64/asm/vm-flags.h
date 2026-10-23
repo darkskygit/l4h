@@ -1,2 +1,3 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#define VM_STACK_DEFAULT_FLAGS (VM_GROWSDOWN | VM_DATA_FLAGS_NON_EXEC)
+/* As on arm64 (without MTE): see x86/asm/vm-flags.h. */
+#define VM_DATA_DEFAULT_FLAGS	VM_DATA_FLAGS_TSK_EXEC

@@ -83,7 +83,8 @@ static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 
 		outstanding = 0;
 	}
 	do {
-		u32 s = ++seq, n;
+		/* 0 is "none" (outstanding, and the page's initial seq). */
+		u32 s = ++seq ?: ++seq, n;
 		long left;
 
 		if (READ_ONCE(page->state) == L4H_ATTEST_FAILED) {

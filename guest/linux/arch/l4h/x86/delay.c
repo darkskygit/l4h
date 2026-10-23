@@ -8,25 +8,19 @@
 #include <linux/kernel.h>
 #include <linux/delay.h>
 #include <asm/param.h>
+#include <l4h_sys.h>
 
+/*
+ * loops_per_jiffy is in TSC ticks (lpj_fine, kernel/time.c), so wait for
+ * the TSC to advance by `loops`, as x86's delay_tsc(): a loop of
+ * instructions runs at the core clock, which is not the TSC's.
+ */
 void __delay(unsigned long loops)
 {
-	asm volatile(
-		"test %0,%0\n"
-		"jz 3f\n"
-		"jmp 1f\n"
+	unsigned long long start = l4h_rdtsc();
 
-		".align 16\n"
-		"1: jmp 2f\n"
-
-		".align 16\n"
-		"2: dec %0\n"
-		" jnz 2b\n"
-		"3: dec %0\n"
-
-		: /* we don't need output */
-		: "a" (loops)
-	);
+	while (l4h_rdtsc() - start < loops)
+		cpu_relax();
 }
 EXPORT_SYMBOL(__delay);
 

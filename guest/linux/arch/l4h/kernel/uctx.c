@@ -236,7 +236,8 @@ void l4h_uctx_mm_gone(struct task_struct *t, struct mm_struct *mm)
 	local_irq_restore(flags);
 }
 
-static void prepare_user(struct task_struct *t)
+/* Returns false if it gave the CPU away: the caller starts again. */
+static bool prepare_user(struct task_struct *t)
 {
 	struct thread_struct *th = &t->thread;
 	struct l4h_uctx *u = &th->uctx;
@@ -263,6 +264,11 @@ static void prepare_user(struct task_struct *t)
 
 	mm_running_enter(t, mm);
 	root = l4h_mm_activate(mm, &gen);
+	if (!root) {
+		/* The vCPU may have changed: redo the above. */
+		cond_resched();
+		return false;
+	}
 	if (u->vspace != root || th->vs_gen != gen) {
 		int err;
 
@@ -281,6 +287,7 @@ static void prepare_user(struct task_struct *t)
 			panic("l4h: WriteFPU failed\n");
 		u->fp_state = L4H_FP_IN_REGS;
 	}
+	return true;
 }
 
 /* Map an seL4 user exception to the native Linux signal. */
@@ -394,7 +401,13 @@ void userspace(struct uml_pt_regs *regs)
 	while (1) {
 		current_mm_sync();
 		uctx_ensure(t);
-		prepare_user(t);
+		if (!prepare_user(t))
+			continue;
+		/* Its locks deliver events, after interrupt_end() looked. */
+		if (unlikely(read_thread_flags() & _TIF_WORK_MASK)) {
+			interrupt_end();
+			continue;
+		}
 
 		stop = l4h_user_run(u, regs->gp, 0);
 		/* The TCB now owns the FPU state again. */
@@ -419,8 +432,6 @@ void userspace(struct uml_pt_regs *regs)
 			break;
 		}
 
-		if (read_thread_flags() & _TIF_WORK_MASK)
-			l4h_sync_regs(t);
 		interrupt_end();
 
 		/* Avoid -ERESTARTSYS handling in host */

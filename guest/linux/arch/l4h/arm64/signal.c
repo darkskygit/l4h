@@ -74,9 +74,10 @@ SYSCALL_DEFINE0(rt_sigreturn)
 	if (copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)) ||
 	    copy_from_user(&sc, &frame->uc.uc_mcontext, sizeof(sc)))
 		goto bad;
-	if ((sc.user.pstate & ~0xf0000000UL) || (sc.user.pc & 3) ||
+	if ((sc.user.pstate & L4H_PSTATE_BAD) || (sc.user.pc & 3) ||
 	    sc.user.pc >= TASK_SIZE || sc.user.sp >= TASK_SIZE)
 		goto bad;
+	sc.user.pstate &= L4H_PSTATE_KEPT;
 	/* Walk the extensible records, requiring a terminator and one FPSIMD record. */
 	for (;;) {
 		void __user *record = frame->uc.uc_mcontext.__reserved + off;

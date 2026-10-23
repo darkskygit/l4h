@@ -122,6 +122,9 @@ EXPORT_SYMBOL(physmem_size);
 unsigned long task_size;
 EXPORT_SYMBOL(task_size);
 long elf_aux_hwcap;
+#ifdef CONFIG_UML_X86
+long elf_aux_hwcap2;
+#endif
 unsigned long end_iomem;
 EXPORT_SYMBOL(end_iomem);
 
@@ -226,6 +229,9 @@ static void __init l4h_cpu_features(void)
 		boot_cpu_data.x86_capability[CPUID_7_0_EBX] = b;
 		boot_cpu_data.x86_capability[CPUID_7_ECX] = c;
 		boot_cpu_data.x86_capability[CPUID_7_EDX] = d;
+		/* seL4 enables wrfsbase and friends (KernelFSGSBase=inst). */
+		if (b & BIT(0))
+			elf_aux_hwcap2 |= BIT(1);	/* HWCAP2_FSGSBASE */
 	}
 	cpuid(0x80000000, 0, &max, &b, &c, &d);
 	if (max >= 0x80000001) {

@@ -90,21 +90,28 @@ static int sync_one_pte(pte_t *pte, unsigned long addr, struct vm_ops *ops)
 	}
 }
 
-static inline int update_pte_range(pmd_t *pmd, unsigned long addr,
+/*
+ * The walk runs without mmap_lock: munmap's free_pgtables() may clear an
+ * entry meanwhile (its tables are freed only after the flush, which waits
+ * for this walk).  Each entry is read once, and the table below it found
+ * from that value: a second read could find it cleared, and the walk
+ * would go on in the kernel's memory at __va(0).
+ */
+static inline int update_pte_range(pmd_t pmdv, unsigned long addr,
 				   unsigned long end,
 				   struct vm_ops *ops)
 {
 	pte_t *pte;
 	int ret = 0;
 
-	pte = pte_offset_kernel(pmd, addr);
+	pte = (pte_t *)pmd_page_vaddr(pmdv) + pte_index(addr);
 	do {
 		ret = sync_one_pte(pte, addr, ops);
 	} while (pte++, addr += PAGE_SIZE, ((addr < end) && !ret));
 	return ret;
 }
 
-static inline int update_pmd_range(pud_t *pud, unsigned long addr,
+static inline int update_pmd_range(pud_t pudv, unsigned long addr,
 				   unsigned long end,
 				   struct vm_ops *ops)
 {
@@ -112,22 +119,24 @@ static inline int update_pmd_range(pud_t *pud, unsigned long addr,
 	unsigned long next;
 	int ret = 0;
 
-	pmd = pmd_offset(pud, addr);
+	pmd = pud_pgtable(pudv) + pmd_index(addr);
 	do {
+		pmd_t v = READ_ONCE(*pmd);
+
 		next = pmd_addr_end(addr, end);
-		if (!pmd_present(*pmd)) {
-			if (pmd_needsync(*pmd)) {
+		if (!pmd_present(v)) {
+			if (pmd_needsync(v)) {
 				ret = ops->unmap(ops->mm_idp, addr,
 						 next - addr);
 				pmd_mkuptodate(*pmd);
 			}
 		}
-		else ret = update_pte_range(pmd, addr, next, ops);
+		else ret = update_pte_range(v, addr, next, ops);
 	} while (pmd++, addr = next, ((addr < end) && !ret));
 	return ret;
 }
 
-static inline int update_pud_range(p4d_t *p4d, unsigned long addr,
+static inline int update_pud_range(p4d_t p4dv, unsigned long addr,
 				   unsigned long end,
 				   struct vm_ops *ops)
 {
@@ -135,17 +144,19 @@ static inline int update_pud_range(p4d_t *p4d, unsigned long addr,
 	unsigned long next;
 	int ret = 0;
 
-	pud = pud_offset(p4d, addr);
+	pud = p4d_pgtable(p4dv) + pud_index(addr);
 	do {
+		pud_t v = READ_ONCE(*pud);
+
 		next = pud_addr_end(addr, end);
-		if (!pud_present(*pud)) {
-			if (pud_needsync(*pud)) {
+		if (!pud_present(v)) {
+			if (pud_needsync(v)) {
 				ret = ops->unmap(ops->mm_idp, addr,
 						 next - addr);
 				pud_mkuptodate(*pud);
 			}
 		}
-		else ret = update_pmd_range(pud, addr, next, ops);
+		else ret = update_pmd_range(v, addr, next, ops);
 	} while (pud++, addr = next, ((addr < end) && !ret));
 	return ret;
 }
@@ -160,15 +171,17 @@ static inline int update_p4d_range(pgd_t *pgd, unsigned long addr,
 
 	p4d = p4d_offset(pgd, addr);
 	do {
+		p4d_t v = READ_ONCE(*p4d);
+
 		next = p4d_addr_end(addr, end);
-		if (!p4d_present(*p4d)) {
-			if (p4d_needsync(*p4d)) {
+		if (!p4d_present(v)) {
+			if (p4d_needsync(v)) {
 				ret = ops->unmap(ops->mm_idp, addr,
 						 next - addr);
 				p4d_mkuptodate(*p4d);
 			}
 		} else
-			ret = update_pud_range(p4d, addr, next, ops);
+			ret = update_pud_range(v, addr, next, ops);
 	} while (p4d++, addr = next, ((addr < end) && !ret));
 	return ret;
 }
@@ -300,10 +313,14 @@ void flush_tlb_all(void)
 
 void flush_tlb_mm(struct mm_struct *mm)
 {
-	struct vm_area_struct *vma;
-	VMA_ITERATOR(vmi, mm, 0);
-
-	for_each_vma(vmi, vma)
-		um_tlb_mark_sync(mm, vma->vm_start, vma->vm_end);
+	/*
+	 * All of user space, not the VMAs: when mmu_gathers nest (munmap
+	 * against MADV_DONTNEED), tlb_finish_mmu() ends with this full flush
+	 * after munmap took its VMAs out of the tree, and the PTEs it cleared
+	 * must still be synced before their pages are freed.  The mm may also
+	 * not be ours to walk (unmap_mapping_range() holds no mmap_lock).  The
+	 * walk skips empty upper levels.
+	 */
+	um_tlb_mark_sync(mm, 0, TASK_SIZE);
 	l4h_tlb_flush_sync(mm);
 }

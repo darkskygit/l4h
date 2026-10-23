@@ -19,6 +19,13 @@
 #define PT_FIX_EXEC_STACK(sp) \
 	do {                  \
 	} while (0)
+/*
+ * As arm64's valid_native_regs(): a user PSTATE is EL0t (M[4:0] clear)
+ * with DAIF clear.  Its other bits are dropped (L4H_PSTATE_KEPT), not
+ * refused: seL4 keeps only NZCV of a user context.
+ */
+#define L4H_PSTATE_BAD 0x3dfUL
+#define L4H_PSTATE_KEPT 0xf0000000UL
 #define profile_pc(r) PT_REGS_IP(r)
 #define user_stack_pointer(r) PT_REGS_SP(r)
 static inline long regs_return_value(struct pt_regs *r)

@@ -78,9 +78,15 @@ static u64 notrace l4h_sched_clock(void)
 
 static DEFINE_PER_CPU(struct clock_event_device, l4h_clockevent);
 
+/*
+ * Clockevent deltas are in units of 8 TSC ticks, as on x86 (TSC_DIVISOR):
+ * the clockevent frequency is a u32, and TSCs run at 4.3 GHz and more.
+ */
+#define L4H_TIMER_SHIFT 3
+
 static int l4h_timer_next(unsigned long delta, struct clock_event_device *evt)
 {
-	l4h_timer_arm(l4h_rdtsc() + delta);
+	l4h_timer_arm(l4h_rdtsc() + (delta << L4H_TIMER_SHIFT));
 	return 0;
 }
 
@@ -112,9 +118,11 @@ void l4h_timer_setup_cpu(void)
 		.irq			= TIMER_IRQ,
 		.cpumask		= cpumask_of(smp_processor_id()),
 	};
-	/* Deltas are in TSC ticks; the seL4 timer has microsecond-ish
-	 * granularity, so do not ask for less than ~2 us. */
-	clockevents_config_and_register(evt, l4h_tsc_hz, l4h_tsc_hz / 500000, ~0ul >> 1);
+	/* The seL4 timer has microsecond-ish granularity, so do not ask for
+	 * less than ~2 us. */
+	clockevents_config_and_register(evt, l4h_tsc_hz >> L4H_TIMER_SHIFT,
+					(l4h_tsc_hz / 500000) >> L4H_TIMER_SHIFT,
+					~0ul >> (1 + L4H_TIMER_SHIFT));
 }
 
 #ifdef CONFIG_PARAVIRT
@@ -129,11 +137,12 @@ void __init time_init(void)
 {
 	u64 hz = l4h_tsc_hz;
 
-	if (!hz)
+	if (hz < 1000)
 		panic("l4h: unknown TSC frequency\n");
-	clocks_calc_mult_shift(&tsc_to_ns_mult, &tsc_to_ns_shift, hz, NSEC_PER_SEC, 600);
+	/* In kHz, as on x86: rates in Hz are u32 and overflow at 4.3 GHz. */
+	clocks_calc_mult_shift(&tsc_to_ns_mult, &tsc_to_ns_shift, hz / 1000, NSEC_PER_MSEC, 600);
 	lpj_fine = hz / HZ;
-	clocksource_register_hz(&l4h_tsc_clocksource, hz);
+	clocksource_register_khz(&l4h_tsc_clocksource, hz / 1000);
 	sched_clock_register(l4h_sched_clock, 64, NSEC_PER_SEC);
 	l4h_timer_setup_cpu();
 #ifdef CONFIG_PARAVIRT

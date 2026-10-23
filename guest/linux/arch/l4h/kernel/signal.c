@@ -92,6 +92,55 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 	signal_setup_done(err, ksig, singlestep);
 }
 
+#ifdef CONFIG_UML_ARM64
+/*
+ * As arm64: a syscall's restart is prepared before get_signal(), so that
+ * a tracer at the signal stop sees the PC rewound, x0 restored and no
+ * syscall (NT_ARM_SYSTEM_CALL reads -1, and register writes leave the
+ * original x0 alone), and it is undone only if the PC is still the
+ * restart address.  One signal per call: interrupt_end() calls again.
+ */
+void do_signal(struct pt_regs *regs)
+{
+	unsigned long continue_addr = 0, restart_addr = 0;
+	bool syscall = PT_REGS_SYSCALL_NR(regs) >= 0;
+	struct ksignal ksig;
+	long retval = 0;
+
+	if (syscall) {
+		continue_addr = PT_REGS_IP(regs);
+		restart_addr = continue_addr - 4;
+		retval = PT_REGS_SYSCALL_RET(regs);
+		PT_REGS_SYSCALL_NR(regs) = -1;
+		switch (retval) {
+		case -ERESTARTNOHAND:
+		case -ERESTARTSYS:
+		case -ERESTARTNOINTR:
+		case -ERESTART_RESTARTBLOCK:
+			PT_REGS_RESTART_SYSCALL(regs);
+			break;
+		}
+	}
+
+	if (get_signal(&ksig)) {
+		if (PT_REGS_IP(regs) == restart_addr &&
+		    (retval == -ERESTARTNOHAND ||
+		     retval == -ERESTART_RESTARTBLOCK ||
+		     (retval == -ERESTARTSYS &&
+		      !(ksig.ka.sa.sa_flags & SA_RESTART)))) {
+			PT_REGS_SYSCALL_RET(regs) = -EINTR;
+			PT_REGS_IP(regs) = continue_addr;
+		}
+		handle_signal(&ksig, regs);
+		return;
+	}
+
+	if (syscall && PT_REGS_IP(regs) == restart_addr &&
+	    retval == -ERESTART_RESTARTBLOCK)
+		PT_REGS_ORIG_SYSCALL(regs) = __NR_restart_syscall;
+	restore_saved_sigmask();
+}
+#else
 void do_signal(struct pt_regs *regs)
 {
 	struct ksignal ksig;
@@ -127,3 +176,4 @@ void do_signal(struct pt_regs *regs)
 	if (!handled_sig)
 		restore_saved_sigmask();
 }
+#endif

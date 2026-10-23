@@ -160,7 +160,7 @@ void l4h_user_sync_regs(struct l4h_uctx *u, unsigned long *gp)
 /* Bind this vCPU's SC_U to u.  Switch-out releases it before migration. */
 static void bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u)
 {
-	int err;
+	int err, waited = 0;
 
 	if (v->sc_owner == u && u->sc_vcpu == v->id)
 		return;
@@ -171,11 +171,17 @@ static void bind_sc(struct l4h_vcpu *v, struct l4h_uctx *u)
 	 * seL4_Yield, which charges SC_K all of its remaining budget: under a
 	 * cap, SC_K and SC_U share the vCPU's budget. */
 	while ((err = seL4_TCB_SetSchedParams(u->tcb, v->ktcb, L4H_PRIO_USER, L4H_PRIO_USER,
-					      v->sc_u, u->fault_ep)) == seL4_IllegalOperation)
+					      v->sc_u, u->fault_ep)) == seL4_IllegalOperation) {
 		l4h_wait_briefly();
+		waited = 1;
+	}
 	l4h_BUG_ON(err);
 	u->sc_vcpu = v->id;
 	v->sc_owner = u;
+	/* The waits took their events off the notification: signal it again,
+	 * or the Recv that runs u would not return for them. */
+	if (waited && __atomic_load_n(&v->ntfn_pending, __ATOMIC_ACQUIRE))
+		seL4_Signal(L4H_CPTR(L4H_SLOT_VCPU(v->id) + L4H_VCPU_IPI));
 }
 
 void l4h_user_deschedule(struct l4h_uctx *u)

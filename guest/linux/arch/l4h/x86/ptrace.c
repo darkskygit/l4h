@@ -6,6 +6,7 @@
 #include <linux/regset.h>
 #include <asm/user32.h>
 #include <asm/sigcontext.h>
+#include <asm/fpu/api.h>
 
 #ifdef CONFIG_X86_32
 /*
@@ -222,14 +223,29 @@ static int generic_fpregs_active(struct task_struct *target, const struct user_r
 	return regset->n;
 }
 
+/* The XSAVE image: the legacy area's software bytes, then the header. */
+#define XSAVE_SW_OFFSET		464
+#define XSAVE_HDR_OFFSET	512
+
 static int generic_fpregs_get(struct task_struct *target,
 			      const struct user_regset *regset,
 			      struct membuf to)
 {
-	void *fpregs = task_pt_regs(target)->regs.fp;
+	u8 *fpregs = (u8 *)task_pt_regs(target)->regs.fp;
+	unsigned int size = regset->size * regset->n;
+	/* As x86 reports them (user_xstateregs.i387.xstate_fx_sw[]): XCR0,
+	 * then zeros.  gdb reads XCR0 there; the image holds whatever was
+	 * last written to these bytes. */
+	u64 sw[(XSAVE_HDR_OFFSET - XSAVE_SW_OFFSET) / 8] = { l4h_xfeatures };
 
 	l4h_fpu_fetch(target);
-	membuf_write(&to, fpregs, regset->size * regset->n);
+	if (regset->core_note_type != NT_X86_XSTATE || size <= XSAVE_HDR_OFFSET) {
+		membuf_write(&to, fpregs, size);
+		return 0;
+	}
+	membuf_write(&to, fpregs, XSAVE_SW_OFFSET);
+	membuf_write(&to, sw, sizeof(sw));
+	membuf_write(&to, fpregs + XSAVE_HDR_OFFSET, size - XSAVE_HDR_OFFSET);
 	return 0;
 }
 
@@ -238,12 +254,19 @@ static int generic_fpregs_set(struct task_struct *target,
 			      unsigned int pos, unsigned int count,
 			      const void *kbuf, const void __user *ubuf)
 {
-	void *fpregs = task_pt_regs(target)->regs.fp;
+	u8 *fpregs = (u8 *)task_pt_regs(target)->regs.fp;
+	int ret;
 
 	l4h_fpu_fetch(target);
 	l4h_fpu_dirty(target);
-	return user_regset_copyin(&pos, &count, &kbuf, &ubuf,
-				  fpregs, 0, regset->size * regset->n);
+	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
+				 fpregs, 0, regset->size * regset->n);
+	/* As x86 xfpregs_set(): x87 and SSE state written through the
+	 * legacy regset is not in its init state, or XRSTOR ignores it. */
+	if (!ret && regset->core_note_type != NT_X86_XSTATE &&
+	    host_fp_size > XSAVE_HDR_OFFSET)
+		*(u64 *)(fpregs + XSAVE_HDR_OFFSET) |= 3;
+	return ret;
 }
 
 static struct user_regset uml_regsets[] __ro_after_init = {
