@@ -134,6 +134,8 @@ pub struct Config {
     pub watchdog_secs: usize,
     /// Confine devices with the AMD IOMMU, if there is one (§8.5).
     pub iommu: bool,
+    /// With it, remap their interrupts too.
+    pub iommu_intremap: bool,
 }
 
 impl Config {
@@ -157,6 +159,7 @@ impl Config {
             fb_console: parse_usize(option_env!("L4H_FB_CONSOLE"), 0) != 0,
             watchdog_secs: parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0),
             iommu: parse_usize(option_env!("L4H_IOMMU"), 1) != 0,
+            iommu_intremap: parse_usize(option_env!("L4H_IOMMU_INTREMAP"), 1) != 0,
         };
         let Some(text) = text else { return c };
         let Ok(text) = core::str::from_utf8(text) else {
@@ -220,6 +223,7 @@ impl Config {
             },
             "fb_console" => flag(&mut self.fb_console),
             "iommu" => flag(&mut self.iommu),
+            "iommu_intremap" => flag(&mut self.iommu_intremap),
             "watchdog_secs" => num(&mut self.watchdog_secs),
             _ => false,
         }

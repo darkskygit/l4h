@@ -414,7 +414,17 @@ enum l4h_ctl_op {
 	 * -EINVAL for an unrepresentable date, -ENOSYS if no RTC is available,
 	 * -EIO on hardware access failure. */
 	L4H_CTL_RTC_SET = 23,
+	/* -> vals: state (L4H_IOMMU_*), interrupts remapped (0/1), IOMMUs,
+	 * devices confined, devices behind no IOMMU, events logged since
+	 * boot.  AMD IOMMUs only (DESIGN.md §8.5).  dom0 only, like every
+	 * control call. */
+	L4H_CTL_IOMMU_INFO = 24,
 };
+
+#define L4H_IOMMU_NONE          0 /* none found, or none l4h drives */
+#define L4H_IOMMU_OFF           1 /* iommu=0 */
+#define L4H_IOMMU_ON            2 /* devices confined */
+#define L4H_IOMMU_FAILED        3 /* found but unusable (see the serial log) */
 
 #define L4H_NIC_NO_MAC_LOCK     (1ull << 0) /* allow any source MAC */
 #define L4H_NIC_ISOLATED        (1ull << 1) /* no frames to or from other isolated ports */

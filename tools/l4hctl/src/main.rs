@@ -78,6 +78,8 @@ fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: O
 
 const USAGE: &str = "usage: l4hctl <command>
   info                         host resources
+  iommu                        IOMMU state: DMA and interrupts confined,
+                               devices, logged faults
   host-reboot                  reset the machine (every guest stops; sync
                                dom0's disks first)
   rtc-set [UNIX_SECONDS]       set the machine RTC in UTC (default: dom0's
@@ -169,6 +171,21 @@ fn run(args: &[String]) -> Result<i32> {
             println!("memory: {} MiB free of {} MiB", r.vals[1] >> 20, r.vals[2] >> 20);
             println!("disks:  {}", r.vals[3]);
             println!("vms:    {}", r.vals[4]);
+            // A host that predates CTL_IOMMU_INFO: no line.
+            if let Ok(i) = ctl.iommu_info() {
+                let irq = if i.state != IOMMU_ON { "" } else if i.intremap { ", interrupts remapped" } else { ", interrupts not remapped" };
+                println!("iommu:  {}{irq}", i.state_name());
+            }
+        }
+        "iommu" => {
+            let i = ctl.iommu_info()?;
+            println!("state:      {}", i.state_name());
+            if i.state == IOMMU_ON {
+                println!("iommus:     {}", i.units);
+                println!("interrupts: {}", if i.intremap { "remapped" } else { "not remapped (iommu_intremap=0)" });
+                println!("devices:    {} confined, {} behind no IOMMU", i.confined, i.unconfined);
+                println!("events:     {}", i.events);
+            }
         }
         "host-reboot" => {
             ctl.host_reboot()?;

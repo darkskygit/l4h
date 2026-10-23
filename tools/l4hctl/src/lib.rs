@@ -39,6 +39,11 @@ pub const CTL_BLK_WRITE: u32 = 20;
 pub const CTL_BLK_INFO: u32 = 21;
 pub const CTL_HOST_REBOOT: u32 = 22;
 pub const CTL_RTC_SET: u32 = 23;
+pub const CTL_IOMMU_INFO: u32 = 24;
+pub const IOMMU_NONE: u64 = 0;
+pub const IOMMU_OFF: u64 = 1;
+pub const IOMMU_ON: u64 = 2;
+pub const IOMMU_FAILED: u64 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -233,7 +238,41 @@ pub struct HostInfo {
     pub nics: u64,
 }
 
+/// The host's IOMMU, from [`Ctl::iommu_info`].
+#[derive(Clone, Copy, Debug)]
+pub struct IommuInfo {
+    /// IOMMU_NONE, IOMMU_OFF, IOMMU_ON or IOMMU_FAILED.
+    pub state: u64,
+    /// Devices can raise only their own interrupts.
+    pub intremap: bool,
+    pub units: u64,
+    /// Devices confined to the memory they were given.
+    pub confined: u64,
+    /// Devices l4h drives that no IOMMU covers.
+    pub unconfined: u64,
+    /// Faults and errors the IOMMUs logged since boot.
+    pub events: u64,
+}
+
+impl IommuInfo {
+    pub fn state_name(&self) -> &'static str {
+        match self.state {
+            IOMMU_NONE => "none",
+            IOMMU_OFF => "off (iommu=0)",
+            IOMMU_ON => "on",
+            IOMMU_FAILED => "failed (see the serial log)",
+            _ => "unknown",
+        }
+    }
+}
+
 impl Ctl {
+    /// The IOMMU's state; an error from a host that predates the call.
+    pub fn iommu_info(&self) -> Result<IommuInfo> {
+        let v = self.call(CTL_IOMMU_INFO, &[], &[], &[])?.vals;
+        Ok(IommuInfo { state: v[0], intremap: v[1] != 0, units: v[2], confined: v[3], unconfined: v[4], events: v[5] })
+    }
+
     pub fn host_info(&self) -> Result<HostInfo> {
         let r = self.call(CTL_HOST_INFO, &[], &[], &[])?;
         let v = r.vals;

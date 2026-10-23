@@ -244,6 +244,13 @@ pub const CTL_BLK_WRITE: u32 = 20;
 pub const CTL_BLK_INFO: u32 = 21;
 pub const CTL_HOST_REBOOT: u32 = 22;
 pub const CTL_RTC_SET: u32 = 23;
+pub const CTL_IOMMU_INFO: u32 = 24;
+/// CTL_IOMMU_INFO states: no IOMMU found (or none l4h drives), turned
+/// off (`iommu=0`), confining devices, found but unusable.
+pub const IOMMU_NONE: u64 = 0;
+pub const IOMMU_OFF: u64 = 1;
+pub const IOMMU_ON: u64 = 2;
+pub const IOMMU_FAILED: u64 = 3;
 pub const NIC_NO_MAC_LOCK: u64 = 1 << 0;
 pub const NIC_ISOLATED: u64 = 1 << 1;
 

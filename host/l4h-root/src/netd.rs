@@ -12,7 +12,7 @@ use crate::blkd::{VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
-use crate::iommu::Iommu;
+use crate::amdvi::AmdVi;
 use crate::mem::{Alloc, Arena, Dest, Slot, UtRegion};
 use crate::pci::{self, Pci};
 use crate::vmm;
@@ -115,7 +115,7 @@ fn used_bars(d: &pci::Device) -> u8 {
 pub fn spawn(
     nics: &[pci::Device],
     pci: &Pci,
-    iommu: &mut Iommu,
+    iommu: &mut AmdVi,
     devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
@@ -171,7 +171,7 @@ pub fn spawn(
             },
             revision: d.revision as u32,
             pci_bdf: bdf(d),
-            msi_data: pci::msi_data(NIC_MSI_BASE + n as u64),
+            msi_data: iommu.msi_data(dom, NIC_MSI_BASE + n as u64),
             msi_address: pci::msi_address(),
             common,
             notify,

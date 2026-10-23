@@ -5,12 +5,18 @@
 //! the memory it was given, at its physical address.  Drivers see no
 //! difference; a device that strays faults instead of reaching memory.
 //!
+//! Interrupts are remapped too: a device root drives has a table of the
+//! interrupts it may send, and its MSI data is an index into it; any
+//! other device's MSIs are dropped.
+//!
 //! No IOMMU (no IVRS table, an Intel host, aarch64, `iommu=0`) leaves
 //! every operation a no-op: devices then reach all memory, as before.
 
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use l4h_host::fixed::ArrayVec;
+
+use l4h_abi as abi;
 
 use crate::mem::Alloc;
 use crate::pci;
@@ -74,6 +80,7 @@ const RING_MASK: u64 = 0x7fff0;
 const CMD_COMPLETION_WAIT: u32 = 0x1 << 28;
 const CMD_INV_DEVTAB_ENTRY: u32 = 0x2 << 28;
 const CMD_INV_IOMMU_PAGES: u32 = 0x3 << 28;
+const CMD_INV_INT_TABLE: u32 = 0x5 << 28;
 const CMD_INV_IOMMU_ALL: u32 = 0x8 << 28;
 
 // Device table entries, first quadword: valid, translation valid, paging
@@ -84,6 +91,19 @@ const DTE_TV: u64 = 1 << 1;
 const DTE_IR: u64 = 1 << 61;
 const DTE_IW: u64 = 1 << 62;
 const DTE_BLOCKED: u64 = DTE_V | DTE_TV;
+// Device table entries, third quadword: the interrupt table is valid,
+// its length (log2 of the entries) in bits 4:1, its address, and fixed
+// and arbitrated interrupts remapped (IntCtl 10b; 00b: dropped).
+const DTE_IV: u64 = 1 << 0;
+const DTE_INTCTL_REMAP: u64 = 2 << 60;
+/// Interrupt table entries per device: 16 (IntTabLen 4).  Root uses
+/// one per vector it gives a device; the rest stay invalid.
+const IRT_LEN: u64 = 4;
+const IRT_ENTRIES: usize = 1 << IRT_LEN;
+// Interrupt table entries (32-bit format): remapping enabled, fixed
+// delivery (IntType 0), physical destination APIC ID in bits 15:8, the
+// vector in bits 23:16.
+const IRTE_REMAP_EN: u32 = 1 << 0;
 
 // I/O page table entries: present, next level in bits 11:9 (0: a page),
 // force coherent, read, write.
@@ -100,10 +120,14 @@ const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 pub struct Domain {
     id: u16,
     root: usize,
+    /// The interrupt table of a device root drives (else 0), and the
+    /// device IDs that use it.
+    irt: usize,
+    dev: [u16; 2],
 }
 
 impl Domain {
-    pub const NONE: Domain = Domain { id: 0, root: 0 };
+    pub const NONE: Domain = Domain { id: 0, root: 0, irt: 0, dev: [0; 2] };
 }
 
 /// A memory range the firmware needs devices first..=last to keep
@@ -149,12 +173,21 @@ struct Unit {
 struct DevInfo {
     flags: [u8; DEVICES],
     covered: [u64; DEVICES / 64],
+    /// I/O APICs and HPETs: their interrupts pass unremapped, since seL4
+    /// programs them in the compatibility format.
+    special: [u64; DEVICES / 64],
     alias: [u16; DEVICES],
     chunks: ArrayVec<(usize, usize), MAX_CHUNKS>,
 }
 
 static mut DEV_INFO: DevInfo =
-    DevInfo { flags: [0; DEVICES], covered: [0; DEVICES / 64], alias: [0; DEVICES], chunks: ArrayVec::new() };
+    DevInfo {
+    flags: [0; DEVICES],
+    covered: [0; DEVICES / 64],
+    special: [0; DEVICES / 64],
+    alias: [0; DEVICES],
+    chunks: ArrayVec::new(),
+};
 static DEV_INFO_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 impl DevInfo {
@@ -169,7 +202,7 @@ impl DevInfo {
     }
 }
 
-pub struct Iommu {
+pub struct AmdVi {
     units: ArrayVec<Unit, MAX_UNITS>,
     /// Pages of the last chunk handed out.
     used: usize,
@@ -179,9 +212,17 @@ pub struct Iommu {
     shared: Option<Domain>,
     next_domain: u16,
     ticks_per_ms: u64,
+    /// Remap interrupts (`iommu_intremap`).
+    intremap: bool,
     /// Events not printed (beyond EVENTS_PER_POLL).
     dropped: u64,
     dev: Option<&'static mut DevInfo>,
+    /// For CTL_IOMMU_INFO: abi::IOMMU_*, the devices given a domain and
+    /// those behind no IOMMU, and the events logged since boot.
+    state: u64,
+    confined: u64,
+    unconfined: u64,
+    events: u64,
 }
 
 pub fn device_id(d: &pci::Device) -> u16 {
@@ -210,10 +251,10 @@ struct Ivhd {
     base: usize,
 }
 
-impl Iommu {
+impl AmdVi {
     /// No IOMMU: every device reaches all memory.
     pub fn none() -> Self {
-        Iommu {
+        AmdVi {
             units: ArrayVec::new(),
             used: 0,
             devtab: 0,
@@ -221,9 +262,26 @@ impl Iommu {
             shared: None,
             next_domain: 1,
             ticks_per_ms: 0,
+            intremap: false,
             dropped: 0,
             dev: None,
+            state: abi::IOMMU_NONE,
+            confined: 0,
+            unconfined: 0,
+            events: 0,
         }
+    }
+
+    /// Turned off (`iommu=0`): as `none`, but reported so.
+    pub fn off() -> Self {
+        AmdVi { state: abi::IOMMU_OFF, ..AmdVi::none() }
+    }
+
+    /// CTL_IOMMU_INFO's values: state, interrupts remapped, IOMMUs,
+    /// devices confined, devices behind no IOMMU, events logged.
+    pub fn info(&self) -> [u64; 6] {
+        let remapped = self.active() && self.intremap;
+        [self.state, remapped as u64, self.units.len() as u64, self.confined, self.unconfined, self.events]
     }
 
     /// Whether devices are confined.
@@ -234,9 +292,11 @@ impl Iommu {
     /// Find the IOMMUs (IVRS), block every device and enable them.  None
     /// found, or one that cannot be used, leaves devices unconfined.
     #[cfg(target_arch = "x86_64")]
-    pub fn init(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, pci: &pci::Pci, ticks_per_ms: u64) -> Self {
-        let mut me = Iommu::none();
+    pub fn init(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys, pci: &pci::Pci, ticks_per_ms: u64,
+        intremap: bool) -> Self {
+        let mut me = AmdVi::none();
         me.ticks_per_ms = ticks_per_ms;
+        me.intremap = intremap;
         let mut buf = [0u8; 32 << 10];
         let Some(ivrs) = crate::acpi::find(bootinfo, phys, b"IVRS", &mut buf) else {
             info!("l4h-root: no AMD IOMMU (IVRS): DMA is not confined");
@@ -244,6 +304,7 @@ impl Iommu {
         };
         if ivrs.len() < 48 || (u32_at(ivrs, 4) as usize) > ivrs.len() {
             sel4::debug_println!("l4h-root: iommu: IVRS unreadable or over {} bytes: DMA is not confined", buf.len());
+            me.state = abi::IOMMU_FAILED;
             return me;
         }
         assert!(!DEV_INFO_TAKEN.swap(true, Ordering::Relaxed), "IOMMU device table info taken twice");
@@ -256,6 +317,7 @@ impl Iommu {
         let ivrs = &ivrs[..u32_at(ivrs, 4) as usize];
         let Some(units) = me.parse(ivrs, dev) else {
             sel4::debug_println!("l4h-root: iommu: IVRS malformed: DMA is not confined");
+            me.state = abi::IOMMU_FAILED;
             return me;
         };
         if units.is_empty() {
@@ -372,6 +434,9 @@ impl Iommu {
                 0x48 => {
                     let id = u16_at(ent, 5);
                     dev.set(id, flags, id);
+                    dev.special[id as usize / 64] |= 1 << (id % 64);
+                    let what = match ent[7] { 1 => "I/O APIC", 2 => "HPET", _ => "special device" };
+                    info!("l4h-root: iommu: {} {} at {:02x}:{:02x}.{}", what, ent[4], id >> 8, (id >> 3) & 0x1f, id & 7);
                 }
                 _ => {}
             }
@@ -388,6 +453,7 @@ impl Iommu {
         for (n, u) in units.iter().enumerate() {
             let Some(frames) = phys.alloc.slots.global(|s| phys.devmem.frames(s, u.base, MMIO_BYTES)) else {
                 sel4::debug_println!("l4h-root: iommu at {:#x}: registers not in device memory: DMA is not confined", u.base);
+                self.state = abi::IOMMU_FAILED;
                 return;
             };
             let va = crate::layout::IOMMU_MMIO.base + n * MMIO_BYTES;
@@ -402,7 +468,8 @@ impl Iommu {
         self.used = CHUNK_PAGES;
         self.devtab = devtab;
         for id in 0..=u16::MAX {
-            self.write_dte(id, DTE_BLOCKED, 0);
+            let irq = self.irq_dte(id, Domain::NONE);
+            self.write_dte(id, DTE_BLOCKED, 0, irq);
         }
         let (sems, sems_pa) = self.page(phys.alloc);
         for (n, u) in units.iter().enumerate() {
@@ -438,6 +505,7 @@ impl Iommu {
             info!("l4h-root: iommu {:02x}:{:02x}.{} at {:#x}: enabled", u.id >> 8, (u.id >> 3) & 0x1f, u.id & 7, u.base);
             let _ = self.units.push(unit);
         }
+        self.state = abi::IOMMU_ON;
         // Whatever the firmware left cached.
         if self.units.iter().all(|u| u.inv_all) {
             self.command([0, CMD_INV_IOMMU_ALL, 0, 0]);
@@ -558,12 +626,12 @@ impl Iommu {
 
     /// Write device ID `id`'s entry: `q0`, and `domain` with the IVHD's
     /// settings.  The first quadword, which enables translation, last.
-    fn write_dte(&mut self, id: u16, q0: u64, domain: u16) {
+    fn write_dte(&mut self, id: u16, q0: u64, domain: u16, irq: u64) {
         let flags = self.dev.as_ref().map_or(0, |d| d.flags[id as usize]) as u64;
         // SysMgt (bits 5:4) to bits 41:40; INITPass, EIntPass, NMIPass
         // (bits 2:0) to 58:56; Lint0Pass, Lint1Pass (7:6) to 63:62.
         let q1 = domain as u64 | (flags >> 4 & 3) << 40;
-        let q2 = (flags & 7) << 56 | (flags >> 6 & 3) << 62;
+        let q2 = irq | (flags & 7) << 56 | (flags >> 6 & 3) << 62;
         let e = self.dte(id);
         unsafe {
             e.add(3).write_volatile(0);
@@ -576,21 +644,62 @@ impl Iommu {
 
     /// Point device ID `id` at domain `d`; takes effect at the next sync.
     fn set_dte(&mut self, id: u16, d: Domain) {
-        self.write_dte(id, DTE_V | DTE_TV | LEVELS << 9 | d.root as u64 | DTE_IR | DTE_IW, d.id);
+        let irq = self.irq_dte(id, d);
+        self.write_dte(id, DTE_V | DTE_TV | LEVELS << 9 | d.root as u64 | DTE_IR | DTE_IW, d.id, irq);
         self.command([id as u32, CMD_INV_DEVTAB_ENTRY, 0, 0]);
+        self.command([id as u32, CMD_INV_INT_TABLE, 0, 0]);
+    }
+
+    /// Device ID `id`'s interrupt settings in domain `d`: its table if
+    /// root drives it, else none, so that its MSIs are dropped.  I/O
+    /// APICs and HPETs, and every device without `intremap`, pass theirs
+    /// unremapped (IV 0).
+    fn irq_dte(&self, id: u16, d: Domain) -> u64 {
+        let special = self.dev.as_ref().is_some_and(|dev| dev.special[id as usize / 64] & 1 << (id % 64) != 0);
+        if !self.intremap || special {
+            0
+        } else if d.irt != 0 {
+            d.irt as u64 | IRT_LEN << 1 | DTE_IV | DTE_INTCTL_REMAP
+        } else {
+            DTE_IV
+        }
+    }
+
+    /// The MSI data that makes device `d` raise CPU vector `vector` (as
+    /// `pci::msi_data` numbers them), at the address `pci::msi_address`
+    /// (APIC ID 0).  Remapped: the index of an entry of the device's
+    /// interrupt table; else the vector itself.
+    pub fn msi_data(&mut self, d: Domain, vector: u64) -> u32 {
+        let data = pci::msi_data(vector);
+        if d.irt == 0 {
+            return data;
+        }
+        let table = self.table(d.irt as u64) as *mut u32;
+        let entry = (data & 0xff) << 16 | IRTE_REMAP_EN;
+        let free = (0..IRT_ENTRIES).find(|&i| {
+            let e = unsafe { table.add(i).read_volatile() };
+            e == entry || e & IRTE_REMAP_EN == 0
+        });
+        let i = free.expect("l4h-root: iommu: device interrupt table full");
+        unsafe { table.add(i).write_volatile(entry) };
+        for id in d.dev {
+            self.command([id as u32, CMD_INV_INT_TABLE, 0, 0]);
+        }
+        self.sync();
+        i as u32
     }
 
     /// The domain device ID `id` is in, if any.
     fn domain_of(&self, id: u16) -> Option<Domain> {
         let e = self.dte(id);
         let (q0, q1) = unsafe { (e.read_volatile(), e.add(1).read_volatile()) };
-        (q0 & DTE_TV != 0 && q0 >> 9 & 7 != 0).then(|| Domain { id: q1 as u16, root: (q0 & PTE_ADDR) as usize })
+        (q0 & DTE_TV != 0 && q0 >> 9 & 7 != 0).then(|| Domain { id: q1 as u16, root: (q0 & PTE_ADDR) as usize, ..Domain::NONE })
     }
 
     /// A new, empty domain, for device ID `id` (named if one runs out).
     fn new_domain(&mut self, alloc: &mut Alloc, id: u16) -> Domain {
         assert!(self.next_domain != 0, "l4h-root: iommu: out of domain IDs at device {:#06x}", id);
-        let d = Domain { id: self.next_domain, root: self.page(alloc).1 };
+        let d = Domain { id: self.next_domain, root: self.page(alloc).1, ..Domain::NONE };
         self.next_domain = self.next_domain.wrapping_add(1);
         // Translations the firmware may have cached under this ID.
         self.flush(d);
@@ -610,15 +719,21 @@ impl Iommu {
                 "l4h-root: iommu: {:02x}:{:02x}.{} is behind no IOMMU: its DMA is not confined",
                 d.bus, d.dev, d.func
             );
+            self.unconfined += 1;
             return Domain::NONE;
         }
         let alias = self.dev.as_ref().unwrap().alias[id as usize];
-        let dom = self.unity_domain(alloc, id, |u| u.covers(id) || u.covers(alias));
+        let mut dom = self.unity_domain(alloc, id, |u| u.covers(id) || u.covers(alias));
+        if self.intremap {
+            dom.irt = self.page(alloc).1;
+            dom.dev = [id, alias];
+        }
         self.set_dte(id, dom);
         if alias != id {
             self.set_dte(alias, dom);
         }
         self.sync();
+        self.confined += 1;
         dom
     }
 
@@ -744,6 +859,7 @@ impl Iommu {
             while self.units[u].head != tail {
                 let at = (self.units[u].evt + self.units[u].head) as *const u32;
                 let e: [u32; 4] = core::array::from_fn(|i| unsafe { at.add(i).read_volatile() });
+                self.events += 1;
                 if printed < EVENTS_PER_POLL {
                     printed += 1;
                     let id = e[0] & 0xffff;

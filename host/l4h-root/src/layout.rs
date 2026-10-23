@@ -97,10 +97,10 @@ regions! {
     KMOD_IMAGE = 0x7600_0000_0000, l4h_abi::KMOD_MAX as usize;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
-    /// The registers of each AMD IOMMU, 16 KiB apart (iommu.rs).
+    /// The registers of each AMD IOMMU, 16 KiB apart (amdvi.rs).
     IOMMU_MMIO = 0x7800_0000_0000, MIB;
     /// The IOMMUs' device table, I/O page tables, command buffers and
-    /// event logs, in 2 MiB chunks (iommu.rs): page tables for 4 TiB.
+    /// event logs, in 2 MiB chunks (amdvi.rs): page tables for 4 TiB.
     IOMMU_TABLES = 0x7900_0000_0000, 8 * GIB;
 }
 

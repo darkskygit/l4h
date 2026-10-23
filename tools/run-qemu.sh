@@ -16,9 +16,11 @@ balloon=()
 # L4H_QEMU_IOMMU=amd adds an AMD IOMMU, which needs the q35 machine and
 # must come before the devices it translates.  NVMe always goes through
 # it; virtio disks and NICs are made to (iommu_platform), not the
-# balloon, whose free page reports name memory it is not given.
+# balloon, whose free page reports name memory it is not given.  Root
+# remaps interrupts, which QEMU does only with the I/O APIC in QEMU
+# (kernel-irqchip=split).
 iommu=()
-[ "${L4H_QEMU_IOMMU:-}" = amd ] && iommu=(-machine q35 -device amd-iommu,intremap=off
+[ "${L4H_QEMU_IOMMU:-}" = amd ] && iommu=(-machine q35,kernel-irqchip=split -device amd-iommu,intremap=on
     -global virtio-blk-pci.iommu_platform=on -global virtio-scsi-pci.iommu_platform=on
     -global virtio-net-pci.iommu_platform=on)
 exec qemu-system-x86_64 \

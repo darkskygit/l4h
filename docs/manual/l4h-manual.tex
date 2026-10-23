@@ -449,6 +449,8 @@ Variable & Meaning & Default \\
 \texttt{iommu} & 1: confine devices with the AMD IOMMU, if the host has
   one; 0: do not, e.g.\ for an integrated GPU that shows the framebuffer
   console & 1 \\
+\texttt{iommu\_intremap} & 1: with \texttt{iommu}, also let each device raise
+  only its own interrupts; 0: pass interrupts unremapped & 1 \\
 \bottomrule
 \end{tabularx}
 \caption{Host settings. Each defaults to its \texttt{L4H\_}-prefixed,
@@ -714,12 +716,29 @@ cores:  4
 memory: 2950 MiB free of 3968 MiB
 disks:  2
 vms:    1
+iommu:  on, interrupts remapped
+# l4hctl iommu
+state:      on
+iommus:     1
+interrupts: remapped
+devices:    3 confined, 0 behind no IOMMU
+events:     0
 # l4hctl disks
 disk 0: pci 00:03.0 virtio-blk, owner vm 0
 disk 1: pci 00:04.0 nvme, owner -
 # l4hctl nics
 nic 0: pci 00:05.0 virtio-net, uplink of switch 0
 \end{lstlisting}
+
+\cmd{iommu} shows whether devices are confined. The state is \texttt{on}
+on an AMD host whose IOMMU l4h drives, \texttt{off} with \texttt{iommu=0},
+\texttt{none} without one (Intel hosts, cloud VMs, aarch64), and
+\texttt{failed} if the firmware's description of it cannot be used (the
+serial log says why). With it on, \texttt{interrupts} says whether each
+device can raise only its own interrupts (\texttt{iommu\_intremap}), a
+device \texttt{behind no IOMMU} reaches all memory, and \texttt{events}
+counts the faults and errors the IOMMU logged since boot, which the serial
+log shows.
 
 \section{Creating a VM}
 
@@ -1315,7 +1334,7 @@ path; PCRs~8 and~9 change with dom0's files and \file{l4h.conf}.
 \begin{caveat}
 A report is only as trustworthy as the host: seL4, the host components and
 the hardware. Without an AMD IOMMU a malicious device could change any
-memory; with one, it can still send any interrupt. On a cloud VM, the provider's hypervisor and virtual TPM are
+memory; with one, it is confined to its own memory and interrupts. On a cloud VM, the provider's hypervisor and virtual TPM are
 trusted as well. Disks and networks are dom0's choice and are not measured.
 Hosts without a TPM, and aarch64 hosts, offer no attestation.
 \end{caveat}

@@ -15,7 +15,7 @@ use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
-use crate::iommu::Iommu;
+use crate::amdvi::AmdVi;
 use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
 use crate::pci::{self, Pci};
 use crate::vspace::{FRAME_BP, map_frame};
@@ -166,7 +166,7 @@ impl Memd {
     /// Free page reports name memory the balloon never reads, so it is
     /// given its DMA pages only: one that translates them through the
     /// IOMMU (QEMU's `iommu_platform=on`) cannot report.
-    pub fn attach_balloon(&mut self, d: &pci::Device, pci: &Pci, iommu: &mut Iommu, alloc: &mut Alloc, devmem: &mut DevMem) {
+    pub fn attach_balloon(&mut self, d: &pci::Device, pci: &Pci, iommu: &mut AmdVi, alloc: &mut Alloc, devmem: &mut DevMem) {
         let cap = |t: u8| d.virtio_caps.iter().find(|c| c.cfg_type == t).copied();
         let (Some(common), Some(notify), Some(device)) =
             (cap(VIRTIO_PCI_CAP_COMMON_CFG), cap(VIRTIO_PCI_CAP_NOTIFY_CFG), cap(VIRTIO_PCI_CAP_DEVICE_CFG))

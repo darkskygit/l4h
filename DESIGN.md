@@ -1148,7 +1148,7 @@ NAT, DHCP and firewalling belong in a VM.
 ### 8.5 IOMMU (AMD-Vi)
 
 On an AMD host, `l4h-root` confines every device with the IOMMU, which it
-drives itself (`l4h-root/src/iommu.rs`, about 770 lines). seL4 keeps
+drives itself (`l4h-root/src/amdvi.rs`, about 890 lines). seL4 keeps
 `KernelIOMMU` off. seL4's VT-d code was tested on two chipsets, has no
 AMD support, and would only let root delegate I/O mappings, which nothing
 in l4h needs: root alone gives devices memory.
@@ -1160,8 +1160,7 @@ in l4h needs: root alone gives devices memory.
   command buffer and an event log per IOMMU, enables them, and
   invalidates whatever the firmware left cached. The IVHDs give each
   device ID's interrupt pass-through and SysMgt bits, and its alias
-  behind a PCI bridge. Interrupts are not remapped (DTE.IV is 0), so MSIs
-  pass as before.
+  behind a PCI bridge.
 - **Domains.** Each device root enables gets a domain of its own: a domain
   ID and a 4-level I/O page table, set in the device's entry and its
   alias's. The table maps exactly the memory the device was given, at its
@@ -1176,6 +1175,21 @@ in l4h needs: root alone gives devices memory.
   - The balloon (memd) gets its DMA pages. Free page reports name memory
     the device is never given. A balloon that translates them (QEMU's
     `iommu_platform=on`) cannot report.
+- **Interrupts.** Root remaps them too (`iommu_intremap`, on by default).
+  A device root enables gets a table of 16 interrupt entries (32-bit
+  format), named in its device table entry with IntCtl "remapped".
+  `AmdVi::msi_data` fills one entry per vector (fixed delivery to APIC ID
+  0, the vector `pci::msi_data` gives) and returns its index. Root puts
+  the index in blkd's and netd's MSI data in place of the vector, so the
+  drivers write the MSI-X table unchanged. The device can then raise only
+  its own vectors: any other MSI data selects an invalid entry, and the
+  IOMMU drops the interrupt. Devices root does not drive get IV set and
+  no table, so their MSIs are dropped. The I/O APICs and HPETs (IVHD
+  special devices) keep IV 0: seL4 programs them in the compatibility
+  format, so their interrupts pass unremapped. A device that spoofs their
+  requester ID can still inject any vector; root does not turn on ACS
+  source validation. The entries use the 32-bit format, so destinations
+  are APIC IDs below 256 (no x2APIC XTEn or GA mode).
 - **Unity ranges.** IVMD ranges stay mapped for the devices they name:
   ranges for all devices in one shared domain, others in a domain per
   range. A device root enables also gets the ranges that name it.
@@ -1191,19 +1205,31 @@ in l4h needs: root alone gives devices memory.
 - **Faults.** Root reads the event logs every 100 ms (its balance tick)
   and prints up to 8 events per tick: page faults, with the device, the
   address and the domain, and errors.
+- **Status.** `l4hctl iommu` (`CTL_IOMMU_INFO`, dom0 only like every
+  control call) shows whether the IOMMU is on, off (`iommu=0`), absent
+  or unusable; whether interrupts are remapped; the devices confined and
+  those behind no IOMMU; and the events logged since boot. `l4hctl info`
+  shows the first two in one line.
 - **Off.** With no IVRS, or `iommu=0` in `l4h.conf`, every operation is a
-  no-op and devices reach all memory, as before. This includes Intel
+  no-op and devices reach all memory, as before. `iommu_intremap=0` keeps
+  DMA confined but passes every interrupt unremapped. This includes Intel
   hosts (VT-d is not driven), cloud VMs without a vIOMMU, and aarch64. A
   device that no IVHD covers is reported at enable and left untranslated.
   Root blocks devices it does not drive. An integrated GPU that scans out
   of system RAM therefore loses its picture: use `iommu=0` there.
 
-`L4H_QEMU_IOMMU=amd` (`tools/run-qemu.sh`) adds QEMU's `amd-iommu` on a
-q35 machine and sets `iommu_platform=on` for virtio disks and NICs (NVMe
-always translates). `run-blktest.sh` passes with it on NVMe and
+`L4H_QEMU_IOMMU=amd` (`tools/run-qemu.sh`) adds QEMU's `amd-iommu`
+(`intremap=on`, which needs `kernel-irqchip=split`) on a q35 machine,
+and sets `iommu_platform=on` for virtio disks and NICs (NVMe always
+translates). `run-blktest.sh` passes with it on NVMe and
 virtio-blk. With the pool left unmapped, the controller's DMA to it fails
 and the guest's mount fails. QEMU's emulation returns no translation but
 logs no page fault event, so the event log reader is untested there.
+`run-nettest.sh` and `run-ctltest.sh` pass with it too. QEMU's
+`amdvi_ir_*` traces show the controller's MSI data 0 remapped to its
+vector. Given an index whose entry is invalid, the controller's
+interrupts are aborted (`RemapEn is disabled`) and its I/O stalls, while
+the I/O APIC's pass unremapped.
 
 ---
 
@@ -1339,7 +1365,7 @@ little-endian structs defined in `include/l4h/abi.h` and mirrored in
 
 | Area | Implemented operations |
 |------|------------------------|
-| Host | `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `rtc_set`: machine RTC in UTC epoch seconds |
+| Host | `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `rtc_set`: machine RTC in UTC epoch seconds; `iommu_info`: IOMMU state, interrupt remapping, confined and unconfined devices, events logged (§8.5) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores for the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched` |
 | Block | `blk_attach`: disk, read-only flag and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports and counters), `nic_info` (PCI address, switch, MAC) |
@@ -1590,8 +1616,9 @@ this does not cover:
   dom0's files and settings (PCRs 8–9). A small EFI shim in front of GRUB
   could save the log.
 - **DMA.** Without an AMD IOMMU (§8.5), a malicious device can DMA
-  anywhere. With one, it can reach only memory it was given. It can still
-  send any MSI, since interrupts are not remapped.
+  anywhere. With one, it can reach only memory it was given, and raise
+  only its own interrupts. A device that spoofs an I/O APIC's requester
+  ID can still inject any vector.
 - **The cloud provider.** On a cloud VM, the provider's hypervisor and
   vTPM are trusted too, and nothing is encrypted.
 - **Disks and networks.** They are dom0's choice and not measured, as for

@@ -17,6 +17,7 @@ macro_rules! info {
 
 #[cfg(target_arch = "x86_64")]
 mod acpi;
+mod amdvi;
 mod blkd;
 mod bootmod;
 mod component;
@@ -27,7 +28,6 @@ mod devmem;
 mod elf;
 mod font;
 mod guest;
-mod iommu;
 mod kimage;
 mod layout;
 mod mem;
@@ -201,7 +201,7 @@ pub struct Host {
     pub wins: Windows,
     pub asids: AsidPools,
     pub pci: pci::Pci,
-    pub iommu: iommu::Iommu,
+    pub iommu: amdvi::AmdVi,
     pub devmem: devmem::DevMem,
     /// Disk controllers, and their units as host disks.
     pub ctrls: &'static mut ArrayVec<Controller, { pci::MAX_DISK_CTRLS }>,
@@ -495,17 +495,17 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // PCI devices: disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
     // The IOMMU before any device is enabled: from here on, a device
-    // reaches only memory root gives it (iommu.rs).
+    // reaches only memory root gives it (amdvi.rs).
     #[cfg(target_arch = "x86_64")]
     let mut iommu = if cfg.iommu {
         let mut phys = acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames);
-        iommu::Iommu::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000)
+        amdvi::AmdVi::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000, cfg.iommu_intremap)
     } else {
         sel4::debug_println!("l4h-root: iommu=0: DMA is not confined");
-        iommu::Iommu::none()
+        amdvi::AmdVi::off()
     };
     #[cfg(not(target_arch = "x86_64"))]
-    let mut iommu = iommu::Iommu::none();
+    let mut iommu = if cfg.iommu { amdvi::AmdVi::none() } else { amdvi::AmdVi::off() };
     // The statics' only references, taken once here; the root task is
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };

@@ -59,6 +59,10 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             ];
             Ok(())
         }
+        abi::CTL_IOMMU_INFO => {
+            resp.vals = h.iommu.info();
+            Ok(())
+        }
         abi::CTL_DISK_INFO => {
             let i = a[0] as usize;
             if !h.ctrls[h.disks.get(i).ok_or(ENOENT)?.ctrl].failed { h.ensure_disk(i)?; }
