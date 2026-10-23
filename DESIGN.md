@@ -356,6 +356,19 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   unbacked memory maps the host's zero page. A reset's duration therefore
   shows roughly how much of the memory was non-zero, not what it held:
   a guest that resets a block another guest used learns only that.
+  On Arm each page is first cleaned and invalidated to the point of
+  coherency. The reads go through the kernel window, which is cacheable,
+  and a guest can write its frame through a non-cacheable (Device)
+  mapping, which leaves clean cached copies alone. Those copies read as
+  zero over non-zero memory, the clear was skipped, and whatever was made
+  from the memory next (a CNode, a page table, another guest's frame) saw
+  the guest's data once the lines were evicted. Clearing unconditionally
+  never had this problem: its dirty zeros are the last write. x86 reads
+  without a flush. Write-combining and uncached user mappings alias the
+  write-back kernel window too, which the architecture does not support,
+  but x86 CPUs snoop their caches on such accesses in practice. Flushing
+  every line on every reset would cost about as much as the clear it
+  saves.
 - **0020, framebuffer console (x86).** With the command-line option
   `fb_console`, everything the kernel prints (its own messages and host
   components' debug output) is also drawn on the lower half of the
