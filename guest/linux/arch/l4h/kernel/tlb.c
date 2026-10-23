@@ -59,18 +59,19 @@ static int sync_one_pte(pte_t *pte, unsigned long addr, struct vm_ops *ops)
 			r = pte_read(v);
 			w = pte_write(v);
 			x = pte_exec(v);
-			/*
-			 * Old pages stay mapped readable (seL4 has no accessed
-			 * bit to emulate; unmapping them only costs faults), and
-			 * clean ones read-only so that the first write marks
-			 * them dirty.
-			 */
-			if (!pte_young(v) || !pte_dirty(v))
+			/* Clean pages are read-only, so that the first write
+			 * marks them dirty. */
+			if (!pte_dirty(v))
 				w = 0;
 
 			prot = (r ? UM_PROT_READ : 0) |
 			       (w ? UM_PROT_WRITE : 0) |
 			       (x ? UM_PROT_EXEC : 0);
+			/* Old user pages lose user access, so that the next
+			 * access makes them young: reclaim sees which pages
+			 * are used.  Kernel pages are always young. */
+			if (prot && !pte_young(v) && ops->mmap != kern_map)
+				prot = L4H_PROT_AGED;
 
 			ret = ops->mmap(ops->mm_idp, addr, PAGE_SIZE, prot, phys);
 			if (ret == -ENOMEM && ops->mmap == kern_map) {
@@ -207,7 +208,7 @@ static inline int update_p4d_range(pgd_t *pgd, unsigned long addr,
  * the guest.  Their PTEs stay unsynced, the range is marked again, and the
  * sync returns -ENOMEM for l4h_kernel_map_sync() to retry.
  */
-int um_tlb_sync(struct mm_struct *mm)
+static int __um_tlb_sync(struct mm_struct *mm, bool aging)
 {
 	pgd_t *pgd;
 	struct vm_ops ops = {};
@@ -227,7 +228,7 @@ int um_tlb_sync(struct mm_struct *mm)
 	mm->context.sync_tlb_range_to = 0;
 	raw_spin_unlock_irqrestore(&mm->context.sync_lock, flags);
 	if (end == 0)
-		goto out;
+		goto flush;
 	start = addr;
 
 	ops.mm_idp = &mm->context.id;
@@ -251,21 +252,48 @@ int um_tlb_sync(struct mm_struct *mm)
 		} else
 			ret = update_p4d_range(pgd, addr, next, &ops);
 	} while (pgd++, addr = next, ((addr < end) && !ret));
-	if (mm != &init_mm)
-		l4h_mm_flush_deferred(mm);
 	if (ops.enomem) {
 		um_tlb_mark_sync(mm, start, end);
 		if (!ret)
 			ret = -ENOMEM;
 	}
 
-out:
+flush:
+	/* Even with nothing to sync: another sync may have taken this
+	 * flush's range, and left the flushes of aging to a later one. */
+	if (mm != &init_mm)
+		l4h_mm_flush_deferred(mm, aging);
 	if (mm == &init_mm)
 		raw_spin_unlock_irqrestore(&mm->context.sync_walk_lock, wflags);
 	else
 		raw_spin_unlock(&mm->context.sync_walk_lock);
 
 	return ret;
+}
+
+int um_tlb_sync(struct mm_struct *mm)
+{
+	return __um_tlb_sync(mm, false);
+}
+
+/*
+ * Clearing the accessed bit, as x86 does, does not wait for the TLBs: a
+ * page that stays reachable meanwhile only looks unused for a little
+ * longer.  Its PTE is synced at once (on SMP, as for any flush), which
+ * remaps it kernel-only without a flush (seL4 patch 0017).  The flush is
+ * left to the next sync that is not aging, which a flush always is, or to
+ * the aging sync that completes a batch (L4H_AGED_BATCH, kernel/vspace.c).
+ * Stale entries meanwhile grant only the rights the page had, and an
+ * unmap still invalidates its page at once.
+ */
+int ptep_clear_flush_young(struct vm_area_struct *vma, unsigned long address,
+			   pte_t *ptep)
+{
+	int young = ptep_test_and_clear_young(vma, address, ptep);
+
+	if (young && IS_ENABLED(CONFIG_SMP))
+		__um_tlb_sync(vma->vm_mm, true);
+	return young;
 }
 
 /*

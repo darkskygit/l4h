@@ -81,7 +81,11 @@ struct l4h_as {
 	unsigned long nr_pages, nr_tables;
 	long charged;		/* as_cost() last added to the owner mm */
 	bool flush_pending;	/* rights lowered with L4H_PROT_DEFER_FLUSH */
+	unsigned int aged;	/* pages aged since the last flush (as_age_page()) */
 };
+
+/* Aged pages whose TLB flush one aging sync may leave to a later one. */
+#define L4H_AGED_BATCH	64
 
 static void as_init(struct l4h_as *as, unsigned long root)
 {
@@ -91,6 +95,7 @@ static void as_init(struct l4h_as *as, unsigned long root)
 	as->nr_pages = as->nr_tables = 0;
 	as->charged = 0;
 	as->flush_pending = false;
+	as->aged = 0;
 }
 
 /*
@@ -224,6 +229,34 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 }
 
 /*
+ * Age the page at `va`, which maps `phys` (an old PTE): a mapping of that
+ * frame stays, for the guest kernel only, so that the next user access
+ * faults and the fault makes the PTE young again.  Its TLB flush is left to
+ * l4h_mm_flush_deferred(): it only lowers rights, and is not needed before
+ * the page is reused, as unmapping invalidates at once.  Nothing is mapped
+ * where nothing was: that access faults anyway.
+ */
+static int as_age_page(struct l4h_as *as, unsigned long va, unsigned long phys)
+{
+	unsigned long vpn = va >> PAGE_SHIFT;
+	void *e = xa_load(&as->pages, vpn);
+
+	if (!e)
+		return 0;
+	if (entry_pfn(e) != phys >> PAGE_SHIFT) {
+		as_unmap_range(as, va, va + PAGE_SIZE);
+		return 0;
+	}
+	if (!entry_prot(e))
+		return 0;
+	if (l4h_page_map(entry_slot(e), as->root, va, L4H_PROT_DEFER_FLUSH))
+		return -EFAULT;
+	xa_store(&as->pages, vpn, mk_entry(entry_slot(e), entry_pfn(e), 0), GFP_ATOMIC);
+	as->aged++;
+	return 0;
+}
+
+/*
  * Remove every mapping and page table, leaving an empty VSpace root.
  *
  * The tables go first, the highest level first: oldest first, as a table is
@@ -253,6 +286,7 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 	as->nr_tables = 0;
 	/* Covered by those invalidations too. */
 	as->flush_pending = false;
+	as->aged = 0;
 	xa_for_each(&as->pages, vpn, e) {
 		xa_erase(&as->pages, vpn);
 		l4h_slot_delete(entry_slot(e));
@@ -598,6 +632,9 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 
 		if (!prot) {
 			as_unmap_range(as, virt, virt + len);
+		} else if (prot & L4H_PROT_AGED) {
+			for (off = 0; off < len && !err; off += PAGE_SIZE)
+				err = as_age_page(as, virt + off, phys + off);
 		} else {
 			for (off = 0; off < len && !err; off += PAGE_SIZE) {
 				err = as_map_page(as, virt + off, phys + off, prot, from_sync);
@@ -618,18 +655,28 @@ int map(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot, u
 	return map_pages(mm_idp, virt, len, prot, phys, true);
 }
 
-/* tlb.c: at the end of a sync of `mm`, before anyone relies on it. */
-void l4h_mm_flush_deferred(struct mm_struct *mm)
+/*
+ * tlb.c: at the end of a sync of `mm`, before anyone relies on it.  The
+ * sync of clearing an accessed bit (`aging`) leaves the flush of aged pages
+ * to a later sync, until there is a batch of them; any other sync completes
+ * it: its caller may rely on rights lowered (write-protected, cleaned)
+ * while a stale entry from before the page was aged still grants them.
+ */
+void l4h_mm_flush_deferred(struct mm_struct *mm, bool aging)
 {
 	struct l4h_mm *m = mm_l4h(mm);
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&m->lock, flags);
-	if (m->vs >= 0 && vs_pool[m->vs].as.flush_pending) {
+	if (m->vs >= 0) {
 		struct l4h_as *as = &vs_pool[m->vs].as;
 
-		WARN_ON(l4h_vspace_flush(as->root));
-		as->flush_pending = false;
+		if (as->flush_pending ||
+		    (as->aged && (!aging || as->aged >= L4H_AGED_BATCH))) {
+			WARN_ON(l4h_vspace_flush(as->root));
+			as->flush_pending = false;
+			as->aged = 0;
+		}
 	}
 	raw_spin_unlock_irqrestore(&m->lock, flags);
 }
