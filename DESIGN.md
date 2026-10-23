@@ -433,7 +433,9 @@ boot CPU's ID_AA64ISAR0/1/2 and PFR0/1 to root as a bootinfo chunk, root
 copies them into each guest's `l4h_bootinfo.cpu_id`, and the guest derives
 AT_HWCAP from them; the AES drivers bind through
 `module_cpu_feature_match()` on those HWCAPs. Patches outside `arch/l4h` handle kbuild's UML-style UAPI
-headers and restricted DMA pools without a device tree (§15.1).
+headers, restricted DMA pools without a device tree (§15.1), the HRTICK
+default, the x86 SIMD crypto menu and event polling in `cond_resched`
+(§5.4).
 
 ### 5.1 Layout in the Linux tree
 
@@ -624,7 +626,8 @@ attaches that object to the faulting task, and refills the pool.
   `CONFIG_PREEMPT_VOLUNTARY`), and before blocking. The E3 timer only
   signals `N_v`, so the same check also compares `rdtsc` against the
   vCPU's armed deadline. The default guest configuration uses
-  `CONFIG_PREEMPT_VOLUNTARY`.
+  `CONFIG_PREEMPT_VOLUNTARY`. `CONFIG_PREEMPT` compiles `cond_resched`
+  out, so `arch/l4h` refuses to build with it.
 
   *Revised:* `cond_resched` did not poll at first. A loop that waits for
   another task with `cond_resched` and plain spinlocks then never sees
@@ -2042,7 +2045,9 @@ memory the guest can retype.
   has struct pages but never enters the page allocator.
   `guest/linux/patches/0002` adds `swiotlb_dev_init_pool(dev, base, size)`
   and lets `DMA_RESTRICTED_POOL` be built without OF. The pool gets one
-  swiotlb area per possible CPU (as far as 128-slot segments allow), and a
+  swiotlb area per possible CPU, as far as areas of whole 128-slot
+  segments allow (a free run never crosses a segment, so no allocation
+  reaches into an area whose lock it does not hold), and a
   full pool does not warn: it is normal back-pressure.
   - The transport registers one platform device, `virtio-l4h`, binds it to
     the pool and makes it the parent (DMA device) of every virtio device.

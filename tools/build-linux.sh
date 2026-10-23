@@ -15,13 +15,38 @@ if [ ! -d "$src" ]; then
     exit 1
 fi
 ln -sfn "$root/guest/linux/arch/l4h" "$src/arch/l4h"
-# Out-of-tree patches outside arch/l4h, applied once.
-for p in "$root"/guest/linux/patches/*.patch; do
-    [ -e "$p" ] || continue
-    stamp=$src/.l4h-applied-$(basename "$p")
-    [ -e "$stamp" ] && continue
+# Out-of-tree patches outside arch/l4h.  $src/.l4h-patches keeps a copy of
+# each patch applied: from the first one that changed or went away, the
+# applied patches are reverted (last first) and the current ones applied.
+shopt -s nullglob
+applied=$src/.l4h-patches
+mkdir -p "$applied"
+# Trees patched before the copies were kept have only stamps.
+for s in "$src"/.l4h-applied-*.patch; do
+    n=${s##*/.l4h-applied-}
+    p=$root/guest/linux/patches/$n
+    if [ ! -e "$p" ] || ! patch -d "$src" -p1 -R --dry-run -s -f < "$p" >/dev/null; then
+        echo "$src: $n changed since it was applied: extract linux-6.18.y there again" >&2
+        exit 1
+    fi
+    cp "$p" "$applied/$n"
+    rm "$s"
+done
+have=("$applied"/*.patch)
+want=("$root"/guest/linux/patches/*.patch)
+keep=0
+while [ $keep -lt ${#have[@]} ] && [ $keep -lt ${#want[@]} ] &&
+      cmp -s "${have[$keep]}" "${want[$keep]}" &&
+      [ "$(basename "${have[$keep]}")" = "$(basename "${want[$keep]}")" ]; do
+    keep=$((keep + 1))
+done
+for ((i = ${#have[@]} - 1; i >= keep; i--)); do
+    patch -d "$src" -p1 -R -f -s < "${have[$i]}"
+    rm "${have[$i]}"
+done
+for p in "${want[@]:$keep}"; do
     patch -d "$src" -p1 --forward -s < "$p"
-    touch "$stamp"
+    cp "$p" "$applied/"
 done
 mkdir -p "$out"
 mk=(make -C "$src" O="$out" ARCH=l4h SUBARCH="$arch"

@@ -1,6 +1,12 @@
 --- a/crypto/Kconfig
 +++ b/crypto/Kconfig
-@@ -1445 +1445,2 @@
+@@ -1442,7 +1442,8 @@ endif
+ if SPARC
+ source "arch/sparc/crypto/Kconfig"
+ endif
 -if X86
 +# The l4h x86_64 guest has kernel-mode SIMD (arch/l4h/x86/fpu.c).
 +if X86 || L4H_X86_SIMD
+ source "arch/x86/crypto/Kconfig"
+ endif
+ endif

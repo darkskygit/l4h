@@ -24,6 +24,16 @@
 #include <os.h>
 #include <l4h_sys.h>
 
+/*
+ * A vCPU sees events only where it polls for them, cond_resched() among
+ * them (guest/linux/patches/0005).  CONFIG_PREEMPTION compiles
+ * cond_resched() out, and a task that waits there for another one would
+ * never be told to reschedule (DESIGN.md §5.4).
+ */
+#ifdef CONFIG_PREEMPTION
+#error "l4h needs PREEMPT_NONE or PREEMPT_VOLUNTARY: cond_resched() polls for events"
+#endif
+
 extern void l4h_timer_interrupt(void);
 extern void l4h_handle_ipi(unsigned long reasons);
 
