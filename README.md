@@ -15,6 +15,11 @@ current status of each part.
 Unless otherwise noted, l4h is licensed under the GNU General Public License
 version 2 only (`GPL-2.0-only`). See [LICENSE](LICENSE) for the full text.
 
+The guest userspace CLI and Rust client library in `tools/l4hctl`, and the
+attestation verifier `tools/l4h-attest.py`, are licensed under the BSD
+2-Clause license (`BSD-2-Clause`). See [tools/l4hctl/LICENSE](tools/l4hctl/LICENSE);
+the standalone verifier also carries the full license text.
+
 Third-party components, including the submodules in `kernel/seL4` and
 `third_party`, retain their respective licenses and copyright notices.
 
