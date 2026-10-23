@@ -73,7 +73,10 @@ int l4h_collect_events(int *timer, unsigned long *ipi, unsigned long *events)
 
 	*timer = 0;
 	dl = v->timer_deadline;
-	if (dl && l4h_rdtsc() >= dl) {
+	/* seL4 fires a timer up to its precision (1 us on x86) before the
+	 * deadline and then forgets it, so its badge counts as the expiry:
+	 * the clockevent handler copes with being early and re-arms. */
+	if (dl && ((word & L4H_BADGE_TIMER) || l4h_rdtsc() >= dl)) {
 		v->timer_deadline = 0;
 		*timer = 1;
 		any = 1;
@@ -86,7 +89,6 @@ int l4h_collect_events(int *timer, unsigned long *ipi, unsigned long *events)
 		if (events[i])
 			any = 1;
 	}
-	(void)word;
 	return any;
 }
 
@@ -122,6 +124,10 @@ void l4h_wait_briefly(void)
 		dl = saved;
 	seL4_TCB_SetTimer(v->ktcb, dl, L4H_BADGE_TIMER);
 	seL4_Wait(v->ntfn, &badge);
+	/* A timer badge is the short wait's own, not the kernel's expiry:
+	 * re-arming `saved` below signals again if that is due. */
+	if (dl != saved)
+		badge &= ~L4H_BADGE_TIMER;
 	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
 	seL4_TCB_SetTimer(v->ktcb, saved, L4H_BADGE_TIMER);
 }

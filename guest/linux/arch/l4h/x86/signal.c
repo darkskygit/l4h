@@ -19,6 +19,7 @@
 
 #include <linux/regset.h>
 #include <asm/sigframe.h>
+#include <uapi/asm/processor-flags.h>
 
 #ifdef CONFIG_X86_32
 struct _xstate_64 {
@@ -367,6 +368,18 @@ SYSCALL_DEFINE0(sigreturn)
 
 #else
 
+/* The initial FPU state: XSTATE_BV 0 makes XRSTOR load x87, SSE and AVX
+ * in their init state; MXCSR is loaded from the image. */
+static void fpu_init_image(struct pt_regs *regs)
+{
+	struct _fpstate_64 *fp = (struct _fpstate_64 *)regs->regs.fp;
+
+	memset(regs->regs.fp, 0, host_fp_size);
+	fp->cwd = 0x37f;
+	fp->mxcsr = 0x1f80;
+	l4h_fpu_dirty(current);
+}
+
 int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 			  struct pt_regs *regs, sigset_t *set)
 {
@@ -386,8 +399,10 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 	/* Subtract 128 for a red zone and 8 for proper alignment */
 	frame = (struct rt_sigframe __user *) ((unsigned long) frame - 128 - 8);
 
-	if (!access_ok(frame, sizeof(*frame) + math_size))
+	if (!access_ok(frame, sizeof(*frame) + math_size)) {
+		err = -EFAULT;
 		goto out;
+	}
 
 	if (ksig->ka.sa.sa_flags & SA_SIGINFO) {
 		err |= copy_siginfo_to_user(&frame->info, &ksig->info);
@@ -419,16 +434,19 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 	 * Set up to return from userspace.  If provided, use a stub
 	 * already in userspace.
 	 */
-	/* x86-64 should always use SA_RESTORER. */
-	if (ksig->ka.sa.sa_flags & SA_RESTORER)
-		err |= __put_user((void __user *)ksig->ka.sa.sa_restorer,
-				  &frame->pretcode);
-	else
-		/* could use a vstub here */
-		return err;
-
+	/* x86-64 must use SA_RESTORER: without one the handler could not
+	 * return, and x86 fails the delivery (SIGSEGV). */
+	if (!(ksig->ka.sa.sa_flags & SA_RESTORER))
+		return -EFAULT;
+	err |= __put_user((void __user *)ksig->ka.sa.sa_restorer, &frame->pretcode);
 	if (err)
 		return err;
+
+	/* The handler starts as on x86: DF, TF and RF clear (the ABI says DF
+	 * is clear at function entry; rep movs would run backwards) and the
+	 * FPU in its initial state, the interrupted one being in the frame. */
+	PT_REGS_EFLAGS(regs) &= ~(X86_EFLAGS_DF | X86_EFLAGS_TF | X86_EFLAGS_RF);
+	fpu_init_image(regs);
 
 	PT_REGS_SP(regs) = (unsigned long) frame;
 	PT_REGS_DI(regs) = sig;

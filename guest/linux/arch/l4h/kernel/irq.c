@@ -69,9 +69,29 @@ int l4h_event_irq(unsigned int event)
 }
 EXPORT_SYMBOL_GPL(l4h_event_irq);
 
+/*
+ * The registers an interrupt reports.  current->thread.regs are the user
+ * registers of the task, with is_user set, so they stand for the interrupted
+ * context only when the event stopped user mode.  Everywhere else the vCPU
+ * was running the kernel, and a tick that said "user" would let RCU take a
+ * quiescent state inside a read-side critical section.
+ */
+static DEFINE_PER_CPU(struct pt_regs, kernel_irq_regs);
+static DEFINE_PER_CPU(bool, irq_from_user);
+
+/* Deliver the events that stopped the current task's user context. */
+void l4h_dispatch_user_interrupt(void)
+{
+	this_cpu_write(irq_from_user, true);
+	l4h_dispatch_pending();
+	this_cpu_write(irq_from_user, false);
+}
+
 void l4h_deliver_events(int timer, unsigned long ipi, unsigned long *events)
 {
-	struct pt_regs *old_regs = set_irq_regs(&current->thread.regs);
+	struct pt_regs *regs = this_cpu_read(irq_from_user) ? &current->thread.regs :
+			       this_cpu_ptr(&kernel_irq_regs);
+	struct pt_regs *old_regs = set_irq_regs(regs);
 	unsigned int w;
 
 	irq_enter();

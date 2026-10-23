@@ -340,8 +340,10 @@ int l4h_user_run(struct l4h_uctx *u, unsigned long *gp, int read_regs_on_interru
 			u->stop = L4H_STOP_EXCEPTION;
 			break;
 		}
-		/* Normalize ESR.WnR to the shared faultinfo write bit. */
-		u->fault_code = (u->fault_code & (1UL << 6)) ? 2 : 0;
+		/* Normalize ESR.WnR to the shared faultinfo write bit.  Cache
+		 * maintenance (DC CVAU, IC IVAU, ..., which seL4 lets EL0
+		 * run) also sets WnR, with CM: it is a read, as on arm64. */
+		u->fault_code = (u->fault_code & (1UL << 6)) && !(u->fault_code & (1UL << 8)) ? 2 : 0;
 #endif
 		if (seL4_GetMR(seL4_VMFault_PrefetchFault))
 			u->fault_code |= 0x10;	/* instruction fetch */

@@ -415,7 +415,7 @@ void userspace(struct uml_pt_regs *regs)
 			handle_exception(regs, u);
 			break;
 		case L4H_STOP_INTERRUPT:
-			l4h_dispatch_pending();
+			l4h_dispatch_user_interrupt();
 			break;
 		}
 

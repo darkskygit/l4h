@@ -99,7 +99,8 @@ int putreg(struct task_struct *child, int regno, unsigned long value)
 
 	case EFLAGS:
 		value &= FLAG_MASK;
-		child->thread.regs.regs.gp[HOST_EFLAGS] |= value;
+		child->thread.regs.regs.gp[HOST_EFLAGS] =
+			(child->thread.regs.regs.gp[HOST_EFLAGS] & ~FLAG_MASK) | value;
 		return 0;
 
 	default:
@@ -139,6 +140,10 @@ int poke_user(struct task_struct *child, long addr, long data)
 		addr -= offsetof(struct user, u_debugreg[0]);
 		addr = addr / sizeof(long);
 		if ((addr == 4) || (addr == 5))
+			return -EIO;
+		/* Debug registers are never loaded (no seL4 hardware debug
+		 * API): refuse to enable breakpoints that would not fire. */
+		if (addr == 7 && (data & 0xff))
 			return -EIO;
 		child->thread.arch.debugregs[addr] = data;
 		return 0;
