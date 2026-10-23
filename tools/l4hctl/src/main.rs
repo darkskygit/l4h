@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! l4hctl: command-line client of the l4h control API (DESIGN.md §9.1).
 
 use std::io::{self, Write};

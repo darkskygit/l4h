@@ -3,6 +3,7 @@
 # dom0 userspace tools, for a dom0 of any distribution (see the user
 # manual; the kernel is in the UEFI application, tools/mkefi.sh):
 #   bin/l4hctl         the control CLI (static)
+#   share/licenses/l4hctl/LICENSE   the CLI's BSD 2-Clause license
 #   l4h.conf.example   host settings, for l4h/l4h.conf
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -12,8 +13,9 @@ mkdir -p "$out"
 pkg=$(mktemp -d)
 trap 'rm -rf "$pkg"' EXIT
 dir=$pkg/l4h-dom0-x86_64
-mkdir -p "$dir/bin"
+mkdir -p "$dir/bin" "$dir/share/licenses/l4hctl"
 cp "$root/tools/l4hctl/target/release/l4hctl" "$dir/bin/l4hctl"
+cp "$root/tools/l4hctl/LICENSE" "$dir/share/licenses/l4hctl/LICENSE"
 cat > "$dir/l4h.conf.example" <<'CONF'
 # l4h host settings: copy to l4h/l4h.conf on the EFI system partition.
 # One key=value per line; GRUB reads this file too, so no spaces around
