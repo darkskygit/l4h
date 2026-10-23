@@ -77,6 +77,8 @@ struct l4h_as {
 	unsigned long root;
 	struct list_head tables;
 	struct xarray pages;
+	unsigned long nr_pages, nr_tables;
+	long charged;		/* as_cost() last added to the owner mm */
 	bool flush_pending;	/* rights lowered with L4H_PROT_DEFER_FLUSH */
 };
 
@@ -85,7 +87,31 @@ static void as_init(struct l4h_as *as, unsigned long root)
 	as->root = root;
 	INIT_LIST_HEAD(&as->tables);
 	xa_init(&as->pages);
+	as->nr_pages = as->nr_tables = 0;
+	as->charged = 0;
 	as->flush_pending = false;
+}
+
+/*
+ * Guest memory an address space takes beyond its pages: per mapping a slot
+ * (32 bytes of slot CNode) and its xarray entry, and the seL4 page tables.
+ * A process with many mappings of few pages (the zero page) has almost no
+ * RSS, so this goes into its page-table bytes, which the OOM killer counts.
+ */
+#define MAPPING_COST	48
+
+static long as_cost(struct l4h_as *as)
+{
+	return as->nr_pages * MAPPING_COST + as->nr_tables * PAGE_SIZE;
+}
+
+/* Bring mm's charge for `as` up to date.  Must hold the mm's lock. */
+static void as_charge(struct l4h_as *as, struct mm_struct *mm)
+{
+	long cost = as_cost(as);
+
+	atomic_long_add(cost - as->charged, &mm->pgtables_bytes);
+	as->charged = cost;
 }
 
 static int as_add_table(struct l4h_as *as, int level, unsigned long va)
@@ -117,6 +143,7 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 		return err == L4H_ERR_DELETE_FIRST ? 0 : -EFAULT;
 	}
 	list_add(&t->link, &as->tables);
+	as->nr_tables++;
 	return 0;
 }
 
@@ -155,6 +182,7 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 	if (e) {
 		xa_erase(&as->pages, vpn);
 		l4h_slot_delete(entry_slot(e));
+		as->nr_pages--;
 	}
 	slot = l4h_cap_copy(L4H_FRAME_CPTR(phys), L4H_RIGHTS_ALL);
 	if (!slot)
@@ -176,6 +204,7 @@ static int as_map_page(struct l4h_as *as, unsigned long va, unsigned long phys, 
 		l4h_slot_delete(slot);
 		return err;
 	}
+	as->nr_pages++;
 	return 0;
 }
 
@@ -188,6 +217,7 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 		xa_erase(&as->pages, vpn);
 		/* Deleting the frame capability removes the mapping. */
 		l4h_slot_delete(entry_slot(e));
+		as->nr_pages--;
 	}
 }
 
@@ -204,6 +234,7 @@ static void as_reset(struct l4h_as *as)
 		l4h_obj_free(&t->obj);
 		kfree(t);
 	}
+	as->nr_tables = 0;
 }
 
 /* ---- the guest-kernel VSpace (vmalloc, modules, ...) */
@@ -319,6 +350,7 @@ static int nr_vs;
 static LIST_HEAD(vs_lru);		/* owned entries, least recently used first */
 static LIST_HEAD(vs_free);
 static DEFINE_RAW_SPINLOCK(vs_lock);
+static int nr_resetting;		/* detached entries not yet emptied */
 static atomic64_t vs_generation = ATOMIC64_INIT(1);
 
 static struct l4h_mm *mm_l4h(struct mm_struct *mm)
@@ -336,41 +368,90 @@ void l4h_mm_init(struct mm_struct *mm)
 	atomic_set(&m->running, 0);
 }
 
-/* Must hold vs_lock and the owner's lock. */
+/*
+ * Take `s` from its owner.  Must hold vs_lock and the owner's lock.  The
+ * entry is then on no list and its mappings are out of everyone's reach:
+ * the caller empties it with vs_reset_free(), without vs_lock.
+ */
 static void vs_detach(struct vs_slot *s)
 {
 	struct l4h_mm *m = mm_l4h(s->owner);
 
-	as_reset(&s->as);
+	atomic_long_sub(s->as.charged, &s->owner->pgtables_bytes);
+	s->as.charged = 0;
 	m->vs = -1;
 	m->gen = 0;
 	s->owner = NULL;
-	list_move(&s->lru, &vs_free);
+	list_del_init(&s->lru);
+	nr_resetting++;
 }
 
-/* A free pool entry, taken from the least recently activated mm without
- * running threads if there is none.  Must hold vs_lock. */
-static struct vs_slot *vs_take(void)
+/*
+ * Empty a detached entry and free it.  That is one seL4 delete per mapping
+ * and page table, so it runs without vs_lock and with interrupts as the
+ * caller has them: every vCPU that returns to user mode takes vs_lock.
+ */
+static void vs_reset_free(struct vs_slot *s)
 {
-	if (list_empty(&vs_free)) {
-		struct vs_slot *victim = NULL, *it;
-		struct l4h_mm *vm;
+	unsigned long flags;
 
-		list_for_each_entry(it, &vs_lru, lru) {
-			if (!atomic_read(&mm_l4h(it->owner)->running)) {
-				victim = it;
-				break;
-			}
+	as_reset(&s->as);
+	raw_spin_lock_irqsave(&vs_lock, flags);
+	nr_resetting--;
+	list_add(&s->lru, &vs_free);
+	raw_spin_unlock_irqrestore(&vs_lock, flags);
+}
+
+/*
+ * A free pool entry.  Must hold vs_lock.  If there is none, returns NULL
+ * and detaches the entry of the least recently activated mm without running
+ * threads into *victim, for the caller to empty with vs_reset_free() before
+ * it retries; *victim stays NULL if only entries being emptied could be
+ * freed.
+ */
+static struct vs_slot *vs_take(struct vs_slot **victim)
+{
+	struct vs_slot *it;
+	struct l4h_mm *vm;
+
+	*victim = NULL;
+	if (!list_empty(&vs_free))
+		return list_first_entry(&vs_free, struct vs_slot, lru);
+	list_for_each_entry(it, &vs_lru, lru) {
+		if (!atomic_read(&mm_l4h(it->owner)->running)) {
+			*victim = it;
+			break;
 		}
-		if (!victim)
-			panic("l4h: all %d process VSpaces are in use by running threads\n", nr_vs);
-		/* vs_detach() clears the owner: unlock the lock we took. */
-		vm = mm_l4h(victim->owner);
-		raw_spin_lock(&vm->lock);
-		vs_detach(victim);
-		raw_spin_unlock(&vm->lock);
 	}
-	return list_first_entry(&vs_free, struct vs_slot, lru);
+	if (!*victim) {
+		if (!nr_resetting)
+			panic("l4h: all %d process VSpaces are in use by running threads\n", nr_vs);
+		return NULL;
+	}
+	/* vs_detach() clears the owner: unlock the lock we took. */
+	vm = mm_l4h((*victim)->owner);
+	raw_spin_lock(&vm->lock);
+	vs_detach(*victim);
+	raw_spin_unlock(&vm->lock);
+	return NULL;
+}
+
+/* Wait for vs_take() to succeed.  Takes vs_lock, and returns with it held. */
+static struct vs_slot *vs_take_wait(unsigned long *flags)
+{
+	struct vs_slot *s, *victim;
+
+	for (;;) {
+		raw_spin_lock_irqsave(&vs_lock, *flags);
+		s = vs_take(&victim);
+		if (s)
+			return s;
+		raw_spin_unlock_irqrestore(&vs_lock, *flags);
+		if (victim)
+			vs_reset_free(victim);
+		else
+			cpu_relax();
+	}
 }
 
 /*
@@ -381,16 +462,25 @@ static struct vs_slot *vs_take(void)
 unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 {
 	struct l4h_mm *m = mm_l4h(mm);
+	struct vs_slot *s, *victim;
 	unsigned long flags;
-	struct vs_slot *s;
 
-	raw_spin_lock_irqsave(&vs_lock, flags);
-	if (m->vs >= 0) {
-		s = &vs_pool[m->vs];
-		list_move_tail(&s->lru, &vs_lru);
-		goto out;
+	for (;;) {
+		raw_spin_lock_irqsave(&vs_lock, flags);
+		if (m->vs >= 0) {
+			s = &vs_pool[m->vs];
+			list_move_tail(&s->lru, &vs_lru);
+			goto out;
+		}
+		s = vs_take(&victim);
+		if (s)
+			break;
+		raw_spin_unlock_irqrestore(&vs_lock, flags);
+		if (victim)
+			vs_reset_free(victim);
+		else
+			cpu_relax();
 	}
-	s = vs_take();
 	raw_spin_lock(&m->lock);
 	s->owner = mm;
 	m->vs = s - vs_pool;
@@ -406,15 +496,20 @@ out:
 void l4h_mm_release(struct mm_struct *mm)
 {
 	struct l4h_mm *m = mm_l4h(mm);
+	struct vs_slot *s = NULL;
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&vs_lock, flags);
 	if (m->vs >= 0) {
+		s = &vs_pool[m->vs];
 		raw_spin_lock(&m->lock);
-		vs_detach(&vs_pool[m->vs]);
+		vs_detach(s);
 		raw_spin_unlock(&m->lock);
 	}
 	raw_spin_unlock_irqrestore(&vs_lock, flags);
+	/* The mm's pages are freed after this returns: empty it now. */
+	if (s)
+		vs_reset_free(s);
 }
 
 /*
@@ -428,8 +523,7 @@ unsigned long l4h_vspace_get(void)
 	unsigned long flags, root;
 	struct vs_slot *s;
 
-	raw_spin_lock_irqsave(&vs_lock, flags);
-	s = vs_take();
+	s = vs_take_wait(&flags);
 	list_del_init(&s->lru);
 	root = s->as.root;
 	raw_spin_unlock_irqrestore(&vs_lock, flags);
@@ -464,7 +558,8 @@ static struct mm_struct *idp_mm(struct mm_id *mm_idp)
 static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot,
 		     unsigned long phys, bool from_sync)
 {
-	struct l4h_mm *m = mm_l4h(idp_mm(mm_idp));
+	struct mm_struct *mm = idp_mm(mm_idp);
+	struct l4h_mm *m = mm_l4h(mm);
 	unsigned long flags, off;
 	int err = 0;
 
@@ -481,6 +576,7 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 					err = 0;
 			}
 		}
+		as_charge(as, mm);
 	}
 	raw_spin_unlock_irqrestore(&m->lock, flags);
 	return err;
@@ -511,12 +607,15 @@ void l4h_mm_flush_deferred(struct mm_struct *mm)
 
 int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)
 {
-	struct l4h_mm *m = mm_l4h(idp_mm(mm_idp));
+	struct mm_struct *mm = idp_mm(mm_idp);
+	struct l4h_mm *m = mm_l4h(mm);
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&m->lock, flags);
-	if (m->vs >= 0)
+	if (m->vs >= 0) {
 		as_unmap_range(&vs_pool[m->vs].as, addr, addr + len);
+		as_charge(&vs_pool[m->vs].as, mm);
+	}
 	raw_spin_unlock_irqrestore(&m->lock, flags);
 	return 0;
 }

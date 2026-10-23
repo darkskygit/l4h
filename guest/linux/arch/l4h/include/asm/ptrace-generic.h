@@ -14,7 +14,9 @@ struct pt_regs {
 	struct uml_pt_regs regs;
 };
 
-#define arch_has_single_step()	(1)
+/* seL4 clears TF in user flags and l4h builds it without the hardware
+ * debug API: PTRACE_SINGLESTEP fails (EIO) rather than run to the next stop. */
+#define arch_has_single_step()	(0)
 
 #define EMPTY_REGS { .regs = EMPTY_UML_PT_REGS }
 

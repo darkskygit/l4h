@@ -48,7 +48,8 @@ pte_t *virt_to_pte(struct mm_struct *mm, unsigned long addr)
  * the access: present, readable (not PROT_NONE) or writable.  The caller
  * holds mmap_lock and has checked that a VMA covers @virt, so the page
  * tables stay in place (munmap frees them only after removing the VMA); the
- * PTE lock keeps the entry stable while we check it and take the reference.
+ * PTE lock keeps the entry stable while we check it, take the reference and
+ * mark it accessed (and dirty).
  */
 static struct page *get_mapped_page(struct mm_struct *mm, unsigned long virt,
 				    int is_write)
@@ -81,6 +82,14 @@ static struct page *get_mapped_page(struct mm_struct *mm, unsigned long virt,
 	    pfn_valid(pte_pfn(pte))) {
 		page = pte_page(pte);
 		get_page(page);
+		/*
+		 * The access goes through the direct map, which no MMU
+		 * watches: mark the PTE as the CPU would.  Reclaim drops a
+		 * clean page instead of writing it back (MADV_FREE).
+		 */
+		if (is_write ? !pte_dirty(pte) || !pte_young(pte) : !pte_young(pte))
+			set_pte_at(mm, virt, ptep, is_write ? pte_mkdirty(pte_mkyoung(pte)) :
+							      pte_mkyoung(pte));
 	}
 	pte_unmap_unlock(ptep, ptl);
 	return page;

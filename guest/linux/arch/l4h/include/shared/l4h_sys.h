@@ -199,6 +199,8 @@ void l4h_send_ipi(int cpu, unsigned long reasons);
 
 /* Implemented by the kernel: deliver collected events (irqs disabled). */
 void l4h_deliver_events(int timer, unsigned long ipi, unsigned long *events);
+/* Deliver the events that stopped user mode: they interrupted user code. */
+void l4h_dispatch_user_interrupt(void);
 
 /* ---- console, power, hypercalls */
 void l4h_console_write(const char *s, unsigned int n);

@@ -44,6 +44,14 @@ static unsigned long kick_cap;
 static DECLARE_WAIT_QUEUE_HEAD(answered);
 static DEFINE_MUTEX(attest_lock);
 static u32 seq;
+/* A request the host has not answered yet although its caller gave up: the
+ * host still owns the page until done says so. */
+static u32 outstanding;
+
+static bool attest_answered(u32 s)
+{
+	return READ_ONCE(page->done) == s || READ_ONCE(page->state) == L4H_ATTEST_FAILED;
+}
 
 static irqreturn_t attest_interrupt(int irq, void *data)
 {
@@ -64,9 +72,19 @@ static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 
 
 	if (in_len > L4H_ATTEST_PAGE_DATA)
 		return -EINVAL;
-	mutex_lock(&attest_lock);
+	if (mutex_lock_killable(&attest_lock))
+		return -EINTR;
+	/* The host would write that answer over our request. */
+	if (outstanding) {
+		if (wait_event_killable(answered, attest_answered(outstanding))) {
+			mutex_unlock(&attest_lock);
+			return -EINTR;
+		}
+		outstanding = 0;
+	}
 	do {
 		u32 s = ++seq, n;
+		long left;
 
 		if (READ_ONCE(page->state) == L4H_ATTEST_FAILED) {
 			ret = -EIO;
@@ -81,8 +99,14 @@ static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 
 		smp_wmb();
 		WRITE_ONCE(page->seq, s);
 		l4h_signal(kick_cap);
-		if (!wait_event_timeout(answered, READ_ONCE(page->done) == s, ATTEST_TIMEOUT)) {
-			ret = -ETIMEDOUT;
+		left = wait_event_killable_timeout(answered, attest_answered(s), ATTEST_TIMEOUT);
+		if (left <= 0) {
+			outstanding = s;
+			ret = left ? -EINTR : -ETIMEDOUT;
+			break;
+		}
+		if (READ_ONCE(page->done) != s) {
+			ret = -EIO;	/* the host failed */
 			break;
 		}
 		smp_rmb();

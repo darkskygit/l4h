@@ -37,8 +37,13 @@ void handle_syscall(struct uml_pt_regs *r)
 	struct pt_regs *regs = container_of(r, struct pt_regs, regs);
 	int syscall;
 
-	/* Initialize the syscall number and default return value. */
-	UPT_SYSCALL_NR(r) = PT_SYSCALL_NR(r->gp);
+	/* Initialize the syscall number and default return value.  arm64
+	 * takes the number from w8, so the restart checks see the number
+	 * that is dispatched (x86 keeps all of orig_ax, as on x86). */
+	if (IS_ENABLED(CONFIG_UML_ARM64))
+		UPT_SYSCALL_NR(r) = (int)PT_SYSCALL_NR(r->gp);
+	else
+		UPT_SYSCALL_NR(r) = PT_SYSCALL_NR(r->gp);
 	/* ARM x0 is also the first argument, visible at a ptrace entry stop. */
 	if (!IS_ENABLED(CONFIG_UML_ARM64) || UPT_SYSCALL_NR(r) == -1)
 		PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);

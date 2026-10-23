@@ -175,6 +175,8 @@ static void vl4h_del_vqs(struct virtio_device *vdev)
 
 	list_for_each_entry_safe(vq, n, &vdev->vqs, list)
 		vl4h_del_vq(vq);
+	/* free_irq() warns about a hint left behind. */
+	irq_update_affinity_hint(d->irq, NULL);
 	free_irq(d->irq, d);
 }
 
@@ -258,8 +260,12 @@ static const char *vl4h_bus_name(struct virtio_device *vdev)
 static int vl4h_set_vq_affinity(struct virtqueue *vq, const struct cpumask *cpu_mask)
 {
 	struct virtio_l4h_device *d = to_vl4h(vq->vdev);
-	unsigned int cpu = cpumask_first(cpu_mask);
+	unsigned int cpu;
 
+	/* NULL clears the hint (virtio-net when it removes its queues). */
+	if (!cpu_mask)
+		return irq_update_affinity_hint(d->irq, NULL);
+	cpu = cpumask_first(cpu_mask);
 	if (cpu >= nr_cpu_ids)
 		return 0;
 	WRITE_ONCE(d->regs->irq_vcpu, cpu);

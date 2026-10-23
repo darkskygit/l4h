@@ -32,7 +32,8 @@
  * found, or no capability slot is left (l4h_objmem_oom()).
  *
  * Slots live in second-level CNodes (radix 12, guard 6) that we create in
- * root slots [L4H_SLOT_DYN_BASE, 4096).  A slot is named by
+ * root slots [L4H_SLOT_DYN_BASE, 4096), and delete again when they are empty
+ * and enough slots are free elsewhere.  A slot is named by
  * L4H_CPTR2(root, index) and addressed in CNode operations with depth 64.
  */
 #include <linux/kernel.h>
@@ -341,10 +342,10 @@ static struct chunk *__obj_retype(int type, int size_bits, unsigned long node_in
 	return ch;
 }
 
-/* Retype a permanent object, as big as a chunk of its class, straight
- * from an object block into root slot `root_slot`: the block stays busy
- * for good. */
-static int __block_retype_permanent(int type, int size_bits, unsigned long root_slot)
+/* Retype an object as big as a chunk of its class straight from an object
+ * block into root slot `root_slot`.  Returns the block, which stays busy
+ * until __block_release_direct(), or a negative errno. */
+static int __block_retype_direct(int type, int size_bits, unsigned long root_slot)
 {
 	int bits = l4h_obj_bits(type, size_bits);
 	int class = obj_class(type, bits);
@@ -359,7 +360,14 @@ static int __block_retype_permanent(int type, int size_bits, unsigned long root_
 		return -ENOMEM;
 	blocks[b].used = ALIGN(blocks[b].used, 1ul << bits) + (1ul << bits);
 	blocks[b].busy++;
-	return 0;
+	return b;
+}
+
+/* The object from __block_retype_direct() in block `b` is gone. */
+static void __block_release_direct(unsigned int b)
+{
+	if (!--blocks[b].busy && !is_open(b))
+		__block_freed(b);
 }
 
 static void __obj_put(struct chunk *ch)
@@ -378,42 +386,74 @@ static void __obj_put(struct chunk *ch)
 struct l2_cnode {
 	unsigned long used[BITS_TO_LONGS(L2_SLOTS)];
 	unsigned int free;
+	unsigned int block;	/* the object block the CNode lives in */
+	bool live;		/* the CNode exists (bookkeeping is kept) */
 };
 
+/* L2 CNodes, by root slot - L4H_SLOT_DYN_BASE; [0, nr_l2) were ever used. */
 static struct l2_cnode *l2[NR_L2];
 static unsigned int nr_l2;
+static unsigned long l2_free_slots;	/* free slots in all live L2 CNodes */
 
 static int l2_add(void)
 {
-	unsigned int idx = nr_l2;
-	unsigned long root = L4H_SLOT_DYN_BASE + idx;
+	unsigned int idx;
+	unsigned long root;
 	struct l2_cnode *c;
-	int err;
+	int b, err;
 
+	for (idx = 0; idx < nr_l2 && l2[idx]->live; idx++)
+		;
 	if (idx >= NR_L2)
 		return -ENOSPC;
-	c = early_zalloc(sizeof(*c));
+	c = idx < nr_l2 ? l2[idx] : early_zalloc(sizeof(*c));
 	if (!c)
 		return -ENOMEM;
-	/* The CNode lives as long as the guest.  It is retyped straight from
-	 * an object block (a chunk would need a slot, which needs this CNode)
-	 * into the scratch root slot, then mutated into place with the guard
-	 * that makes it resolve exactly 18 bits. */
-	if (__block_retype_permanent(L4H_OBJ_CNODE, L2_BITS, SCRATCH_SLOT)) {
-		if (slab_is_available())
+	root = L4H_SLOT_DYN_BASE + idx;
+	/* The CNode is retyped straight from an object block (a chunk would
+	 * need a slot, which needs this CNode) into the scratch root slot,
+	 * then mutated into place with the guard that makes it resolve
+	 * exactly 18 bits.  l2_trim() deletes it again once it is empty. */
+	b = __block_retype_direct(L4H_OBJ_CNODE, L2_BITS, SCRATCH_SLOT);
+	if (b < 0) {
+		if (idx == nr_l2 && slab_is_available())
 			kfree(c);	/* (memblock memory is simply leaked) */
 		return -ENOMEM;
 	}
 	err = l4h_cnode_mutate(root, L4H_ROOT_DEPTH, SCRATCH_SLOT, L4H_ROOT_DEPTH,
 			       /* seL4_CNode_CapData_new(guard 0, guard size) */ (L2_GUARD & 0x3f));
 	BUG_ON(err);
+	bitmap_zero(c->used, L2_SLOTS);
 	c->free = L2_SLOTS;
 	/* Index 0 is never handed out so that cptr 0 stays "no capability". */
 	__set_bit(0, c->used);
 	c->free--;
+	c->block = b;
+	c->live = true;
+	l2_free_slots += c->free;
 	l2[idx] = c;
-	nr_l2++;
+	if (idx == nr_l2)
+		nr_l2++;
 	return 0;
+}
+
+/*
+ * Delete the L2 CNode of `cptr` if that slot was its last one in use and the
+ * other CNodes have a whole CNode's worth of free slots left: otherwise a
+ * process that maps many pages once (each mapping is a slot) would keep its
+ * CNodes, and their object blocks, for the life of the guest.
+ */
+static void __l2_trim(unsigned long cptr)
+{
+	unsigned int idx = (cptr >> L4H_L2_INDEX_BITS) - L4H_SLOT_DYN_BASE;
+	struct l2_cnode *c = l2[idx];
+
+	if (c->free != L2_SLOTS - 1 || l2_free_slots - c->free < L2_SLOTS)
+		return;
+	WARN_ON(l4h_cnode_delete(L4H_SLOT_DYN_BASE + idx, L4H_ROOT_DEPTH));
+	c->live = false;
+	l2_free_slots -= c->free;
+	__block_release_direct(c->block);
 }
 
 static unsigned long __slot_alloc(void)
@@ -425,12 +465,13 @@ static unsigned long __slot_alloc(void)
 			struct l2_cnode *c = l2[i];
 			unsigned long bit;
 
-			if (!c->free)
+			if (!c->live || !c->free)
 				continue;
 			bit = find_first_zero_bit(c->used, L2_SLOTS);
 			BUG_ON(bit >= L2_SLOTS);
 			__set_bit(bit, c->used);
 			c->free--;
+			l2_free_slots--;
 			return L4H_CPTR2(L4H_SLOT_DYN_BASE + i, bit);
 		}
 		if (l2_add())
@@ -443,10 +484,10 @@ static bool __slots_left(void)
 {
 	unsigned int i;
 
-	if (nr_l2 < NR_L2)
+	if (l2_free_slots || nr_l2 < NR_L2)
 		return true;
 	for (i = 0; i < nr_l2; i++)
-		if (l2[i]->free)
+		if (!l2[i]->live)
 			return true;
 	return false;
 }
@@ -459,9 +500,10 @@ static void __slot_free(unsigned long cptr)
 
 	BUG_ON(root < L4H_SLOT_DYN_BASE || root - L4H_SLOT_DYN_BASE >= nr_l2);
 	c = l2[root - L4H_SLOT_DYN_BASE];
-	BUG_ON(!test_bit(bit, c->used));
+	BUG_ON(!c->live || !test_bit(bit, c->used));
 	__clear_bit(bit, c->used);
 	c->free++;
+	l2_free_slots++;
 }
 
 unsigned long l4h_slot_alloc(void)
@@ -481,6 +523,7 @@ void l4h_slot_free(unsigned long cptr)
 
 	raw_spin_lock_irqsave(&caps_lock, flags);
 	__slot_free(cptr);
+	__l2_trim(cptr);
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 }
 EXPORT_SYMBOL_GPL(l4h_slot_free);
@@ -534,6 +577,7 @@ void l4h_obj_free(struct l4h_obj *o)
 	raw_spin_lock_irqsave(&caps_lock, flags);
 	__slot_free(o->cptr);
 	__obj_put(o->chunk);
+	__l2_trim(o->cptr);
 	raw_spin_unlock_irqrestore(&caps_lock, flags);
 	o->cptr = 0;
 }
