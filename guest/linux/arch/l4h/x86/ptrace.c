@@ -223,29 +223,76 @@ static int generic_fpregs_active(struct task_struct *target, const struct user_r
 	return regset->n;
 }
 
-/* The XSAVE image: the legacy area's software bytes, then the header. */
+/* The XSAVE image (standard format): the legacy area, its software bytes,
+ * the header and the extended components. */
+#define XSAVE_MXCSR_OFFSET	24
+#define XSAVE_ST_OFFSET		32
+#define XSAVE_XMM_OFFSET	160
+#define XSAVE_PAD_OFFSET	416
 #define XSAVE_SW_OFFSET		464
 #define XSAVE_HDR_OFFSET	512
+#define XSAVE_EXT_OFFSET	576
 
+/* Extended components (AVX and up) enabled by seL4, by offset. */
+static struct { u32 bit, offset, size; } xsave_comps[16];
+static unsigned int nr_xsave_comps;
+
+static void write_or_zero(struct membuf *to, const u8 *src, unsigned int len, bool live)
+{
+	if (live)
+		membuf_write(to, src, len);
+	else
+		membuf_zero(to, len);
+}
+
+/*
+ * As x86's copy_xstate_to_uabi_buf(): a component in its init state
+ * (XSTATE_BV clear, as XSAVEOPT leaves it) is reported with its initial
+ * values, not the stale bytes the image still holds there.  A tracer that
+ * writes the registers back unchanged would otherwise make that stale
+ * state live (generic_fpregs_set()).
+ */
 static int generic_fpregs_get(struct task_struct *target,
 			      const struct user_regset *regset,
 			      struct membuf to)
 {
 	u8 *fpregs = (u8 *)task_pt_regs(target)->regs.fp;
-	unsigned int size = regset->size * regset->n;
+	unsigned int size = regset->size * regset->n, i, off;
+	bool xstate = regset->core_note_type == NT_X86_XSTATE;
+	/* FCW 0x37f, the rest of the x87 control and status zero. */
+	static const u8 fp_init[XSAVE_MXCSR_OFFSET] = { 0x7f, 0x03 };
+	const u32 mxcsr_init = 0x1f80;
 	/* As x86 reports them (user_xstateregs.i387.xstate_fx_sw[]): XCR0,
-	 * then zeros.  gdb reads XCR0 there; the image holds whatever was
-	 * last written to these bytes. */
+	 * then zeros.  gdb reads XCR0 there. */
 	u64 sw[(XSAVE_HDR_OFFSET - XSAVE_SW_OFFSET) / 8] = { l4h_xfeatures };
+	u64 hdr[(XSAVE_EXT_OFFSET - XSAVE_HDR_OFFSET) / 8] = { 0 };
+	u64 bv = ~0ull;
 
 	l4h_fpu_fetch(target);
-	if (regset->core_note_type != NT_X86_XSTATE || size <= XSAVE_HDR_OFFSET) {
-		membuf_write(&to, fpregs, size);
+	if (host_fp_size > XSAVE_HDR_OFFSET)
+		bv = *(u64 *)(fpregs + XSAVE_HDR_OFFSET);
+
+	membuf_write(&to, bv & 1 ? fpregs : fp_init, XSAVE_MXCSR_OFFSET);
+	membuf_write(&to, bv & 6 ? fpregs + XSAVE_MXCSR_OFFSET : (const u8 *)&mxcsr_init, 4);
+	membuf_write(&to, fpregs + XSAVE_MXCSR_OFFSET + 4, 4);	/* MXCSR_MASK */
+	write_or_zero(&to, fpregs + XSAVE_ST_OFFSET, XSAVE_XMM_OFFSET - XSAVE_ST_OFFSET, bv & 1);
+	write_or_zero(&to, fpregs + XSAVE_XMM_OFFSET, XSAVE_PAD_OFFSET - XSAVE_XMM_OFFSET, bv & 2);
+	membuf_zero(&to, XSAVE_SW_OFFSET - XSAVE_PAD_OFFSET);
+	if (!xstate || size <= XSAVE_HDR_OFFSET) {
+		membuf_zero(&to, XSAVE_HDR_OFFSET - XSAVE_SW_OFFSET);
 		return 0;
 	}
-	membuf_write(&to, fpregs, XSAVE_SW_OFFSET);
 	membuf_write(&to, sw, sizeof(sw));
-	membuf_write(&to, fpregs + XSAVE_HDR_OFFSET, size - XSAVE_HDR_OFFSET);
+	hdr[0] = bv & l4h_xfeatures;
+	membuf_write(&to, hdr, sizeof(hdr));
+	off = XSAVE_EXT_OFFSET;
+	for (i = 0; i < nr_xsave_comps && xsave_comps[i].offset + xsave_comps[i].size <= size; i++) {
+		membuf_zero(&to, xsave_comps[i].offset - off);
+		write_or_zero(&to, fpregs + xsave_comps[i].offset, xsave_comps[i].size,
+			      bv & BIT_ULL(xsave_comps[i].bit));
+		off = xsave_comps[i].offset + xsave_comps[i].size;
+	}
+	membuf_zero(&to, size - off);
 	return 0;
 }
 
@@ -332,8 +379,25 @@ task_user_regset_view(struct task_struct *tsk)
 
 static int __init init_regset_xstate_info(void)
 {
+	unsigned int bit, i, a, b, c, d;
+
 	uml_regsets[REGSET_XSTATE].n =
 		host_fp_size / uml_regsets[REGSET_XSTATE].size;
+	/* Where each extended component is, for generic_fpregs_get().  CPUID
+	 * leaf 0xd lists them in the standard format, which seL4 saves. */
+	for (bit = 2; bit < 64 && nr_xsave_comps < ARRAY_SIZE(xsave_comps); bit++) {
+		if (!(l4h_xfeatures & BIT_ULL(bit)))
+			continue;
+		asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0xd), "c"(bit));
+		if (!a || b < XSAVE_EXT_OFFSET || b + a > host_fp_size)
+			continue;
+		for (i = nr_xsave_comps; i && xsave_comps[i - 1].offset > b; i--)
+			xsave_comps[i] = xsave_comps[i - 1];
+		xsave_comps[i].bit = bit;
+		xsave_comps[i].offset = b;
+		xsave_comps[i].size = a;
+		nr_xsave_comps++;
+	}
 
 	return 0;
 }

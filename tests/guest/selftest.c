@@ -489,6 +489,63 @@ static void test_ptrace(void)
 	}
 }
 
+/* Stop with SIGSTOP without libc, which could touch the vector registers. */
+#define FPREGS_STOP \
+	"mov $39, %%eax\n\tsyscall\n\t"		/* getpid */ \
+	"mov %%eax, %%edi\n\tmov $19, %%esi\n\t"	/* SIGSTOP */ \
+	"mov $62, %%eax\n\tsyscall\n\t"		/* kill */
+
+static void fpregs_child(void)
+{
+	uint64_t v = 0x123456789abcdef0ull, out;
+
+	ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+	/* XMM0 live with a value, then in its init state (vzeroall), while
+	 * the saved image may still hold the value. */
+	asm volatile("movq %[v], %%xmm0\n\t"
+		     FPREGS_STOP
+		     "vzeroall\n\t"
+		     FPREGS_STOP
+		     "movq %%xmm0, %[out]\n\t"
+		     : [out] "=r"(out) : [v] "r"(v)
+		     : "rax", "rcx", "rdx", "rsi", "rdi", "r11", "memory",
+		       "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+		       "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+	_exit(out == 0 ? 0 : 1);
+}
+
+/* A tracer that writes the FP registers back unchanged must not revive
+ * state the tracee had reset: an init-state component reads as zeros. */
+static void test_ptrace_fpregs(void)
+{
+	struct user_fpregs_struct f;
+	int status, i;
+	pid_t pid;
+
+	if (!__builtin_cpu_supports("avx"))
+		return;
+	pid = fork();
+	CHECK(pid >= 0, "fork: %s", strerror(errno));
+	if (pid == 0)
+		fpregs_child();
+	for (i = 0; i < 2; i++) {
+		if (waitpid(pid, &status, 0) != pid || !WIFSTOPPED(status)) {
+			kill(pid, SIGKILL);
+			waitpid(pid, NULL, 0);
+			CHECK(0, "stop %d: status %x", i, status);
+		}
+		if (ptrace(PTRACE_GETFPREGS, pid, NULL, &f) ||
+		    ptrace(PTRACE_SETFPREGS, pid, NULL, &f) ||
+		    ptrace(PTRACE_CONT, pid, NULL, NULL)) {
+			kill(pid, SIGKILL);
+			waitpid(pid, NULL, 0);
+			CHECK(0, "stop %d: FP registers: %s", i, strerror(errno));
+		}
+	}
+	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "XMM0 not zero after vzeroall and an FP register round trip: %x", status);
+}
+
 
 #else
 static void test_ptrace(void)
@@ -1109,6 +1166,7 @@ static const struct test tests[] = {
 #endif
 	{ "signals_fpu", test_signals_fpu },
 #ifndef __aarch64__
+	{ "ptrace_fpregs", test_ptrace_fpregs },
 	{ "signal_regs", test_signal_regs },
 #endif
 	{ "timers", test_timers },
