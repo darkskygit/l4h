@@ -502,9 +502,11 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   parent and child refault their working sets lazily, so fork followed by exec
   stays cheap.
   *Implemented:* a VSpace that leaves its mm (exit, or eviction from the
-  pool) is emptied one mapping at a time, as one seL4 delete each. That
-  runs after the entry is detached, outside the pool lock and with
-  interrupts as the caller has them, so other vCPUs keep running.
+  pool) is emptied after the entry is detached, outside the pool lock and
+  with interrupts as the caller has them, so other vCPUs keep running. Its
+  page tables go first, highest level first: unmapping one invalidates the
+  ASID once and removes everything below it, so the frame capabilities
+  are then deleted without a TLB shootdown each.
 - **TLB coherence** across cores is seL4's job: unmap shoots down the ASID's
   TLB entries. With several vCPUs, `flush_tlb_*` syncs synchronously, so a
   page is never freed while another vCPU can still reach it. The fault-path

@@ -70,6 +70,7 @@ static inline unsigned long entry_prot(void *e)
 struct table {
 	struct list_head link;
 	struct l4h_obj obj;
+	int level;		/* index into l4h_pt_level_obj[] */
 };
 
 /* One seL4 address space: a VSpace root plus the page tables we added. */
@@ -142,6 +143,7 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 		kfree(t);
 		return err == L4H_ERR_DELETE_FIRST ? 0 : -EFAULT;
 	}
+	t->level = level;
 	list_add(&t->link, &as->tables);
 	as->nr_tables++;
 	return 0;
@@ -221,29 +223,44 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 	}
 }
 
-/* Remove every mapping and page table, leaving an empty VSpace root.  With
- * `may_sleep`, gives the CPU away now and then: that can be a million
- * seL4 deletes. */
+/*
+ * Remove every mapping and page table, leaving an empty VSpace root.
+ *
+ * The tables go first, the highest level first.  Unmapping one invalidates
+ * the whole ASID once (x86_64 flushPDPT()/flushPD(), aarch64
+ * unmapPageTable()) and takes everything below it out of the VSpace; the
+ * lower tables and the frames then find no mapping from the root and are
+ * deleted without a flush.  Deleting the frames first was a TLB shootdown,
+ * to every core the address space ran on, per mapping.
+ *
+ * With `may_sleep`, gives the CPU away now and then: there can be a million
+ * frame capabilities to delete.
+ */
 static void as_reset(struct l4h_as *as, bool may_sleep)
 {
 	struct table *t, *n;
 	unsigned long vpn;
+	int level;
 	void *e;
 
-	/* Unmapping invalidates each translation, deferred or not. */
+	for (level = L4H_NR_PT_LEVELS; level-- > 0;) {
+		list_for_each_entry_safe(t, n, &as->tables, link) {
+			if (t->level != level)
+				continue;
+			list_del(&t->link);
+			l4h_obj_free(&t->obj);
+			kfree(t);
+		}
+	}
+	as->nr_tables = 0;
+	/* Covered by those invalidations too. */
+	as->flush_pending = false;
 	xa_for_each(&as->pages, vpn, e) {
 		xa_erase(&as->pages, vpn);
 		l4h_slot_delete(entry_slot(e));
 		if (!(--as->nr_pages % 1024) && may_sleep)
 			cond_resched();
 	}
-	as->flush_pending = false;
-	list_for_each_entry_safe(t, n, &as->tables, link) {
-		list_del(&t->link);
-		l4h_obj_free(&t->obj);
-		kfree(t);
-	}
-	as->nr_tables = 0;
 }
 
 /* ---- the guest-kernel VSpace (vmalloc, modules, ...) */
