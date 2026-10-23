@@ -392,6 +392,17 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   into frames without clearing, and lists the modules with their loader
   strings in a bootinfo chunk (`SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES`).
   This is how dom0 is loaded from disk (§10).
+- **0022, TSC frequency from CPUID (x86).** seL4 read the TSC rate from
+  the platform info MSR on a fixed list of models ending at Skylake and
+  measured it against the PIT everywhere else. Alder Lake and later
+  platforms may gate the 8254 clock (on an Alder Lake-P mini PC it
+  advances a few ticks in 10 ms, busy or idle), and the PIT wait then
+  never ends, before the kernel prints anything. Intel CPUs that
+  enumerate the rate in CPUID leaf 0x15 (or the base frequency in 0x16,
+  where 0x15 leaves the crystal out) now take it from there, rounded to
+  the nearest MHz. With TSC-deadline mode, which all of them have, the
+  PIT is then not used at all. QEMU/KVM and Hyper-V report leaf 0x15 as
+  zero, so VMs keep measuring with the PIT.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4

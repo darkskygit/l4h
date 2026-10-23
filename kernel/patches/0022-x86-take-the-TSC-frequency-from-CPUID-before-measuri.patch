@@ -1,0 +1,83 @@
+From 61344ff577945bec6f9ca8a78832f22d3719bf2b Mon Sep 17 00:00:00 2001
+From: l4h <z@univalence.me>
+Date: Fri, 23 Oct 2026 10:04:32 -0700
+Subject: [PATCH] x86: take the TSC frequency from CPUID before measuring it
+ with the PIT
+
+Intel CPUs from Skylake on enumerate the TSC frequency in CPUID leaf
+0x15 (the TSC/crystal ratio and, usually, the crystal frequency) or,
+where the crystal is left out, as the base frequency in leaf 0x16.  The
+platform info MSR is read only for a fixed list of models that ends at
+Skylake, so every later model measured the TSC against the PIT.
+
+Alder Lake and later platforms may gate the 8254 clock: on an Alder
+Lake-P mini PC its counter advances by a handful of ticks in 10 ms, even
+with a core spinning, so pit_wait_wraparound() never returns and the
+kernel stops before its first message.  Linux on the same machine takes
+the rate from CPUID leaf 0x15 and never touches the PIT.
+
+Use leaf 0x15 (or 0x16) on Intel CPUs that provide it, rounding to the
+nearest MHz, before the MSR and the PIT.  The APIC timer rate still
+comes from the PIT, but it is measured only on CPUs without TSC-deadline
+mode, which all of these have.
+---
+ src/plat/pc99/machine/hardware.c | 36 ++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/plat/pc99/machine/hardware.c b/src/plat/pc99/machine/hardware.c
+index f71791f0c..05f98a623 100644
+--- a/src/plat/pc99/machine/hardware.c
++++ b/src/plat/pc99/machine/hardware.c
+@@ -97,6 +97,36 @@ BOOT_CODE static inline uint32_t measure_tsc_khz(void)
+     return 0;
+ }
+ 
++/* The TSC frequency Intel CPUs enumerate, in MHz, or 0. Leaf 0x15 gives the
++ * TSC/crystal ratio and usually the crystal frequency; where it leaves the
++ * crystal out, leaf 0x16 gives the base frequency, which is then the TSC
++ * frequency. Recent platforms (Alder Lake and later) may gate the 8254 clock,
++ * so the PIT cannot be relied on to measure it. */
++BOOT_CODE static uint32_t tsc_cpuid_mhz(void)
++{
++    if (x86_cpuid_get_identity()->vendor != X86_VENDOR_INTEL) {
++        return 0;
++    }
++    uint32_t max_leaf = x86_cpuid_eax(0x0, 0x0);
++    if (max_leaf < 0x15) {
++        return 0;
++    }
++    uint32_t denominator = x86_cpuid_eax(0x15, 0x0);
++    uint32_t numerator = x86_cpuid_ebx(0x15, 0x0);
++    uint32_t crystal_hz = x86_cpuid_ecx(0x15, 0x0);
++    if (denominator == 0 || numerator == 0) {
++        return 0;
++    }
++    if (crystal_hz != 0) {
++        uint64_t hz = (uint64_t)crystal_hz * numerator / denominator;
++        return (uint32_t)((hz + 500000) / 1000000);
++    }
++    if (max_leaf >= 0x16) {
++        return x86_cpuid_eax(0x16, 0x0) & 0xffff;
++    }
++    return 0;
++}
++
+ BOOT_CODE static uint32_t tsc_measure_mhz(void)
+ {
+ 
+@@ -104,6 +134,12 @@ BOOT_CODE static uint32_t tsc_measure_mhz(void)
+     return CONFIG_PC99_TSC_FREQUENCY / 1000000;
+ #endif
+ 
++    uint32_t cpuid_mhz = tsc_cpuid_mhz();
++    if (cpuid_mhz != 0) {
++        printf("TSC frequency from CPUID: %lu MHz\n", (long) cpuid_mhz);
++        return cpuid_mhz;
++    }
++
+     x86_cpu_identity_t *model_info = x86_cpuid_get_model_info();
+     uint32_t valid_models[] = {
+         NEHALEM_1_MODEL_ID, NEHALEM_2_MODEL_ID, NEHALEM_3_MODEL_ID,
+-- 
+2.47.3
+
