@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * l4h guest <-> host ABI.
  *

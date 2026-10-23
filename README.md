@@ -10,6 +10,14 @@ The user manual is in [docs/manual](docs/manual/l4h-manual.tex); render it
 with `make -C docs/manual`. See [DESIGN.md](DESIGN.md) for the design, the decisions behind it and the
 current status of each part.
 
+## License
+
+Unless otherwise noted, l4h is licensed under the GNU General Public License
+version 2 only (`GPL-2.0-only`). See [LICENSE](LICENSE) for the full text.
+
+Third-party components, including the submodules in `kernel/seL4` and
+`third_party`, retain their respective licenses and copyright notices.
+
 ## What works
 
 - **Guests.**

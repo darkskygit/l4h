@@ -5,7 +5,7 @@ default-members = ["l4h-root"]
 
 [workspace.package]
 edition = "2024"
-license = "BSD-2-Clause"
+license = "GPL-2.0-only"
 version = "0.1.0"
 
 [workspace.dependencies]
