@@ -116,15 +116,30 @@ Configuration:
   enable.
 - `KernelSkimWindow=OFF`, required by patch 0004's preservation of user
   RSP across syscalls. l4h targets CPUs unaffected by Meltdown (see below).
+  **Nothing checks this at boot.** On a CPU affected by Meltdown
+  (`IA32_ARCH_CAPABILITIES.RDCL_NO` clear: most Intel parts before Cascade
+  Lake, such as GCE N1 and E2 on Skylake or Broadwell hosts) any guest
+  thread can read the kernel window, which maps all RAM, including other
+  guests' memory. Do not deploy l4h on such CPUs.
 
-Release builds keep debug syscalls off.
+Release builds turn the debug syscalls off but keep kernel printing on, for
+the host components' serial log: `seL4_DebugPutChar` and
+`seL4_DebugDumpScheduler` stay available to threads with an MCP of at least
+`KernelDebugSyscallMinMCP` (below).
 
 **Revised (security audit, v1).** Development builds keep
 `KernelDebugBuild` on, and debug syscalls need no capability: one of them,
 `seL4_DebugHalt`, stops the machine. Patch 0008 therefore reserves debug
 syscalls to threads with an MCP of at least `KernelDebugSyscallMinMCP`
 (101 for l4h). Guest threads are confined to MCP 100, so in a guest they
-are unknown syscalls in every build. `L4H_RELEASE=1 tools/build-kernel.sh`
+are unknown syscalls in every build. The same threshold silences the
+kernel's messages about failed invocations (`userError`) and about threads
+that fault without a fault handler: every kernel print is a synchronous
+serial write with the kernel lock held, so a guest could otherwise stall
+every core by failing invocations in a loop. With
+`KernelInvocationReportErrorIPC` (off in l4h), error replies to such
+threads carry an empty message rather than the shared buffer, which would
+hold an earlier invocation's message. `L4H_RELEASE=1 tools/build-kernel.sh`
 turns the debug build off. `KernelMaxNumNodes` is 64. XSAVE covers x87,
 SSE and AVX; the guest hides AVX-512, AMX and PKU, which seL4 does not
 enable, from its CPU feature set.
@@ -142,8 +157,9 @@ fault.
 
 E1 adds a new bit for the existing `seL4_TCB_SetFlags` (which today only has
 `fpuDisabled`). When the bit is set, *every* syscall instruction from that
-thread raises `seL4_Fault_UnknownSyscall`, which already carries all GPRs,
-FaultIP, SP and FLAGS. The check goes in `c_handle_syscall` and the fastpath
+thread raises `seL4_Fault_UnknownSyscall`, which already carries FaultIP,
+SP, FLAGS and the argument registers (all GPRs on x86_64; X0–X7 on aarch64,
+plus X8 with patch 0007). The check goes in `c_handle_syscall` and the fastpath
 entry on each arch, before the `SYSCALL_MIN..MAX` range test. The patch is
 roughly 30 lines per arch, and the semantics do not depend on the ISA.
 
