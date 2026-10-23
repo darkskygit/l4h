@@ -2,5 +2,11 @@
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sys /sys
 /bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox mount -t devtmpfs dev /dev
+if [ -f /bin/l4h_page_aging.ko ] && ! /bin/busybox insmod /bin/l4h_page_aging.ko; then
+	echo 'SELFTEST: FAIL (page aging module)'
+	/bin/busybox poweroff -f
+	exit 1
+fi
 /bin/selftest
 /bin/busybox poweroff -f

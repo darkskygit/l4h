@@ -1,0 +1,295 @@
+From 10c2cfcad7a8ab177062191367e5b7bde74ffcd7 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Fri, 23 Oct 2026 13:02:35 -0700
+Subject: [PATCH] vspace: expose accessed bits of native 4 KiB mappings
+
+---
+ .../arm/interfaces/object-api-arch.xml        | 20 ++++
+ .../x86/interfaces/object-api-arch.xml        | 20 ++++
+ src/arch/arm/64/kernel/vspace.c               | 93 +++++++++++++++++++
+ src/arch/x86/kernel/vspace.c                  | 48 ++++++++++
+ src/fastpath/fastpath.c                       |  8 ++
+ 5 files changed, 189 insertions(+)
+
+diff --git a/libsel4/arch_include/arm/interfaces/object-api-arch.xml b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
+index cf528709d..59faf2c99 100644
+--- a/libsel4/arch_include/arm/interfaces/object-api-arch.xml
++++ b/libsel4/arch_include/arm/interfaces/object-api-arch.xml
+@@ -408,6 +408,26 @@
+                 </description>
+             </error>
+         </method>
++        <method id="ARMPageTestAndClearAccessed" name="TestAndClearAccessed"
++            manual_name="Test and Clear Accessed">
++            <condition><and><config var="CONFIG_ARCH_AARCH64"/><not><config var="CONFIG_ARM_HYPERVISOR_SUPPORT"/></not></and></condition>
++            <brief>Test and clear the accessed bit of a mapped 4 KiB frame.</brief>
++            <description>
++                The mapping is located using the capability's ASID and address,
++                and must still refer to the same frame. Clearing is atomic and
++                does not invalidate the TLB: a cached translation can delay the
++                observation of a later access. Permissions and dirty state are
++                unchanged. Larger pages and non-native mappings are unsupported.
++            </description>
++            <param dir="out" name="accessed" type="seL4_Word"
++                description="One if the accessed bit was set, otherwise zero."/>
++            <error name="seL4_IllegalOperation">
++                <description>The frame is not a mapped native 4 KiB page.</description>
++            </error>
++            <error name="seL4_InvalidCapability">
++                <description>The capability's mapping is stale.</description>
++            </error>
++        </method>
+         <method id="ARMPageGetAddress" name="GetAddress" manual_name="Get Address">
+             <brief>
+                 Get the physical address of the underlying frame.
+diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+index c2a9c074f..835927d7b 100644
+--- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
++++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+@@ -393,6 +393,26 @@
+                 </description>
+             </error>
+         </method>
++        <method id="X86PageTestAndClearAccessed" name="TestAndClearAccessed"
++            manual_name="Test and Clear Accessed">
++            <condition><config var="CONFIG_ARCH_X86_64"/></condition>
++            <brief>Test and clear the accessed bit of a mapped 4 KiB frame.</brief>
++            <description>
++                The mapping is located using the capability's ASID and address,
++                and must still refer to the same frame. Clearing is atomic and
++                does not invalidate the TLB: a cached translation can delay the
++                observation of a later access. Permissions and dirty state are
++                unchanged. Larger pages and non-native mappings are unsupported.
++            </description>
++            <param dir="out" name="accessed" type="seL4_Word"
++                description="One if the accessed bit was set, otherwise zero."/>
++            <error name="seL4_IllegalOperation">
++                <description>The frame is not a mapped native 4 KiB page.</description>
++            </error>
++            <error name="seL4_InvalidCapability">
++                <description>The capability's mapping is stale.</description>
++            </error>
++        </method>
+         <method id="X86PageGetAddress" name="GetAddress" manual_name="Get Address"
+             manual_label='page_getaddress'>
+             <brief>
+diff --git a/src/arch/arm/64/kernel/vspace.c b/src/arch/arm/64/kernel/vspace.c
+index 7334c1d77..8d78d3f0b 100644
+--- a/src/arch/arm/64/kernel/vspace.c
++++ b/src/arch/arm/64/kernel/vspace.c
+@@ -710,6 +710,39 @@ static pte_t makeUserPagePTE(paddr_t paddr, vm_rights_t vm_rights, vm_attributes
+     }
+ }
+ 
++#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
++/* Without hardware AF updates, repair access-flag faults in seL4, without
++ * fault IPC to the VSpace owner.  Only native EL0 4 KiB mappings qualify.
++ * An AF already set by another core is also a successfully handled fault. */
++static bool_t handleAccessFlagFault(tcb_t *thread, vptr_t addr, word_t fault)
++{
++    if ((fault & MASK(6)) != 0xb || addr > USER_TOP) {
++        return false;
++    }
++    cap_t root = TCB_PTR_CTE_PTR(thread, tcbVTable)->cap;
++    if (!isValidNativeRoot(root)) {
++        return false;
++    }
++    findVSpaceForASID_ret_t find_ret = findVSpaceForASID(cap_vspace_cap_get_capVSMappedASID(root));
++    if (find_ret.status != EXCEPTION_NONE ||
++        find_ret.vspace_root != VSPACE_PTR(cap_vspace_cap_get_capVSBasePtr(root))) {
++        return false;
++    }
++    lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root, addr);
++    if (lu_ret.ptBitsLeft != seL4_PageBits ||
++        !pte_is_page_type(*lu_ret.ptSlot) ||
++        !(pte_pte_4k_page_get_AP(*lu_ret.ptSlot) & 1)) {
++        return false;
++    }
++    __atomic_fetch_or(&lu_ret.ptSlot->words[0], BIT(10), __ATOMIC_RELAXED);
++    cleanByVA_PoU((vptr_t)lu_ret.ptSlot, pptr_to_paddr(lu_ret.ptSlot));
++    dsb();
++    /* AF=0 translations are not cached, so setting AF needs no TLBI. */
++    setThreadState(thread, ThreadState_Restart);
++    return true;
++}
++#endif
++
+ exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
+ {
+     switch (vm_faultType) {
+@@ -718,6 +751,11 @@ exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
+ 
+         addr = getFAR();
+         fault = getDFSR();
++#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
++        if (handleAccessFlagFault(thread, addr, fault)) {
++            return EXCEPTION_NONE;
++        }
++#endif
+ 
+ #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+         /* use the IPA */
+@@ -734,6 +772,11 @@ exception_t handleVMFault(tcb_t *thread, vm_fault_type_t vm_faultType)
+ 
+         pc = getRestartPC(thread);
+         fault = getIFSR();
++#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
++        if (handleAccessFlagFault(thread, pc, fault)) {
++            return EXCEPTION_NONE;
++        }
++#endif
+ 
+ #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+         if (ARCH_NODE_STATE(armHSVCPUActive)) {
+@@ -1505,6 +1548,51 @@ static inline bool_t CONST checkVPAlignment(vm_page_size_t sz, word_t w)
+     return (w & MASK(pageBitsForSize(sz))) == 0;
+ }
+ 
++#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
++static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
++{
++    asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
++    if (cap_frame_cap_get_capFSize(cap) != ARMSmallPage || asid == asidInvalid) {
++        current_syscall_error.type = seL4_IllegalOperation;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++
++    findVSpaceForASID_ret_t find_ret = findVSpaceForASID(asid);
++    if (find_ret.status != EXCEPTION_NONE) {
++        goto stale;
++    }
++    lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root,
++                                           cap_frame_cap_get_capFMappedAddress(cap));
++    if (lu_ret.ptBitsLeft != seL4_PageBits || !pte_is_page_type(*lu_ret.ptSlot) ||
++        pte_get_page_base_address(*lu_ret.ptSlot) !=
++        pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap))) {
++        goto stale;
++    }
++
++    word_t old = __atomic_fetch_and(&lu_ret.ptSlot->words[0], ~BIT(10), __ATOMIC_RELAXED);
++    cleanByVA_PoU((vptr_t)lu_ret.ptSlot, pptr_to_paddr(lu_ret.ptSlot));
++    dsb();
++    /* Do not invalidate: an older AF=1 translation may delay a sample,
++     * just as on x86.  A subsequent walk either sets AF in hardware or
++     * takes the access-flag fault handled above. */
++    tcb_t *thread = NODE_STATE(ksCurThread);
++    if (call) {
++        word_t *ipcBuffer = lookupIPCBuffer(true, thread);
++        setRegister(thread, badgeRegister, 0);
++        unsigned int length = setMR(thread, ipcBuffer, 0, !!(old & BIT(10)));
++        setRegister(thread, msgInfoRegister, wordFromMessageInfo(
++                        seL4_MessageInfo_new(0, 0, 0, length)));
++    }
++    setThreadState(thread, ThreadState_Running);
++    return EXCEPTION_NONE;
++
++stale:
++    current_syscall_error.type = seL4_InvalidCapability;
++    current_syscall_error.invalidCapNumber = 0;
++    return EXCEPTION_SYSCALL_ERROR;
++}
++#endif
++
+ static exception_t decodeARMFrameInvocation(word_t invLabel, word_t length,
+                                             cte_t *cte, cap_t cap, bool_t call, word_t *buffer)
+ {
+@@ -1602,6 +1690,11 @@ static exception_t decodeARMFrameInvocation(word_t invLabel, word_t length,
+                                         makeUserPagePTE(base, vmRights, attributes, frameSize), lu_ret.ptSlot);
+     }
+ 
++#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
++    case ARMPageTestAndClearAccessed:
++        return decodePageTestAndClearAccessed(cap, call);
++#endif
++
+     case ARMPageUnmap:
+         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
+         return performPageInvocationUnmap(cap, cte);
+diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
+index 81d41b332..f9f4d6d30 100644
+--- a/src/arch/x86/kernel/vspace.c
++++ b/src/arch/x86/kernel/vspace.c
+@@ -982,6 +982,49 @@ static create_mapping_pde_return_t createSafeMappingEntries_PDE(paddr_t base, wo
+ }
+ 
+ 
++#ifdef CONFIG_ARCH_X86_64
++static exception_t decodePageTestAndClearAccessed(cap_t cap, bool_t call)
++{
++    asid_t asid = cap_frame_cap_get_capFMappedASID(cap);
++    if (cap_frame_cap_get_capFSize(cap) != X86_SmallPage ||
++        asid == asidInvalid || cap_frame_cap_get_capFMapType(cap) != X86_MappingVSpace) {
++        current_syscall_error.type = seL4_IllegalOperation;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++
++    findVSpaceForASID_ret_t find_ret = findVSpaceForASID(asid);
++    if (find_ret.status != EXCEPTION_NONE) {
++        goto stale;
++    }
++    lookupPTSlot_ret_t lu_ret = lookupPTSlot(find_ret.vspace_root,
++                                           cap_frame_cap_get_capFMappedAddress(cap));
++    if (lu_ret.status != EXCEPTION_NONE || !pte_ptr_get_present(lu_ret.ptSlot) ||
++        pte_ptr_get_page_base_address(lu_ret.ptSlot) !=
++        pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap))) {
++        goto stale;
++    }
++
++    /* The CPU can set A/D on another core even under the kernel lock.
++     * Clear only A, atomically, preserving in particular the dirty bit. */
++    word_t old = __atomic_fetch_and(&lu_ret.ptSlot->words[0], ~BIT(5), __ATOMIC_RELAXED);
++    tcb_t *thread = NODE_STATE(ksCurThread);
++    if (call) {
++        word_t *ipcBuffer = lookupIPCBuffer(true, thread);
++        setRegister(thread, badgeRegister, 0);
++        unsigned int length = setMR(thread, ipcBuffer, 0, !!(old & BIT(5)));
++        setRegister(thread, msgInfoRegister, wordFromMessageInfo(
++                        seL4_MessageInfo_new(0, 0, 0, length)));
++    }
++    setThreadState(thread, ThreadState_Running);
++    return EXCEPTION_NONE;
++
++stale:
++    current_syscall_error.type = seL4_InvalidCapability;
++    current_syscall_error.invalidCapNumber = 0;
++    return EXCEPTION_SYSCALL_ERROR;
++}
++#endif
++
+ exception_t decodeX86FrameInvocation(
+     word_t invLabel,
+     word_t length,
+@@ -1141,6 +1184,11 @@ exception_t decodeX86FrameInvocation(
+         return EXCEPTION_SYSCALL_ERROR;
+     }
+ 
++#ifdef CONFIG_ARCH_X86_64
++    case X86PageTestAndClearAccessed:
++        return decodePageTestAndClearAccessed(cap, call);
++#endif
++
+     case X86PageUnmap: { /* Unmap */
+         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
+         return performX86FrameInvocationUnmap(cap, cte);
+diff --git a/src/fastpath/fastpath.c b/src/fastpath/fastpath.c
+index 358fa7730..842eedd1d 100644
+--- a/src/fastpath/fastpath.c
++++ b/src/fastpath/fastpath.c
+@@ -730,6 +730,14 @@ void NORETURN fastpath_vm_fault(vm_fault_type_t type)
+     pde_t stored_hw_asid;
+     dom_t dom;
+ 
++#if defined(CONFIG_ARCH_AARCH64) && !defined(CONFIG_ARM_HYPERVISOR_SUPPORT)
++    /* Access-flag faults may be resolved inside the kernel. */
++    word_t fault = type == ARMDataAbort ? getDFSR() : getIFSR();
++    if ((fault & MASK(6)) == 0xb) {
++        vm_fault_slowpath(type);
++    }
++#endif
++
+     /* Get the fault handler endpoint */
+ #ifdef CONFIG_KERNEL_MCS
+     handler_cap = TCB_PTR_CTE_PTR(NODE_STATE(ksCurThread), tcbFaultHandler)->cap;
+-- 
+2.47.3
+

@@ -147,6 +147,17 @@ int l4h_page_unmap(unsigned long frame)
 #endif
 }
 
+int l4h_page_test_and_clear_accessed(unsigned long frame, int *accessed)
+{
+#ifdef __aarch64__
+	seL4_ARM_Page_TestAndClearAccessed_t ret = seL4_ARM_Page_TestAndClearAccessed(frame);
+#else
+	seL4_X86_Page_TestAndClearAccessed_t ret = seL4_X86_Page_TestAndClearAccessed(frame);
+#endif
+	*accessed = ret.error ? 0 : ret.accessed;
+	return ret.error;
+}
+
 /* Complete the maps made with L4H_PROT_DEFER_FLUSH in `vspace`. */
 int l4h_vspace_flush(unsigned long vspace)
 {

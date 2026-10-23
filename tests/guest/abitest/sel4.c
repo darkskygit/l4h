@@ -7,6 +7,7 @@
  *   - seL4_TCB_ReadFPU of the user thread's FPU state (E2),
  *   - seL4 debug syscalls refused to guest threads,
  *   - seL4_X86_ExecuteNever mappings,
+ *   - hardware accessed bits, AArch64 access-flag faults, stale mappings,
  *   - seL4_TCB_SetTimer delivering a timer badge (E3),
  *   - the I/O pool: a virtio-blk driver that ignores ACCESS_PLATFORM or
  *     puts rings or buffers outside the pool is refused,
@@ -73,6 +74,8 @@ static inline uint64_t rdtsc(void)
 #define FPU_V0_OFFSET		0
 #define FRAME_TYPE		seL4_ARM_SmallPageObject
 #define frame_unmap		seL4_ARM_Page_Unmap
+#define frame_accessed		seL4_ARM_Page_TestAndClearAccessed
+#define accessed_result		seL4_ARM_Page_TestAndClearAccessed_t
 #else
 #define SYS_getpid		39
 #define SYS_exit		60
@@ -85,6 +88,8 @@ static inline uint64_t rdtsc(void)
 #define FPU_V0_OFFSET		160
 #define FRAME_TYPE		seL4_X86_4K
 #define frame_unmap		seL4_X86_Page_Unmap
+#define frame_accessed		seL4_X86_Page_TestAndClearAccessed
+#define accessed_result		seL4_X86_Page_TestAndClearAccessed_t
 #endif
 
 /* ---- capabilities: slots are depth-64 CPtrs into level-2 CNodes */
@@ -209,7 +214,13 @@ static int user_test(void)
 	int err;
 
 	CHECK(prog_frame, "no program frame copy", 0);
+	accessed_result ar = frame_accessed(prog_frame);
+	CHECK(ar.error == seL4_IllegalOperation, "accessed on unmapped cap=", ar.error);
 	TRY(map_user_page(prog_frame, ABITEST_USER_VA, seL4_CanRead));
+	ar = frame_accessed(prog_frame);
+	CHECK(ar.error == 0, "clear program accessed=", ar.error);
+	ar = frame_accessed(prog_frame);
+	CHECK(ar.error == 0 && ar.accessed == 0, "program accessed not cleared=", ar.accessed);
 	ep = abitest_obj(L4H_OBJ_ENDPOINT, 0);
 	reply = abitest_obj(L4H_OBJ_REPLY, 0);
 	utcb = abitest_obj(L4H_OBJ_TCB, 0);
@@ -244,6 +255,10 @@ static int user_test(void)
 		sysregs[i] = seL4_GetMR(i);
 	say("E1 trapped Linux syscall from user thread, at user_prog+%#lx",
 	    sysregs[seL4_UnknownSyscall_FaultIP] - ABITEST_USER_VA);
+	ar = frame_accessed(prog_frame);
+	CHECK(ar.error == 0 && ar.accessed == 1, "instruction fetch not accessed=", ar.accessed);
+	ar = frame_accessed(prog_frame);
+	CHECK(ar.error == 0 && ar.accessed == 0, "instruction access counted twice=", ar.accessed);
 
 	/* E2: the user thread's xmm0 / d0 is visible through ReadFPU. */
 	err = seL4_TCB_ReadFPU(utcb, L4H_CPTR(vcpu_caps + L4H_VCPU_IPCBUF), L4H_FPU_SCRATCH_OFFSET);
@@ -269,6 +284,10 @@ static int user_test(void)
 	seL4_CPtr zero_frame = copy_cap(L4H_FRAME_CPTR(t->zero_gpa));
 	CHECK(zero_frame, "no zero frame copy", 0);
 	TRY(map_user_page(zero_frame, 0x500000, seL4_CanRead));
+	ar = frame_accessed(zero_frame);
+	CHECK(ar.error == 0, "clear data accessed=", ar.error);
+	ar = frame_accessed(zero_frame);
+	CHECK(ar.error == 0 && ar.accessed == 0, "data accessed not cleared=", ar.accessed);
 	seL4_Send(reply, seL4_MessageInfo_new(0, 0, 0, 0));
 
 	/* 3: 64 syscalls with rdx = -1 .. -64 (all seL4 syscall numbers,
@@ -283,6 +302,14 @@ static int user_test(void)
 		seL4_Word r[MR_COUNT];
 		for (int i = 0; i < MR_COUNT; i++)
 			r[i] = seL4_GetMR(i);
+		if (n == -1) {
+			/* On Cortex-A57 AF=0 caused a kernel-only data abort:
+			 * the next delivered event must still be this syscall. */
+			ar = frame_accessed(zero_frame);
+			CHECK(ar.error == 0 && ar.accessed == 1, "load not accessed=", ar.accessed);
+			ar = frame_accessed(zero_frame);
+			CHECK(ar.error == 0 && ar.accessed == 0, "load counted twice=", ar.accessed);
+		}
 		r[seL4_UnknownSyscall_FaultIP] += SYSCALL_INSN_LEN;
 		for (int i = 0; i < MR_COUNT; i++)
 			seL4_SetMR(i, r[i]);
@@ -314,11 +341,15 @@ static int user_test(void)
 	say("debug syscalls refused to guest threads");
 	seL4_TCB_Suspend(utcb);
 
-#ifndef __aarch64__
-	/* 6: seL4_X86_ExecuteNever (patch 0009): the program page, remapped
-	 * execute-never, faults on instruction fetch. */
+	/* 6: Clearing A/AF must preserve execute-never permissions. */
+#ifdef __aarch64__
+	err = seL4_ARM_Page_Map(prog_frame, t->vspace, ABITEST_USER_VA, seL4_CanRead, seL4_ARM_ExecuteNever);
+#else
 	err = seL4_X86_Page_Map(prog_frame, t->vspace, ABITEST_USER_VA, seL4_CanRead, seL4_X86_ExecuteNever);
+#endif
 	CHECK(err == 0, "remap xn err=", err);
+	ar = frame_accessed(prog_frame);
+	CHECK(ar.error == 0, "clear xn accessed=", ar.error);
 	err = write_pc(&regs, ABITEST_USER_VA);
 	CHECK(err == 0, "write regs err=", err);
 	info = recv(&badge);
@@ -329,7 +360,45 @@ static int user_test(void)
 	      seL4_GetMR(seL4_VMFault_PrefetchFault));
 	say("execute-never mappings fault on instruction fetch");
 	seL4_TCB_Suspend(utcb);
+	TRY(map_user_page(prog_frame, ABITEST_USER_VA, seL4_CanRead));
+	ar = frame_accessed(prog_frame);
+	CHECK(ar.error == 0, "clear executable accessed=", ar.error);
+	ar = frame_accessed(zero_frame);
+	CHECK(ar.error == 0, "clear read-only accessed=", ar.error);
+	err = write_pc(&regs, ABITEST_USER_VA + (user_write - user_prog));
+	CHECK(err == 0, "write test regs=", err);
+	info = recv(&badge);
+	CHECK(seL4_MessageInfo_get_label(info) == seL4_Fault_VMFault, "read-only label=",
+	      seL4_MessageInfo_get_label(info));
+	CHECK(seL4_GetMR(seL4_VMFault_Addr) == 0x500000, "read-only fault addr=",
+	      seL4_GetMR(seL4_VMFault_Addr));
+	CHECK(seL4_GetMR(seL4_VMFault_PrefetchFault) == 0, "read-only prefetch=",
+	      seL4_GetMR(seL4_VMFault_PrefetchFault));
+#ifdef __aarch64__
+	CHECK((seL4_GetMR(seL4_VMFault_FSR) & 0x3f) == 0xf, "expected permission fault, FSR=",
+	      seL4_GetMR(seL4_VMFault_FSR));
+#else
+	CHECK((seL4_GetMR(seL4_VMFault_FSR) & 3) == 3, "expected write protection fault, FSR=",
+	      seL4_GetMR(seL4_VMFault_FSR));
 #endif
+	seL4_TCB_Suspend(utcb);
+	say("clearing accessed preserves read-only permissions");
+
+	/* A cap can still name an ASID/VA after another frame replaced its
+	 * mapping.  It must not clear the replacement frame's accessed bit. */
+	seL4_CPtr stale = copy_cap(L4H_FRAME_CPTR(t->zero_gpa));
+	seL4_CPtr replacement = copy_cap(L4H_FRAME_CPTR(t->user_gpa));
+	CHECK(stale && replacement, "no stale-map test caps", 0);
+	TRY(map_user_page(stale, 0x600000, seL4_CanRead));
+	TRY(map_user_page(replacement, 0x600000, seL4_CanRead));
+	ar = frame_accessed(stale);
+	CHECK(ar.error == seL4_InvalidCapability, "accessed on replaced mapping=", ar.error);
+	CHECK(frame_unmap(replacement) == 0, "unmap replacement", 0);
+	ar = frame_accessed(stale);
+	CHECK(ar.error == seL4_InvalidCapability, "accessed on absent mapping=", ar.error);
+	ar = frame_accessed(replacement);
+	CHECK(ar.error == seL4_IllegalOperation, "accessed after unmap=", ar.error);
+	say("accessed bits track reads and instruction fetches without guest faults; invalid mappings rejected");
 	return 0;
 }
 

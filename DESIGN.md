@@ -406,6 +406,22 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   the nearest MHz. With TSC-deadline mode, which all of them have, the
   PIT is then not used at all. QEMU/KVM and Hyper-V report leaf 0x15 as
   zero, so VMs keep measuring with the PIT.
+- **0023, accessed bits of native 4 KiB frames (x86_64 and aarch64).**
+  `seL4_X86_Page_TestAndClearAccessed` / `seL4_ARM_Page_TestAndClearAccessed`
+  resolves a frame cap's mapped ASID and address, verifies the physical
+  frame, atomically clears its A/AF bit, and returns the old bit. Unmapped
+  caps, non-native mappings and larger frames are refused; stale mappings
+  return `InvalidCapability`. The atomic operation preserves concurrent
+  hardware updates to other bits, including x86's dirty bit.
+
+  Clearing does not invalidate TLBs: a cached A=1/AF=1 translation can delay
+  the next sample, as with native x86 Linux aging. On AArch64 without
+  hardware AF updates, a later walk faults with AF=0. seL4 handles this
+  access-flag fault for an EL0 4 KiB mapping by setting AF and restarting
+  the instruction, without fault IPC to Linux. AF=0 translations cannot
+  be cached, so setting AF needs no invalidation. Permission and other
+  faults still go to the VSpace owner. The loader leaves `TCR_EL1.HA` off;
+  enabling hardware AF updates on FEAT_HAFDBS CPUs is a future optimization.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -431,7 +447,7 @@ configuration on x86. aarch64 is the better long-term path to proof coverage.
 `arch/x86/um`. UML already provides most of what is needed:
 - the separate-address-space kernel;
 - x86 signal frames, ptrace and the syscall table;
-- software page tables with accessed/dirty emulation and a batched
+- software page tables with hardware accessed and software dirty tracking, and a batched
   "TLB sync" to the host.
 
 The UML host layer (`os-Linux`) is replaced by `os-sel4`, which is built
@@ -527,7 +543,8 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
 ### 5.3 Memory management: Linux page tables mirrored into seL4
 
 - The guest kernel keeps ordinary Linux 4-level software page tables. The PTE
-  format belongs to `arch/l4h`, and A/D bits are maintained in software.
+  format belongs to `arch/l4h`; young combines software and hardware state,
+  while dirty is maintained in software.
 - The seL4 VSpace of each mm is a **cache** of those page tables, filled
   lazily:
   1. A user access to an unmapped address raises an seL4 VMFault, which
@@ -539,11 +556,29 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
 
   Optionally, the kernel pre-maps from `set_pte_at` for pages it has just
   faulted in.
-- **Software dirty and accessed bits.** Shared writable file pages are mapped
-  read-only until the first write, and the write fault sets `pte_dirty`. A
-  page counts as young when it is mapped, and aging is done by unmapping. This
-  is the same approach Linux uses on architectures without hardware A/D
-  bits.
+- **Hardware accessed and software dirty bits.** Clean writable pages are
+  mapped read-only until the first write, whose fault sets `pte_dirty`.
+  Aging leaves permissions unchanged: `ptep_test_and_clear_young()` returns
+  and clears the software young bit OR the hardware accessed bit, using
+  patch 0023 on the frame cap recorded in `as->pages`. The mm's VSpace lock
+  protects that cap against unmapping and pool eviction. An mm with no
+  VSpace has only its software bit to clear. `ptep_clear_flush_young()` is
+  the same operation, with no remap or TLB flush. Each reclaim sample costs
+  one seL4 invocation per mapped page. Reads then need no Linux fault;
+  AArch64 without hardware AF updates pays one seL4 entry after a new walk.
+
+  The old implementation left old pages readable but never observed reads,
+  so reclaim treated read-hot code and data as cold. Software dirty
+  tracking is retained because losing a dirty bit can lose data.
+  A remap or VSpace eviction can lose one accessed sample. Callers that
+  only inspect `pte_young()` see the software bit: in this configuration
+  that includes smaps' cosmetic `Referenced` count. Reclaim and `clear_refs`
+  use test-and-clear. MGLRU, DAMON, idle-page tracking and NUMA balancing
+  are disabled and would need hardware-bit support before being enabled.
+  `page_aging` uses a test-only module to sample reclaim's hook; it checks
+  hot/cold pages after `clear_refs`, no Linux refaults, and data integrity
+  during concurrent aging. The ABI test exercises the raw invocation and
+  the AArch64 access-flag handler for both reads and instruction fetches.
 - **Cap-slot tracking.** Every seL4 mapping needs its own frame-cap copy. PTE
   pages are allocated at order 1, and the second 4 KiB holds a parallel
   512-entry array of CNode slot indices, so unmapping is O(1).

@@ -650,11 +650,38 @@ int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)
 }
 
 /*
+ * The caller holds the PTE lock.  m->lock keeps the VSpace and frame cap
+ * alive against mapping changes and pool eviction.  Clear both bits even
+ * if the software one was set: short-circuiting would count an access
+ * twice.  This changes no permissions, so needs neither a sync nor a
+ * flush.  Atomic bit operations preserve a concurrent sync's NEEDSYNC.
+ */
+int ptep_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
+			    pte_t *ptep)
+{
+	struct l4h_mm *m = mm_l4h(vma->vm_mm);
+	unsigned long flags;
+	int young = test_and_clear_bit(7, &pte_val(*ptep));
+	int accessed = 0;
+
+	raw_spin_lock_irqsave(&m->lock, flags);
+	if (m->vs >= 0) {
+		void *e = xa_load(&vs_pool[m->vs].as.pages, addr >> PAGE_SHIFT);
+
+		/* A pending sync may still name the old frame. */
+		if (e && entry_pfn(e) == pte_pfn(READ_ONCE(*ptep)))
+			WARN_ON_ONCE(l4h_page_test_and_clear_accessed(entry_slot(e), &accessed));
+	}
+	raw_spin_unlock_irqrestore(&m->lock, flags);
+	return young | accessed;
+}
+EXPORT_SYMBOL_GPL(ptep_test_and_clear_young);
+
+/*
  * After a successful page fault, install the PTE for `address` directly,
- * with the protection UML's TLB sync would use (it emulates the accessed
- * and dirty bits by mapping old pages inaccessible and clean ones
- * read-only).  Returns -ENOMEM if there was no memory for the seL4
- * objects the mapping needs.
+ * with the protection the TLB sync uses: clean pages are read-only to
+ * emulate the dirty bit.  Returns -ENOMEM if there was no memory for the
+ * seL4 objects the mapping needs.
  */
 int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 {
@@ -696,7 +723,7 @@ int l4h_map_fault(struct mm_struct *mm, unsigned long address)
 	if (!pte)
 		goto out_unlock;
 	entry = *pte;
-	if (pte_present(entry) && pte_young(entry) && pte_read(entry)) {
+	if (pte_present(entry) && pte_read(entry)) {
 		prot = UM_PROT_READ;
 		if (pte_exec(entry))
 			prot |= UM_PROT_EXEC;
