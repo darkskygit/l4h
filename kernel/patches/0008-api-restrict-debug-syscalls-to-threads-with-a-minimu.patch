@@ -1,4 +1,4 @@
-From faf8bae6d517c734caaa17b911bb5e4d6dc1a874 Mon Sep 17 00:00:00 2001
+From f7721b16c2b60a31a101d1f21f0035253f95071f Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 22:58:58 -0700
 Subject: [PATCH 8/8] api: restrict debug syscalls to threads with a minimum
@@ -21,13 +21,21 @@ invocations (userError) and about threads that fault without a fault
 handler. Each is a synchronous serial write with the kernel lock held, so
 untrusted code could otherwise stall every core by failing invocations in
 a loop, in any build with printing.
+
+With KernelInvocationReportErrorIPC, userError formats into a buffer
+shared by all invocations, which the error reply copies to the caller:
+the reply now carries an empty message to threads below the threshold,
+and every invocation starts with the buffer empty, so an error never
+reports a message left by an earlier invocation (possibly of a more
+privileged thread).
 ---
  config.cmake              | 11 +++++++++++
  include/api/syscall.h     |  1 +
  include/api/types.h       | 29 +++++++++++++++++++++--------
- src/api/syscall.c         |  5 +++++
+ src/api/syscall.c         | 11 +++++++++++
  src/kernel/faulthandler.c |  4 ++++
- 5 files changed, 42 insertions(+), 8 deletions(-)
+ src/object/endpoint.c     | 11 +++++++++--
+ 6 files changed, 57 insertions(+), 10 deletions(-)
 
 diff --git a/config.cmake b/config.cmake
 index 750ab9b19..ac5d49823 100644
@@ -114,7 +122,7 @@ index aee35fafa..bdf2f324f 100644
  #else /* !CONFIG_PRINTING */
  #define userError(...)
 diff --git a/src/api/syscall.c b/src/api/syscall.c
-index 82014adaf..3f56510fb 100644
+index 82014adaf..19f2c9653 100644
 --- a/src/api/syscall.c
 +++ b/src/api/syscall.c
 @@ -113,6 +113,10 @@ exception_t handleUnknownSyscall(word_t w)
@@ -136,6 +144,19 @@ index 82014adaf..3f56510fb 100644
      MCS_DO_IF_BUDGET({
  #ifdef CONFIG_SET_TLS_BASE_SELF
          if (w == SysSetTLSBase)
+@@ -328,6 +333,12 @@ static exception_t handleInvocation(bool_t isCall, bool_t isBlocking)
+ 
+     thread = NODE_STATE(ksCurThread);
+ 
++#ifdef CONFIG_KERNEL_INVOCATION_REPORT_ERROR_IPC
++    /* An error without a userError message reports none, not the message
++     * of an earlier invocation. */
++    ((char *)current_debug_error.errorMessage)[0] = '\0';
++#endif
++
+     info = messageInfoFromWord(getRegister(thread, msgInfoRegister));
+ #ifndef CONFIG_KERNEL_MCS
+     cptr_t cptr = getRegister(thread, capRegister);
 diff --git a/src/kernel/faulthandler.c b/src/kernel/faulthandler.c
 index 99df97ea2..2aaaf51a6 100644
 --- a/src/kernel/faulthandler.c
@@ -158,6 +179,28 @@ index 99df97ea2..2aaaf51a6 100644
  #endif
  
      setThreadState(tptr, ThreadState_Inactive);
+diff --git a/src/object/endpoint.c b/src/object/endpoint.c
+index 6e34398eb..55fb27899 100644
+--- a/src/object/endpoint.c
++++ b/src/object/endpoint.c
+@@ -307,8 +307,15 @@ void replyFromKernel_error(tcb_t *thread)
+ 
+ #ifdef CONFIG_KERNEL_INVOCATION_REPORT_ERROR_IPC
+     char *debugBuffer = (char *)(ipcBuffer + DEBUG_MESSAGE_START + 1);
+-    word_t add = strlcpy(debugBuffer, (char *)current_debug_error.errorMessage,
+-                         DEBUG_MESSAGE_MAXLEN * sizeof(word_t));
++    word_t add = 0;
++    /* userError does not write messages for threads that may not debug,
++     * so the buffer holds another invocation's message: send none. */
++    if (threadMayDebug(thread)) {
++        add = strlcpy(debugBuffer, (char *)current_debug_error.errorMessage,
++                      DEBUG_MESSAGE_MAXLEN * sizeof(word_t));
++    } else {
++        debugBuffer[0] = '\0';
++    }
+ 
+     len += (add / sizeof(word_t)) + 1;
+ #endif
 -- 
 2.43.0
 
