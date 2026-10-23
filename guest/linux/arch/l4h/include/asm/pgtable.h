@@ -149,6 +149,14 @@ static inline int pte_young(pte_t pte)
 	return pte_get_bits(pte, _PAGE_ACCESSED);
 }
 
+#define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+int ptep_test_and_clear_young(struct vm_area_struct *vma, unsigned long addr,
+			    pte_t *ptep);
+
+/* Aging needs no TLB flush; cached translations may delay the next sample. */
+#define __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH
+#define ptep_clear_flush_young ptep_test_and_clear_young
+
 static inline int pte_needsync(pte_t pte)
 {
 	return pte_get_bits(pte, _PAGE_NEEDSYNC);

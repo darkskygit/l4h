@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+mkswap /dev/vda
+swapon /dev/vda
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup
+echo +memory > /sys/fs/cgroup/cgroup.subtree_control
+mkdir /sys/fs/cgroup/reclaim
+echo 67108864 > /sys/fs/cgroup/reclaim/memory.max
+echo 536870912 > /sys/fs/cgroup/reclaim/memory.swap.max
+grep '^pswp' /proc/vmstat > /tmp/swap-before
+seconds=120
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in reclaim_seconds=*) seconds=${arg#*=} ;; esac
+done
+sh -c 'echo $$ > /sys/fs/cgroup/reclaim/cgroup.procs; exec /bin/reclaim-stress "$1"' sh "$seconds" || echo 'RECLAIM: FAIL (worker exit)'
+echo 'RECLAIM: swap counters before/after (includes initialization)'
+cat /tmp/swap-before
+grep '^pswp' /proc/vmstat
+echo 'RECLAIM: memcg counters'
+cat /sys/fs/cgroup/reclaim/memory.events
+grep -E '^(pgfault|pgmajfault|pgscan|pgsteal)' /sys/fs/cgroup/reclaim/memory.stat
+poweroff -f

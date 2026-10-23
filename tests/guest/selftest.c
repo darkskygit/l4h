@@ -16,9 +16,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/user.h>
@@ -33,6 +35,7 @@
 #include <elf.h>
 #endif
 #include <linux/futex.h>
+#include "page-aging/page-aging.h"
 
 static int failures;
 
@@ -997,6 +1000,127 @@ static void test_smp_fork_storm(void)
 	CHECK(atomic_load(&stress_errors) == 0, "%d errors", atomic_load(&stress_errors));
 }
 
+#define AGING_PAGES 512
+
+static int clear_refs(void)
+{
+	int fd = open("/proc/self/clear_refs", O_WRONLY), ok;
+
+	if (fd < 0)
+		return -1;
+	ok = write(fd, "1", 1) == 1;
+	close(fd);
+	return ok ? 0 : -1;
+}
+
+static volatile unsigned long *aging_mem;
+static atomic_int aging_stop, aging_bad;
+
+static void *aging_reader(void *arg)
+{
+	unsigned long i = 0;
+
+	while (!atomic_load(&aging_stop)) {
+		if (aging_mem[i * 512] != i)
+			atomic_fetch_add(&aging_bad, 1);
+		i = (i + 1) % AGING_PAGES;
+	}
+	return NULL;
+}
+
+static int sample_young(int fd, const volatile void *start, size_t size)
+{
+	struct aging_range range = { .start = (uintptr_t)start, .size = size };
+
+	return ioctl(fd, L4H_AGING_SAMPLE, &range);
+}
+
+/* clear_refs and reclaim must see reads even after the software young bit
+ * is clear.  The test module invokes reclaim's hook; smaps' Referenced
+ * intentionally only sees the software PTE. */
+static void test_page_aging(void)
+{
+	unsigned long i, sum = 0;
+	pthread_t reader;
+	struct rusage before, after;
+	int fd = open("/dev/l4h_page_aging", O_RDONLY), hot, cold, aging_err = 0;
+	const size_t churn_size = 32 * 1024 * 1024;
+	volatile unsigned long *churn = mmap(NULL, churn_size, PROT_READ | PROT_WRITE,
+					   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	char *area = mmap(NULL, (AGING_PAGES + 2) * 4096, PROT_NONE,
+			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	/* Other runners reuse this binary without the test module.  They
+	 * still exercise concurrent aging and data integrity below. */
+	if (fd < 0)
+		printf("  page_aging: hardware sampling skipped (no test module)\n");
+	CHECK(area != MAP_FAILED && churn != MAP_FAILED, "mmap: %s", strerror(errno));
+	aging_mem = (volatile unsigned long *)(area + 4096);
+	CHECK(mprotect((void *)aging_mem, AGING_PAGES * 4096, PROT_READ | PROT_WRITE) == 0,
+	      "mprotect: %s", strerror(errno));
+	for (i = 0; i < churn_size / 4096; i++)
+		churn[i * 512] = i;
+	for (i = 0; i < AGING_PAGES; i++)
+		aging_mem[i * 512] = i;
+	if (fd >= 0) {
+		CHECK(sample_young(fd, aging_mem, AGING_PAGES * 4096) == AGING_PAGES,
+		      "initial software young bits missing");
+		CHECK(sample_young(fd, aging_mem, AGING_PAGES * 4096) == 0,
+		      "test-and-clear did not clear both bits");
+	}
+	CHECK(mprotect((void *)aging_mem, AGING_PAGES * 4096, PROT_READ) == 0, "read-only");
+	CHECK(clear_refs() == 0, "clear_refs: %s", strerror(errno));
+	if (fd >= 0)
+		CHECK(sample_young(fd, aging_mem, AGING_PAGES * 4096) == 0,
+		      "clear_refs did not clear hardware accessed bits");
+	/* Aging deliberately does not invalidate TLBs.  Evict cached AF=1/A=1
+	 * translations before checking that page walks record new accesses. */
+	for (i = 0; i < churn_size / 4096; i++)
+		sum += churn[i * 512];
+	sum = 0;
+	getrusage(RUSAGE_SELF, &before);
+	for (i = 0; i < AGING_PAGES / 2; i++)
+		sum += aging_mem[i * 512];
+	getrusage(RUSAGE_SELF, &after);
+	CHECK(sum == (AGING_PAGES / 2) * (AGING_PAGES / 2 - 1) / 2, "data changed");
+	if (fd >= 0) {
+		hot = sample_young(fd, aging_mem, AGING_PAGES / 2 * 4096);
+		cold = sample_young(fd, aging_mem + AGING_PAGES / 2 * 512, AGING_PAGES / 2 * 4096);
+		CHECK(hot >= AGING_PAGES / 2 * 3 / 4 && cold >= 0 && cold <= 16,
+		      "young pages: hot=%d, cold=%d", hot, cold);
+		CHECK(sample_young(fd, aging_mem, AGING_PAGES * 4096) == 0, "access counted twice");
+	}
+	CHECK(after.ru_minflt - before.ru_minflt < 8 && after.ru_majflt == before.ru_majflt,
+	      "aging delivered guest faults: minor=%ld major=%ld",
+	      after.ru_minflt - before.ru_minflt, after.ru_majflt - before.ru_majflt);
+	munmap((void *)churn, churn_size);
+	CHECK(mprotect((void *)aging_mem, AGING_PAGES * 4096, PROT_READ | PROT_WRITE) == 0,
+	      "read-write");
+
+	/* Aging while another thread reads and the main thread writes. */
+	atomic_store(&aging_stop, 0);
+	atomic_store(&aging_bad, 0);
+	CHECK(pthread_create(&reader, NULL, aging_reader, NULL) == 0, "pthread_create");
+	for (int round = 0; round < 50; round++) {
+		if (clear_refs()) {
+			aging_err = 1;
+			break;
+		}
+		for (i = round % 2; i < AGING_PAGES; i += 2)
+			aging_mem[i * 512 + 1] = round;
+	}
+	atomic_store(&aging_stop, 1);
+	pthread_join(reader, NULL);
+	CHECK(!aging_err, "clear_refs during reads");
+	CHECK(!atomic_load(&aging_bad), "%d reads saw wrong data", atomic_load(&aging_bad));
+	for (i = 0; i < AGING_PAGES; i++)
+		CHECK(aging_mem[i * 512] == i && aging_mem[i * 512 + 1] == 48 + i % 2,
+		      "page %lu lost data", i);
+	munmap(area, (AGING_PAGES + 2) * 4096);
+	if (fd >= 0)
+		close(fd);
+}
+
 /* More live processes than the guest has seL4 VSpaces (64): sleeping ones
  * lose theirs and get one back when they run again. */
 static void test_vspace_evict(void)
@@ -1183,6 +1307,7 @@ static const struct test tests[] = {
 	{ "uaccess_race", test_uaccess_race },
 	{ "smp_fork_storm", test_smp_fork_storm },
 	{ "vspace_evict", test_vspace_evict },
+	{ "page_aging", test_page_aging },
 };
 
 int main(int argc, char **argv)

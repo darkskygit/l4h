@@ -21,8 +21,8 @@ struct abitest {
 	int blk;		/* a virtio-blk device no driver uses, or -1 */
 };
 
-/* The user program (user.S): position independent, user_debug inside it. */
-extern char user_prog[], user_debug[], user_end[];
+/* The user program (user.S) and its position-independent fault helpers. */
+extern char user_prog[], user_debug[], user_write[], user_end[];
 
 /* main.c: objects, slots and mappings, deleted when the tests are done. */
 unsigned long abitest_obj(int type, int size_bits);	/* L4H_OBJ_*; 0 if none */

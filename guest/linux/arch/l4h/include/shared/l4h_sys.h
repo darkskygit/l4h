@@ -64,6 +64,7 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 #define L4H_PROT_DEFER_FLUSH	8
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
 int l4h_page_unmap(unsigned long frame);
+int l4h_page_test_and_clear_accessed(unsigned long frame, int *accessed);
 int l4h_vspace_flush(unsigned long vspace);
 int l4h_pt_map(int type, unsigned long table, unsigned long vspace, unsigned long va);
 
