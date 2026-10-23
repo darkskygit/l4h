@@ -1,4 +1,4 @@
-From 21cea7fd1a3d681a0cab2d69c661e54793285d63 Mon Sep 17 00:00:00 2001
+From 62a5e39417ffad935576160405b0a0b9205554b8 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:29:02 -0700
 Subject: [PATCH 1/7] tcb: add seL4_TCBFlag_trapSyscalls
@@ -11,8 +11,8 @@ where the seL4 syscall-number register (rdx on x86_64, x7 on aarch64) holds
 an arbitrary user value.
 
 The check is done on the slowpath and before dispatching to any fastpath on
-x86, Arm and RISC-V. Debug and benchmark syscalls are not interpreted for
-trapping threads.
+x86, Arm and RISC-V (on x86 with VT-x, also before SysVMEnter). Debug and
+benchmark syscalls are not interpreted for trapping threads.
 ---
  include/api/syscall.h                     |  3 +++
  libsel4/include/interfaces/object-api.xml |  6 +++++-
@@ -20,8 +20,8 @@ trapping threads.
  src/api/syscall.c                         | 10 ++++++++++
  src/arch/arm/c_traps.c                    | 12 +++++++++++-
  src/arch/riscv/c_traps.c                  |  9 ++++++++-
- src/arch/x86/c_traps.c                    |  7 +++++--
- 7 files changed, 47 insertions(+), 5 deletions(-)
+ src/arch/x86/c_traps.c                    | 10 +++++++---
+ 7 files changed, 49 insertions(+), 6 deletions(-)
 
 diff --git a/include/api/syscall.h b/include/api/syscall.h
 index 42cb8fb5e..ab818621b 100644
@@ -173,10 +173,20 @@ index bae151662..e6609fdf9 100644
      benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
      ksKernelEntry.is_fastpath = 1;
 diff --git a/src/arch/x86/c_traps.c b/src/arch/x86/c_traps.c
-index 99ffc2a61..a2e04c9ad 100644
+index 99ffc2a61..d69edc1e5 100644
 --- a/src/arch/x86/c_traps.c
 +++ b/src/arch/x86/c_traps.c
-@@ -115,7 +115,8 @@ void NORETURN slowpath(syscall_t syscall)
+@@ -98,7 +98,8 @@ void NORETURN slowpath(syscall_t syscall)
+ {
+ 
+ #ifdef CONFIG_VTX
+-    if (syscall == SysVMEnter && NODE_STATE(ksCurThread)->tcbArch.tcbVCPU) {
++    if (syscall == SysVMEnter && NODE_STATE(ksCurThread)->tcbArch.tcbVCPU &&
++        !threadTrapsSyscalls(NODE_STATE(ksCurThread))) {
+         vcpu_update_state_sysvmenter(NODE_STATE(ksCurThread)->tcbArch.tcbVCPU);
+         if (NODE_STATE(ksCurThread)->tcbBoundNotification
+             && notification_ptr_get_state(NODE_STATE(ksCurThread)->tcbBoundNotification) == NtfnState_Active) {
+@@ -115,7 +116,8 @@ void NORETURN slowpath(syscall_t syscall)
      }
  #endif
      /* check for undefined syscall */
@@ -186,7 +196,7 @@ index 99ffc2a61..a2e04c9ad 100644
  #ifdef TRACK_KERNEL_ENTRIES
          ksKernelEntry.path = Entry_UnknownSyscall;
          /* ksKernelEntry.word word is already set to syscall */
-@@ -167,7 +168,9 @@ void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t sy
+@@ -167,7 +169,9 @@ void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t sy
  #endif /* TRACK_KERNEL_ENTRIES */
  
  #ifdef CONFIG_FASTPATH
@@ -198,5 +208,5 @@ index 99ffc2a61..a2e04c9ad 100644
          UNREACHABLE();
      } else if (syscall == (syscall_t)SysReplyRecv) {
 -- 
-2.47.3
+2.43.0
 

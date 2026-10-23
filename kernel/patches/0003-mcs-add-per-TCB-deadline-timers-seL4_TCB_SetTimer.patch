@@ -1,27 +1,34 @@
-From bbc385271f651808b2ddd1549a072370fa7b13d9 Mon Sep 17 00:00:00 2001
+From 9aabc67551d3dcdc2bd77707e8537fc7f82cadda Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:32:05 -0700
 Subject: [PATCH 3/7] mcs: add per-TCB deadline timers (seL4_TCB_SetTimer)
 
 Allow user level to arm a one-shot, absolute deadline timer that signals a
 badge to the TCB's bound notification when it expires. Armed timers are
-kept in a per-core queue sorted by deadline, and the queue head is taken
-into account when programming the MCS kernel's one-shot timer, so no
-additional hardware timer is needed.
+kept in a per-core red-black tree ordered by deadline, and its first node
+is taken into account when programming the MCS kernel's one-shot timer, so
+no additional hardware timer is needed.
+
+User level chooses how many timers are armed: any TCB it can retype can
+hold one. Arming and disarming therefore take O(log n) time, and at most
+32 timers fire per kernel entry; due timers beyond those fire on the next
+timer interrupt, which is programmed to come at once. A sorted list let
+one user arm 100,000 timers and then hold the kernel lock for milliseconds
+on each SetTimer.
 
 This gives user-level OS personalities (e.g. paravirtualised guest
 kernels) a cheap clock-event device on platforms without a spare timer
 device such as cloud VMs without HPET.
 ---
- include/kernel/thread.h                   |  4 ++
- include/model/statedata.h                 |  1 +
- include/object/structures.h               |  9 +++
- libsel4/include/interfaces/object-api.xml | 21 +++++++
- src/kernel/thread.c                       | 68 +++++++++++++++++++++++
- src/model/statedata.c                     |  2 +
- src/object/objecttype.c                   |  1 +
- src/object/tcb.c                          | 24 ++++++++
- 8 files changed, 130 insertions(+)
+ include/kernel/thread.h                   |   4 +
+ include/model/statedata.h                 |   2 +
+ include/object/structures.h               |  11 +
+ libsel4/include/interfaces/object-api.xml |  21 ++
+ src/kernel/thread.c                       | 286 ++++++++++++++++++++++
+ src/model/statedata.c                     |   4 +
+ src/object/objecttype.c                   |   1 +
+ src/object/tcb.c                          |  24 ++
+ 8 files changed, 353 insertions(+)
 
 diff --git a/include/kernel/thread.h b/include/kernel/thread.h
 index 4a828f6bc..da4ce5bbc 100644
@@ -39,34 +46,37 @@ index 4a828f6bc..da4ce5bbc 100644
   * of periodic threads waiting for budget recharge */
  void postpone(sched_context_t *sc);
 diff --git a/include/model/statedata.h b/include/model/statedata.h
-index e1b4830ac..64f3de48f 100644
+index e1b4830ac..7b53a8d4d 100644
 --- a/include/model/statedata.h
 +++ b/include/model/statedata.h
-@@ -65,6 +65,7 @@ NODE_STATE_DECLARE(tcb_t, *ksSchedulerAction);
+@@ -65,6 +65,8 @@ NODE_STATE_DECLARE(tcb_t, *ksSchedulerAction);
  
  #ifdef CONFIG_KERNEL_MCS
  NODE_STATE_DECLARE(tcb_queue_t, ksReleaseQueue);
 +NODE_STATE_DECLARE(tcb_t *, ksTimerQueue);
++NODE_STATE_DECLARE(tcb_t *, ksTimerRoot);
  NODE_STATE_DECLARE(ticks_t, ksConsumed);
  NODE_STATE_DECLARE(ticks_t, ksCurTime);
  NODE_STATE_DECLARE(bool_t, ksReprogram);
 diff --git a/include/object/structures.h b/include/object/structures.h
-index 340f24e60..5023c7031 100644
+index 340f24e60..840fc9584 100644
 --- a/include/object/structures.h
 +++ b/include/object/structures.h
-@@ -274,6 +274,15 @@ struct tcb {
+@@ -274,6 +274,17 @@ struct tcb {
  
      /* scheduling context that this tcb yielded to */
      sched_context_t *tcbYieldTo;
 +
 +    /* Deadline timer (seL4_TCB_SetTimer): absolute deadline in timer ticks,
 +     * or 0 if disarmed; the badge signalled to the bound notification; the
-+     * core whose timer queue holds the TCB; and the queue links. */
++     * core whose timer tree holds the TCB; and the red-black tree links. */
 +    ticks_t tcbTimerDeadline;
 +    word_t tcbTimerBadge;
 +    word_t tcbTimerCore;
-+    struct tcb *tcbTimerNext;
-+    struct tcb *tcbTimerPrev;
++    word_t tcbTimerRed;
++    struct tcb *tcbTimerParent;
++    struct tcb *tcbTimerLeft;
++    struct tcb *tcbTimerRight;
  #else
      /* Timeslice remaining, 1 word */
      word_t tcbTimeSlice;
@@ -103,7 +113,7 @@ index 1f433596e..705c27010 100644
  
      <interface name="seL4_CNode" manual_name="CNode">
 diff --git a/src/kernel/thread.c b/src/kernel/thread.c
-index 581327f64..4435fff24 100644
+index 581327f64..af8cb337c 100644
 --- a/src/kernel/thread.c
 +++ b/src/kernel/thread.c
 @@ -619,6 +619,11 @@ void setNextInterrupt(void)
@@ -118,25 +128,228 @@ index 581327f64..4435fff24 100644
      /* We should never be attempting to schedule anything earlier than ksCurTime */
      assert(next_interrupt >= NODE_STATE(ksCurTime));
  
-@@ -743,8 +748,71 @@ static void tcbReleaseDequeue(void)
+@@ -743,8 +748,289 @@ static void tcbReleaseDequeue(void)
      possibleSwitchTo(awakened);
  }
  
++/* Armed deadline timers form a red-black tree per core, ordered by
++ * deadline, so that arming and disarming a timer take O(log n) time however
++ * many timers user level arms. ksTimerQueue caches the tree's first node. */
++
++static inline bool_t timerIsRed(tcb_t *t)
++{
++    return t != NULL && t->tcbTimerRed;
++}
++
++static void timerReplaceChild(tcb_t **root, tcb_t *parent, tcb_t *old, tcb_t *new)
++{
++    if (parent == NULL) {
++        *root = new;
++    } else if (parent->tcbTimerLeft == old) {
++        parent->tcbTimerLeft = new;
++    } else {
++        parent->tcbTimerRight = new;
++    }
++}
++
++static void timerRotateLeft(tcb_t **root, tcb_t *x)
++{
++    tcb_t *y = x->tcbTimerRight;
++    x->tcbTimerRight = y->tcbTimerLeft;
++    if (y->tcbTimerLeft) {
++        y->tcbTimerLeft->tcbTimerParent = x;
++    }
++    y->tcbTimerParent = x->tcbTimerParent;
++    timerReplaceChild(root, x->tcbTimerParent, x, y);
++    y->tcbTimerLeft = x;
++    x->tcbTimerParent = y;
++}
++
++static void timerRotateRight(tcb_t **root, tcb_t *x)
++{
++    tcb_t *y = x->tcbTimerLeft;
++    x->tcbTimerLeft = y->tcbTimerRight;
++    if (y->tcbTimerRight) {
++        y->tcbTimerRight->tcbTimerParent = x;
++    }
++    y->tcbTimerParent = x->tcbTimerParent;
++    timerReplaceChild(root, x->tcbTimerParent, x, y);
++    y->tcbTimerRight = x;
++    x->tcbTimerParent = y;
++}
++
++static void timerInsertFixup(tcb_t **root, tcb_t *z)
++{
++    tcb_t *p;
++    while ((p = z->tcbTimerParent) != NULL && p->tcbTimerRed) {
++        /* p is red, so it is not the root and g exists */
++        tcb_t *g = p->tcbTimerParent;
++        if (p == g->tcbTimerLeft) {
++            tcb_t *u = g->tcbTimerRight;
++            if (timerIsRed(u)) {
++                p->tcbTimerRed = false;
++                u->tcbTimerRed = false;
++                g->tcbTimerRed = true;
++                z = g;
++                continue;
++            }
++            if (z == p->tcbTimerRight) {
++                timerRotateLeft(root, p);
++                z = p;
++                p = z->tcbTimerParent;
++            }
++            p->tcbTimerRed = false;
++            g->tcbTimerRed = true;
++            timerRotateRight(root, g);
++        } else {
++            tcb_t *u = g->tcbTimerLeft;
++            if (timerIsRed(u)) {
++                p->tcbTimerRed = false;
++                u->tcbTimerRed = false;
++                g->tcbTimerRed = true;
++                z = g;
++                continue;
++            }
++            if (z == p->tcbTimerLeft) {
++                timerRotateRight(root, p);
++                z = p;
++                p = z->tcbTimerParent;
++            }
++            p->tcbTimerRed = false;
++            g->tcbTimerRed = true;
++            timerRotateLeft(root, g);
++        }
++    }
++    (*root)->tcbTimerRed = false;
++}
++
++/* x (possibly NULL) is one black node short on every path; parent is its
++ * parent. */
++static void timerRemoveFixup(tcb_t **root, tcb_t *x, tcb_t *parent)
++{
++    while (x != *root && !timerIsRed(x)) {
++        /* x's sibling w exists: its side has at least one black node */
++        if (x == parent->tcbTimerLeft) {
++            tcb_t *w = parent->tcbTimerRight;
++            if (w->tcbTimerRed) {
++                w->tcbTimerRed = false;
++                parent->tcbTimerRed = true;
++                timerRotateLeft(root, parent);
++                w = parent->tcbTimerRight;
++            }
++            if (!timerIsRed(w->tcbTimerLeft) && !timerIsRed(w->tcbTimerRight)) {
++                w->tcbTimerRed = true;
++                x = parent;
++                parent = x->tcbTimerParent;
++            } else {
++                if (!timerIsRed(w->tcbTimerRight)) {
++                    w->tcbTimerLeft->tcbTimerRed = false;
++                    w->tcbTimerRed = true;
++                    timerRotateRight(root, w);
++                    w = parent->tcbTimerRight;
++                }
++                w->tcbTimerRed = parent->tcbTimerRed;
++                parent->tcbTimerRed = false;
++                w->tcbTimerRight->tcbTimerRed = false;
++                timerRotateLeft(root, parent);
++                x = *root;
++            }
++        } else {
++            tcb_t *w = parent->tcbTimerLeft;
++            if (w->tcbTimerRed) {
++                w->tcbTimerRed = false;
++                parent->tcbTimerRed = true;
++                timerRotateRight(root, parent);
++                w = parent->tcbTimerLeft;
++            }
++            if (!timerIsRed(w->tcbTimerLeft) && !timerIsRed(w->tcbTimerRight)) {
++                w->tcbTimerRed = true;
++                x = parent;
++                parent = x->tcbTimerParent;
++            } else {
++                if (!timerIsRed(w->tcbTimerLeft)) {
++                    w->tcbTimerRight->tcbTimerRed = false;
++                    w->tcbTimerRed = true;
++                    timerRotateLeft(root, w);
++                    w = parent->tcbTimerLeft;
++                }
++                w->tcbTimerRed = parent->tcbTimerRed;
++                parent->tcbTimerRed = false;
++                w->tcbTimerLeft->tcbTimerRed = false;
++                timerRotateRight(root, parent);
++                x = *root;
++            }
++        }
++    }
++    if (x) {
++        x->tcbTimerRed = false;
++    }
++}
++
 +void timerQueueRemove(tcb_t *tcb)
 +{
 +    if (tcb->tcbTimerDeadline == 0) {
 +        return;
 +    }
-+    if (tcb->tcbTimerPrev) {
-+        tcb->tcbTimerPrev->tcbTimerNext = tcb->tcbTimerNext;
++    tcb_t **root = &NODE_STATE_ON_CORE(ksTimerRoot, tcb->tcbTimerCore);
++
++    if (NODE_STATE_ON_CORE(ksTimerQueue, tcb->tcbTimerCore) == tcb) {
++        /* The first node has no left child: its successor is the first
++         * node of its right subtree, or else its parent. */
++        tcb_t *next = tcb->tcbTimerRight;
++        if (next) {
++            while (next->tcbTimerLeft) {
++                next = next->tcbTimerLeft;
++            }
++        } else {
++            next = tcb->tcbTimerParent;
++        }
++        NODE_STATE_ON_CORE(ksTimerQueue, tcb->tcbTimerCore) = next;
++    }
++
++    tcb_t *x;
++    tcb_t *xParent;
++    bool_t removedRed = tcb->tcbTimerRed;
++    if (tcb->tcbTimerLeft == NULL || tcb->tcbTimerRight == NULL) {
++        x = tcb->tcbTimerLeft ? tcb->tcbTimerLeft : tcb->tcbTimerRight;
++        xParent = tcb->tcbTimerParent;
++        timerReplaceChild(root, xParent, tcb, x);
++        if (x) {
++            x->tcbTimerParent = xParent;
++        }
 +    } else {
-+        NODE_STATE_ON_CORE(ksTimerQueue, tcb->tcbTimerCore) = tcb->tcbTimerNext;
++        /* Put the successor y in tcb's place. */
++        tcb_t *y = tcb->tcbTimerRight;
++        while (y->tcbTimerLeft) {
++            y = y->tcbTimerLeft;
++        }
++        removedRed = y->tcbTimerRed;
++        x = y->tcbTimerRight;
++        if (y->tcbTimerParent == tcb) {
++            xParent = y;
++        } else {
++            xParent = y->tcbTimerParent;
++            xParent->tcbTimerLeft = x;
++            if (x) {
++                x->tcbTimerParent = xParent;
++            }
++            y->tcbTimerRight = tcb->tcbTimerRight;
++            y->tcbTimerRight->tcbTimerParent = y;
++        }
++        timerReplaceChild(root, tcb->tcbTimerParent, tcb, y);
++        y->tcbTimerParent = tcb->tcbTimerParent;
++        y->tcbTimerLeft = tcb->tcbTimerLeft;
++        y->tcbTimerLeft->tcbTimerParent = y;
++        y->tcbTimerRed = tcb->tcbTimerRed;
 +    }
-+    if (tcb->tcbTimerNext) {
-+        tcb->tcbTimerNext->tcbTimerPrev = tcb->tcbTimerPrev;
++    if (!removedRed) {
++        timerRemoveFixup(root, x, xParent);
 +    }
-+    tcb->tcbTimerNext = NULL;
-+    tcb->tcbTimerPrev = NULL;
++
++    tcb->tcbTimerParent = NULL;
++    tcb->tcbTimerLeft = NULL;
++    tcb->tcbTimerRight = NULL;
++    tcb->tcbTimerRed = false;
 +    tcb->tcbTimerDeadline = 0;
 +}
 +
@@ -147,34 +360,49 @@ index 581327f64..4435fff24 100644
 +        return;
 +    }
 +
-+    tcb_t *prev = NULL;
-+    tcb_t *next = NODE_STATE(ksTimerQueue);
-+    while (next != NULL && next->tcbTimerDeadline <= deadline) {
-+        prev = next;
-+        next = next->tcbTimerNext;
++    tcb_t **root = &NODE_STATE(ksTimerRoot);
++    tcb_t **link = root;
++    tcb_t *parent = NULL;
++    bool_t first = true;
++    while (*link != NULL) {
++        parent = *link;
++        if (deadline < parent->tcbTimerDeadline) {
++            link = &parent->tcbTimerLeft;
++        } else {
++            link = &parent->tcbTimerRight;
++            first = false;
++        }
 +    }
 +
 +    tcb->tcbTimerDeadline = deadline;
 +    tcb->tcbTimerBadge = badge;
-+    tcb->tcbTimerCore = getCurrentCPUIndex();
-+    tcb->tcbTimerPrev = prev;
-+    tcb->tcbTimerNext = next;
-+    if (prev) {
-+        prev->tcbTimerNext = tcb;
-+    } else {
++    tcb->tcbTimerCore = CURRENT_CPU_INDEX();
++    tcb->tcbTimerParent = parent;
++    tcb->tcbTimerLeft = NULL;
++    tcb->tcbTimerRight = NULL;
++    tcb->tcbTimerRed = true;
++    *link = tcb;
++    timerInsertFixup(root, tcb);
++
++    if (first) {
 +        NODE_STATE(ksTimerQueue) = tcb;
 +        NODE_STATE(ksReprogram) = true;
 +    }
-+    if (next) {
-+        next->tcbTimerPrev = tcb;
-+    }
 +}
++
++/* At most this many timers fire per kernel entry, which bounds the time
++ * the kernel spends here however many timers are due. The rest stay due:
++ * setNextInterrupt() then programs the timer to fire again at once. */
++#define TIMER_FIRE_BATCH 32
 +
 +static void fireTimers(void)
 +{
-+    while (NODE_STATE(ksTimerQueue) != NULL &&
-+           NODE_STATE(ksTimerQueue)->tcbTimerDeadline <= NODE_STATE(ksCurTime) + getTimerPrecision()) {
++    for (word_t i = 0; i < TIMER_FIRE_BATCH; i++) {
 +        tcb_t *tcb = NODE_STATE(ksTimerQueue);
++        if (tcb == NULL ||
++            tcb->tcbTimerDeadline > NODE_STATE(ksCurTime) + getTimerPrecision()) {
++            return;
++        }
 +        word_t badge = tcb->tcbTimerBadge;
 +        timerQueueRemove(tcb);
 +        if (tcb->tcbBoundNotification) {
@@ -191,14 +419,16 @@ index 581327f64..4435fff24 100644
          tcbReleaseDequeue();
      }
 diff --git a/src/model/statedata.c b/src/model/statedata.c
-index 6b238fb90..568548723 100644
+index 6b238fb90..8ec232be0 100644
 --- a/src/model/statedata.c
 +++ b/src/model/statedata.c
-@@ -28,6 +28,8 @@ compile_assert(ksReadyQueuesL1BitmapBigEnough, (L2_BITMAP_SIZE - 1) <= wordBits)
+@@ -28,6 +28,10 @@ compile_assert(ksReadyQueuesL1BitmapBigEnough, (L2_BITMAP_SIZE - 1) <= wordBits)
  #ifdef CONFIG_KERNEL_MCS
  /* Head of the queue of threads waiting for their budget to be replenished */
  UP_STATE_DEFINE(tcb_queue_t, ksReleaseQueue);
-+/* Armed deadline timers on this core, sorted by deadline */
++/* Armed deadline timers on this core: a red-black tree ordered by
++ * deadline, and its first (earliest) node */
++UP_STATE_DEFINE(tcb_t *, ksTimerRoot);
 +UP_STATE_DEFINE(tcb_t *, ksTimerQueue);
  #endif
  
@@ -216,10 +446,10 @@ index e6c603623..82ea3041c 100644
              if (sc) {
                  schedContext_unbindTCB(sc);
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index dde25aee9..6bb2503e0 100644
+index 3e8c44b28..3d94d5023 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -925,6 +925,25 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
+@@ -933,6 +933,25 @@ static exception_t decodeFPUTransfer(cap_t cap, word_t length, word_t *buffer, b
  }
  #endif /* CONFIG_HAVE_FPU */
  
@@ -245,7 +475,7 @@ index dde25aee9..6bb2503e0 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -1021,6 +1040,11 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -1029,6 +1048,11 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  
@@ -258,5 +488,5 @@ index dde25aee9..6bb2503e0 100644
      case TCBReadFPU:
          return decodeFPUTransfer(cap, length, buffer, true);
 -- 
-2.47.3
+2.43.0
 

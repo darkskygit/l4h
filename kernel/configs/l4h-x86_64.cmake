@@ -17,6 +17,9 @@ set(KernelIOMMU OFF CACHE BOOL "")
 set(KernelVTX OFF CACHE BOOL "")
 # The Meltdown "skim window" is incompatible with preserving user RSP across
 # syscalls (patch 0004); l4h targets CPUs that are not affected by Meltdown.
+# Nothing checks this at boot: on an affected CPU (IA32_ARCH_CAPABILITIES.
+# RDCL_NO clear, e.g. Intel before Cascade Lake) any guest can read all RAM
+# through the kernel window.  Do not deploy there (DESIGN.md §4).
 set(KernelSkimWindow OFF CACHE BOOL "")
 set(KernelRootCNodeSizeBits "19" CACHE STRING "")
 set(KernelMaxNumBootinfoUntypedCaps "230" CACHE STRING "")

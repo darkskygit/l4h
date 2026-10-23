@@ -1,4 +1,4 @@
-From c7f166f0428514a7ca30d9dddd240463ffb32ab3 Mon Sep 17 00:00:00 2001
+From efee42ce0302736fba146ea39e8e844ef472d764 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 10:16:20 -0700
 Subject: [PATCH 4/7] x86_64: preserve the user stack pointer across syscalls
@@ -10,16 +10,36 @@ that convention: their syscalls are delivered as faults and must return
 with RSP intact.
 
 Save the user RSP into the user context on 'syscall' entry (through a
-per-node scratch slot) and restore it on sysret.  This makes the RSP of
+per-node scratch slot) and restore it on sysret, from both the slow path
+and the fastpath.  This makes the RSP of
 syscall-entered threads accurate in fault messages and ReadRegisters.
 Only supported without the SKIM window.
 ---
- include/arch/x86/arch/64/mode/model/smp.h |  7 ++++++-
- src/arch/x86/64/c_traps.c                 |  5 +++++
- src/arch/x86/64/model/statedata.c         |  5 +++++
- src/arch/x86/64/traps.S                   | 18 ++++++++++++++++++
- 4 files changed, 34 insertions(+), 1 deletion(-)
+ .../arch/x86/arch/64/mode/fastpath/fastpath.h  |  5 +++++
+ include/arch/x86/arch/64/mode/model/smp.h      |  7 ++++++-
+ src/arch/x86/64/c_traps.c                      |  5 +++++
+ src/arch/x86/64/model/statedata.c              |  5 +++++
+ src/arch/x86/64/traps.S                        | 18 ++++++++++++++++++
+ 5 files changed, 39 insertions(+), 1 deletion(-)
 
+diff --git a/include/arch/x86/arch/64/mode/fastpath/fastpath.h b/include/arch/x86/arch/64/mode/fastpath/fastpath.h
+index 8bb3c349f..ffabec752 100644
+--- a/include/arch/x86/arch/64/mode/fastpath/fastpath.h
++++ b/include/arch/x86/arch/64/mode/fastpath/fastpath.h
+@@ -245,8 +245,13 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
+             "movq %%rsp, %%cr3\n"
+ #endif /* CONFIG_KERNEL_SKIM_WINDOW */
+ #endif /* defined(ENABLE_SMP_SUPPORT) && defined(CONFIG_KERNEL_SKIM_WINDOW) */
++#ifdef CONFIG_KERNEL_SKIM_WINDOW
+             // clear RSP to not leak information to the user
+             "xor %%rsp, %%rsp\n"
++#else
++            // restore the thread's RSP (saved on syscall entry)
++            "movq 8(%%rsp), %%rsp\n"
++#endif
+             // More register but we can ignore and are done restoring
+             // enable interrupt disabled by sysenter
+             "sysretq\n"
 diff --git a/include/arch/x86/arch/64/mode/model/smp.h b/include/arch/x86/arch/64/mode/model/smp.h
 index 76d6421ac..61a420d87 100644
 --- a/include/arch/x86/arch/64/mode/model/smp.h
@@ -101,5 +121,5 @@ index f477325ec..ce11edfad 100644
      push    %rcx            # save NextIP
      push    %r11            # save RFLAGS
 -- 
-2.47.3
+2.43.0
 

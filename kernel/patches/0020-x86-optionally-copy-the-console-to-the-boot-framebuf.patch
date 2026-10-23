@@ -1,7 +1,8 @@
-From a8e6611e627acfc1f2ac32bc169ae94dbbc1cd0f Mon Sep 17 00:00:00 2001
+From ba11df0d16c4d647f8e0a15d9636b2c3d129996c Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Tue, 20 Oct 2026 09:29:04 -0700
-Subject: [PATCH] x86: optionally copy the console to the boot framebuffer
+Subject: [PATCH] x86: optionally copy the console to the boot
+ framebuffer
 
 The fb_console command-line option draws everything the kernel prints,
 its own messages and user debug output, on the lower half of the
@@ -10,13 +11,17 @@ top instead of scrolling, so the framebuffer is never read.  This shows
 the console on machines whose serial port cannot be reached, such as
 Latitude.sh servers, whose BMC offers only a graphical console through
 its web proxy.
+
+Only a direct-RGB, 32 bpp framebuffer below 4 GiB whose pitch holds a
+row of pixels is used, and drawing is clipped to the console area, even
+when cores that do not hold the kernel lock (panics) race on the cursor.
 ---
  include/arch/x86/arch/kernel/cmdline.h |   3 +
- include/plat/pc99/plat/machine/io.h    |   3 +
- src/arch/x86/kernel/boot_sys.c         |   7 ++
+ include/plat/pc99/plat/machine/io.h    |   4 +
+ src/arch/x86/kernel/boot_sys.c         |   7 +
  src/arch/x86/kernel/cmdline.c          |   6 +
- src/plat/pc99/machine/io.c             | 160 +++++++++++++++++++++++++
- 5 files changed, 179 insertions(+)
+ src/plat/pc99/machine/io.c             | 171 +++++++++++++++++++++++++
+ 5 files changed, 191 insertions(+)
 
 diff --git a/include/arch/x86/arch/kernel/cmdline.h b/include/arch/x86/arch/kernel/cmdline.h
 index 47fbb2a0a..523d7d7ac 100644
@@ -33,20 +38,21 @@ index 47fbb2a0a..523d7d7ac 100644
  
  void cmdline_parse(const char *cmdline, cmdline_opt_t *cmdline_opt);
 diff --git a/include/plat/pc99/plat/machine/io.h b/include/plat/pc99/plat/machine/io.h
-index bc6e8cd09..fc5e764cf 100644
+index bc6e8cd09..efa674651 100644
 --- a/include/plat/pc99/plat/machine/io.h
 +++ b/include/plat/pc99/plat/machine/io.h
-@@ -25,5 +25,8 @@ uint32_t in32(uint16_t port);
+@@ -25,5 +25,9 @@ uint32_t in32(uint16_t port);
  
  #if defined(CONFIG_DEBUG_BUILD) || defined(CONFIG_PRINTING)
  void serial_init(uint16_t port);
 +#ifdef CONFIG_PRINTING
-+void fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp);
++void fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp,
++                uint8_t type);
 +#endif
  #endif
  
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index 35b5c894a..666ce1911 100644
+index 35b5c894a..a0c2db23c 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
 @@ -8,6 +8,7 @@
@@ -63,7 +69,7 @@ index 35b5c894a..666ce1911 100644
              boot_state.fb_info = *fb;
 +#ifdef CONFIG_PRINTING
 +            if (cmdline_opt.fb_console) {
-+                fbcon_init(fb->addr, fb->pitch, fb->width, fb->height, fb->bpp);
++                fbcon_init(fb->addr, fb->pitch, fb->width, fb->height, fb->bpp, fb->type);
 +                printf("Boot config: console copied to the framebuffer\n");
 +            }
 +#endif
@@ -95,10 +101,10 @@ index 3dc26c2ec..211cf84ea 100644
      printf("Boot config: disable_iommu = %s\n", cmdline_opt->disable_iommu ? "true" : "false");
  }
 diff --git a/src/plat/pc99/machine/io.c b/src/plat/pc99/machine/io.c
-index 83a53bac5..683e7e3af 100644
+index 83a53bac5..8dae0c994 100644
 --- a/src/plat/pc99/machine/io.c
 +++ b/src/plat/pc99/machine/io.c
-@@ -31,12 +31,172 @@ void serial_init(uint16_t port)
+@@ -31,12 +31,183 @@ void serial_init(uint16_t port)
  
  #ifdef CONFIG_PRINTING
  
@@ -210,11 +216,17 @@ index 83a53bac5..683e7e3af 100644
 +    word_t pitch, cols, rows, top, row, col;
 +} fbcon;
 +
-+BOOT_CODE void fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp)
++/* Multiboot2 framebuffer type: direct RGB colour */
++#define FB_TYPE_RGB 1
++
++BOOT_CODE void fbcon_init(uint64_t paddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t bpp,
++                          uint8_t type)
 +{
 +    /* The boot page tables and the kernel window both map the low 4 GiB at
 +     * PPTR_BASE. */
-+    if (bpp != 32 || width < 640 || height < 400 || paddr + (uint64_t)pitch * height > 0x100000000ull) {
++    if (type != FB_TYPE_RGB || bpp != 32 || width < 640 || height < 400 ||
++        pitch < (uint64_t)width * 4 || paddr >= 0x100000000ull ||
++        (uint64_t)pitch * height > 0x100000000ull - paddr) {
 +        return;
 +    }
 +    fbcon.base = (uint32_t *)(PPTR_BASE + (word_t)paddr);
@@ -228,6 +240,11 @@ index 83a53bac5..683e7e3af 100644
 +
 +static void fbcon_glyph(word_t row, word_t col, unsigned char c)
 +{
++    /* Prints from cores that do not hold the kernel lock (panics) can race
++     * on the cursor: never draw outside the console area. */
++    if (row >= fbcon.rows || col >= fbcon.cols) {
++        return;
++    }
 +    const uint8_t *g = c >= 0x20 && c < 0x7f ? fbcon_font[c - 0x20] : fbcon_font[0];
 +    for (word_t y = 0; y < 16; y++) {
 +        volatile uint32_t *p = (volatile uint32_t *)((word_t)fbcon.base + ((fbcon.top + row) * 16 + y) * fbcon.pitch) + col * 8;
@@ -246,7 +263,7 @@ index 83a53bac5..683e7e3af 100644
 +        fbcon.col = 0;
 +        return;
 +    }
-+    if (c == '\n' || fbcon.col == fbcon.cols) {
++    if (c == '\n' || fbcon.col >= fbcon.cols) {
 +        fbcon.col = 0;
 +        fbcon.row = (fbcon.row + 1) % fbcon.rows;
 +        /* Clear the new line and mark the one after it as the edge. */
@@ -272,5 +289,5 @@ index 83a53bac5..683e7e3af 100644
      out8(x86KSdebugPort, c);
  }
 -- 
-2.47.3
+2.43.0
 

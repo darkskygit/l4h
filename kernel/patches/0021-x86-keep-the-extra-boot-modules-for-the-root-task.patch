@@ -1,4 +1,4 @@
-From 61647eb1a99f7d52a70499dff715fb3d390893f3 Mon Sep 17 00:00:00 2001
+From a61923f4c1a70a5ea7bb2a4325d67ab658321bdd Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Tue, 20 Oct 2026 23:27:25 -0700
 Subject: [PATCH] x86: keep the extra boot modules for the root task
@@ -8,21 +8,27 @@ Their memory is not even safe: the root task's image is moved down to the
 end of the kernel image, over wherever the boot loader put them, and what
 survives becomes ordinary Untypeds, which are cleared when retyped.
 
-Copy each later module (up to SEL4_X86_MAX_BOOT_MODULES) to page-aligned
-memory above the root task's loaded image, take that memory out of the
-available RAM so that it reaches the root task as device Untypeds, which
-retype into frames without clearing, and list the modules, with their
-loader-provided strings, in a new bootinfo chunk,
-SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES (seL4_X86_BootModules_t).  Both
+Copy each later module (up to SEL4_X86_MAX_BOOT_MODULES; further ones are
+ignored with a warning) to page-aligned memory above the root task's
+loaded image and below 4 GiB, which the boot page tables map, take that
+memory out of the available RAM so that it reaches the root task as device
+Untypeds, which retype into frames without clearing, and list the modules,
+with their loader-provided strings, in a new bootinfo chunk,
+SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES (seL4_X86_BootModules_t). Both
 multiboot1 and multiboot2 are handled.
+
+find_load_paddr() now skips memory regions that end below the minimum
+address: their size wrapped around, so it returned the minimum address
+without checking that the image fits, and an image larger than the region
+at that address was copied past the end of RAM.
 ---
  include/arch/x86/arch/kernel/boot.h           |   3 +-
  include/arch/x86/arch/kernel/boot_sys.h       |   1 +
- .../x86/sel4/arch/bootinfo_types.h            |  19 ++++
+ .../x86/sel4/arch/bootinfo_types.h            |  19 +++
  libsel4/include/sel4/bootinfo_types.h         |   1 +
  src/arch/x86/kernel/boot.c                    |  17 ++-
- src/arch/x86/kernel/boot_sys.c                | 105 +++++++++++++++++-
- 6 files changed, 143 insertions(+), 3 deletions(-)
+ src/arch/x86/kernel/boot_sys.c                | 115 +++++++++++++++++-
+ 6 files changed, 153 insertions(+), 3 deletions(-)
 
 diff --git a/include/arch/x86/arch/kernel/boot.h b/include/arch/x86/arch/kernel/boot.h
 index a4f7fa057..e88efb4ee 100644
@@ -132,20 +138,38 @@ index 93b320964..8f8216b1e 100644
      /* set up sched control for each core */
      init_sched_control(root_cnode_cap, CONFIG_MAX_NUM_NODES);
 diff --git a/src/arch/x86/kernel/boot_sys.c b/src/arch/x86/kernel/boot_sys.c
-index 666ce1911..2986c1556 100644
+index a0c2db23c..7c20f9b3c 100644
 --- a/src/arch/x86/kernel/boot_sys.c
 +++ b/src/arch/x86/kernel/boot_sys.c
-@@ -76,6 +76,98 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
+@@ -66,6 +66,16 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
+     for (i = 0; i < boot_state.mem_p_regs.count; i++) {
+         paddr_t start = MAX(min_paddr, boot_state.mem_p_regs.list[i].start);
+         paddr_t end = boot_state.mem_p_regs.list[i].end;
++#ifdef CONFIG_ARCH_X86_64
++        /* Images are copied through the boot page tables, which map only
++         * the low 4 GiB. */
++        end = MIN(end, 0x100000000ull);
++#endif
++        /* A region below min_paddr has nothing to offer (and its size
++         * would wrap around). */
++        if (start >= end) {
++            continue;
++        }
+         word_t region_size = end - start;
+ 
+         if (region_size >= image_size) {
+@@ -76,6 +86,98 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
      return 0;
  }
  
 +/* Note a boot module after the first, to hand to the root task. */
-+BOOT_CODE static bool_t add_extra_module(paddr_t start, paddr_t end, char const *name)
++BOOT_CODE static void add_extra_module(paddr_t start, paddr_t end, char const *name)
 +{
 +    seL4_X86_BootModules_t *mods = &boot_state.extra_mods;
 +    if (mods->count == SEL4_X86_MAX_BOOT_MODULES) {
-+        printf("More than %d extra boot modules\n", (int)SEL4_X86_MAX_BOOT_MODULES);
-+        return false;
++        printf("More than %d extra boot modules: ignoring '%s'\n", (int)SEL4_X86_MAX_BOOT_MODULES,
++               name ? name : "");
++        return;
 +    }
 +    seL4_X86_BootModule_t *m = &mods->modules[mods->count++];
 +    m->paddr = start;
@@ -155,7 +179,6 @@ index 666ce1911..2986c1556 100644
 +        m->name[i] = name[i];
 +    }
 +    m->name[i] = '\0';
-+    return true;
 +}
 +
 +/* Take reg out of the available physical memory: it then becomes device
@@ -234,7 +257,7 @@ index 666ce1911..2986c1556 100644
  BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, paddr_t load_paddr)
  {
      v_region_t v_reg;
-@@ -180,7 +272,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
+@@ -180,7 +282,8 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
              &boot_state.acpi_rsdp,
              &boot_state.vbe_info,
              &boot_state.mb_mmap_info,
@@ -244,7 +267,7 @@ index 666ce1911..2986c1556 100644
          )) {
          return false;
      }
-@@ -460,6 +553,10 @@ static BOOT_CODE bool_t try_boot_sys(void)
+@@ -460,6 +563,10 @@ static BOOT_CODE bool_t try_boot_sys(void)
          return false;
      }
  
@@ -255,26 +278,26 @@ index 666ce1911..2986c1556 100644
      /* calculate final location of userland images */
      ui_p_regs.start = boot_state.ki_p_reg.end;
      ui_p_regs.end = ui_p_regs.start + load_paddr - mods_end_paddr;
-@@ -549,6 +646,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
+@@ -549,6 +656,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
          if (boot_state.mods_end_paddr < modules[i].end) {
              boot_state.mods_end_paddr = modules[i].end;
          }
-+        if (i > 0 && !add_extra_module(modules[i].start, modules[i].end, (char const *)(word_t)modules[i].name)) {
-+            return false;
++        if (i > 0) {
++            add_extra_module(modules[i].start, modules[i].end, (char const *)(word_t)modules[i].name);
 +        }
      }
  
      /* initialize the memory. We track two kinds of memory regions. Physical memory
-@@ -660,6 +760,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
+@@ -660,6 +770,9 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
              if (boot_state.mods_end_paddr < module->end) {
                  boot_state.mods_end_paddr = module->end;
              }
-+            if (mod_count > 1 && !add_extra_module(module->start, module->end, module->string)) {
-+                return false;
++            if (mod_count > 1) {
++                add_extra_module(module->start, module->end, module->string);
 +            }
          } else if (tag->type == MULTIBOOT2_TAG_MEMORY) {
              multiboot2_memory_t const *s = (multiboot2_memory_t *)(behind_tag + 8);
              multiboot2_memory_t const *e = (multiboot2_memory_t *)((word_t)tag + tag->size);
 -- 
-2.47.3
+2.43.0
 

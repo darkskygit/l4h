@@ -116,15 +116,30 @@ Configuration:
   enable.
 - `KernelSkimWindow=OFF`, required by patch 0004's preservation of user
   RSP across syscalls. l4h targets CPUs unaffected by Meltdown (see below).
+  **Nothing checks this at boot.** On a CPU affected by Meltdown
+  (`IA32_ARCH_CAPABILITIES.RDCL_NO` clear: most Intel parts before Cascade
+  Lake, such as GCE N1 and E2 on Skylake or Broadwell hosts) any guest
+  thread can read the kernel window, which maps all RAM, including other
+  guests' memory. Do not deploy l4h on such CPUs.
 
-Release builds keep debug syscalls off.
+Release builds turn the debug syscalls off but keep kernel printing on, for
+the host components' serial log: `seL4_DebugPutChar` and
+`seL4_DebugDumpScheduler` stay available to threads with an MCP of at least
+`KernelDebugSyscallMinMCP` (below).
 
 **Revised (security audit, v1).** Development builds keep
 `KernelDebugBuild` on, and debug syscalls need no capability: one of them,
 `seL4_DebugHalt`, stops the machine. Patch 0008 therefore reserves debug
 syscalls to threads with an MCP of at least `KernelDebugSyscallMinMCP`
 (101 for l4h). Guest threads are confined to MCP 100, so in a guest they
-are unknown syscalls in every build. `L4H_RELEASE=1 tools/build-kernel.sh`
+are unknown syscalls in every build. The same threshold silences the
+kernel's messages about failed invocations (`userError`) and about threads
+that fault without a fault handler: every kernel print is a synchronous
+serial write with the kernel lock held, so a guest could otherwise stall
+every core by failing invocations in a loop. With
+`KernelInvocationReportErrorIPC` (off in l4h), error replies to such
+threads carry an empty message rather than the shared buffer, which would
+hold an earlier invocation's message. `L4H_RELEASE=1 tools/build-kernel.sh`
 turns the debug build off. `KernelMaxNumNodes` is 64. XSAVE covers x87,
 SSE and AVX; the guest hides AVX-512, AMX and PKU, which seL4 does not
 enable, from its CPU feature set.
@@ -142,8 +157,9 @@ fault.
 
 E1 adds a new bit for the existing `seL4_TCB_SetFlags` (which today only has
 `fpuDisabled`). When the bit is set, *every* syscall instruction from that
-thread raises `seL4_Fault_UnknownSyscall`, which already carries all GPRs,
-FaultIP, SP and FLAGS. The check goes in `c_handle_syscall` and the fastpath
+thread raises `seL4_Fault_UnknownSyscall`, which already carries FaultIP,
+SP, FLAGS and the argument registers (all GPRs on x86_64; X0–X7 on aarch64,
+plus X8 with patch 0007). The check goes in `c_handle_syscall` and the fastpath
 entry on each arch, before the `SYSCALL_MIN..MAX` range test. The patch is
 roughly 30 lines per arch, and the semantics do not depend on the ISA.
 
@@ -157,8 +173,11 @@ invocation that reads or writes it.
 E2 adds `seL4_TCB_ReadFPU(tcb, frame_cap, offset)` and
 `seL4_TCB_WriteFPU(tcb, frame_cap, offset)`. They copy the arch FPU save area
 (`XSAVE` format on x86, `V0–V31+FPSR/FPCR` on arm64) to or from a frame the
-caller owns. The kernel validates the size and alignment and rejects an
-invalid XSAVE header on write.
+caller owns. The kernel validates the frame, offset and alignment, and on
+write sanitises the XSAVE header and MXCSR so that loading the image cannot
+fault in the kernel. A target that is running (the caller itself, or a
+thread on another core) gets its FPU reloaded, since it returns to user
+level without passing through the scheduler.
 
 Fallback if upstream objects: user-mode trampolines in the guest vDSO run
 `xsave`/`xrstor` on the thread's behalf. This needs no kernel change, but it
@@ -179,15 +198,20 @@ E3 adds a deadline timer to each TCB:
   (TSC on x86, generic timer counter on aarch64).
 - At the deadline the kernel signals the badge on the TCB's bound
   notification, if any, and disarms the timer.
-- TCBs with armed timers sit in a per-core list ordered by deadline. The kernel programs
-  the hardware with the minimum of the next budget event and the head of that
-  list.
+- TCBs with armed timers sit in a per-core red-black tree ordered by
+  deadline, whose first node is cached. The kernel programs the hardware
+  with the minimum of the next budget event and that first node.
+- Arming and disarming take O(log n) time, and at most 32 timers fire per
+  kernel entry (the rest fire on the next, immediate, timer interrupt).
+  Guests arm timers on TCBs they retype from their own memory, so n is
+  theirs to choose: a sorted list let one guest hold the kernel lock for
+  milliseconds per call.
 - A timer fires on the core it was last armed on. Migrated vCPUs re-arm on
   their new core.
 
 The guest clockevent invokes `seL4_TCB_SetTimer` on its vCPU's kTCB, so
 there is **no user-level timer server** and no IPC hop. No separate Timer
-object is allocated or retyped. The per-core queue uses an O(n) insert.
+object is allocated or retyped.
 
 ### Not required
 
@@ -264,18 +288,24 @@ We need no IOMMU, since no device is passed into a guest.
   - A bad boot core left the root task with an initial budget below the
     minimum, failing `refill_sufficient` in `switchToThread`.
   - The rates are now measured once, on the boot core, as the median of
-    5 wraparounds each, and the APIC ratio is at least 1. This is an
-    upstream bug.
+    5 wraparounds each. This is an upstream bug.
+  - Countdown mode converted TSC ticks to APIC ticks by their truncated
+    integer ratio, so timers fired up to twice as late (a 2.99 GHz TSC
+    with a 1 GHz APIC timer gave a ratio of 2). The conversion now uses
+    both rates, and a delay too long for the 32-bit count fires early and
+    is programmed again instead of wrapping.
 
 
 - **0004, x86_64 user RSP across syscalls.** seL4's fast `syscall` entry
   never saved the user RSP, and the `sysretq` path cleared it. Only the
   libsel4 convention of keeping RSP in RBX made this work. Trapped Linux
   threads returned with RSP = 0. The patch saves RSP on entry, through a
-  per-node scratch slot, and restores it on `sysretq`. It requires
-  `KernelSkimWindow=OFF`, the Meltdown mitigation. The CPUs l4h targets,
-  such as GCP C3/N4/C4 Sapphire Rapids and later and recent AMD parts, are
-  not affected by Meltdown.
+  per-node scratch slot, and restores it on `sysretq`, on both the slow
+  path and the fastpath. It requires `KernelSkimWindow=OFF`, the Meltdown
+  mitigation. The CPUs l4h targets, such as GCP N2 (Cascade Lake and Ice
+  Lake), C3/N4/C4 (Sapphire Rapids and later) and recent AMD parts, are not
+  affected by Meltdown. Neither the kernel nor `l4h-root` checks this at
+  boot (see the configuration above).
 - **0005, SMP IPI barrier.** `ipi_wait()` reset its arrival counter and
   released waiters with two unordered plain stores, and GCC emits them in
   the wrong order. A following remote call (TLB shootdown, remote TCB stall)
@@ -287,9 +317,11 @@ We need no IOMMU, since no device is passed into a guest.
   every private page, so a 16 MiB fork with three busy threads took 140 ms.
   - Maps into a not-present entry invalidate nothing. Remaps that only
     raise rights invalidate the address on the current core only.
-  - A remap with `seL4_X86_DeferFlush` that lowers rights leaves the TLBs
-    alone. `seL4_X64_PML4_Flush` then flushes the ASID once. The guest
-    uses this for the downgrades of one TLB sync (§5).
+  - A remap with `seL4_X86_DeferFlush` that only lowers rights (same
+    frame, same memory type) leaves the TLBs alone.
+    `seL4_X64_PML4_Flush` then flushes the ASID once. The guest uses this
+    for the downgrades of one TLB sync (§5). Any other change still
+    invalidates at once.
   - Stale entries only grant rights the same frame cap had at the same
     address. Unmapping, the only way to reuse the frame, still invalidates
     at once.
@@ -304,7 +336,8 @@ We need no IOMMU, since no device is passed into a guest.
 - **0020, framebuffer console (x86).** With the command-line option
   `fb_console`, everything the kernel prints (its own messages and host
   components' debug output) is also drawn on the lower half of the
-  multiboot2 framebuffer, if it is 32 bpp and below 4 GiB: 8x8 glyphs
+  multiboot2 framebuffer, if it is direct RGB at 32 bpp and below 4 GiB:
+  8x8 glyphs
   doubled vertically, wrapping instead of scrolling so the framebuffer is
   never read. For machines whose serial port is out of reach but whose
   screen is not, such as Latitude.sh servers behind their BMC's web proxy
@@ -313,8 +346,10 @@ We need no IOMMU, since no device is passed into a guest.
   module as the root task and ignores the rest, and their memory is not
   safe: the root task's image is moved over wherever the loader put them,
   and what survives becomes ordinary Untypeds, cleared on retype. The
-  kernel now copies each later module (up to 8) to page-aligned memory
-  above the root task's loaded image, leaves that memory out of the RAM it
+  kernel now copies each later module (up to 8; it ignores more, with a
+  warning) to page-aligned memory above the root task's loaded image and
+  below 4 GiB, or stops if there is not enough, leaves that memory out of
+  the RAM it
   manages, so it reaches the root task as device Untypeds that retype
   into frames without clearing, and lists the modules with their loader
   strings in a bootinfo chunk (`SEL4_BOOTINFO_HEADER_X86_BOOT_MODULES`).
@@ -328,7 +363,8 @@ We need no IOMMU, since no device is passed into a guest.
 
 **Decision:** l4h carries E1–E3 and the fixes above as patches in
 `kernel/patches/`, and proposes them upstream through the seL4 RFC process. They are designed as independent
-commits, and each has its own sel4test cases.
+commits. They have no sel4test cases yet: l4h's integration tests
+(`tests/`, e.g. `tests/guest/abitest`) exercise them through the guest.
 
 **Verification note:** the MCS SMP x86_64 configuration is not covered by the
 seL4 proofs today, with or without E1–E3. l4h still benefits from seL4's
@@ -1652,7 +1688,10 @@ Rules that keep the port cheap:
     in x7, and x8 is not otherwise part of the fault message.
   - FaultIP points at the `svc` instruction, so the guest advances it by
     4 (x86_64: by 2).
-  - Patch 0015 uses inner-shareable broadcast TLB maintenance at EL1.
+  - Patch 0015 uses inner-shareable broadcast TLB maintenance at EL1, on
+    full 16-bit ASIDs. The kernel refuses to boot unless the loader has
+    set `TCR_EL1.AS` (16-bit ASIDs): with 8-bit ASIDs, address spaces whose
+    seL4 ASIDs differ only in the upper 8 bits share TLB entries.
     Patch 0016 reads the architectural counter frequency at boot for MCS
     budget and consumed-time conversions; the same image handles TCG's
     62.5 MHz counter and Apple M4 HVF's 24 MHz counter.
@@ -1660,7 +1699,8 @@ Rules that keep the port cheap:
     root task as an extra bootinfo chunk, for the guests' HWCAPs (§5).
 - **Boot.** rust-sel4's kernel loader only entered EL2 kernels.
   `third_party/patches/rust-sel4/0001` adds the EL1 path: it drops from EL2
-  with the EL1 translation regime set up and no traps.
+  with the EL1 translation regime set up and no traps. Both EL1 paths set
+  `TCR_EL1.AS` when `ID_AA64MMFR0_EL1.ASIDBits` reports 16-bit ASIDs.
   `tools/build-loader-aarch64.sh` applies the patch and builds the loader.
   Patch 0002 also supports direct EL1 entry, initializes the EL1 translation
   regime and selects QEMU's HVC PSCI conduit when EL2 is unavailable.
@@ -1780,7 +1820,8 @@ injection and paravirtual spinlocks remain future work.
 1. **M0, platform.**
    - Toolchains and the seL4 MCS SMP build.
    - A Rust `l4h-root` hello world boots in QEMU on 4 cores.
-   - E1, E2 and E3 implemented, each with sel4test-style unit tests.
+   - E1, E2 and E3 implemented, tested through the guest ABI test
+     (`tests/guest/abitest`).
 2. **M1, single-vCPU guest (dom0 only).**
    - dom0 with embedded images and build-time settings boots `arch/l4h`
      to an initramfs shell over the hvc console.

@@ -11,7 +11,7 @@
      disable_mmu sctlr_el2, x8
  
      bl      invalidate_icache
-@@ -106,4 +110,40 @@
+@@ -106,4 +110,50 @@
  
      ldp     x29, x30, [sp], #16
      ret
@@ -34,6 +34,16 @@
 +    mrs     x9, id_aa64mmfr0_el1
 +    and     x9, x9, #7
 +    orr     x8, x8, x9, lsl #32
++    /* seL4 tags address spaces with 16-bit ASIDs: use them (TCR_EL1.AS)
++     * when the CPU has them (ID_AA64MMFR0_EL1.ASIDBits == 2), or the
++     * hardware ignores their upper 8 bits and address spaces share TLB
++     * entries.  seL4 refuses to boot without them. */
++    mrs     x9, id_aa64mmfr0_el1
++    ubfx    x9, x9, #4, #4
++    cmp     x9, #2
++    b.ne    9f
++    orr     x8, x8, #(1 << 36)
++9:
 +    msr     tcr_el1, x8
 +    ldr     x8, =loader_level_0_table
 +    ldr     x8, [x8]
@@ -66,7 +76,7 @@
      ldr     x8, =MAIR(0x00, MT_DEVICE_nGnRnE) | \
                   MAIR(0x04, MT_DEVICE_nGnRE) | \
                   MAIR(0x0c, MT_DEVICE_GRE) | \
-@@ -72,6 +77,9 @@
+@@ -82,6 +87,9 @@
      msr     tcr_el1, x8
      msr     ttbr0_el1, x7
      msr     ttbr1_el1, x7
@@ -76,7 +86,7 @@
      /* EL1 is AArch64; no stage 2, no traps of timers, FP or system
       * registers. */
      mov     x8, #(1 << 31)
-@@ -82,6 +90,7 @@
+@@ -92,6 +100,7 @@
      mov     x8, #0x33ff
      msr     cptr_el2, x8
      msr     hstr_el2, xzr
@@ -84,7 +94,7 @@
      /* SCTLR_EL1: RES1 bits, MMU, data and instruction caches. */
      ldr     x8, =0x30d01805
      msr     sctlr_el1, x8
-@@ -89,6 +98,11 @@
+@@ -99,6 +108,11 @@
      tlbi    vmalle1is
      dsb     ish
      isb

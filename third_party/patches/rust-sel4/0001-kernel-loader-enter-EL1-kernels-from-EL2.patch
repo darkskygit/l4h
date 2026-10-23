@@ -2,7 +2,7 @@ diff --git a/crates/sel4-kernel-loader/asm/aarch64/tail.S b/crates/sel4-kernel-l
 index b56f077c..06327053 100644
 --- a/crates/sel4-kernel-loader/asm/aarch64/tail.S
 +++ b/crates/sel4-kernel-loader/asm/aarch64/tail.S
-@@ -46,3 +46,52 @@ BEGIN_FUNC(switch_translation_tables_el2)
+@@ -46,3 +46,62 @@ BEGIN_FUNC(switch_translation_tables_el2)
      ret
  
  END_FUNC(switch_translation_tables_el2)
@@ -29,6 +29,16 @@ index b56f077c..06327053 100644
 +    mrs     x9, id_aa64mmfr0_el1
 +    and     x9, x9, #7
 +    orr     x8, x8, x9, lsl #32
++    /* seL4 tags address spaces with 16-bit ASIDs: use them (TCR_EL1.AS)
++     * when the CPU has them (ID_AA64MMFR0_EL1.ASIDBits == 2), or the
++     * hardware ignores their upper 8 bits and address spaces share TLB
++     * entries.  seL4 refuses to boot without them. */
++    mrs     x9, id_aa64mmfr0_el1
++    ubfx    x9, x9, #4, #4
++    cmp     x9, #2
++    b.ne    9f
++    orr     x8, x8, #(1 << 36)
++9:
 +    msr     tcr_el1, x8
 +    msr     ttbr0_el1, x7
 +    msr     ttbr1_el1, x7

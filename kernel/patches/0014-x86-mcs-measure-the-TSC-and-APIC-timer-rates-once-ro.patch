@@ -1,7 +1,8 @@
-From 1d681ff88a3f80632f3982ed4aa590a64b443d02 Mon Sep 17 00:00:00 2001
+From 54935e92195556be320cbb227baffa85892cdf88 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sun, 18 Oct 2026 06:49:04 -0700
-Subject: [PATCH] x86, mcs: measure the TSC and APIC timer rates once, robustly
+Subject: [PATCH] x86, mcs: measure the TSC and APIC timer rates once,
+ robustly
 
 Every core measured the TSC and APIC timer rates again in apic_init()
 and overwrote the shared x86KStscMhz and x86KSapicRatio, so the clock
@@ -18,28 +19,91 @@ a budget below the minimum, failing assert(refill_sufficient(...)) in
 switchToThread().
 
 Measure the rates once, on the boot core, as the median of 5
-wraparounds each, and keep the APIC ratio at least 1.
+wraparounds each.
+
+In APIC countdown mode, convert deadlines from TSC to APIC timer ticks
+with both rates rather than their truncated integer ratio, which made
+timers fire up to twice as late (a 2.99 GHz TSC and a 1 GHz APIC timer
+gave a ratio of 2) and, below 1, was 0, the value that means TSC deadline
+mode. A delay longer than the 32-bit count holds now fires early and is
+programmed again, instead of wrapping (to 0, which stops the timer, for
+exact multiples of 2^32).
 ---
- include/arch/x86/arch/machine/timer.h |  1 +
- src/arch/x86/kernel/apic.c            | 51 +++++++++++++++++----------
- src/plat/pc99/machine/hardware.c      | 41 +++++++++++++++++++--
- 3 files changed, 72 insertions(+), 21 deletions(-)
+ include/arch/x86/arch/machine/timer.h   | 15 +++++--
+ include/arch/x86/arch/model/statedata.h |  3 +-
+ src/arch/x86/kernel/apic.c              | 57 ++++++++++++++++---------
+ src/arch/x86/model/statedata.c          |  5 ++-
+ src/plat/pc99/machine/hardware.c        | 41 ++++++++++++++++--
+ 5 files changed, 92 insertions(+), 29 deletions(-)
 
 diff --git a/include/arch/x86/arch/machine/timer.h b/include/arch/x86/arch/machine/timer.h
-index 3367f7d33..791af37fe 100644
+index 3367f7d33..8b5bc9cee 100644
 --- a/include/arch/x86/arch/machine/timer.h
 +++ b/include/arch/x86/arch/machine/timer.h
-@@ -92,4 +92,5 @@ static inline void resetTimer(void)
+@@ -62,13 +62,19 @@ static inline PURE time_t ticksToUs(ticks_t ticks)
+ 
+ static inline void setDeadline(ticks_t deadline)
+ {
+-    if (likely(x86KSapicRatio == 0)) {
++    if (likely(x86KSapicKhz == 0)) {
+         x86_wrmsr(IA32_TSC_DEADLINE_MSR, deadline);
+     } else {
+         /* Must not underflow */
+         deadline -= MIN(deadline, getCurrentTime());
+-        /* Convert deadline from tscKhz to apic khz. Must be at least 1 tick. */
+-        apic_write_reg(APIC_TIMER_COUNT, MAX(1, div64(deadline, x86KSapicRatio)));
++        /* The count register has 32 bits: a later deadline fires early,
++         * and is then programmed again. */
++        deadline = MIN(deadline, x86KSapicMaxDelta);
++        /* Convert deadline from TSC ticks to APIC timer ticks (with the
++         * exact rates, not their truncated ratio, which made timers fire
++         * up to twice as late). Must be at least 1 tick. */
++        apic_write_reg(APIC_TIMER_COUNT,
++                       MAX(1, div64(deadline * x86KSapicKhz, x86KStscMhz * 1000u)));
+     }
+ }
+ 
+@@ -78,7 +84,7 @@ static inline void setDeadline(ticks_t deadline)
+  * exits to the hypervisor when the kernel runs virtualised. */
+ static inline bool_t timerArmed(void)
+ {
+-    if (likely(x86KSapicRatio == 0)) {
++    if (likely(x86KSapicKhz == 0)) {
+         return x86_rdmsr(IA32_TSC_DEADLINE_MSR) != 0;
+     }
+     return apic_read_reg(APIC_TIMER_CURRENT) != 0;
+@@ -92,4 +98,5 @@ static inline void resetTimer(void)
  
  
  BOOT_CODE uint32_t tsc_init(void);
 +BOOT_CODE uint32_t median_khz(uint32_t *s, int n);
  
+diff --git a/include/arch/x86/arch/model/statedata.h b/include/arch/x86/arch/model/statedata.h
+index 01656dbb3..2b4327eab 100644
+--- a/include/arch/x86/arch/model/statedata.h
++++ b/include/arch/x86/arch/model/statedata.h
+@@ -90,6 +90,7 @@ extern x86_irq_state_t x86KSIRQState[];
+ extern word_t x86KSAllocatedIOPorts[NUM_IO_PORTS / CONFIG_WORD_SIZE];
+ #ifdef CONFIG_KERNEL_MCS
+ extern uint32_t x86KStscMhz;
+-extern uint32_t x86KSapicRatio;
++extern uint32_t x86KSapicKhz;
++extern ticks_t x86KSapicMaxDelta;
+ #endif
+ 
 diff --git a/src/arch/x86/kernel/apic.c b/src/arch/x86/kernel/apic.c
-index 290ec5745..dbc71124b 100644
+index 290ec5745..e1a377bf0 100644
 --- a/src/arch/x86/kernel/apic.c
 +++ b/src/arch/x86/kernel/apic.c
-@@ -16,21 +16,28 @@
+@@ -8,6 +8,7 @@
+ #include <machine/io.h>
+ #include <arch/machine.h>
+ #include <arch/kernel/apic.h>
++#include <arch/machine/timer.h>
+ #include <linker.h>
+ #include <plat/machine/devices.h>
+ #include <plat/machine/pit.h>
+@@ -16,21 +17,28 @@
  #define APIC_TIMER_MODE_ONE_SHOT 0
  #define APIC_TIMER_MODE_TSC_DEADLINE  2
  
@@ -74,7 +138,7 @@ index 290ec5745..dbc71124b 100644
  }
  
  BOOT_CODE paddr_t apic_get_base_paddr(void)
-@@ -52,18 +59,26 @@ BOOT_CODE bool_t apic_init(bool_t mask_legacy_irqs)
+@@ -52,18 +60,27 @@ BOOT_CODE bool_t apic_init(bool_t mask_legacy_irqs)
      }
  
  #ifdef CONFIG_KERNEL_MCS
@@ -101,18 +165,51 @@ index 290ec5745..dbc71124b 100644
 +        /* can we use tsc deadline mode? */
 +        uint32_t cpuid = x86_cpuid_ecx(0x1, 0x0);
 +        if (!(cpuid & BIT(CPUID_TSC_DEADLINE_BIT))) {
-+            apic_khz = apic_measure_freq();
 +            /* 0 means TSC deadline mode */
-+            x86KSapicRatio = MAX(1, div64((uint64_t)x86KStscMhz * 1000llu, apic_khz));
-+            printf("Apic Khz %lu, TSC Mhz %lu, ratio %lu\n", (long) apic_khz, (long) x86KStscMhz, (long) x86KSapicRatio);
++            apic_khz = MAX(1, apic_measure_freq());
++            x86KSapicKhz = apic_khz;
++            x86KSapicMaxDelta = div64(0xffffffffllu * x86KStscMhz * 1000llu, apic_khz);
++            printf("Apic Khz %lu, TSC Mhz %lu\n", (long) apic_khz, (long) x86KStscMhz);
 +        } else {
 +            // use tsc deadline mode
-+            x86KSapicRatio = 0;
++            x86KSapicKhz = 0;
 +            printf("TSC Mhz %lu, TSC deadline mode\n", (long) x86KStscMhz);
 +        }
      }
  #else
      apic_khz = apic_measure_freq();
+@@ -77,7 +94,7 @@ BOOT_CODE bool_t apic_init(bool_t mask_legacy_irqs)
+     }
+ 
+ #ifdef CONFIG_KERNEL_MCS
+-    if (x86KSapicRatio != 0) {
++    if (x86KSapicKhz != 0) {
+         /* initialise APIC timer */
+         apic_write_reg(APIC_TIMER_DIVIDE, 0xb); /* divisor = 1 */
+     }
+@@ -139,7 +156,7 @@ BOOT_CODE bool_t apic_init(bool_t mask_legacy_irqs)
+ 
+     /* initialise timer */
+ #ifdef CONFIG_KERNEL_MCS
+-    uint32_t timer_mode = x86KSapicRatio == 0 ? APIC_TIMER_MODE_TSC_DEADLINE :
++    uint32_t timer_mode = x86KSapicKhz == 0 ? APIC_TIMER_MODE_TSC_DEADLINE :
+                           APIC_TIMER_MODE_ONE_SHOT;
+ #else
+     uint32_t timer_mode = 1;
+diff --git a/src/arch/x86/model/statedata.c b/src/arch/x86/model/statedata.c
+index 9af5acfb1..1ff31f008 100644
+--- a/src/arch/x86/model/statedata.c
++++ b/src/arch/x86/model/statedata.c
+@@ -71,5 +71,8 @@ x86_irq_state_t x86KSIRQState[maxIRQ + 1];
+ word_t x86KSAllocatedIOPorts[NUM_IO_PORTS / CONFIG_WORD_SIZE];
+ #ifdef CONFIG_KERNEL_MCS
+ uint32_t x86KStscMhz;
+-uint32_t x86KSapicRatio;
++/* APIC timer rate, or 0 in TSC deadline mode */
++uint32_t x86KSapicKhz;
++/* The longest delay, in TSC ticks, that the 32-bit APIC timer count holds */
++ticks_t x86KSapicMaxDelta;
+ #endif
 diff --git a/src/plat/pc99/machine/hardware.c b/src/plat/pc99/machine/hardware.c
 index 3c3de243a..f71791f0c 100644
 --- a/src/plat/pc99/machine/hardware.c
@@ -196,5 +293,5 @@ index 3c3de243a..f71791f0c 100644
 +    return tsc_mhz;
 +}
 -- 
-2.47.3
+2.43.0
 
