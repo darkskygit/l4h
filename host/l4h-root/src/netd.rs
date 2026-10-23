@@ -12,6 +12,7 @@ use crate::blkd::{VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
+use crate::iommu::Iommu;
 use crate::mem::{Alloc, Arena, Dest, Slot, UtRegion};
 use crate::pci::{self, Pci};
 use crate::vmm;
@@ -114,6 +115,7 @@ fn used_bars(d: &pci::Device) -> u8 {
 pub fn spawn(
     nics: &[pci::Device],
     pci: &Pci,
+    iommu: &mut Iommu,
     devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
@@ -156,6 +158,9 @@ pub fn spawn(
             .retype(&FRAME_BP, frames.len(), Dest::root(frames.start))
             .expect("NIC DMA frames");
         let _ = dma.push(frames);
+        // The NIC reaches its DMA memory only.
+        let dom = iommu.attach(alloc, d);
+        iommu.map(alloc, dom, paddr, 1 << NIC_DMA_BITS, true);
         cfg.nics[n] = net::NicConfig {
             kind: if gvnic {
                 net::NIC_GVNIC

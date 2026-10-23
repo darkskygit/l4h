@@ -14,7 +14,7 @@ use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::ioport::Ports;
 use l4h_rt::sel4;
 use l4h_virtio::{
-    DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Device, Dma, F_INDIRECT_DESC, F_VERSION_1, Mmio, NO_VECTOR,
+    DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Device, Dma, F_ACCESS_PLATFORM, F_INDIRECT_DESC, F_VERSION_1, Mmio, NO_VECTOR,
     STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy, legacy_ring_size,
 };
 
@@ -229,7 +229,7 @@ impl VirtioScsi {
                 dev.fail();
                 panic!("blkd {:#x}: device lacks VERSION_1 (features {:#x})", id, offered);
             }
-            let features = F_VERSION_1 | (offered & F_INDIRECT_DESC);
+            let features = F_VERSION_1 | (offered & (F_INDIRECT_DESC | F_ACCESS_PLATFORM));
             if !dev.set_features(features) {
                 dev.fail();
                 panic!("blkd {:#x}: features rejected", id);

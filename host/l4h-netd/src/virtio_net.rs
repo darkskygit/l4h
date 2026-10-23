@@ -6,7 +6,7 @@ use l4h_rt::host::fixed::ArrayVec;
 use l4h_rt::host::net::{self, NicConfig};
 use l4h_rt::ioport::Ports;
 use l4h_virtio::{
-    DESC_F_WRITE, Device, Dma, F_VERSION_1, Mmio, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy,
+    DESC_F_WRITE, Device, Dma, F_ACCESS_PLATFORM, F_VERSION_1, Mmio, STATUS_ACK, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, Virtq, legacy,
 };
 
 use crate::pool::Frame;
@@ -116,7 +116,7 @@ impl VirtioNet {
             let dev = modern_device(c);
             dev.reset();
             let offered = dev.features();
-            let want = F_VERSION_1 | wanted(offered);
+            let want = F_VERSION_1 | wanted(offered) | (offered & F_ACCESS_PLATFORM);
             if offered & F_VERSION_1 == 0 || !dev.set_features(want) {
                 dev.fail();
                 panic!("netd: NIC {} rejects VERSION_1", n);

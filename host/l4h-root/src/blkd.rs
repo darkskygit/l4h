@@ -14,6 +14,7 @@ use l4h_host::{self as host, blk};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
+use crate::iommu::{Domain, Iommu};
 use crate::mem::{Alloc, Arena, Dest, Slot};
 use crate::pci::{self, Pci};
 use crate::vmm;
@@ -65,6 +66,9 @@ pub struct Controller {
     /// issued once.
     io: Option<cap::Null>,
     driver: Option<Blkd>,
+    /// The device's IOMMU domain: blkd's DMA memory and its clients'
+    /// I/O pools.
+    dom: Domain,
 }
 
 /// A host disk: unit `unit` of controller `ctrl`.
@@ -106,7 +110,7 @@ impl Controller {
         assert!(row < pci::MAX_DISK_CTRLS, "more than {} disk controllers", pci::MAX_DISK_CTRLS);
         // Each row is handed out once, so this is its only reference.
         let clients = unsafe { &mut (*addr_of_mut!(CLIENTS))[row] };
-        Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None }
+        Controller { pci, kind, vector, bars: [const { None }; 6], clients, failed: false, io: None, driver: None, dom: Domain::NONE }
     }
 
     /// The attachments of disk `disk`, with their client indices.
@@ -192,6 +196,8 @@ pub struct Attachment {
     pub disk: usize,
     pub window: blk::DiskWindow,
     pub read_only: bool,
+    /// The client's I/O pool: physical address and size.
+    pool: (usize, usize),
 }
 
 struct Blkd {
@@ -214,6 +220,7 @@ pub fn start(
     id: u32,
     disk: &mut Controller,
     pci: &Pci,
+    iommu: &mut Iommu,
     devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
@@ -256,6 +263,9 @@ pub fn start(
         .retype(&FRAME_BP, n_dma, Dest::root(dma_frames.start))
         .expect("blkd DMA frames");
     arena.own(dma_slot, dma_paddr, DMA_BITS);
+    // The device reaches this memory, and the pools of attached clients.
+    let dom = iommu.attach(alloc, d);
+    iommu.map(alloc, dom, dma_paddr, 1 << DMA_BITS, true);
 
     // Plain integers: all zeroes is a valid (empty) configuration.
     let mut cfg: blk::BlkdConfig = unsafe { core::mem::zeroed() };
@@ -333,6 +343,7 @@ pub fn start(
 
     let staging = dma_frames.start + n_dma - blk::STAGING_SIZE / PAGE..dma_frames.end;
     disk.driver = Some(Blkd { comp, arena, staging });
+    disk.dom = dom;
 }
 
 /// A call to blkd.  One that has failed answers u64::MAX (l4h_rt::abort_trap).
@@ -344,8 +355,9 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 
 /// Attach a checked window of host disk `disk` to one client of its
 /// running shared controller.
+#[allow(clippy::too_many_arguments)]
 pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index: usize,
-    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc) -> (usize, vmm::Backend) {
+    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, vmm::Backend) {
     let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
     let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES }> = (0..blk::CHANNEL_PAGES)
@@ -362,7 +374,10 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index:
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
-    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only });
+    // Reads write the pool, writes read it.
+    let pool = (client.pool.paddr, client.pool.size);
+    iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);
+    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, pool });
     (i, vmm::Backend::Blk { chan, kick })
 }
 
@@ -397,17 +412,21 @@ fn quarantine(disk: &mut Controller, pci: &Pci) {
     pci.disable(&disk.pci);
 }
 
-/// Drain this client before its memory is reused. A timeout quarantines
-/// the controller and all its DMA targets until host reboot.
-pub fn remove(disk: &mut Controller, i: usize, pci: &Pci) -> bool {
+/// Drain this client before its memory is reused, then take its pool
+/// away from the device. A timeout quarantines the controller and all
+/// its DMA targets until host reboot. Whether the device can no longer
+/// reach the pool: drained, or cut off by the IOMMU.
+pub fn remove(disk: &mut Controller, i: usize, pci: &Pci, iommu: &mut Iommu) -> bool {
     let driver = disk.driver.as_ref().unwrap();
     let quiet = !disk.failed && call(driver.comp.service_ep, blk::BLKD_REMOVE, &[i as u64]) == 0;
     if !quiet {
         quarantine(disk, pci);
     }
     let _ = disk.driver.as_ref().unwrap().comp.slot(blk::BLKD_SLOT_CLIENT_DONE + i as u64).delete();
-    disk.clients[i] = None;
-    quiet
+    if let Some(a) = disk.clients[i].take() {
+        iommu.unmap(disk.dom, a.pool.0, a.pool.1);
+    }
+    quiet || disk.dom != Domain::NONE
 }
 
 /// Provision an unattached range of host disk `index`. Data copies occur

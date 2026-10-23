@@ -132,6 +132,8 @@ pub struct Config {
     pub fb_console: bool,
     /// Seconds between watchdog dumps of guest vCPU state; 0 disables.
     pub watchdog_secs: usize,
+    /// Confine devices with the AMD IOMMU, if there is one (§8.5).
+    pub iommu: bool,
 }
 
 impl Config {
@@ -154,6 +156,7 @@ impl Config {
             serial_irq: parse_usize(option_env!("L4H_SERIAL_IRQ"), 4) as u64,
             fb_console: parse_usize(option_env!("L4H_FB_CONSOLE"), 0) != 0,
             watchdog_secs: parse_usize(option_env!("L4H_WATCHDOG_SECS"), 0),
+            iommu: parse_usize(option_env!("L4H_IOMMU"), 1) != 0,
         };
         let Some(text) = text else { return c };
         let Ok(text) = core::str::from_utf8(text) else {
@@ -179,6 +182,13 @@ impl Config {
     fn set(&mut self, key: &str, value: &'static str) -> bool {
         let num = |v: &mut usize| try_parse_usize(value).map(|n| *v = n).is_some();
         let bdf = |v: &mut Option<u32>| try_parse_bdf(value).map(|n| *v = Some(n)).is_some();
+        let flag = |v: &mut bool| match value {
+            "0" | "1" => {
+                *v = value == "1";
+                true
+            }
+            _ => false,
+        };
         match key {
             "dom0_mem_mb" => num(&mut self.dom0_mem_mb),
             "dom0_vcpus" => num(&mut self.dom0_vcpus),
@@ -208,17 +218,8 @@ impl Config {
                 }
                 _ => false,
             },
-            "fb_console" => match value {
-                "0" => {
-                    self.fb_console = false;
-                    true
-                }
-                "1" => {
-                    self.fb_console = true;
-                    true
-                }
-                _ => false,
-            },
+            "fb_console" => flag(&mut self.fb_console),
+            "iommu" => flag(&mut self.iommu),
             "watchdog_secs" => num(&mut self.watchdog_secs),
             _ => false,
         }

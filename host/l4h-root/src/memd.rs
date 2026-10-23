@@ -15,6 +15,7 @@ use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
+use crate::iommu::Iommu;
 use crate::mem::{Alloc, Arena, Dest, ObjCtx, Slot};
 use crate::pci::{self, Pci};
 use crate::vspace::{FRAME_BP, map_frame};
@@ -162,7 +163,10 @@ impl Memd {
 
     /// Have memd report free memory through `d`, a virtio-balloon: map its
     /// BARs and DMA pages into memd, and enable it.
-    pub fn attach_balloon(&mut self, d: &pci::Device, pci: &Pci, alloc: &mut Alloc, devmem: &mut DevMem) {
+    /// Free page reports name memory the balloon never reads, so it is
+    /// given its DMA pages only: one that translates them through the
+    /// IOMMU (QEMU's `iommu_platform=on`) cannot report.
+    pub fn attach_balloon(&mut self, d: &pci::Device, pci: &Pci, iommu: &mut Iommu, alloc: &mut Alloc, devmem: &mut DevMem) {
         let cap = |t: u8| d.virtio_caps.iter().find(|c| c.cfg_type == t).copied();
         let (Some(common), Some(notify), Some(device)) =
             (cap(VIRTIO_PCI_CAP_COMMON_CFG), cap(VIRTIO_PCI_CAP_NOTIFY_CFG), cap(VIRTIO_PCI_CAP_DEVICE_CFG))
@@ -207,6 +211,8 @@ impl Memd {
             notify_mult: notify.notify_off_multiplier as u64,
             dma_paddr: paddr as u64,
         };
+        let dom = iommu.attach(alloc, d);
+        iommu.map(alloc, dom, paddr, memd::DMA_PAGES * PAGE, true);
         pci.enable(d);
         if link(alloc).call(memd::MEMD_BALLOON, &cfg.to_mrs()) != 0 {
             pci.disable(d);

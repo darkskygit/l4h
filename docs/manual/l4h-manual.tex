@@ -159,8 +159,10 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
 \paragraph{Trust.} The seL4 kernel, \texttt{l4h-root}, \texttt{l4h-memd},
 \texttt{l4h-blkd} and \texttt{l4h-netd} are trusted by everyone. dom0 is trusted to decide what
 runs, and nothing more. Guest kernels are untrusted, and capabilities confine
-them. The host does not rely on an IOMMU: the trusted drivers validate every
-DMA address, and guests never touch device registers.
+them. The trusted drivers validate every DMA address, and guests never touch
+device registers. On an AMD host, \texttt{l4h-root} also confines every
+device with the IOMMU to the memory it was given (the setting
+\texttt{iommu}); elsewhere nothing confines a device.
 
 \paragraph{The I/O pool.} Each guest has a small I/O pool, 4~MiB by
 default, that belongs to the host and is mapped into the guest after its
@@ -444,6 +446,9 @@ Variable & Meaning & Default \\
 \texttt{fb\_console} & 1: GRUB and seL4 also print on the screen & 0 \\
 \texttt{watchdog\_secs} & print every guest's vCPU state every $n$ seconds
   & 0 \\
+\texttt{iommu} & 1: confine devices with the AMD IOMMU, if the host has
+  one; 0: do not, e.g.\ for an integrated GPU that shows the framebuffer
+  console & 1 \\
 \bottomrule
 \end{tabularx}
 \caption{Host settings. Each defaults to its \texttt{L4H\_}-prefixed,
@@ -928,9 +933,10 @@ complete the reset (an NVMe controller that stays ready past its timeout,
 up to two minutes, or a virtio device that does not reset within two
 seconds), the serial log shows \texttt{device did not reset}, \cmd{l4hctl
 disks} marks it \texttt{failed}, and attaching it fails with \texttt{I/O
-error}. The destroyed VM's I/O pool and the driver's DMA memory stay out of
-use, since the device may still write to them, so \cmd{l4hctl info} shows
-less free memory. Reboot the host to recover both. The VM's RAM is reused
+error}. The driver's DMA memory stays out of use, since the device may still
+write to it, and so does the destroyed VM's I/O pool unless an AMD IOMMU cuts
+the device off from it; \cmd{l4hctl info} then shows less free memory.
+Reboot the host to recover it. The VM's RAM is reused
 at once: a device is never given guest RAM.
 
 \begin{caveat}
@@ -1308,8 +1314,8 @@ path; PCRs~8 and~9 change with dom0's files and \file{l4h.conf}.
 
 \begin{caveat}
 A report is only as trustworthy as the host: seL4, the host components and
-the hardware. There is no IOMMU, so a malicious device could change any
-memory. On a cloud VM, the provider's hypervisor and virtual TPM are
+the hardware. Without an AMD IOMMU a malicious device could change any
+memory; with one, it can still send any interrupt. On a cloud VM, the provider's hypervisor and virtual TPM are
 trusted as well. Disks and networks are dom0's choice and are not measured.
 Hosts without a TPM, and aarch64 hosts, offer no attestation.
 \end{caveat}

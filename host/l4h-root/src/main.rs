@@ -27,6 +27,7 @@ mod devmem;
 mod elf;
 mod font;
 mod guest;
+mod iommu;
 mod kimage;
 mod layout;
 mod mem;
@@ -200,6 +201,7 @@ pub struct Host {
     pub wins: Windows,
     pub asids: AsidPools,
     pub pci: pci::Pci,
+    pub iommu: iommu::Iommu,
     pub devmem: devmem::DevMem,
     /// Disk controllers, and their units as host disks.
     pub ctrls: &'static mut ArrayVec<Controller, { pci::MAX_DISK_CTRLS }>,
@@ -312,7 +314,7 @@ impl Host {
         for c in 0..self.ctrls.len() {
             let failed = self.ctrls[c].failed;
             if !failed {
-                blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci,
+                blkd::start(0x100 + c as u32, &mut self.ctrls[c], &self.pci, &mut self.iommu,
                     &mut self.devmem, &mut self.alloc, &mut self.wins.a, &mut self.asids, &self.info);
             }
             if self.ctrls[c].kind != l4h_host::blk::BLKD_VIRTIO_SCSI {
@@ -353,7 +355,7 @@ impl Host {
                 return Err(ctl::EBUSY);
             }
             let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
-            let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, read_only, &mut h.alloc);
+            let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, read_only, &mut h.alloc, &mut h.iommu);
             let active = blkd::activate(&mut h.ctrls[c], unit, client, g, &backend, &mut h.wins.a, &h.pci);
             // One each per device, of which add_device allows no more.
             g.backends.must_push((d, backend));
@@ -422,10 +424,11 @@ impl Host {
         for &p in &g.ports {
             self.netd.remove_port(p);
         }
-        // Disks are quiesced before any memory they were given is reused.
+        // Disks are quiesced, or cut off by the IOMMU, before any memory
+        // they were given is reused.
         let mut quiet = true;
         for &(ctrl, client) in &g.disks {
-            quiet &= blkd::remove(&mut self.ctrls[ctrl], client, &self.pci);
+            quiet &= blkd::remove(&mut self.ctrls[ctrl], client, &self.pci, &mut self.iommu);
         }
         let name = g.name.clone();
         self.asids.in_use -= g.asids;
@@ -491,6 +494,18 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
 
     // PCI devices: disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
+    // The IOMMU before any device is enabled: from here on, a device
+    // reaches only memory root gives it (iommu.rs).
+    #[cfg(target_arch = "x86_64")]
+    let mut iommu = if cfg.iommu {
+        let mut phys = acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames);
+        iommu::Iommu::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000)
+    } else {
+        sel4::debug_println!("l4h-root: iommu=0: DMA is not confined");
+        iommu::Iommu::none()
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let mut iommu = iommu::Iommu::none();
     // The statics' only references, taken once here; the root task is
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };
@@ -541,7 +556,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         }
     }
     if let Some(d) = balloon {
-        memd.attach_balloon(&d, &pci, &mut alloc, &mut devmem);
+        memd.attach_balloon(&d, &pci, &mut iommu, &mut alloc, &mut devmem);
     }
     #[cfg(target_arch = "x86_64")]
     let reset = reset::Reset::find(bootinfo, &mut acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames));
@@ -552,7 +567,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         #[cfg(target_arch = "x86_64")]
         acpi_frames,
     );
-    let netd = netd::spawn(&nics, &pci, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
+    let netd = netd::spawn(&nics, &pci, &mut iommu, &mut devmem, &mut alloc, &mut wins.a, &mut asids, &info);
 
     let mut h = Host {
         info,
@@ -560,6 +575,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         wins,
         asids,
         pci,
+        iommu,
         devmem,
         ctrls,
         disks: unsafe { &mut *(&raw mut DISKS) },
@@ -792,6 +808,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
             sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
             last_balance = now;
             dashboard::Dashboard::tick(h);
+            h.iommu.poll();
             if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                 watchdog_dump(h);
                 next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;

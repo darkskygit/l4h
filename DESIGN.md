@@ -234,7 +234,8 @@ object is allocated or retyped.
 ### Not required
 
 Unlike Fiasco vCPU mode, we need no new interrupt-injection primitive (§5.4).
-We need no IOMMU, since no device is passed into a guest.
+We need no IOMMU support in the kernel, since no device is passed into a
+guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
 
 ### Found during implementation
 
@@ -1144,6 +1145,66 @@ NAT, DHCP and firewalling belong in a VM.
 - **Control.** `l4hctl`, dom0 only (§9.1).
 - **Future devices.** virtio-rng, virtio-vsock and virtio-balloon.
 
+### 8.5 IOMMU (AMD-Vi)
+
+On an AMD host, `l4h-root` confines every device with the IOMMU, which it
+drives itself (`l4h-root/src/iommu.rs`, about 770 lines). seL4 keeps
+`KernelIOMMU` off. seL4's VT-d code was tested on two chipsets, has no
+AMD support, and would only let root delegate I/O mappings, which nothing
+in l4h needs: root alone gives devices memory.
+
+- **Boot.** Before it enables or resets any PCI device, root reads the
+  IVRS table and takes over every IOMMU on segment 0. It maps the IOMMU's
+  registers and builds one device table for all of them, in which every
+  device ID is blocked (V and TV set, no page table, no IR/IW). It sets a
+  command buffer and an event log per IOMMU, enables them, and
+  invalidates whatever the firmware left cached. The IVHDs give each
+  device ID's interrupt pass-through and SysMgt bits, and its alias
+  behind a PCI bridge. Interrupts are not remapped (DTE.IV is 0), so MSIs
+  pass as before.
+- **Domains.** Each device root enables gets a domain of its own: a domain
+  ID and a 4-level I/O page table, set in the device's entry and its
+  alias's. The table maps exactly the memory the device was given, at its
+  physical address, so drivers are unchanged. The virtio drivers accept
+  `VIRTIO_F_ACCESS_PLATFORM`.
+  - A NIC (netd) gets its 4 MiB of DMA memory.
+  - A disk controller (blkd) gets blkd's 4 MiB, and each client's I/O
+    pool while it is attached. `blkd::remove` unmaps the pool after the
+    drain, or after a quarantine, so a device that does not reset no
+    longer pins the pool. blkd's own DMA memory stays out of use as
+    before.
+  - The balloon (memd) gets its DMA pages. Free page reports name memory
+    the device is never given. A balloon that translates them (QEMU's
+    `iommu_platform=on`) cannot report.
+- **Unity ranges.** IVMD ranges stay mapped for the devices they name:
+  ranges for all devices in one shared domain, others in a domain per
+  range. A device root enables also gets the ranges that name it.
+- **Tables.** The device table, I/O page tables, command buffers and event
+  logs come from 2 MiB chunks of root memory, mapped in root
+  (`layout::IOMMU_TABLES`) and kept until reboot. Unmapping clears the
+  leaf entries and keeps the tables, so a pool slot that is attached again
+  reuses them. Every map and unmap ends with INVALIDATE_IOMMU_PAGES for
+  the domain and a COMPLETION_WAIT. A map does this too, since an IOMMU
+  may cache missing entries (NpCache). Root stops if an IOMMU does not
+  complete a command within a second, since it could then no longer
+  confine anything.
+- **Faults.** Root reads the event logs every 100 ms (its balance tick)
+  and prints up to 8 events per tick: page faults, with the device, the
+  address and the domain, and errors.
+- **Off.** With no IVRS, or `iommu=0` in `l4h.conf`, every operation is a
+  no-op and devices reach all memory, as before. This includes Intel
+  hosts (VT-d is not driven), cloud VMs without a vIOMMU, and aarch64. A
+  device that no IVHD covers is reported at enable and left untranslated.
+  Root blocks devices it does not drive. An integrated GPU that scans out
+  of system RAM therefore loses its picture: use `iommu=0` there.
+
+`L4H_QEMU_IOMMU=amd` (`tools/run-qemu.sh`) adds QEMU's `amd-iommu` on a
+q35 machine and sets `iommu_platform=on` for virtio disks and NICs (NVMe
+always translates). `run-blktest.sh` passes with it on NVMe and
+virtio-blk. With the pool left unmapped, the controller's DMA to it fails
+and the guest's mount fails. QEMU's emulation returns no translation but
+logs no page fault event, so the event log reader is untested there.
+
 ---
 
 ## 9. Host components
@@ -1362,8 +1423,9 @@ external orchestration can run in dom0.
   and blkd's DMA memory are then kept out of the free pool; guest RAM
   and other host objects are reclaimed (§15.1). Disks are also reset at boot,
   with bus mastering off, before anything enables them, since firmware
-  may leave a controller running. There is no IOMMU (§8.2), so nothing
-  else confines a device.
+  may leave a controller running. Without an AMD IOMMU (§8.5), nothing
+  else confines a device. With one, the pool is unmapped from the device
+  after the drain or quarantine, so it is not pinned.
   `tests/run-ctltest.sh` destroys guests in the middle of throttled reads,
   on virtio-blk and NVMe, and checks that the next guest, which reuses the
   memory, sees no disk data appear in it. Before the reset was added, the
@@ -1527,8 +1589,9 @@ this does not cover:
   machine. Those values also depend on the firmware (PCRs 0–7) and on
   dom0's files and settings (PCRs 8–9). A small EFI shim in front of GRUB
   could save the log.
-- **DMA.** There is no IOMMU (§8.2), so a malicious device can DMA
-  anywhere.
+- **DMA.** Without an AMD IOMMU (§8.5), a malicious device can DMA
+  anywhere. With one, it can reach only memory it was given. It can still
+  send any MSI, since interrupts are not remapped.
 - **The cloud provider.** On a cloud VM, the provider's hypervisor and
   vTPM are trusted too, and nothing is encrypted.
 - **Disks and networks.** They are dom0's choice and not measured, as for
@@ -2003,7 +2066,8 @@ memory the guest can retype.
   (`blkd::detach`, `reset`) before any memory is reused. Only the pool and
   blkd's DMA memory can be device targets now, so a device that does not
   confirm the reset pins those (`Guest::destroy(pin_pool)`), not the
-  guest's RAM.
+  guest's RAM. With an AMD IOMMU the pool is unmapped from the device
+  instead, and only blkd's DMA memory stays pinned (§8.5).
 - **Tests.** `tests/guest/abitest` plays a hostile driver against a virtio-blk
   disk: no `ACCESS_PLATFORM`, rings in RAM or across the pool's end,
   header, data or status in RAM, a buffer past the pool's end; a read

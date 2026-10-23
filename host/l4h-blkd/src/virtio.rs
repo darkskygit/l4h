@@ -3,7 +3,7 @@
 
 use l4h_rt::host::blk::{self, BlkdConfig};
 use l4h_rt::host::fixed::ArrayVec;
-use l4h_virtio::{DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Device, Dma, F_INDIRECT_DESC, F_VERSION_1, Mmio, Virtq};
+use l4h_virtio::{DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Device, Dma, F_ACCESS_PLATFORM, F_INDIRECT_DESC, F_VERSION_1, Mmio, Virtq};
 
 use crate::{DevInfo, Driver, MAX_PIECES, Seg};
 
@@ -50,7 +50,7 @@ impl VirtioBlk {
             dev.fail();
             panic!("blkd {:#x}: device lacks VERSION_1/INDIRECT_DESC (features {:#x})", id, offered);
         }
-        let features = want | (offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE));
+        let features = want | (offered & (VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_BLK_SIZE | F_ACCESS_PLATFORM));
         if !dev.set_features(features) {
             dev.fail();
             panic!("blkd {:#x}: features rejected", id);

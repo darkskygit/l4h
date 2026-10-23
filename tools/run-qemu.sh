@@ -13,9 +13,17 @@ objcopy -O elf32-i386 "$root/build/sel4/bin/kernel.elf" "$root/build/kernel32.el
 # (L4H_BALLOON=0 leaves the device out).
 balloon=()
 [ "${L4H_BALLOON:-1}" = 1 ] && balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-legacy=on)
+# L4H_QEMU_IOMMU=amd adds an AMD IOMMU, which needs the q35 machine and
+# must come before the devices it translates.  NVMe always goes through
+# it; virtio disks and NICs are made to (iommu_platform), not the
+# balloon, whose free page reports name memory it is not given.
+iommu=()
+[ "${L4H_QEMU_IOMMU:-}" = amd ] && iommu=(-machine q35 -device amd-iommu,intremap=off
+    -global virtio-blk-pci.iommu_platform=on -global virtio-scsi-pci.iommu_platform=on
+    -global virtio-net-pci.iommu_platform=on)
 exec qemu-system-x86_64 \
     -enable-kvm -cpu host,-vmx,+invtsc \
     -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-4G}" \
-    -nographic -serial mon:stdio -no-reboot \
+    -nographic -serial mon:stdio -no-reboot "${iommu[@]}" \
     -kernel "$root/build/kernel32.elf" \
     -initrd "$rootserver" "${balloon[@]}" "$@"
