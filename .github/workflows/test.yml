@@ -56,6 +56,8 @@ jobs:
         run: |
           test -c /dev/kvm && test -w /dev/kvm
           grep -c ^processor /proc/cpuinfo; free -g
+      - name: Host version metadata
+        run: tests/run-versiontest.sh
       - name: Build seL4
         run: tools/build-kernel.sh
       - name: CPU topology and migration policy

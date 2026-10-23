@@ -142,15 +142,23 @@ tools/run-dom0.sh build/my.cpio.gz "console=hvc0" 600   # output in build/qemu.l
 Inside dom0, `l4hctl help` lists the control commands, for example:
 
 ```sh
+l4hctl version                       # running host's version, e.g. v2026.10.1
 l4hctl create web --initrd /web.cpio.gz --mem 512 --vcpus 2 \
     --disk 0 --nic 0
 l4hctl console 1 --follow
 ```
 
+Host builds use `L4H_VERSION` when set; otherwise the build scripts derive
+it from `git describe --tags --match 'v*' --always --dirty`, or use `unknown`
+without Git metadata. Release builds set it to the tag being published.
+When building `l4h-root` directly with Cargo, set `L4H_VERSION` explicitly;
+without it, the host reports `unknown`.
+
 ## Tests
 
 | Test | What it checks |
 |------|----------------|
+| `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim and fixed-container panic safety |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |

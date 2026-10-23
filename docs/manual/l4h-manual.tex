@@ -711,6 +711,8 @@ with status 1 (Section~\ref{sec:errors}).
 \section{Host information}
 
 \begin{lstlisting}
+# l4hctl version
+v2026.10.1
 # l4hctl info
 cores:  4
 memory: 2950 MiB free of 3968 MiB
@@ -729,6 +731,12 @@ disk 1: pci 00:04.0 nvme, owner -
 # l4hctl nics
 nic 0: pci 00:05.0 virtio-net, uplink of switch 0
 \end{lstlisting}
+
+\cmd{version} prints the running host's build version. Releases report
+their exact tag, including the leading \texttt{v}. Development builds use
+a Git description (with \texttt{-dirty} for tracked changes), or
+\texttt{unknown} without build metadata. Older hosts that predate this
+command return \texttt{not supported}.
 
 \cmd{iommu} shows whether devices are confined. The state is \texttt{on}
 on an AMD host whose IOMMU l4h drives, \texttt{off} with \texttt{iommu=0},
@@ -1545,6 +1553,8 @@ Op & Name & Arguments & Results \\
 17 & \texttt{VM\_INFO} & VM & host core of vCPUs 0--5 \\
 18 & \texttt{VM\_STATS} & VM & CPU use in tenths of a percent, cap \\
 19 & \texttt{VM\_SHUTDOWN} & VM, 0 power off / 1 reboot & -- \\
+25 & \texttt{HOST\_VERSION} & -- & byte length in \texttt{vals[0]}; UTF-8
+  build version in data, without a terminating NUL \\
 \bottomrule
 \end{longtable}
 

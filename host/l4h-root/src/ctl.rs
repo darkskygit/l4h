@@ -19,6 +19,12 @@ pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
 
+const HOST_VERSION: &str = match option_env!("L4H_VERSION") {
+    Some(version) => version,
+    None => "unknown",
+};
+const _: () = assert!(!HOST_VERSION.is_empty() && HOST_VERSION.len() <= abi::CTL_DATA_MAX);
+
 /// Execute the request in the control page of guest `caller` (dom0).
 pub fn handle(h: &mut Host, caller: usize) {
     let Some(page) = h.guest(caller).and_then(|g| g.ctl_page()) else { return };
@@ -48,6 +54,12 @@ fn cstr(data: &[u8]) -> &[u8] {
 fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlResp) -> Result<(), i64> {
     let a = &req.args;
     match req.op {
+        abi::CTL_HOST_VERSION => {
+            let version = HOST_VERSION.as_bytes();
+            resp.vals[0] = version.len() as u64;
+            resp.data[..version.len()].copy_from_slice(version);
+            Ok(())
+        }
         abi::CTL_HOST_INFO => {
             resp.vals = [
                 h.info.cores as u64,

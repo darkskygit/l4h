@@ -1403,7 +1403,7 @@ little-endian structs defined in `include/l4h/abi.h` and mirrored in
 
 | Area | Implemented operations |
 |------|------------------------|
-| Host | `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `rtc_set`: machine RTC in UTC epoch seconds; `iommu_info`: IOMMU state, interrupt remapping, confined and unconfined devices, events logged (§8.5) |
+| Host | `host_version`: running host's build version (the tag for a release); `host_info`: cores, free/total bytes, disk, VM and NIC counts; `host_reboot`; `rtc_set`: machine RTC in UTC epoch seconds; `iommu_info`: IOMMU state, interrupt remapping, confined and unconfined devices, events logged (§8.5) |
 | Guests | `vm_create`, `vm_load`, `vm_start`, `vm_shutdown`, `vm_destroy`, `vm_list`, `vm_info` (cores for the first six vCPUs), `vm_stats` (CPU use and cap), `vm_set_sched` |
 | Block | `blk_attach`: disk, read-only flag and LBA window; `disk_info`: PCI address, owner, failed flag and kind |
 | Network | `switch_create`, `switch_attach_uplink`, `nic_create` (MAC, MAC lock, isolation), `switch_info` (ports and counters), `nic_info` (PCI address, switch, MAC) |

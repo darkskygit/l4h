@@ -419,6 +419,10 @@ enum l4h_ctl_op {
 	 * boot.  AMD IOMMUs only (DESIGN.md §8.5).  dom0 only, like every
 	 * control call. */
 	L4H_CTL_IOMMU_INFO = 24,
+	/* -> vals[0] = byte length (<= L4H_CTL_DATA_MAX); data: host build
+	 * version in UTF-8, without a terminating NUL (e.g. v2026.10.1).
+	 * This is independent of L4H_CTL_VERSION, the control ABI version. */
+	L4H_CTL_HOST_VERSION = 25,
 };
 
 #define L4H_IOMMU_NONE          0 /* none found, or none l4h drives */

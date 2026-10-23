@@ -6,6 +6,7 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=L4H_VERSION");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     for (var, file) in [
         ("L4H_VMM_ELF", "l4h-vmm.elf"),

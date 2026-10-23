@@ -10,6 +10,8 @@ mkdir -p "$out/ctlroot"
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/build-l4hctl.sh"
+export L4H_VERSION=$("$root/tools/version.sh")
+printf '%s\n' "$L4H_VERSION" > "$out/host-version"
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
 rm -rf "$out/ctlroot"/* && mkdir -p "$out/ctlroot"
 cp "$out/vm.cpio.gz" "$out/ctlroot/"
@@ -23,7 +25,7 @@ for i in 1 2; do head -c 32M /dev/zero | tr '\000' '\245' > "$out/dma$i.img"; do
 slow=throttling.bps-read=2097152
 # mkinitramfs copies extra files into /bin; move the payload to / in init.
 "$root/tools/mkinitramfs.sh" "$out/ctltest.cpio.gz" "$root/tests/guest/init-ctltest" \
-    "$l4h_ctl" "$out/ctlroot/vm.cpio.gz" >/dev/null
+    "$l4h_ctl" "$out/ctlroot/vm.cpio.gz" "$out/host-version" >/dev/null
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
 L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0,disable-legacy=on \
     -drive file=$out/dma1.img,if=none,id=d1,format=raw,$slow -device virtio-blk-pci,drive=d1,disable-legacy=on \

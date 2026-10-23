@@ -77,6 +77,7 @@ fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: O
 }
 
 const USAGE: &str = "usage: l4hctl <command>
+  version                      running host's build version
   info                         host resources
   iommu                        IOMMU state: DMA and interrupts confined,
                                devices, logged faults
@@ -165,6 +166,7 @@ fn run(args: &[String]) -> Result<i32> {
     }
     let ctl = Ctl::open()?;
     match cmd.as_str() {
+        "version" => println!("{}", ctl.host_version()?),
         "info" => {
             let r = ctl.call(CTL_HOST_INFO, &[], &[], &[])?;
             println!("cores:  {}", r.vals[0]);

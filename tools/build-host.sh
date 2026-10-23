@@ -6,6 +6,7 @@
 # build.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+export L4H_VERSION=$("$root/tools/version.sh")
 cd "$root/host"
 cargo build -q --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd
 out=$root/host/target/x86_64-sel4/debug

@@ -3,6 +3,7 @@
 # components without their debug information, as in tools/build-host.sh.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+export L4H_VERSION=$("$root/tools/version.sh")
 cd "$root/host"
 export SEL4_PREFIX=$root/build/sel4-aarch64
 export CC_aarch64_sel4=aarch64-linux-gnu-gcc CC_aarch64_sel4_roottask=aarch64-linux-gnu-gcc

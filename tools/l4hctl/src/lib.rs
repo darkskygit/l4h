@@ -40,6 +40,7 @@ pub const CTL_BLK_INFO: u32 = 21;
 pub const CTL_HOST_REBOOT: u32 = 22;
 pub const CTL_RTC_SET: u32 = 23;
 pub const CTL_IOMMU_INFO: u32 = 24;
+pub const CTL_HOST_VERSION: u32 = 25;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
 pub const IOMMU_ON: u64 = 2;
@@ -267,6 +268,16 @@ impl IommuInfo {
 }
 
 impl Ctl {
+    /// The running host's build version; an error from a host that predates the call.
+    pub fn host_version(&self) -> Result<String> {
+        let r = self.call(CTL_HOST_VERSION, &[], &[], &[])?;
+        if r.vals[0] > CTL_DATA_MAX as u64 {
+            return err("invalid host version length");
+        }
+        String::from_utf8(r.data[..r.vals[0] as usize].to_vec())
+            .map_err(|_| Error("host version is not UTF-8".into()))
+    }
+
     /// The IOMMU's state; an error from a host that predates the call.
     pub fn iommu_info(&self) -> Result<IommuInfo> {
         let v = self.call(CTL_IOMMU_INFO, &[], &[], &[])?.vals;

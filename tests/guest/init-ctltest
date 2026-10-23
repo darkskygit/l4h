@@ -7,6 +7,9 @@ mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 fail() { echo "CTLTEST: FAIL: $*"; poweroff -f; }
 echo "CTLTEST: start"
+version=$(l4hctl version) || fail "version"
+[ "$version" = "$(cat /bin/host-version)" ] || fail "host version: $version"
+echo "CTLTEST: version $version"
 l4hctl info || fail "info"
 l4hctl iommu | sed 's/^/CTLTEST: iommu /' || fail "iommu"
 l4hctl disks
