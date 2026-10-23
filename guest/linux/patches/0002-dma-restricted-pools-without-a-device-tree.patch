@@ -19,7 +19,7 @@ warn.  The device-tree path is unchanged.
 
 --- a/include/linux/swiotlb.h
 +++ b/include/linux/swiotlb.h
-@@ -111,8 +111,11 @@
+@@ -111,6 +111,8 @@ struct io_tlb_mem {
  	struct dentry *debugfs;
  	bool force_bounce;
  	bool for_alloc;
@@ -27,11 +27,8 @@ warn.  The device-tree path is unchanged.
 +	bool quiet;
  #ifdef CONFIG_SWIOTLB_DYNAMIC
  	bool can_grow;
-+
  	u64 phys_limit;
- 	spinlock_t lock;
- 	struct list_head pools;
-@@ -284,12 +287,19 @@
+@@ -284,12 +286,19 @@ extern void swiotlb_print_info(void);
  #ifdef CONFIG_DMA_RESTRICTED_POOL
  struct page *swiotlb_alloc(struct device *dev, size_t size);
  bool swiotlb_free(struct device *dev, struct page *page, size_t size);
@@ -53,7 +50,7 @@ warn.  The device-tree path is unchanged.
  	return NULL;
 --- a/kernel/dma/Kconfig
 +++ b/kernel/dma/Kconfig
-@@ -113,17 +113,22 @@
+@@ -113,12 +113,16 @@ config DMA_NEED_SYNC
  
  config DMA_RESTRICTED_POOL
  	bool "DMA Restricted Pool"
@@ -71,15 +68,9 @@ warn.  The device-tree path is unchanged.
  	  For more information see
  	  <Documentation/devicetree/bindings/reserved-memory/reserved-memory.txt>
  	  and <kernel/dma/swiotlb.c>.
- 	  If unsure, say "n".
- 
-+
- #
- # Should be selected if we can mmap non-coherent mappings to userspace.
- # The only thing that is really required is a way to set an uncached bit
 --- a/kernel/dma/swiotlb.c
 +++ b/kernel/dma/swiotlb.c
-@@ -1425,7 +1425,7 @@
+@@ -1425,7 +1425,7 @@ phys_addr_t swiotlb_tbl_map_single(struct device *dev, phys_addr_t orig_addr,
  	size = ALIGN(mapping_size + offset, alloc_align_mask + 1);
  	index = swiotlb_find_slots(dev, orig_addr, size, alloc_align_mask, &pool);
  	if (index == -1) {
@@ -88,7 +79,7 @@ warn.  The device-tree path is unchanged.
  			dev_warn_ratelimited(dev,
  	"swiotlb buffer is full (sz: %zd bytes), total %lu (slots), used %lu (slots)\n",
  				 size, mem->nslabs, mem_used(mem));
-@@ -1812,6 +1812,112 @@
+@@ -1812,6 +1812,117 @@ bool swiotlb_free(struct device *dev, struct page *page, size_t size)
  	return true;
  }
  
@@ -155,6 +146,12 @@ warn.  The device-tree path is unchanged.
 +		goto fail;
 +	pool = &mem->defpool;
 +	nareas = rounddown_pow_of_two(limit_nareas(roundup_pow_of_two(num_possible_cpus()), nslabs));
++	/*
++	 * Each area must be whole segments: a free run (slots[].list) never
++	 * crosses a segment, so it then never reaches into another area,
++	 * whose lock its allocation does not hold.
++	 */
++	nareas = min_t(unsigned long, nareas, 1UL << __ffs(nslabs / IO_TLB_SEGSIZE));
 +	pool->slots = kcalloc(nslabs, sizeof(*pool->slots), GFP_KERNEL);
 +	pool->areas = kcalloc(nareas, sizeof(*pool->areas), GFP_KERNEL);
 +	if (!pool->slots || !pool->areas)
@@ -172,8 +169,7 @@ warn.  The device-tree path is unchanged.
 +	INIT_LIST_HEAD_RCU(&mem->pools);
 +#endif
 +	add_mem_pool(mem, pool);
-+	snprintf
-+(name, sizeof(name), "swiotlb-%pa", &base);
++	snprintf(name, sizeof(name), "swiotlb-%pa", &base);
 +	swiotlb_create_debugfs_files(mem, name);
 +
 +	rp->base = base;
@@ -201,10 +197,9 @@ warn.  The device-tree path is unchanged.
  static int rmem_swiotlb_device_init(struct reserved_mem *rmem,
  				    struct device *dev)
  {
-@@ -1904,4 +2010,6 @@
+@@ -1904,4 +2015,5 @@ static int __init rmem_swiotlb_setup(struct reserved_mem *rmem)
  }
  
  RESERVEDMEM_OF_DECLARE(dma, "restricted-dma-pool", rmem_swiotlb_setup);
 +#endif /* CONFIG_OF_RESERVED_MEM */
  #endif /* CONFIG_DMA_RESTRICTED_POOL */
-+
