@@ -349,10 +349,6 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   - Stale entries only grant rights the same frame cap had at the same
     address. Unmapping, the only way to reuse the frame, still invalidates
     at once.
-  - Rights are what a user-mode translation gets: none for a
-    supervisor-only (kernel-only) entry, whatever its RW bit. Taking user
-    access away is therefore a lowering, and giving it back a raise. The
-    guest's accessed-bit emulation (§5.3) relies on this.
   - The 16 MiB fork now takes 6 ms, and the copy-on-write fault after it
     7.7 µs/page instead of 47.
 - **0019, Untyped resets skip memory that is already zero.** Resetting an
@@ -521,22 +517,9 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   faulted in.
 - **Software dirty and accessed bits.** Shared writable file pages are mapped
   read-only until the first write, and the write fault sets `pte_dirty`. A
-  page counts as young when it is mapped, and aging is done by taking user
-  access away. This is the same approach Linux uses on architectures without
-  hardware A/D bits.
-
-  *Revised:* old pages used to stay mapped readable, so a page read but not
-  written never became young again and reclaim evicted read-hot pages (code,
-  read-only data). Now the sync remaps an old page kernel-only rather than
-  unmapping it: the frame cap stays, the next user access faults, and the
-  fault makes the PTE young and remaps it, which seL4 invalidates on the
-  current core only (0017). The remap lowers rights with
-  `seL4_X86_DeferFlush`, and clearing an accessed bit
-  (`ptep_clear_flush_young`) does not wait for the TLB flush, as on x86: the
-  ASID is flushed once per 64 aged pages, or by the next sync that is not
-  aging, since a flush may rely on rights lowered meanwhile (write-protect,
-  clean). Aging costs nothing until the guest reclaims memory, and then
-  about one fault per page used since its last scan.
+  page counts as young when it is mapped, and aging is done by unmapping. This
+  is the same approach Linux uses on architectures without hardware A/D
+  bits.
 - **Cap-slot tracking.** Every seL4 mapping needs its own frame-cap copy. PTE
   pages are allocated at order 1, and the second 4 KiB holds a parallel
   512-entry array of CNode slot indices, so unmapping is O(1).

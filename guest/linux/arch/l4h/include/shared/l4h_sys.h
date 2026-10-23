@@ -62,10 +62,6 @@ int l4h_cnode_revoke(unsigned long cap, int depth);
 /* With lowered rights for a frame already mapped there: leave the TLBs to
  * l4h_vspace_flush() (x86_64; elsewhere the map flushes them itself). */
 #define L4H_PROT_DEFER_FLUSH	8
-/* For TLB syncs: the page is old.  One already mapped stays mapped for the
- * guest kernel only (kernel/vspace.c), so its next user access faults and
- * makes it young: seL4 has no accessed bit. */
-#define L4H_PROT_AGED		16
 int l4h_page_map(unsigned long frame, unsigned long vspace, unsigned long va, int prot);
 int l4h_page_unmap(unsigned long frame);
 int l4h_vspace_flush(unsigned long vspace);

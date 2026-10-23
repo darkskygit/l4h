@@ -996,108 +996,6 @@ static void test_smp_fork_storm(void)
 	CHECK(atomic_load(&stress_errors) == 0, "%d errors", atomic_load(&stress_errors));
 }
 
-/* ---- page aging */
-
-#define AGING_PAGES 1024
-
-/* Referenced KiB of the mapping that holds `p` (it may have been merged
- * with a neighbour), from smaps. */
-static long referenced_kb(void *p)
-{
-	unsigned long a = (unsigned long)p, start, end;
-	FILE *f = fopen("/proc/self/smaps", "r");
-	char line[256];
-	long kb = -1;
-	int in = 0;
-
-	if (!f)
-		return -1;
-	while (fgets(line, sizeof(line), f)) {
-		if (sscanf(line, "%lx-%lx ", &start, &end) == 2)
-			in = start <= a && a < end;
-		else if (in && sscanf(line, "Referenced: %ld kB", &kb) == 1)
-			break;
-	}
-	fclose(f);
-	return kb;
-}
-
-static int clear_refs(void)
-{
-	int fd = open("/proc/self/clear_refs", O_WRONLY), ok;
-
-	if (fd < 0)
-		return -1;
-	ok = write(fd, "1", 1) == 1;
-	close(fd);
-	return ok ? 0 : -1;
-}
-
-static volatile unsigned long *aging_mem;
-static atomic_int aging_stop, aging_bad;
-
-static void *aging_reader(void *arg)
-{
-	unsigned long i = 0;
-
-	while (!atomic_load(&aging_stop)) {
-		if (aging_mem[i * 512] != i)
-			atomic_fetch_add(&aging_bad, 1);
-		i = (i + 1) % AGING_PAGES;
-	}
-	return NULL;
-}
-
-/* An old page faults on its next access, reads included, and becomes young
- * again: reclaim sees which pages are used (seL4 has no accessed bit). */
-static void test_page_aging(void)
-{
-	unsigned long i, sum = 0;
-	long kb0, kb1;
-	pthread_t reader;
-
-	/* A mapping of its own (guard pages keep it from merging with a
-	 * neighbour) of small pages, whose Referenced counts it alone. */
-	char *area = mmap(NULL, (AGING_PAGES + 2) * 4096, PROT_NONE,
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-	CHECK(area != MAP_FAILED, "mmap: %s", strerror(errno));
-	aging_mem = (volatile unsigned long *)(area + 4096);
-	CHECK(mprotect((void *)aging_mem, AGING_PAGES * 4096, PROT_READ | PROT_WRITE) == 0,
-	      "mprotect: %s", strerror(errno));
-	madvise((void *)aging_mem, AGING_PAGES * 4096, MADV_NOHUGEPAGE);
-	for (i = 0; i < AGING_PAGES; i++)
-		aging_mem[i * 512] = i;
-	CHECK(clear_refs() == 0, "clear_refs: %s", strerror(errno));
-	kb0 = referenced_kb((void *)aging_mem);
-	for (i = 0; i < AGING_PAGES / 2; i++)
-		sum += aging_mem[i * 512];
-	kb1 = referenced_kb((void *)aging_mem);
-	CHECK(sum == (AGING_PAGES / 2) * (AGING_PAGES / 2 - 1) / 2, "data changed");
-	CHECK(kb0 >= 0 && kb0 <= 64, "%ld KiB referenced after clear_refs", kb0);
-	/* Without the emulation reads leave it near 0.  Not all: reclaim may
-	 * age some of them meanwhile. */
-	CHECK(kb1 >= kb0 + (AGING_PAGES / 2) * 4 / 2,
-	      "reads made %ld KiB referenced, want %d", kb1 - kb0, AGING_PAGES / 2 * 4);
-
-	/* Aging while another thread reads and the main thread writes. */
-	atomic_store(&aging_stop, 0);
-	atomic_store(&aging_bad, 0);
-	CHECK(pthread_create(&reader, NULL, aging_reader, NULL) == 0, "pthread_create");
-	for (int round = 0; round < 50; round++) {
-		clear_refs();
-		for (i = round % 2; i < AGING_PAGES; i += 2)
-			aging_mem[i * 512 + 1] = round;
-	}
-	atomic_store(&aging_stop, 1);
-	pthread_join(reader, NULL);
-	CHECK(!atomic_load(&aging_bad), "%d reads saw wrong data", atomic_load(&aging_bad));
-	for (i = 0; i < AGING_PAGES; i++)
-		CHECK(aging_mem[i * 512] == i && aging_mem[i * 512 + 1] == 48 + i % 2,
-		      "page %lu lost data", i);
-	munmap(area, (AGING_PAGES + 2) * 4096);
-}
-
 /* More live processes than the guest has seL4 VSpaces (64): sleeping ones
  * lose theirs and get one back when they run again. */
 static void test_vspace_evict(void)
@@ -1284,7 +1182,6 @@ static const struct test tests[] = {
 	{ "uaccess_race", test_uaccess_race },
 	{ "smp_fork_storm", test_smp_fork_storm },
 	{ "vspace_evict", test_vspace_evict },
-	{ "page_aging", test_page_aging },
 };
 
 int main(int argc, char **argv)
