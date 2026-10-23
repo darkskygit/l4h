@@ -14,15 +14,25 @@ Read each page first (or each reset chunk, when smaller) and clear it
 only if it holds a non-zero word.  Reading memory the host has not backed
 maps its shared zero page instead.  The memory reads as zero afterwards
 either way.
+
+On Arm the reads go through the kernel window, which is cacheable, while
+user level can have written the memory through a non-cacheable (Device)
+mapping of its frame.  Such writes leave clean cached copies alone, so
+the reads could see stale zeros over non-zero memory and skip the clear;
+an object later made from the memory (a CNode, a page table, another
+user's frame) would see the old contents once those lines are evicted.
+The cached copies are written back and invalidated first, so that the
+reads see the memory itself.  (Clearing unconditionally never had this
+problem: its dirty zeros are the last write.)
 ---
- src/object/untyped.c | 26 ++++++++++++++++++++++++--
- 1 file changed, 24 insertions(+), 2 deletions(-)
+ src/object/untyped.c | 35 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
 
 diff --git a/src/object/untyped.c b/src/object/untyped.c
 index 7e1704ce4..c0350d5e9 100644
 --- a/src/object/untyped.c
 +++ b/src/object/untyped.c
-@@ -231,6 +231,28 @@ exception_t decodeUntypedInvocation(word_t invLabel, word_t length, cte_t *slot,
+@@ -231,6 +231,37 @@ exception_t decodeUntypedInvocation(word_t invLabel, word_t length, cte_t *slot,
                                  destCNode, nodeOffset, nodeWindow, deviceMemory);
  }
  
@@ -39,6 +49,15 @@ index 7e1704ce4..c0350d5e9 100644
 +    for (off = 0; off < BIT(bits); off += step) {
 +        word_t *p = (word_t *)((word_t)ptr + off);
 +        word_t i;
++#ifdef CONFIG_ARCH_ARM
++        /* The reads go through the cacheable kernel window.  A write
++         * through a non-cacheable (Device) user mapping leaves clean
++         * cached copies alone, which would read as zero over non-zero
++         * memory: objects made from it would see its old contents once
++         * they are evicted.  Write back and drop the copies first. */
++        cleanInvalidateCacheRange_RAM((word_t)p, (word_t)p + step - 1,
++                                      addrFromPPtr(p));
++#endif
 +        for (i = 0; i < step / sizeof(word_t); i++) {
 +            if (p[i] != 0) {
 +                memzero(p, step);
@@ -51,7 +70,7 @@ index 7e1704ce4..c0350d5e9 100644
  static exception_t resetUntypedCap(cte_t *srcSlot)
  {
      cap_t prev_cap = srcSlot->cap;
-@@ -252,13 +274,13 @@ static exception_t resetUntypedCap(cte_t *srcSlot)
+@@ -252,13 +283,13 @@ static exception_t resetUntypedCap(cte_t *srcSlot)
  
      if (deviceMemory || block_size < chunk) {
          if (! deviceMemory) {
