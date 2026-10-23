@@ -442,13 +442,14 @@ static void ptrace_tracer(pid_t pid)
 	      "PEEKUSER gs_base: %#lx", v);
 	CHECK(peek_user(pid, sizeof(struct user_regs_struct), &v) == 0 && v == 0,
 	      "PEEKUSER after the registers: %#lx", v);
-	/* Debug registers are eight bytes apart; DR4/DR5 cannot be set. */
+	/* Debug registers are eight bytes apart; DR4/DR5 cannot be set, and
+	 * enabling a DR7 breakpoint is unsupported (seL4 has no debug API). */
 #define PT_DR(n) (offsetof(struct user, u_debugreg) + (n) * sizeof(long))
 	CHECK(poke_user(pid, PT_DR(1), 0x1000) == 0, "POKEUSER DR1 failed");
-	CHECK(poke_user(pid, PT_DR(7), 0x4) == 0, "POKEUSER DR7 failed");
+	CHECK(poke_user(pid, PT_DR(7), 0x4) == -EIO, "POKEUSER enabled DR7 accepted");
 	CHECK(poke_user(pid, PT_DR(4), 0) == -EIO, "POKEUSER DR4 accepted");
 	CHECK(peek_user(pid, PT_DR(1), &v) == 0 && v == 0x1000, "PEEKUSER DR1: %#lx", v);
-	CHECK(peek_user(pid, PT_DR(7), &v) == 0 && v == 0x4, "PEEKUSER DR7: %#lx", v);
+	CHECK(peek_user(pid, PT_DR(7), &v) == 0 && v == 0, "PEEKUSER DR7: %#lx", v);
 	CHECK(peek_user(pid, PT_DR(4), &v) == 0 && v == 0, "PEEKUSER DR4: %#lx", v);
 	CHECK(poke_user(pid, PT_DR(7), 0) == 0 && poke_user(pid, PT_DR(1), 0) == 0,
 	      "clearing DR7/DR1 failed");
