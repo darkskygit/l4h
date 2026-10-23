@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <registers.h>
 #include <asm/ptrace-abi.h>
+#include <asm/segment.h>
 #include <l4h_uctx.h>
 
 /*
@@ -80,12 +81,17 @@ int putreg(struct task_struct *child, int regno, unsigned long value)
 		UPT_SYSCALL_NR(&child->thread.regs.regs) = value;
 		break;
 
+	case CS:
+	case SS:
+		/* Only 64-bit mode exists: the values getreg() reports. */
+		if (value != (regno == CS ? __USER_CS : __USER_DS))
+			return -EIO;
+		return 0;
+
 	case FS:
 	case GS:
 	case DS:
 	case ES:
-	case SS:
-	case CS:
 		if (value && (value & 3) != 3)
 			return -EIO;
 		value &= 0xffff;
@@ -93,7 +99,8 @@ int putreg(struct task_struct *child, int regno, unsigned long value)
 
 	case FS_BASE:
 	case GS_BASE:
-		if (!((value >> 48) == 0 || (value >> 48) == 0xffff))
+		/* As on x86; seL4 would make a non-canonical base 0. */
+		if (value >= TASK_SIZE_MAX)
 			return -EIO;
 		break;
 
@@ -178,12 +185,14 @@ unsigned long getreg(struct task_struct *child, int regno)
 	case FS_BASE:
 	case GS_BASE:
 		break;
+	case CS:
+		return __USER_CS;
+	case SS:
+		return __USER_DS;
 	case FS:
 	case GS:
 	case DS:
 	case ES:
-	case SS:
-	case CS:
 		mask = 0xffff;
 		break;
 	default:

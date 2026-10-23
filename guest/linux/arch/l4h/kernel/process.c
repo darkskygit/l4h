@@ -92,6 +92,14 @@ void interrupt_end(void)
 	while (thread_flags & _TIF_WORK_MASK) {
 		if (thread_flags & _TIF_NEED_RESCHED)
 			schedule();
+		/*
+		 * Signal delivery and resume work (rseq) read and write the
+		 * user registers.  A flag can be set by another vCPU at any
+		 * time, so fetch them here, not before the flags were read.
+		 */
+		if (thread_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL |
+				    _TIF_NOTIFY_RESUME))
+			l4h_sync_regs(current);
 		if (thread_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
 			do_signal(regs);
 		if (thread_flags & _TIF_NOTIFY_RESUME)

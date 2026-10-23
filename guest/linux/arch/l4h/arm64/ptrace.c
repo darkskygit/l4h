@@ -30,8 +30,11 @@ int putreg(struct task_struct *t, int off, unsigned long value)
 {
 	if (off < 0 || off >= 34 * 8 || (off & 7))
 		return -EIO;
-	if (off == 33 * 8 && (value & ~0xf0000000UL))
-		return -EINVAL;
+	if (off == 33 * 8) {
+		if (value & L4H_PSTATE_BAD)
+			return -EINVAL;
+		value &= L4H_PSTATE_KEPT;
+	}
 	t->thread.regs.regs.gp[off / 8] = value;
 	l4h_user_mark_dirty(&t->thread.uctx, 0);
 	return 0;
@@ -66,8 +69,9 @@ static int gpr_set(struct task_struct *t, const struct user_regset *r,
 	err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, gp, 0, sizeof(gp));
 	if (err)
 		return err;
-	if (gp[33] & ~0xf0000000UL)
+	if (gp[33] & L4H_PSTATE_BAD)
 		return -EINVAL;
+	gp[33] &= L4H_PSTATE_KEPT;
 	memcpy(t->thread.regs.regs.gp, gp, sizeof(gp));
 	update_orig_x0(t);
 	l4h_user_mark_dirty(&t->thread.uctx, 0);
@@ -136,13 +140,10 @@ static int syscallno_set(struct task_struct *t, const struct user_regset *r,
 	int err = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &nr, 0,
 				     sizeof(nr));
 
-	if (!err) {
+	/* As arm64: x0 is the tracer's (a skipped syscall's return value);
+	 * handle_syscall() gives a user-issued syscall(-1) -ENOSYS. */
+	if (!err)
 		t->thread.regs.regs.syscall = nr;
-		if (nr == -1) {
-			t->thread.regs.regs.gp[0] = -ENOSYS;
-			l4h_user_mark_dirty(&t->thread.uctx, 0);
-		}
-	}
 	return err;
 }
 static const struct user_regset regsets[] = {

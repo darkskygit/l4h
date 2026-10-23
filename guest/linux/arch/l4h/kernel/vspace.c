@@ -226,7 +226,10 @@ static void as_unmap_range(struct l4h_as *as, unsigned long start, unsigned long
 /*
  * Remove every mapping and page table, leaving an empty VSpace root.
  *
- * The tables go first, the highest level first.  Unmapping one invalidates
+ * The tables go first, the highest level first: oldest first, as a table is
+ * always mapped after the ones above it (as_add_table() maps the missing
+ * parents first on x86_64; on aarch64 seL4 maps a table at the first
+ * missing level, so each is recorded as level 0).  Unmapping one invalidates
  * the whole ASID once (x86_64 flushPDPT()/flushPD(), aarch64
  * unmapPageTable()) and takes everything below it out of the VSpace; the
  * lower tables and the frames then find no mapping from the root and are
@@ -240,17 +243,12 @@ static void as_reset(struct l4h_as *as, bool may_sleep)
 {
 	struct table *t, *n;
 	unsigned long vpn;
-	int level;
 	void *e;
 
-	for (level = L4H_NR_PT_LEVELS; level-- > 0;) {
-		list_for_each_entry_safe(t, n, &as->tables, link) {
-			if (t->level != level)
-				continue;
-			list_del(&t->link);
-			l4h_obj_free(&t->obj);
-			kfree(t);
-		}
+	list_for_each_entry_safe_reverse(t, n, &as->tables, link) {
+		list_del(&t->link);
+		l4h_obj_free(&t->obj);
+		kfree(t);
 	}
 	as->nr_tables = 0;
 	/* Covered by those invalidations too. */
@@ -462,7 +460,11 @@ static struct vs_slot *vs_take(struct vs_slot **victim)
 	return NULL;
 }
 
-/* Wait for vs_take() to succeed.  Takes vs_lock, and returns with it held. */
+/*
+ * Wait for vs_take() to succeed.  Takes vs_lock, and returns with it held.
+ * May sleep: the entries being emptied may belong to tasks that sleep in
+ * as_reset(), and need this vCPU to finish.
+ */
 static struct vs_slot *vs_take_wait(unsigned long *flags)
 {
 	struct vs_slot *s, *victim;
@@ -476,14 +478,16 @@ static struct vs_slot *vs_take_wait(unsigned long *flags)
 		if (victim)
 			vs_reset_free(victim, false);
 		else
-			cpu_relax();
+			cond_resched();
 	}
 }
 
 /*
  * Make sure `mm` has a VSpace and return it (and its generation).  Called
  * before running one of its threads, with the mm marked running so that it
- * is not evicted meanwhile.
+ * is not evicted meanwhile.  Returns 0 if only entries being emptied could
+ * be freed: their tasks may sleep in as_reset() (on this vCPU, too), so the
+ * caller gives the CPU away and retries.
  */
 unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 {
@@ -502,10 +506,9 @@ unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 		if (s)
 			break;
 		raw_spin_unlock_irqrestore(&vs_lock, flags);
-		if (victim)
-			vs_reset_free(victim, false);
-		else
-			cpu_relax();
+		if (!victim)
+			return 0;
+		vs_reset_free(victim, false);
 	}
 	raw_spin_lock(&m->lock);
 	s->owner = mm;

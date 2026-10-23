@@ -253,7 +253,10 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   readable user page without execute permission. The new VM attribute sets
   XD on 4 KiB, 2 MiB and 1 GiB mappings, and boot code enables EFER.NXE when
   the CPU has it. The guest maps pages without `PROT_EXEC` with it, so
-  `mmap`/`mprotect` execute permissions are enforced.
+  `mmap`/`mprotect` execute permissions are enforced. As on x86 and arm64,
+  the heap (`brk`), `.bss` and the stack are executable only with
+  `READ_IMPLIES_EXEC` or an executable `PT_GNU_STACK`; arch/um's default,
+  inherited at first, made every heap writable and executable.
 - **0010, SMP remote calls.** `handleIPI()` read a remote call's operation
   and arguments before checking that the call was pending for this core.
   A late hardware IPI for a call already handled from the lock's wait loop
@@ -573,6 +576,14 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   on oversubscribed hosts. The lock also keeps two syncs from racing on
   one PTE, where one could map a value that the other had already
   replaced and marked synced.
+
+  *Revised:* a full flush (`flush_tlb_mm`) marks all of user space for
+  the sync, not the mm's VMAs. When two mmu_gathers of an mm overlap
+  (`munmap` while another thread runs `MADV_DONTNEED`), `tlb_finish_mmu()`
+  ends with a full flush, after `munmap` has taken its VMAs out of the
+  tree: the PTEs it had cleared were never synced, and other threads kept
+  reaching the pages it then freed. The sync walk reads each page-table
+  entry once, since it runs while `munmap` may clear entries.
 - **VSpace pool.** x86_64 seL4 has only 4096 ASIDs in total (8 pools of
   512). Each guest therefore gets a fixed pool of pre-assigned VSpace roots,
   and the guest kernel recycles them least recently used first. An mm that
@@ -581,6 +592,10 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   its VSpace and page-table objects. Lazy `active_mm` references from idle
   kernel threads and OOM bookkeeping can outlive `waitpid()`; they must
   not retain those objects until `destroy_context()`.
+  An exiting task may sleep while it empties its VSpace, so a vCPU that
+  finds every entry either running or being emptied gives its CPU away
+  and retries; spinning there left those tasks, queued on its own vCPU,
+  unable to finish.
 - **CSpace naming.** A CNode capability held directly in a root slot cannot
   be named by a 64-bit CPtr, because seL4 keeps resolving through it.
   Capabilities that must be named, such as the root CNode itself and user
@@ -630,15 +645,16 @@ context, so a context switch never copies FPU state.
 ```
 seL4_TCB_SetSchedParams(uTCB_A, …, SC=null)
 seL4_TCB_SetSchedParams(uTCB_B, …, SC=SC_U, fault_ep=EP_v[badge B])
-seL4_ReplyRecv(B's reply object, …)   (or seL4_TCB_Resume if B was preempted)
+seL4_ReplyRecv(B's reply object, …)   (or seL4_Recv if B was preempted)
 ```
 
 The second call also migrates B to v's core, because in MCS the core follows
-the scheduling context.
+the scheduling context. A preempted B is runnable, so binding `SC_U` is what
+resumes it.
 
 **Reply objects.** MCS needs a reply object for every task blocked in a fault.
-The guest kernel keeps a pool: it calls `Recv` with a free reply object,
-attaches that object to the faulting task, and refills the pool.
+Each user thread has its own, made with its TCB, and the kernel thread
+receives that thread's faults into it.
 
 **Interrupts and preemption:**
 
@@ -655,7 +671,11 @@ attaches that object to the faulting task, and refills the pool.
   (patch 0005, so also in every `might_sleep` under
   `CONFIG_PREEMPT_VOLUNTARY`), and before blocking. The E3 timer only
   signals `N_v`, so the same check also compares `rdtsc` against the
-  vCPU's armed deadline. The default guest configuration uses
+  vCPU's armed deadline. Events delivered on the way back to user mode
+  can set work flags after they were checked, so the flags are checked
+  again just before the user context runs; and events taken off `N_v`
+  while waiting for `SC_U` budget signal it again, so that the user run
+  returns for them at once. The default guest configuration uses
   `CONFIG_PREEMPT_VOLUNTARY`. `CONFIG_PREEMPT` compiles `cond_resched`
   out, so `arch/l4h` refuses to build with it.
 
@@ -677,7 +697,7 @@ attaches that object to the faulting task, and refills the pool.
   the kTCB and changing its registers to enter an interrupt handler, with
   a safe way to construct the interrupt frame under the guest-owned
   memory model. Current interrupt delivery relies on guest polling.
-- **Idle.** kTCB calls `seL4_Recv(EP_v)`. Idle consumes no CPU, which is what
+- **Idle.** kTCB calls `seL4_Wait(N_v)`. Idle consumes no CPU, which is what
   makes 30 mostly-idle guests on 4 cores practical.
 
 **Exceptions.** A UserException fault carries the vector and error code. We
@@ -704,10 +724,13 @@ would need that page remapped per namespace. The aarch64 vDSO has no time
 functions yet; glibc falls back to the syscall there. `l4h-root` passes the TSC frequency, taken from seL4 bootinfo.
 The clockevent is a per-vCPU one-shot deadline armed with
 `seL4_TCB_SetTimer(kTCB, deadline, L4H_BADGE_TIMER)`, which signals `N_v`.
-seL4 fires a timer up to its precision (1 µs on x86) early and then
-forgets it, so the guest takes the timer badge as the expiry, not only a
-`rdtsc` past the deadline: otherwise an early signal left the vCPU with no
-timer armed.
+seL4 signals a timer once, when its deadline has passed on the core that
+holds it (E3). A vCPU that migrated may read a TSC slightly behind that
+core's, so the guest takes the timer badge as the expiry, not only a
+`rdtsc` past the deadline: otherwise such a signal left the vCPU with no
+timer armed. Rates go to Linux in kHz and the clockevent counts in units
+of 8 TSC ticks, as on x86: Linux takes them as 32-bit values in Hz, which
+TSCs of 4.3 GHz and more overflow. `udelay` waits on the TSC too.
 
 *Revised (v1):* the wall clock at boot comes from `L4H_HC_GET_TIME`:
 `l4h-root` reads the CMOS RTC once at boot, and each VMM adds the TSC time
@@ -726,12 +749,22 @@ through the direct map. It fetches FPU and XSAVE state with E2, then rewrites
 the uTCB's registers with `WriteRegisters`. `rt_sigreturn` reverses this.
 As on x86, the handler starts with DF, TF and RF clear and the initial FPU
 state, and a handler without `SA_RESTORER`, or a frame that cannot be
-written, gets SIGSEGV.
+written or does not fit on the alternate stack, gets SIGSEGV. The XSAVE
+area is 64-byte aligned above the frame, `uc_flags` and the software
+bytes say what it holds, and `rt_sigreturn` re-arms an `SS_AUTODISARM`
+alternate stack. Signals are delivered on registers read back from the
+uTCB when the work flags are handled, not before: another vCPU may raise
+one at any time. On aarch64, a syscall's restart is prepared before the
+signal is dequeued, as on arm64, so a tracer at the signal stop sees the
+rewound PC and no syscall.
 
 **ptrace and coredump** use ReadRegisters/WriteRegisters and E2.
 seL4 clears TF in user flags and l4h builds it without the hardware debug
 API, so `PTRACE_SINGLESTEP` and enabling debug-register breakpoints fail
-with EIO; debuggers use software breakpoints (`int3`).
+with EIO; debuggers use software breakpoints (`int3`). CS and SS read as
+Linux's 64-bit user selectors (0x33, 0x2b; seL4's own are 0x2b and 0x33),
+which is how gdb tells a 64-bit inferior, and `NT_X86_XSTATE` carries XCR0
+in its software bytes, as on x86.
 `PTRACE_ARCH_PRCTL`, and the fs/gs base in `PEEKUSER`/`POKEUSER` and
 `GETREGS`/`SETREGS`, act on the tracee: its fs/gs base is read back from
 its TCB (user code may have changed it with `wrfsbase`), and a new value
@@ -804,9 +837,10 @@ including pool addresses, device indices and lifecycle state.
 - vCPU *v* consists of `kTCB_v`, `SC_K,v`, `SC_U,v`, `EP_v` and `N_v`. The
   boot vCPU starts at the ELF entry, and secondaries start at
   `l4h_secondary_entry` when `l4h-root` resumes them at the guest's request.
-  CPU hotplug is just suspending and resuming those TCBs.
-- **IPIs.** The sender sets a reason bit in the target's per-CPU IPI word and
-  the pending bit in the target's event page, then calls `seL4_Signal(N_target)`.
+  CPU hotplug is not supported (`HOTPLUG_CPU` is off).
+- **IPIs.** The sender sets a reason bit in the target's IPI word and
+  signals `N_target` with the IPI badge (`seL4_Signal` on the target's IPI
+  capability).
   seL4 delivers the signal across cores with a hardware IPI when needed.
 - **TLB shootdown for guest mms** is seL4's job (§5.3), so
   `flush_tlb_mm_range` only unmaps or invalidates the mirror and never IPIs

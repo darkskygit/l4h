@@ -18,6 +18,8 @@ ln -sfn "$root/guest/linux/arch/l4h" "$src/arch/l4h"
 # Out-of-tree patches outside arch/l4h.  $src/.l4h-patches keeps a copy of
 # each patch applied: from the first one that changed or went away, the
 # applied patches are reverted (last first) and the current ones applied.
+# Each patch is tried with --dry-run first, so one that does not apply
+# leaves the tree as the copies describe instead of half patched.
 shopt -s nullglob
 applied=$src/.l4h-patches
 mkdir -p "$applied"
@@ -41,10 +43,12 @@ while [ $keep -lt ${#have[@]} ] && [ $keep -lt ${#want[@]} ] &&
     keep=$((keep + 1))
 done
 for ((i = ${#have[@]} - 1; i >= keep; i--)); do
+    patch -d "$src" -p1 -R -f -s --dry-run < "${have[$i]}"
     patch -d "$src" -p1 -R -f -s < "${have[$i]}"
     rm "${have[$i]}"
 done
 for p in "${want[@]:$keep}"; do
+    patch -d "$src" -p1 --forward -s --dry-run < "$p"
     patch -d "$src" -p1 --forward -s < "$p"
     cp "$p" "$applied/"
 done

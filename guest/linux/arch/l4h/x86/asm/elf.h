@@ -209,6 +209,8 @@ struct task_struct;
 
 extern long elf_aux_hwcap;
 #define ELF_HWCAP (elf_aux_hwcap)
+extern long elf_aux_hwcap2;
+#define ELF_HWCAP2 (elf_aux_hwcap2)
 
 #define SET_PERSONALITY(ex) do {} while(0)
 

@@ -20,6 +20,8 @@
 #include <linux/regset.h>
 #include <asm/sigframe.h>
 #include <uapi/asm/processor-flags.h>
+#include <asm/segment.h>
+#include <asm/fpu/api.h>
 
 #ifdef CONFIG_X86_32
 struct _xstate_64 {
@@ -75,7 +77,9 @@ static int copy_sc_from_user(struct pt_regs *regs,
 	GETREG(R15, r15);
 #endif
 
+#ifdef CONFIG_X86_32
 	GETREG(CS, cs);
+#endif
 	GETREG(EFLAGS, flags);
 #ifdef CONFIG_X86_32
 	GETREG(SS, ss);
@@ -150,11 +154,14 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 	sc.err = fi->error_code;
 	sc.trapno = fi->trap_no;
 	PUTREG(IP, ip);
-	PUTREG(CS, cs);
 	PUTREG(EFLAGS, flags);
 #ifdef CONFIG_X86_32
+	PUTREG(CS, cs);
 	PUTREG(SP, sp_at_signal);
 	PUTREG(SS, ss);
+#else
+	sc.cs = __USER_CS;
+	sc.ss = __USER_DS;
 #endif
 #undef PUTREG
 	sc.oldmask = mask;
@@ -207,6 +214,7 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 		   &to_fp64->fpstate.sw_reserved.extended_size);
 #endif
 	__put_user(host_fp_size, &to_fp64->fpstate.sw_reserved.xstate_size);
+	__put_user(l4h_xfeatures, &to_fp64->fpstate.sw_reserved.xfeatures);
 
 	__put_user(FP_XSTATE_MAGIC1, &to_fp64->fpstate.sw_reserved.magic1);
 	__put_user(FP_XSTATE_MAGIC2,
@@ -388,18 +396,21 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 	int err = 0, sig = ksig->sig;
 	unsigned long fp_to;
 
-	frame = (void __user *)stack_top - sizeof(struct rt_sigframe);
+	/*
+	 * As x86's get_sigframe(): below the red zone, the math frame on a
+	 * 64-byte boundary (user code may xrstor from it), and below that
+	 * the frame, its pretcode 8 bytes off a 16-byte boundary as after a
+	 * call.
+	 */
+	fp_to = round_down(stack_top - 128 - math_size, 64);
+	frame = (struct rt_sigframe __user *)
+		(round_down(fp_to - sizeof(*frame), 16) - 8);
 
-	/* Add required space for math frame */
-	frame = (void __user *)((unsigned long)frame - math_size);
-
-	/* ABI requires 16 byte boundary alignment */
-	frame = (void __user *)round_down((unsigned long)frame, 16);
-
-	/* Subtract 128 for a red zone and 8 for proper alignment */
-	frame = (struct rt_sigframe __user *) ((unsigned long) frame - 128 - 8);
-
-	if (!access_ok(frame, sizeof(*frame) + math_size)) {
+	/* A frame that does not fit on the alternate stack is not written
+	 * below it. */
+	if (on_sig_stack(stack_top) && !on_sig_stack((unsigned long)frame))
+		return -EFAULT;
+	if (!access_ok(frame, fp_to + math_size - (unsigned long)frame)) {
 		err = -EFAULT;
 		goto out;
 	}
@@ -411,11 +422,11 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 	}
 
 	/* Create the ucontext.  */
-	err |= __put_user(0, &frame->uc.uc_flags);
+	err |= __put_user(UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS |
+			  (host_fp_size > sizeof(struct _fpstate_64) ? UC_FP_XSTATE : 0),
+			  &frame->uc.uc_flags);
 	err |= __put_user(NULL, &frame->uc.uc_link);
 	err |= __save_altstack(&frame->uc.uc_stack, PT_REGS_SP(regs));
-
-	fp_to = (unsigned long)frame + sizeof(*frame);
 
 	err |= copy_sc_to_user(&frame->uc.uc_mcontext,
 			       (struct _xstate __user *)fp_to,
@@ -477,6 +488,10 @@ SYSCALL_DEFINE0(rt_sigreturn)
 		goto segfault;
 
 	set_current_blocked(&set);
+
+	/* Re-arms an SS_AUTODISARM alternate stack. */
+	if (restore_altstack(&uc->uc_stack))
+		goto segfault;
 
 	if (copy_sc_from_user(&current->thread.regs, &uc->uc_mcontext))
 		goto segfault;

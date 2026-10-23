@@ -58,6 +58,8 @@ SECTIONS
   . = ALIGN(64);
   .tdata : { __l4h_tls_start = .; *(.tdata .tdata.*) }
   .tbss  : { *(.tbss .tbss.*) *(.tcommon) . = ALIGN(8); __l4h_tls_end = .; }
+  ASSERT(__l4h_tls_end - __l4h_tls_start <= 128,
+         "os-sel4 static TLS is larger than L4H_TLS_SIZE (os-sel4/l4h_os.h)")
 
   _edata  =  .;
   PROVIDE (edata = .);

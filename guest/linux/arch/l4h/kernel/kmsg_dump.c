@@ -6,6 +6,7 @@
 #include <shared/init.h>
 #include <shared/kern.h>
 #include <os.h>
+#include <l4h_sys.h>
 
 static void kmsg_dumper_stdout(struct kmsg_dumper *dumper,
 				struct kmsg_dump_detail *detail)
@@ -45,10 +46,9 @@ static void kmsg_dumper_stdout(struct kmsg_dumper *dumper,
 	kmsg_dump_rewind(&iter);
 
 	os_info("kmsg_dump:\n");
-	while (kmsg_dump_get_line(&iter, true, line, sizeof(line), &len)) {
-		line[len] = '\0';
-		os_info("%s", line);
-	}
+	/* Not through os_info(), which formats into 256 bytes. */
+	while (kmsg_dump_get_line(&iter, true, line, sizeof(line), &len))
+		l4h_console_write(line, len);
 
 	spin_unlock_irqrestore(&lock, flags);
 }

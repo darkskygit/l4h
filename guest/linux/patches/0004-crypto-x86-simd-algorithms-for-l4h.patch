@@ -1,3 +1,11 @@
+crypto: x86 SIMD algorithms for l4h
+
+The l4h x86_64 guest has kernel-mode SIMD (kernel_fpu_begin/end in
+arch/l4h/x86/fpu.c), so offer arch/x86/crypto there.  Blowfish, Camellia,
+Triple DES and 3-way Twofish read boot_cpu_data.x86_vendor (and x86,
+x86_vfm) to skip CPUs they are slow on; l4h's cpuinfo has no such fields,
+so they and the options that select them are not offered on l4h.
+
 --- a/crypto/Kconfig
 +++ b/crypto/Kconfig
 @@ -1442,7 +1442,8 @@ endif
@@ -10,3 +18,61 @@
  source "arch/x86/crypto/Kconfig"
  endif
  endif
+--- a/arch/x86/crypto/Kconfig
++++ b/arch/x86/crypto/Kconfig
+@@ -24,6 +24,7 @@ config CRYPTO_AES_NI_INTEL
+ config CRYPTO_BLOWFISH_X86_64
+ 	tristate "Ciphers: Blowfish, modes: ECB, CBC"
+ 	depends on 64BIT
++	depends on !L4H	# reads boot_cpu_data.x86_vendor
+ 	select CRYPTO_SKCIPHER
+ 	select CRYPTO_BLOWFISH_COMMON
+ 	imply CRYPTO_CTR
+@@ -36,6 +37,7 @@ config CRYPTO_BLOWFISH_X86_64
+ config CRYPTO_CAMELLIA_X86_64
+ 	tristate "Ciphers: Camellia with modes: ECB, CBC"
+ 	depends on 64BIT
++	depends on !L4H	# reads boot_cpu_data.x86_vendor
+ 	select CRYPTO_SKCIPHER
+ 	imply CRYPTO_CTR
+ 	help
+@@ -47,6 +49,7 @@ config CRYPTO_CAMELLIA_X86_64
+ config CRYPTO_CAMELLIA_AESNI_AVX_X86_64
+ 	tristate "Ciphers: Camellia with modes: ECB, CBC (AES-NI/AVX)"
+ 	depends on 64BIT
++	depends on !L4H	# selects CRYPTO_CAMELLIA_X86_64
+ 	select CRYPTO_SKCIPHER
+ 	select CRYPTO_CAMELLIA_X86_64
+ 	imply CRYPTO_XTS
+@@ -60,6 +63,7 @@ config CRYPTO_CAMELLIA_AESNI_AVX_X86_64
+ config CRYPTO_CAMELLIA_AESNI_AVX2_X86_64
+ 	tristate "Ciphers: Camellia with modes: ECB, CBC (AES-NI/AVX2)"
+ 	depends on 64BIT
++	depends on !L4H	# selects CRYPTO_CAMELLIA_AESNI_AVX_X86_64
+ 	select CRYPTO_CAMELLIA_AESNI_AVX_X86_64
+ 	help
+ 	  Length-preserving ciphers: Camellia with ECB and CBC modes
+@@ -104,6 +108,7 @@ config CRYPTO_CAST6_AVX_X86_64
+ config CRYPTO_DES3_EDE_X86_64
+ 	tristate "Ciphers: Triple DES EDE with modes: ECB, CBC"
+ 	depends on 64BIT
++	depends on !L4H	# reads boot_cpu_data.x86_vendor
+ 	select CRYPTO_SKCIPHER
+ 	select CRYPTO_LIB_DES
+ 	imply CRYPTO_CTR
+@@ -240,6 +245,7 @@ config CRYPTO_TWOFISH_X86_64
+ config CRYPTO_TWOFISH_X86_64_3WAY
+ 	tristate "Ciphers: Twofish with modes: ECB, CBC (3-way parallel)"
+ 	depends on 64BIT
++	depends on !L4H	# reads boot_cpu_data.x86_vendor
+ 	select CRYPTO_SKCIPHER
+ 	select CRYPTO_TWOFISH_COMMON
+ 	select CRYPTO_TWOFISH_X86_64
+@@ -255,6 +261,7 @@ config CRYPTO_TWOFISH_X86_64_3WAY
+ config CRYPTO_TWOFISH_AVX_X86_64
+ 	tristate "Ciphers: Twofish with modes: ECB, CBC (AVX)"
+ 	depends on 64BIT
++	depends on !L4H	# selects CRYPTO_TWOFISH_X86_64_3WAY
+ 	select CRYPTO_SKCIPHER
+ 	select CRYPTO_TWOFISH_COMMON
+ 	select CRYPTO_TWOFISH_X86_64

@@ -46,7 +46,10 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	if (copy_from_user(&call, (void __user *)arg, sizeof(call)))
 		return -EFAULT;
 
-	mutex_lock(&ctl_lock);
+	/* Held across copies from user memory, which may take long (a
+	 * userfaultfd or FUSE page): waiters stay killable. */
+	if (mutex_lock_killable(&ctl_lock))
+		return -EINTR;
 	if (copy_from_user(req, u64_to_user_ptr(call.req), sizeof(*req))) {
 		ret = -EFAULT;
 		goto out;
