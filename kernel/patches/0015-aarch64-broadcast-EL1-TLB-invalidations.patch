@@ -1,18 +1,38 @@
-From 56a2a8ccac32188dede1547df6e6d231742db1dc Mon Sep 17 00:00:00 2001
+From f9277addcc1450f8618e78f728fac4241e96d667 Mon Sep 17 00:00:00 2001
 From: l4h <l4h@localhost>
 Date: Sun, 18 Oct 2026 14:13:52 -0700
-Subject: [PATCH] aarch64: broadcast EL1 TLB invalidations in the SMP domain
+Subject: [PATCH] aarch64: broadcast EL1 TLB invalidations in the SMP
+ domain
 
 Use the architectural inner-shareable TLBI operations, bracketed by DSB and ISB, for the global EL1 invalidation APIs. Page mapping, unmapping and ASID eviction otherwise rendezvous with every CPU through software IPIs, causing severe latency under emulation. Preserve local operations and the existing EL2 and AArch32 paths.
+
+Without hypervisor support, seL4 tags address spaces with its own 16-bit
+ASIDs. The ASID invalidation helpers took an 8-bit hw_asid_t, which
+truncated them: they now take asid_t. And the kernel now refuses to boot
+unless TCR_EL1.AS is set: with 8-bit ASIDs the hardware ignores the upper
+8 bits, so address spaces whose ASIDs differ only there would share TLB
+entries, and context switches flush nothing.
 ---
- include/arch/arm/arch/machine/tlb.h | 24 ++++++++++++++++++++++++
- 1 file changed, 24 insertions(+)
+ include/arch/arm/arch/machine/tlb.h | 30 +++++++++++++++++++++++++++--
+ src/arch/arm/kernel/boot.c          | 12 ++++++++++++
+ 2 files changed, 40 insertions(+), 2 deletions(-)
 
 diff --git a/include/arch/arm/arch/machine/tlb.h b/include/arch/arm/arch/machine/tlb.h
-index 7235672db..345276e47 100644
+index 7235672db..f0e45f5b5 100644
 --- a/include/arch/arm/arch/machine/tlb.h
 +++ b/include/arch/arm/arch/machine/tlb.h
-@@ -37,19 +37,43 @@ static inline void invalidateTranslationAllLocal(void)
+@@ -21,7 +21,9 @@ static inline void invalidateTranslationSingleLocal(vptr_t vptr)
+ #endif
+ }
+ 
+-static inline void invalidateTranslationASIDLocal(hw_asid_t hw_asid)
++/* An seL4 ASID on AArch64 without hypervisor support (16 bits), else a
++ * hardware ASID or VMID (8 bits). */
++static inline void invalidateTranslationASIDLocal(asid_t hw_asid)
+ {
+ #if defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(CONFIG_ARCH_AARCH64)
+     invalidateLocalTLB_VMID(hw_asid);
+@@ -37,19 +39,43 @@ static inline void invalidateTranslationAllLocal(void)
  
  static inline void invalidateTranslationSingle(vptr_t vptr)
  {
@@ -29,7 +49,8 @@ index 7235672db..345276e47 100644
 +#endif
  }
  
- static inline void invalidateTranslationASID(hw_asid_t hw_asid)
+-static inline void invalidateTranslationASID(hw_asid_t hw_asid)
++static inline void invalidateTranslationASID(asid_t hw_asid)
  {
 +#if defined(CONFIG_ARCH_AARCH64) && !defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(ENABLE_SMP_SUPPORT)
 +    assert(hw_asid < BIT(16));
@@ -56,6 +77,29 @@ index 7235672db..345276e47 100644
 +#endif
  }
  
+diff --git a/src/arch/arm/kernel/boot.c b/src/arch/arm/kernel/boot.c
+index 139f620b3..fd5183037 100644
+--- a/src/arch/arm/kernel/boot.c
++++ b/src/arch/arm/kernel/boot.c
+@@ -186,6 +186,18 @@ BOOT_CODE static bool_t init_cpu(void)
+         if (!checkTCR_EL2()) {
+             return false;
+         }
++    } else {
++        /* User address spaces are tagged with 16-bit ASIDs, and switching
++         * between them flushes nothing: with 8-bit ASIDs (TCR_EL1.AS clear,
++         * left so by the boot loader) the hardware ignores the upper 8 bits,
++         * and address spaces whose ASIDs differ only there share TLB
++         * entries. */
++        word_t tcr;
++        MRS("tcr_el1", tcr);
++        if (!(tcr & BIT(36))) {
++            printf("TCR_EL1.AS is clear: 16-bit ASIDs are required\n");
++            return false;
++        }
+     }
+ #endif
+ 
 -- 
-2.47.3
+2.43.0
 

@@ -1,4 +1,4 @@
-From 0afc0ce71c34af9f5e7e71cf6dd361f5d893afcc Mon Sep 17 00:00:00 2001
+From c24e2a3b2b69af9082514aa9bbb89eb0b6701450 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 08:30:23 -0700
 Subject: [PATCH 2/7] tcb: add seL4_TCB_ReadFPU and seL4_TCB_WriteFPU
@@ -9,13 +9,17 @@ needed by user-level OS personalities (signal frames, ptrace, fork) that
 manage threads running foreign code.
 
 Any live copy of the state is flushed (possibly from a remote core) before
-the transfer. Images written by user level are sanitised so that loading
-them cannot fault in the kernel.
+the transfer, and loaded again afterwards if the thread is running (the
+caller itself, or a thread on another core): it returns to user level
+without passing through switchToThread(), which is where the FPU is
+loaded, and would otherwise fault on its next FPU instruction. Images
+written by user level are sanitised so that loading them cannot fault in
+the kernel.
 ---
- libsel4/include/interfaces/object-api.xml | 56 ++++++++++++++
- libsel4/include/sel4/constants.h          | 11 +++
- src/object/tcb.c                          | 92 +++++++++++++++++++++++
- 3 files changed, 159 insertions(+)
+ libsel4/include/interfaces/object-api.xml |  56 ++++++++++++
+ libsel4/include/sel4/constants.h          |  11 +++
+ src/object/tcb.c                          | 100 ++++++++++++++++++++++
+ 3 files changed, 167 insertions(+)
 
 diff --git a/libsel4/include/interfaces/object-api.xml b/libsel4/include/interfaces/object-api.xml
 index 37885cbb0..1f433596e 100644
@@ -107,10 +111,10 @@ index c356a1395..c8237b5df 100644
  typedef enum {
      seL4_TCBFlag_NoFlag = 0x0,
 diff --git a/src/object/tcb.c b/src/object/tcb.c
-index 521e33bd6..dde25aee9 100644
+index 521e33bd6..3e8c44b28 100644
 --- a/src/object/tcb.c
 +++ b/src/object/tcb.c
-@@ -841,6 +841,90 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
+@@ -841,6 +841,98 @@ static exception_t decodeSetFlags(cap_t cap, word_t length, bool_t call, word_t
      return EXCEPTION_NONE;
  }
  
@@ -176,7 +180,7 @@ index 521e33bd6..dde25aee9 100644
 +    if (offset % 64 != 0 || offset >= frameSize || frameSize - offset < sizeof(user_fpu_state_t)) {
 +        userError("TCB %sFPU: Invalid offset.", toFrame ? "Read" : "Write");
 +        current_syscall_error.type = seL4_InvalidArgument;
-+        current_syscall_error.invalidArgumentNumber = 1;
++        current_syscall_error.invalidArgumentNumber = 0;
 +        return EXCEPTION_SYSCALL_ERROR;
 +    }
 +
@@ -186,13 +190,21 @@ index 521e33bd6..dde25aee9 100644
 +    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
 +
 +    /* Flush any live copy of the state (possibly on another core) back
-+     * into the TCB; the next FPU use reloads it lazily. */
++     * into the TCB. */
++    bool_t owned = nativeThreadUsingFPU(thread);
 +    fpuRelease(thread);
 +    if (toFrame) {
 +        memcpy(frame, &thread->tcbArch.tcbContext.fpuState, sizeof(user_fpu_state_t));
 +    } else {
 +        memcpy(&thread->tcbArch.tcbContext.fpuState, frame, sizeof(user_fpu_state_t));
 +        sanitiseFpuState(&thread->tcbArch.tcbContext.fpuState);
++    }
++    /* A thread that is running (the caller itself, or a thread on another
++     * core) returns to user level without passing through switchToThread(),
++     * which is the only place that loads the FPU: load it again, or its
++     * next FPU instruction faults. */
++    if (owned && thread == NODE_STATE_ON_CORE(ksCurThread, SMP_TERNARY(thread->tcbAffinity, 0))) {
++        switchFpuOwner(thread, SMP_TERNARY(thread->tcbAffinity, 0));
 +    }
 +    return EXCEPTION_NONE;
 +}
@@ -201,7 +213,7 @@ index 521e33bd6..dde25aee9 100644
  /* The following functions sit in the syscall error monad, but include the
   * exception cases for the preemptible bottom end, as they call the invoke
   * functions directly.  This is a significant deviation from the Haskell
-@@ -937,6 +1021,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
+@@ -937,6 +1029,14 @@ exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
      case TCBSetFlags:
          return decodeSetFlags(cap, length, call, buffer);
  
@@ -217,5 +229,5 @@ index 521e33bd6..dde25aee9 100644
          /* Haskell: "throw IllegalOperation" */
          userError("TCB: Illegal operation.");
 -- 
-2.47.3
+2.43.0
 

@@ -1,4 +1,4 @@
-From f4144d11d56a0cf490fed3d1e9cd2b87c887ef53 Mon Sep 17 00:00:00 2001
+From faf8bae6d517c734caaa17b911bb5e4d6dc1a874 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Sat, 17 Oct 2026 22:58:58 -0700
 Subject: [PATCH 8/8] api: restrict debug syscalls to threads with a minimum
@@ -15,11 +15,19 @@ below it get an unknown-syscall fault for these system calls, as for any
 undefined one. The default, 0, keeps the current behaviour. Since a thread
 cannot raise its MCP beyond the MCP of the TCB authorising the change,
 untrusted code confined to a lower MCP band cannot regain access.
+
+The same threshold applies to the kernel's messages about failed
+invocations (userError) and about threads that fault without a fault
+handler. Each is a synchronous serial write with the kernel lock held, so
+untrusted code could otherwise stall every core by failing invocations in
+a loop, in any build with printing.
 ---
- config.cmake          | 11 +++++++++++
- include/api/syscall.h |  7 +++++++
- src/api/syscall.c     |  5 +++++
- 3 files changed, 23 insertions(+)
+ config.cmake              | 11 +++++++++++
+ include/api/syscall.h     |  1 +
+ include/api/types.h       | 29 +++++++++++++++++++++--------
+ src/api/syscall.c         |  5 +++++
+ src/kernel/faulthandler.c |  4 ++++
+ 5 files changed, 42 insertions(+), 8 deletions(-)
 
 diff --git a/config.cmake b/config.cmake
 index 750ab9b19..ac5d49823 100644
@@ -44,23 +52,67 @@ index 750ab9b19..ac5d49823 100644
                DEPENDS "NOT KernelIsMCS" UNDEF_DISABLED)
  config_string(KernelTimeSlice TIME_SLICE "Number of timer ticks until a thread is preempted."
 diff --git a/include/api/syscall.h b/include/api/syscall.h
-index ab818621b..e0e922296 100644
+index ab818621b..990574769 100644
 --- a/include/api/syscall.h
 +++ b/include/api/syscall.h
-@@ -33,6 +33,13 @@ exception_t handleSyscall(syscall_t syscall);
+@@ -33,6 +33,7 @@ exception_t handleSyscall(syscall_t syscall);
  
  /* True if every syscall from the thread must be delivered as a fault. */
  #define threadTrapsSyscalls(_t) (!!((_t)->tcbFlags & seL4_TCBFlag_trapSyscalls))
 +
-+/* True if the thread may use debug and benchmark system calls. */
+ exception_t handleInterruptEntry(void);
+ exception_t handleUnknownSyscall(word_t w);
+ exception_t handleUserLevelFault(word_t w_a, word_t w_b);
+diff --git a/include/api/types.h b/include/api/types.h
+index aee35fafa..bdf2f324f 100644
+--- a/include/api/types.h
++++ b/include/api/types.h
+@@ -100,6 +100,14 @@ static inline word_t CONST wordFromMessageInfo(seL4_MessageInfo_t mi)
+     return mi.words[0];
+ }
+ 
++/* True if the thread may use debug and benchmark system calls, and have the
++ * kernel print messages about its errors and faults. */
 +#if CONFIG_DEBUG_SYSCALL_MIN_MCP > 0
 +#define threadMayDebug(_t) ((_t)->tcbMCP >= CONFIG_DEBUG_SYSCALL_MIN_MCP)
 +#else
 +#define threadMayDebug(_t) true
 +#endif
- exception_t handleInterruptEntry(void);
- exception_t handleUnknownSyscall(word_t w);
- exception_t handleUserLevelFault(word_t w_a, word_t w_b);
++
+ #ifdef CONFIG_PRINTING
+ #ifdef CONFIG_COLOUR_PRINTING
+ #define ANSI_RESET "\033[0m"
+@@ -132,17 +140,22 @@ extern struct debug_syscall_error current_debug_error;
+ 
+ /*
+  * Print to serial a message helping userspace programmers to determine why the
+- * kernel is not performing their requested operation.
++ * kernel is not performing their requested operation.  Only for threads that
++ * may use debug system calls: a print stalls the core, with the kernel lock
++ * held, for as long as the serial port takes to send it.
+  */
+ #define userError(M, ...) \
+     do {                                                                       \
+-        out_error(ANSI_BOLD "<<" ANSI_GREEN "seL4(CPU %" SEL4_PRIu_word ")"    \
+-                ANSI_BOLD " [%s/%d T%p \"%s\" @%lx]: " M ">>" ANSI_RESET "\n", \
+-                CURRENT_CPU_INDEX(),                                           \
+-                __func__, __LINE__, NODE_STATE(ksCurThread),                   \
+-                THREAD_NAME,                                                   \
+-                (word_t)getRestartPC(NODE_STATE(ksCurThread)),                 \
+-                ## __VA_ARGS__);                                               \
++        if (threadMayDebug(NODE_STATE(ksCurThread))) {                         \
++            out_error(ANSI_BOLD "<<" ANSI_GREEN "seL4(CPU %" SEL4_PRIu_word ")"\
++                    ANSI_BOLD " [%s/%d T%p \"%s\" @%lx]: " M ">>" ANSI_RESET \
++                    "\n",                                                      \
++                    CURRENT_CPU_INDEX(),                                       \
++                    __func__, __LINE__, NODE_STATE(ksCurThread),               \
++                    THREAD_NAME,                                               \
++                    (word_t)getRestartPC(NODE_STATE(ksCurThread)),             \
++                    ## __VA_ARGS__);                                           \
++        }                                                                      \
+     } while (0)
+ #else /* !CONFIG_PRINTING */
+ #define userError(...)
 diff --git a/src/api/syscall.c b/src/api/syscall.c
 index 82014adaf..3f56510fb 100644
 --- a/src/api/syscall.c
@@ -84,6 +136,28 @@ index 82014adaf..3f56510fb 100644
      MCS_DO_IF_BUDGET({
  #ifdef CONFIG_SET_TLS_BASE_SELF
          if (w == SysSetTLSBase)
+diff --git a/src/kernel/faulthandler.c b/src/kernel/faulthandler.c
+index 99df97ea2..2aaaf51a6 100644
+--- a/src/kernel/faulthandler.c
++++ b/src/kernel/faulthandler.c
+@@ -150,6 +150,9 @@ void handleDoubleFault(tcb_t *tptr, seL4_Fault_t ex1)
+ #endif
+ {
+ #ifdef CONFIG_PRINTING
++    if (!threadMayDebug(tptr)) {
++        goto no_print;
++    }
+ #ifdef CONFIG_KERNEL_MCS
+     printf("Found thread has no fault handler while trying to handle:\n");
+     print_fault(current_fault);
+@@ -167,6 +170,7 @@ void handleDoubleFault(tcb_t *tptr, seL4_Fault_t ex1)
+     printf("at address %p\n", (void *)getRestartPC(tptr));
+     printf("With stack:\n");
+     Arch_userStackTrace(tptr);
++no_print:
+ #endif
+ 
+     setThreadState(tptr, ThreadState_Inactive);
 -- 
-2.47.3
+2.43.0
 
