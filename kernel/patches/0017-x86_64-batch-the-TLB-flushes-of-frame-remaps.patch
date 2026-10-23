@@ -1,4 +1,4 @@
-From 7f15fc4b351c754804ce85fdcd6057d1aeb35444 Mon Sep 17 00:00:00 2001
+From 6418d8edc2ae48faa6da3fc1f1efdc30fc870d05 Mon Sep 17 00:00:00 2001
 From: l4h <z@univalence.me>
 Date: Mon, 19 Oct 2026 03:30:42 -0700
 Subject: [PATCH] x86_64: batch the TLB flushes of frame remaps
@@ -22,14 +22,22 @@ a fork write-protects every private page.
   the frame, the only way to reuse it, still invalidates its translation
   everywhere.
 
+Rights are the access a user-mode translation gives: none for a
+supervisor-only entry (VMKernelOnly, a map with no rights), whatever its
+RW bit, since seL4 never accesses memory through user addresses; else
+read and, with RW, write.  Taking user access away from a page is
+therefore a lowering, and giving it back a raise: a guest kernel can
+emulate an accessed bit by remapping old pages kernel-only in a batch,
+flushed once, and the next access faults and costs a local invalidation.
+
 Overwriting a present entry with another frame, and every other change,
 still invalidates as before.
 ---
- libsel4/arch_include/x86/sel4/arch/types.h    |  4 ++
+ libsel4/arch_include/x86/sel4/arch/types.h    |  4 +
  .../interfaces/object-api-sel4-arch.xml       | 21 ++++++
- src/arch/x86/64/kernel/vspace.c               | 15 +++++
- src/arch/x86/kernel/vspace.c                  | 64 +++++++++++++++++--
- 4 files changed, 100 insertions(+), 4 deletions(-)
+ src/arch/x86/64/kernel/vspace.c               | 15 ++++
+ src/arch/x86/kernel/vspace.c                  | 73 ++++++++++++++++++-
+ 4 files changed, 109 insertions(+), 4 deletions(-)
 
 diff --git a/libsel4/arch_include/x86/sel4/arch/types.h b/libsel4/arch_include/x86/sel4/arch/types.h
 index 8fb8635eb..30a04f3c6 100644
@@ -105,10 +113,10 @@ index 96d60209c..843dfa1c9 100644
          return EXCEPTION_SYSCALL_ERROR;
  
 diff --git a/src/arch/x86/kernel/vspace.c b/src/arch/x86/kernel/vspace.c
-index 8ca477b79..81d41b332 100644
+index 8ca477b79..4ab0b6289 100644
 --- a/src/arch/x86/kernel/vspace.c
 +++ b/src/arch/x86/kernel/vspace.c
-@@ -794,12 +794,65 @@ void unmapPageTable(asid_t asid, vptr_t vaddr, pte_t *pt)
+@@ -794,12 +794,74 @@ void unmapPageTable(asid_t asid, vptr_t vaddr, pte_t *pt)
                                       SMP_TERNARY(tlb_bitmap_get(find_ret.vspace_root), 0));
  }
  
@@ -128,25 +136,34 @@ index 8ca477b79..81d41b332 100644
 +           pte_get_write_through(old) == pte_get_write_through(pte);
 +}
 +
++/* The access a user-mode translation of `pte` gives: bit 0 read, bit 1
++ * write.  A supervisor-only entry (VMKernelOnly) gives none, whatever its
++ * RW bit, and seL4 itself never accesses memory through user addresses. */
++static word_t pteUserRights(pte_t pte)
++{
++    if (!pte_get_super_user(pte)) {
++        return 0;
++    }
++    return 1 | (pte_get_read_write(pte) << 1);
++}
++
 +/* True if `pte` maps the frame of the present entry `old` with at least its
-+ * rights and the same memory type.  A TLB entry left from `old` can then
-+ * only cause a spurious page fault, which invalidates it. */
++ * user rights and the same memory type.  A TLB entry left from `old` can
++ * then only cause a spurious page fault, which invalidates it. */
 +static bool_t pteRightsRaised(pte_t old, pte_t pte)
 +{
 +    return pteSameFrameAndType(old, pte) &&
-+           pte_get_read_write(pte) >= pte_get_read_write(old) &&
-+           pte_get_super_user(pte) >= pte_get_super_user(old) &&
++           (pteUserRights(pte) & pteUserRights(old)) == pteUserRights(old) &&
 +           pte_get_xd(pte) <= pte_get_xd(old);
 +}
 +
 +/* True if `pte` maps the frame of the present entry `old` with at most its
-+ * rights and the same memory type: the only change seL4_X86_DeferFlush
++ * user rights and the same memory type: the only change seL4_X86_DeferFlush
 + * defers. */
 +static bool_t pteRightsLowered(pte_t old, pte_t pte)
 +{
 +    return pteSameFrameAndType(old, pte) &&
-+           pte_get_read_write(pte) <= pte_get_read_write(old) &&
-+           pte_get_super_user(pte) <= pte_get_super_user(old) &&
++           (pteUserRights(pte) & pteUserRights(old)) == pteUserRights(pte) &&
 +           pte_get_xd(pte) >= pte_get_xd(old);
 +}
 +
@@ -176,7 +193,7 @@ index 8ca477b79..81d41b332 100644
                                       SMP_TERNARY(tlb_bitmap_get(vspace), 0));
      return EXCEPTION_NONE;
  }
-@@ -951,6 +1004,7 @@ exception_t decodeX86FrameInvocation(
+@@ -951,6 +1013,7 @@ exception_t decodeX86FrameInvocation(
          vm_attributes_t vmAttr;
          vm_page_size_t  frameSize;
          asid_t          asid;
@@ -184,7 +201,7 @@ index 8ca477b79..81d41b332 100644
  
          if (length < 3 || current_extra_caps.excaprefs[0] == NULL) {
              current_syscall_error.type = seL4_TruncatedMessage;
-@@ -961,7 +1015,8 @@ exception_t decodeX86FrameInvocation(
+@@ -961,7 +1024,8 @@ exception_t decodeX86FrameInvocation(
          frameSize = cap_frame_cap_get_capFSize(cap);
          vaddr = getSyscallArg(0, buffer);
          w_rightsMask = getSyscallArg(1, buffer);
@@ -194,7 +211,7 @@ index 8ca477b79..81d41b332 100644
  #ifdef CONFIG_ARCH_X86_64
          /* Without execute-disable the XD bit is reserved: ignore it. */
          if (vm_attributes_get_x86XDBit(vmAttr) && !x86_64_nxEnabled()) {
-@@ -1061,7 +1116,8 @@ exception_t decodeX86FrameInvocation(
+@@ -1061,7 +1125,8 @@ exception_t decodeX86FrameInvocation(
              }
  
              setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);

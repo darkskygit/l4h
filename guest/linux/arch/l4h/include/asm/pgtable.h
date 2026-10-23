@@ -264,6 +264,12 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
 	um_tlb_mark_sync(mm, addr, addr + length);
 }
 
+/* kernel/tlb.c: clearing the accessed bit leaves the TLB flush to a batch. */
+#define __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH
+struct vm_area_struct;
+int ptep_clear_flush_young(struct vm_area_struct *vma, unsigned long address,
+			   pte_t *ptep);
+
 #define __HAVE_ARCH_PTE_SAME
 static inline int pte_same(pte_t pte_a, pte_t pte_b)
 {
