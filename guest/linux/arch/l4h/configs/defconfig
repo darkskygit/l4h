@@ -27,6 +27,14 @@ CONFIG_TCP_CONG_BBR=y
 CONFIG_NET_SCHED=y
 CONFIG_NET_SCH_FQ=y
 CONFIG_NET_SCH_CAKE=y
+# BPF programs on tc (the clsact qdisc, cls_bpf, act_bpf) and XDP, with
+# AF_XDP sockets. There is no BPF JIT for ARCH=l4h: programs run in the
+# interpreter.
+CONFIG_NET_CLS_ACT=y
+CONFIG_NET_SCH_INGRESS=y
+CONFIG_NET_CLS_BPF=y
+CONFIG_NET_ACT_BPF=y
+CONFIG_XDP_SOCKETS=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 CONFIG_BLK_DEV=y
