@@ -43,6 +43,8 @@ Third-party components, including the submodules in `kernel/seL4` and
     virtio-net, gVNIC on GCE C3, N4, C4 and later, or ENA on AWS EC2.
   - Checksum and TSO offloads.
   - Routing and NAT are done by a VM, for example Debian with nftables.
+- **Device confinement.** Root drives AMD-Vi and Intel VT-d for per-device
+  DMA mappings and interrupt remapping (`iommu` and `iommu_intremap`).
 - **Control.** dom0, the first guest, controls the host through
   `/dev/l4hctl` and the `l4hctl` CLI: create, start (with an initramfs
   and a command line), shutdown and destroy VMs; console access; disks; switches; NICs; CPU caps. Destroying
@@ -176,6 +178,7 @@ without it, the host reports `unknown`.
 | `tests/run-nettest.sh`, `tests/run-router.sh` | switches, uplink, multi-NIC, isolation, MAC lock, NAT router VM |
 | `tests/run-density.sh 30 256` | 30 guests on 4 cores stay responsive |
 | `tests/run-m6test.sh` | dom0 restart, CPU caps, steal time |
+| `tests/run-vtdtest.sh [--qemu]` | VT-d DMAR parsing, table/interrupt formats and address bounds; with QEMU, DMA, lifecycle, NIC and serial tests |
 | `tests/run-schedtest.sh` | host-side SMT topology, initial placement and migration policy tests |
 | `tests/run-rtctest.sh [--qemu]` | RTC calendar, BCD/binary and 12/24-hour modes, bounds and error recovery; with `--qemu`, dom0 writes verified against the emulated hardware |
 | `tests/run-smttest.sh` | QEMU boot with SMT: CPU discovery, initial placement and busy-vCPU migration |

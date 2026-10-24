@@ -82,6 +82,8 @@ jobs:
         run: tests/run-ctltest.sh
       - name: Network
         run: tests/run-nettest.sh
+      - name: Intel VT-d DMA and interrupt remapping
+        run: tests/run-vtdtest.sh --qemu
       - name: dom0 restart, CPU caps, steal time
         run: tests/run-m6test.sh
       - name: SMT discovery, placement and migration

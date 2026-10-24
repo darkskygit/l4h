@@ -33,8 +33,8 @@ L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-
     "$root/tools/run-dom0.sh" "$out/ctltest.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" ${CTLTEST_TIMEOUT:-$((600 * l4h_test_slow))} \
     | grep -E "CTLTEST|l4hctl|GUEST|vm [0-9]|disk [0-9]|^ *[0-9]+ |memory|l4h-root: guest|panic" || true
 grep -q "CTLTEST: PASS" "$root/build/qemu.log"
-# l4hctl iommu: on and remapping under L4H_QEMU_IOMMU=amd, else none.
-if [ "${L4H_QEMU_IOMMU:-}" = amd ]; then
+# l4hctl iommu: on and remapping with either emulated IOMMU, else none.
+if [[ "${L4H_QEMU_IOMMU:-}" = amd || "${L4H_QEMU_IOMMU:-}" = intel ]]; then
     grep -aq "CTLTEST: iommu state: *on" "$root/build/qemu.log" \
         && grep -aq "CTLTEST: iommu interrupts: *remapped" "$root/build/qemu.log" \
         || { echo "CTLTEST: l4hctl iommu does not show the IOMMU on"; exit 1; }

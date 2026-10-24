@@ -12,7 +12,7 @@ use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, keep_b
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
-use crate::amdvi::AmdVi;
+use crate::iommu::Iommu;
 use crate::mem::{Alloc, Arena, Dest, Slot, UtRegion};
 use crate::pci::{self, Pci};
 use crate::vmm;
@@ -135,7 +135,7 @@ fn used_bars(d: &pci::Device) -> u8 {
 pub fn spawn(
     nics: &[pci::Device],
     pci: &Pci,
-    iommu: &mut AmdVi,
+    iommu: &mut Iommu,
     devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
@@ -182,6 +182,7 @@ pub fn spawn(
         // The NIC reaches its DMA memory only.
         let dom = iommu.attach(alloc, d);
         iommu.map(alloc, dom, paddr, 1 << NIC_DMA_BITS, true);
+        let (msi_address, msi_data) = iommu.msi(dom, NIC_MSI_BASE + n as u64);
         cfg.nics[n] = net::NicConfig {
             kind: if gvnic {
                 net::NIC_GVNIC
@@ -194,8 +195,8 @@ pub fn spawn(
             },
             revision: d.revision as u32,
             pci_bdf: bdf(d),
-            msi_data: iommu.msi_data(dom, NIC_MSI_BASE + n as u64),
-            msi_address: pci::msi_address(),
+            msi_data,
+            msi_address,
             common,
             notify,
             notify_off_multiplier: notify_mult,

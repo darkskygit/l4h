@@ -184,7 +184,7 @@ fn run(args: &[String]) -> Result<i32> {
             println!("state:      {}", i.state_name());
             if i.state == IOMMU_ON {
                 println!("iommus:     {}", i.units);
-                println!("interrupts: {}", if i.intremap { "remapped" } else { "not remapped (iommu_intremap=0)" });
+                println!("interrupts: {}", if i.intremap { "remapped" } else { "not remapped (disabled or unavailable)" });
                 println!("devices:    {} confined, {} behind no IOMMU", i.confined, i.unconfined);
                 println!("events:     {}", i.events);
             }

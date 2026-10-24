@@ -246,7 +246,7 @@ object is allocated or retyped.
 
 Unlike Fiasco vCPU mode, we need no new interrupt-injection primitive (§5.4).
 We need no IOMMU support in the kernel, since no device is passed into a
-guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
+guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.5).
 
 ### Found during implementation
 
@@ -392,9 +392,10 @@ guest. Where there is an AMD IOMMU, root drives it itself (§8.5).
   write-back kernel window too, which the architecture does not support,
   but x86 CPUs snoop their caches on such accesses in practice. Flushing
   every line on every reset would cost about as much as the clear it
-  saves. Device writes cannot leave stale lines either: l4h's AMD-Vi
-  page tables set force-coherent (FC), so even PCIe No Snoop writes are
-  snooped, and without an IOMMU devices can already reach all memory.
+  saves. AMD-Vi page tables set force-coherent (FC), and VT-d sets the
+  snoop bit when the unit supports snoop control. VT-d hardware without
+  snoop control relies on devices issuing coherent DMA. Without an IOMMU
+  devices can already reach all memory.
 - **0020, framebuffer console (x86).** With the command-line option
   `fb_console`, everything the kernel prints (its own messages and host
   components' debug output) is also drawn on the lower half of the
@@ -1422,15 +1423,15 @@ NAT, DHCP and firewalling belong in a VM.
 - **Control.** `l4hctl`, dom0 only (§9.1).
 - **Future devices.** virtio-rng, virtio-vsock and virtio-balloon.
 
-### 8.5 IOMMU (AMD-Vi)
+### 8.5 IOMMU (AMD-Vi and Intel VT-d)
 
-On an AMD host, `l4h-root` confines every device with the IOMMU, which it
-drives itself (`l4h-root/src/amdvi.rs`, about 890 lines). seL4 keeps
+On an AMD or Intel host, `l4h-root` confines devices with the IOMMU, which it
+drives itself (`l4h-root/src/amdvi.rs` and `vtd.rs`, selected by `iommu.rs`). seL4 keeps
 `KernelIOMMU` off. seL4's VT-d code was tested on two chipsets, has no
 AMD support, and would only let root delegate I/O mappings, which nothing
 in l4h needs: root alone gives devices memory.
 
-- **Boot.** Before it enables or resets any PCI device, root reads the
+- **AMD boot.** Before it enables or resets any PCI device, root reads the
   IVRS table and takes over every IOMMU on segment 0. It maps the IOMMU's
   registers and builds one device table for all of them, in which every
   device ID is blocked (V and TV set, no page table, no IR/IW). It sets a
@@ -1452,7 +1453,7 @@ in l4h needs: root alone gives devices memory.
   - The balloon (memd) gets its DMA pages. Free page reports name memory
     the device is never given. A balloon that translates them (QEMU's
     `iommu_platform=on`) cannot report.
-- **Interrupts.** Root remaps them too (`iommu_intremap`, on by default).
+- **AMD interrupts.** Root remaps them too (`iommu_intremap`, on by default).
   A device root enables gets a table of 16 interrupt entries (32-bit
   format), named in its device table entry with IntCtl "remapped".
   `AmdVi::msi_data` fills one entry per vector (fixed delivery to APIC ID
@@ -1467,10 +1468,10 @@ in l4h needs: root alone gives devices memory.
   requester ID can still inject any vector; root does not turn on ACS
   source validation. The entries use the 32-bit format, so destinations
   are APIC IDs below 256 (no x2APIC XTEn or GA mode).
-- **Unity ranges.** IVMD ranges stay mapped for the devices they name:
+- **AMD unity ranges.** IVMD ranges stay mapped for the devices they name:
   ranges for all devices in one shared domain, others in a domain per
   range. A device root enables also gets the ranges that name it.
-- **Tables.** The device table, I/O page tables, command buffers and event
+- **AMD tables.** The device table, I/O page tables, command buffers and event
   logs come from 2 MiB chunks of root memory, mapped in root
   (`layout::IOMMU_TABLES`) and kept until reboot. Unmapping clears the
   leaf entries and keeps the tables, so a pool slot that is attached again
@@ -1479,7 +1480,7 @@ in l4h needs: root alone gives devices memory.
   may cache missing entries (NpCache). Root stops if an IOMMU does not
   complete a command within a second, since it could then no longer
   confine anything.
-- **Faults.** Root reads the event logs every 100 ms (its balance tick)
+- **AMD faults.** Root reads the event logs every 100 ms (its balance tick)
   and prints up to 8 events per tick: page faults, with the device, the
   address and the domain, and errors.
 - **Status.** `l4hctl iommu` (`CTL_IOMMU_INFO`, dom0 only like every
@@ -1487,13 +1488,63 @@ in l4h needs: root alone gives devices memory.
   or unusable; whether interrupts are remapped; the devices confined and
   those behind no IOMMU; and the events logged since boot. `l4hctl info`
   shows the first two in one line.
-- **Off.** With no IVRS, or `iommu=0` in `l4h.conf`, every operation is a
+- **Off.** With no DMAR or IVRS, or `iommu=0` in `l4h.conf`, every operation is a
   no-op and devices reach all memory, as before. `iommu_intremap=0` keeps
-  DMA confined but passes every interrupt unremapped. This includes Intel
-  hosts (VT-d is not driven), cloud VMs without a vIOMMU, and aarch64. A
-  device that no IVHD covers is reported at enable and left untranslated.
+  DMA confined but passes every interrupt unremapped. Hosts without a
+  supported IOMMU include cloud VMs without a vIOMMU and aarch64. A
+  device that no firmware scope covers is reported at enable and left untranslated.
   Root blocks devices it does not drive. An integrated GPU that scans out
   of system RAM therefore loses its picture: use `iommu=0` there.
+
+Intel VT-d uses the same driver-facing operations, with these differences:
+
+- **Discovery.** DMAR DRHDs describe segment 0's remapping units. Explicit
+  endpoint and PCI bridge scopes take precedence over INCLUDE_PCI_ALL;
+  paths are resolved using the bridges' secondary/subordinate buses. Invalid
+  lengths, checksums, overlapping scopes and unsupported scope types fail
+  discovery before any unit is changed. Other PCI segments are not driven.
+- **DMA.** Each unit has a legacy root table and per-bus context tables.
+  Missing entries block DMA; each attached requester gets a private 39- or
+  48-bit second-level page table and domain ID. Contexts reject translated
+  requests and ATS. RMRR ranges are identity mapped for their devices before
+  translation is enabled and remain mapped after attach/unmap. Mapping
+  beyond the unit's address width is rejected. PCI requester aliases behind
+  conventional PCI bridges and phantom functions are not enabled.
+- **Invalidation.** Units with queued invalidation get a page of 128-bit
+  descriptors and a completion word. Maps invalidate cached misses; unmaps
+  invalidate the domain's IOTLB and wait for DMA reads and writes to drain.
+  Older units can use register invalidation for DMA if they support draining.
+  Noncoherent table walkers get CLFLUSH and memory barriers. Tables remain
+  allocated until reboot. Command errors or a one-second timeout stop root.
+- **Interrupts.** When firmware and every unit support it, root enables
+  interrupt remapping with a 256-entry table per unit. Each IRTE permits
+  exactly one requester ID and vector, delivered to APIC ID 0. The common
+  `Iommu::msi` interface returns both address and data: VT-d puts the table
+  index in the remappable MSI address (SHV=0), while AMD-Vi uses MSI data.
+  Compatibility interrupts are blocked globally, so they cannot bypass
+  source validation. seL4 owns the I/O APIC and programs compatibility
+  entries; root leaves the UART's pin masked and polls input every balance
+  tick instead. Local APIC timers and IPIs are unaffected. Extended interrupt
+  mode is not supported. If interrupt remapping is unavailable, DMA remains
+  confined and the status reports interrupts as not remapped. As with
+  AMD-Vi, requester validation relies on the PCI fabric: root does not
+  enable ACS source validation to prevent requester-ID spoofing.
+- **Faults.** Root polls the primary fault records, prints up to eight per
+  tick with requester ID, reason and fault information, and counts every
+  observed record and overflow in `l4hctl iommu`. It masks the unit's fault
+  interrupt and invalidation-completion interrupt.
+
+`L4H_QEMU_IOMMU=intel` adds QEMU's `intel-iommu` with interrupt remapping
+and caching mode enabled, so cached missing translations must be invalidated.
+`tests/run-vtdtest.sh` checks firmware parsing, address bounds, interrupt
+source validation and command encodings on the host; `--qemu` also runs
+virtio-blk, NVMe, VM lifecycle/unmapping, NIC and serial-monitor tests,
+including boot with interrupt remapping or the whole IOMMU disabled.
+An unattached QEMU EDU device also attempts DMA and forged MSIs: its DMA,
+another device's valid IRTE, and a non-present IRTE must all fault. QEMU
+10 passes compatibility-format interrupts through regardless of CFIS
+(`hw/i386/intel_iommu.c`, `vtd_interrupt_remap_msi`), so that test checks
+CFIS is clear but cannot verify compatibility blocking in this emulator.
 
 `L4H_QEMU_IOMMU=amd` (`tools/run-qemu.sh`) adds QEMU's `amd-iommu`
 (`intremap=on`, which needs `kernel-irqchip=split`) on a q35 machine,
@@ -1729,7 +1780,7 @@ external orchestration can run in dom0.
   and blkd's DMA memory are then kept out of the free pool; guest RAM
   and other host objects are reclaimed (§15.1). Disks are also reset at boot,
   with bus mastering off, before anything enables them, since firmware
-  may leave a controller running. Without an AMD IOMMU (§8.5), nothing
+  may leave a controller running. Without a supported IOMMU (§8.5), nothing
   else confines a device. With one, the pool is unmapped from the device
   after the drain or quarantine, so it is not pinned.
   `tests/run-ctltest.sh` destroys guests in the middle of throttled reads,
@@ -1895,7 +1946,7 @@ this does not cover:
   machine. Those values also depend on the firmware (PCRs 0–7) and on
   dom0's files and settings (PCRs 8–9). A small EFI shim in front of GRUB
   could save the log.
-- **DMA.** Without an AMD IOMMU (§8.5), a malicious device can DMA
+- **DMA.** Without a supported IOMMU (§8.5), a malicious device can DMA
   anywhere. With one, it can reach only memory it was given, and raise
   only its own interrupts. A device that spoofs an I/O APIC's requester
   ID can still inject any vector.
@@ -2429,7 +2480,7 @@ memory the guest can retype.
   (`blkd::detach`, `reset`) before any memory is reused. Only the pool and
   blkd's DMA memory can be device targets now, so a device that does not
   confirm the reset pins those (`Guest::destroy(pin_pool)`), not the
-  guest's RAM. With an AMD IOMMU the pool is unmapped from the device
+  guest's RAM. With a supported IOMMU the pool is unmapped from the device
   instead, and only blkd's DMA memory stays pinned (§8.5).
 - **Tests.** `tests/guest/abitest` plays a hostile driver against a virtio-blk
   disk: no `ACCESS_PLATFORM`, rings in RAM or across the pool's end,

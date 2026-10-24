@@ -132,7 +132,7 @@ pub struct Config {
     pub fb_console: bool,
     /// Seconds between watchdog dumps of guest vCPU state; 0 disables.
     pub watchdog_secs: usize,
-    /// Confine devices with the AMD IOMMU, if there is one (§8.5).
+    /// Confine devices with the platform IOMMU, if there is one (§8.5).
     pub iommu: bool,
     /// With it, remap their interrupts too.
     pub iommu_intremap: bool,

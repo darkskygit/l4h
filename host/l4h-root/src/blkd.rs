@@ -14,7 +14,7 @@ use l4h_host::{self as host, blk};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
 use crate::guest::Guest;
-use crate::amdvi::{AmdVi, Domain};
+use crate::iommu::{Iommu, Domain};
 use crate::mem::{Alloc, Arena, Dest, Slot};
 use crate::pci::{self, Pci};
 use crate::vmm;
@@ -229,7 +229,7 @@ pub fn start(
     id: u32,
     disk: &mut Controller,
     pci: &Pci,
-    iommu: &mut AmdVi,
+    iommu: &mut Iommu,
     devmem: &mut DevMem,
     alloc: &mut Alloc,
     win: &mut Window,
@@ -283,8 +283,7 @@ pub fn start(
     cfg.bar0 = blk::PciRegion { va: bar_va(0) as u64, len: d.bars[0].size };
     cfg.pci_bdf = bdf(d);
     let vector = disk.vector;
-    cfg.msi_data = iommu.msi_data(dom, vector);
-    cfg.msi_address = pci::msi_address();
+    (cfg.msi_address, cfg.msi_data) = iommu.msi(dom, vector);
     if let Some(VirtioRegions { common, notify, notify_mult, isr, device, .. }) = regions {
         cfg.common = common;
         cfg.notify = notify;
@@ -366,7 +365,7 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 /// running shared controller.
 #[allow(clippy::too_many_arguments)]
 pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index: usize,
-    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut AmdVi) -> (usize, vmm::Backend) {
+    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, vmm::Backend) {
     let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
     let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES }> = (0..blk::CHANNEL_PAGES)
@@ -425,7 +424,7 @@ fn quarantine(disk: &mut Controller, pci: &Pci) {
 /// away from the device. A timeout quarantines the controller and all
 /// its DMA targets until host reboot. Whether the device can no longer
 /// reach the pool: drained, or cut off by the IOMMU.
-pub fn remove(disk: &mut Controller, i: usize, pci: &Pci, iommu: &mut AmdVi) -> bool {
+pub fn remove(disk: &mut Controller, i: usize, pci: &Pci, iommu: &mut Iommu) -> bool {
     let driver = disk.driver.as_ref().unwrap();
     let quiet = !disk.failed && call(driver.comp.service_ep, blk::BLKD_REMOVE, &[i as u64]) == 0;
     if !quiet {
