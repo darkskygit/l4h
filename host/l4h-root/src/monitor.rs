@@ -33,28 +33,39 @@ pub struct Monitor {
 
 impl Monitor {
     #[cfg(target_arch = "x86_64")]
-    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, base: u16, irq: u64, poll: bool) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, base: u16, irq: u64, iommu: &mut crate::iommu::Iommu) -> Option<Self> {
         use sel4::init_thread::slot;
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         let port = alloc.slots.alloc();
         slot::IO_PORT_CONTROL.cap().ioport_control_issue(base as u64, base as u64 + 7, &abs(port)).ok()?;
         let mut m = Self { port: port as u64, base, irq: None, line: [0; LINE_MAX], len: 0 };
         // Unmapped I/O ports read as all ones. In particular, 0xff has
-        // DR set: treating it as a UART would spin forever on the first
-        // polled receive and stop root's timers, dashboard and control API.
+        // DR set, so never install a receive handler for an absent UART.
         if m.inb(5) == 0xff {
             info!("l4h-root: serial monitor unavailable on port {:#x} (no UART)", base);
             return None;
         }
-        if poll {
-            // VT-d blocks compatibility interrupts, including the I/O
-            // APIC's. Keep its pin masked and collect input on root's tick.
-            m.out(1, 0);
-            info!("l4h-root: serial monitor on port {:#x} (polled, type 'help')", base);
-            return Some(m);
-        }
+        m.out(1, 0);
+        let remap = match iommu.ioapic_irq(0, VECTOR) {
+            Ok(remap) => remap,
+            Err(reason) => {
+                info!("l4h-root: serial monitor unavailable: {}", reason);
+                return None;
+            }
+        };
         let irq_slot = alloc.slots.alloc();
-        slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, irq, 0, 0, VECTOR, &abs(irq_slot)).ok()?;
+        let dst = abs(irq_slot);
+        if let Some(handle) = remap {
+            let err = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_IRQControl_GetIOAPICRemapped(
+                slot::IRQ_CONTROL.cap().bits(), dst.root().bits(), dst.path().bits(), dst.path().depth().try_into().unwrap(),
+                0, irq, 0, 0, VECTOR, handle as u64));
+            if let Some(err) = sel4::Error::from_sys(err) {
+                info!("l4h-root: serial monitor: remapped IRQ failed: {:?}", err);
+                return None;
+            }
+        } else {
+            slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, irq, 0, 0, VECTOR, &dst).ok()?;
+        }
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
         let badged = alloc.slots.alloc();
         abs(badged)
@@ -65,12 +76,13 @@ impl Monitor {
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
         m.out(1, 0x01);
         m.out(4, m.inb(4) | 0x08);
-        info!("l4h-root: serial monitor on port {:#x} (type 'help')", base);
+        info!("l4h-root: serial monitor on port {:#x} ({}interrupts, type 'help')",
+            base, if remap.is_some() { "remapped " } else { "" });
         Some(m)
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _base: u16, _irq: u64, _poll: bool) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _base: u16, _irq: u64, _iommu: &mut crate::iommu::Iommu) -> Option<Self> {
         use sel4::init_thread::slot;
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
@@ -146,10 +158,6 @@ impl Monitor {
         unsafe { ((m.port + 0x44) as *mut u32).write_volatile(0x7ff); }
         if let Some(irq) = m.irq { let _ = irq.irq_handler_ack(); }
         h.monitor = Some(m);
-    }
-
-    pub fn poll(h: &mut Host) {
-        if h.monitor.as_ref().is_some_and(|m| m.irq.is_none()) { Self::interrupt(h); }
     }
 }
 
