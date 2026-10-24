@@ -33,5 +33,31 @@ wait_for "GUEST: ready" 2 120
 printf 'info\r' >&3
 wait_for "monitor: 4 cores" 1 30
 kill "$qemu" 2>/dev/null || true
+wait "$qemu" 2>/dev/null || true
 grep -aE "monitor:|restarting dom0" "$log"
 echo "monitor: PASS"
+
+if [ "${L4H_ARCH:-x86_64}" = x86_64 ]; then
+    # Direct multiboot keeps the kernel's debug console on COM1. Point
+    # root's monitor at absent COM2 so a UART-polling hang is observable
+    # without relying on serial output from the missing device. The VT-d
+    # suite runs this with interrupt remapping, which selects polling.
+    config=$out/monitor-absent.conf
+    cat > "$config" <<'CONF'
+serial_port=0x2f8
+serial_irq=3
+watchdog_secs=1
+CONF
+    log=$root/build/qemu-monitor-absent.log
+    L4H_CONFIG="$config" "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \
+        </dev/null >"$log" 2>&1 &
+    qemu=$!
+    # Root must keep handling timer notifications after its first UART
+    # poll; the old loop never returned when the line status was 0xff.
+    wait_for "l4h-root: watchdog: netd used" 3 30
+    wait_for "GUEST: ready" 1 30
+    kill "$qemu" 2>/dev/null || true
+    wait "$qemu" 2>/dev/null || true
+    grep -aq "serial monitor unavailable on port 0x2f8" "$log"
+    echo "monitor: absent UART PASS"
+fi

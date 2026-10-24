@@ -1166,7 +1166,9 @@ and tcx attachment through `tests/guest/bpftest.c`. On x86_64 the guest has
   disks, switches. Changed character cells only; 8x8 public-domain font.
 - **Serial monitor.** `l4h-root` reads COM1 (I/O ports and IOAPIC IRQ 4)
   and runs `help`, `list`, `info`, `destroy <vm>` and `restart-dom0`. The
-  kernel keeps using the port for output (`tests/run-monitor.sh`).
+  kernel keeps using the port for output (`tests/run-monitor.sh`). An
+  absent UART (line status reads as `0xff`) disables the monitor, including
+  when VT-d interrupt remapping would otherwise select polled input.
 - **dom0 restart.** If dom0 reboots or crashes, `l4h-root` destroys it and
   boots it again from the boot image. Other guests keep running, and the
   new dom0 sees them through the control API (`tests/run-m6test.sh`).

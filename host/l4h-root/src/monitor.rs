@@ -38,10 +38,17 @@ impl Monitor {
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         let port = alloc.slots.alloc();
         slot::IO_PORT_CONTROL.cap().ioport_control_issue(base as u64, base as u64 + 7, &abs(port)).ok()?;
+        let mut m = Self { port: port as u64, base, irq: None, line: [0; LINE_MAX], len: 0 };
+        // Unmapped I/O ports read as all ones. In particular, 0xff has
+        // DR set: treating it as a UART would spin forever on the first
+        // polled receive and stop root's timers, dashboard and control API.
+        if m.inb(5) == 0xff {
+            info!("l4h-root: serial monitor unavailable on port {:#x} (no UART)", base);
+            return None;
+        }
         if poll {
             // VT-d blocks compatibility interrupts, including the I/O
             // APIC's. Keep its pin masked and collect input on root's tick.
-            let m = Self { port: port as u64, base, irq: None, line: [0; LINE_MAX], len: 0 };
             m.out(1, 0);
             info!("l4h-root: serial monitor on port {:#x} (polled, type 'help')", base);
             return Some(m);
@@ -54,7 +61,7 @@ impl Monitor {
             .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), MONITOR_BADGE)
             .ok()?;
         irq.irq_handler_set_notification(sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap()).ok()?;
-        let m = Monitor { port: port as u64, base, irq: Some(irq), line: [0; LINE_MAX], len: 0 };
+        m.irq = Some(irq);
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
         m.out(1, 0x01);
         m.out(4, m.inb(4) | 0x08);
@@ -112,7 +119,11 @@ impl Monitor {
     /// The UART interrupted: collect input, run complete lines.
     pub fn interrupt(h: &mut Host) {
         let Some(mut m) = h.monitor.take() else { return };
-        while m.inb(5) & 1 != 0 {
+        loop {
+            let status = m.inb(5);
+            // Keep the receive path safe if the UART becomes unavailable
+            // after the startup probe, too. PL011 returns only 0 or 1 here.
+            if status == 0xff || status & 1 == 0 { break; }
             let c = m.inb(0);
             match c {
                 b'\r' | b'\n' => {
