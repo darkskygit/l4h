@@ -956,7 +956,9 @@ from the architecture:
   and each then runs `cpuid` (serializing) before it returns. On arm64 the
   JIT patches only branches and NOPs, which one word-sized store and
   instruction-cache maintenance through seL4 (`flush_icache_range`) make
-  safe while other vCPUs run them.
+  safe while other vCPUs run them. Its atomics use LSE when the CPU has it
+  (`HWCAP_ATOMICS`), and LL/SC otherwise: `CONFIG_ARM64_LSE_ATOMICS` builds
+  that emitter and nothing else in the guest kernel.
 - **No exception tables.** A fault of the guest kernel stops the guest
   (§5.2), so a JIT may not emit loads that rely on a fixup.
   Programs with `BPF_PROBE_MEM` loads (BTF pointers, which need

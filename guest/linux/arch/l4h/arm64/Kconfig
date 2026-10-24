@@ -21,6 +21,13 @@ config KERNEL_MODE_NEON
 	  works in the guest kernel, so the arm64 crypto algorithms in
 	  arch/arm64/crypto (ARMv8 Crypto Extensions AES and others) can be
 	  selected.
+config ARM64_LSE_ATOMICS
+	def_bool y
+	help
+	  Build the ARMv8.1 LSE atomics encoders and emitter of the BPF JIT
+	  (arch/arm64/lib/insn.c, arch/arm64/net), which it uses when the CPU
+	  has them (HWCAP_ATOMICS, cpus_have_cap()).  The guest kernel's own
+	  atomics (arch/l4h/arm64/asm/atomic.h) do not use this option.
 config GENERIC_HWEIGHT
 	def_bool y
 config GENERIC_CSUM

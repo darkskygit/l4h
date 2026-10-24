@@ -4,7 +4,8 @@
 # JIT: verified XDP and tc programs, direct tail calls patched in and out,
 # and XDP (generic) and tcx programs on lo.  On x86_64 the guest has
 # 2 GiB, so that vmalloc is out of rel32 reach of the kernel image
-# (arch/l4h/x86/bpf_jit.c).
+# (arch/l4h/x86/bpf_jit.c).  On aarch64, L4H_QEMU_CPU=max gives a CPU with
+# LSE atomics, which the JIT then uses instead of LL/SC.
 # Usage: run-bpftest.sh [vcpus]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
