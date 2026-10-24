@@ -51,8 +51,21 @@ extern const char * const x86_bug_flags[NBUGINTS*32];
  * supporting a possible guest feature where host support for it
  * is not relevant.
  */
-#define cpu_feature_enabled(bit)	\
-	(__builtin_constant_p(bit) && DISABLED_MASK_BIT_SET(bit) ? 0 : static_cpu_has(bit))
+#define cpu_feature_enabled(bit)					\
+	(__builtin_constant_p(bit) && !l4h_feature_known(bit) ? 0 : static_cpu_has(bit))
+
+/*
+ * l4h sets only the x86_capability[] words that CPUID reports (0, 1, 4,
+ * 6, 9, 16 and 18) and X86_FEATURE_PREFER_YMM (l4h_cpu_features()).  The
+ * other features, such as the mitigation and IBT flags, need kernel
+ * infrastructure that l4h does not have and are never set:
+ * cpu_feature_enabled() folds them to 0, as x86 does with its disabled
+ * features, so that code under them (in the x86 BPF JIT) does not
+ * reference symbols l4h lacks.
+ */
+#define l4h_feature_known(bit)						\
+	(((BIT(0) | BIT(1) | BIT(4) | BIT(6) | BIT(9) | BIT(16) | BIT(18)) &	\
+	  BIT((bit) >> 5)) || (bit) == X86_FEATURE_PREFER_YMM)
 
 #define boot_cpu_has(bit)	cpu_has(&boot_cpu_data, bit)
 

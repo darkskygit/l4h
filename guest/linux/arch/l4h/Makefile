@@ -74,6 +74,8 @@ USER_CFLAGS = $(patsubst -I%,,$(filter-out -mcmodel=large -nostdinc -fno-builtin
 core-y += $(ARCH_DIR)/x86/
 # x86 SIMD crypto (AES-NI, ...): needs CONFIG_L4H_X86_SIMD, selected per algorithm.
 core-$(CONFIG_CRYPTO) += $(HOST_DIR)/crypto/
+# The x86-64 BPF JIT, with x86/bpf_jit.c.
+core-$(CONFIG_BPF_JIT) += $(HOST_DIR)/net/
 
 PHONY += linux
 

@@ -1,0 +1,183 @@
+bpf: x86-64 JIT for l4h
+
+The l4h x86_64 guest builds arch/x86/net with arch/l4h/x86/bpf_jit.c,
+which places the images within rel32 reach of the kernel and patches
+code without int3.  What the JIT needs and l4h does not have:
+
+- exception tables: a fault of the guest kernel stops the guest, so
+  programs with BPF_PROBE_MEM loads are left to the interpreter (which
+  checks the address first), and arena accesses are not offered;
+- %gs-based per-CPU data: no per-CPU instructions or private stacks;
+- bpf_timed_may_goto.S, whose headers assume x86 per-CPU assembly.
+
+--- a/arch/x86/net/Makefile
++++ b/arch/x86/net/Makefile
+@@ -6,5 +6,8 @@
+ ifeq ($(CONFIG_X86_32),y)
+         obj-$(CONFIG_BPF_JIT) += bpf_jit_comp32.o
+ else
+-        obj-$(CONFIG_BPF_JIT) += bpf_jit_comp.o bpf_timed_may_goto.o
++        obj-$(CONFIG_BPF_JIT) += bpf_jit_comp.o
++ifndef CONFIG_L4H
++        obj-$(CONFIG_BPF_JIT) += bpf_timed_may_goto.o
++endif
+ endif
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -12,9 +12,11 @@
+ #include <linux/bpf.h>
+ #include <linux/memory.h>
+ #include <linux/sort.h>
++#include <asm/cpufeature.h>
+ #include <asm/extable.h>
+ #include <asm/ftrace.h>
+ #include <asm/set_memory.h>
++#include <asm/nops.h>
+ #include <asm/nospec-branch.h>
+ #include <asm/text-patching.h>
+ #include <asm/unwind.h>
+@@ -196,6 +198,7 @@
+ 	[X86_REG_R12] = 4, /* R12 callee saved */
+ };
+ 
++#ifndef CONFIG_L4H
+ static const int reg2pt_regs[] = {
+ 	[BPF_REG_0] = offsetof(struct pt_regs, ax),
+ 	[BPF_REG_1] = offsetof(struct pt_regs, di),
+@@ -208,6 +211,7 @@
+ 	[BPF_REG_8] = offsetof(struct pt_regs, r14),
+ 	[BPF_REG_9] = offsetof(struct pt_regs, r15),
+ };
++#endif
+ 
+ /*
+  * is_ereg() == true if BPF register 'reg' maps to x86-64 r8..r15
+@@ -1446,6 +1450,7 @@
+ #define FIXUP_ARENA_ACCESS	BIT(31)
+ #define DATA_ARENA_OFFSET_MASK	GENMASK(31, 16)
+ 
++#ifndef CONFIG_L4H
+ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
+ {
+ 	u32 reg = FIELD_GET(FIXUP_REG_MASK, x->fixup);
+@@ -1470,6 +1475,7 @@
+ 
+ 	return true;
+ }
++#endif
+ 
+ static void detect_reg_usage(struct bpf_insn *insn, int insn_cnt,
+ 			     bool *regs_used)
+@@ -1555,7 +1561,7 @@
+ 	emit_mov_imm64(&prog, X86_REG_R9, (__force long) priv_frame_ptr >> 32,
+ 		       (u32) (__force long) priv_frame_ptr);
+ 
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_SMP) && !defined(CONFIG_L4H)
+ 	/* add <r9>, gs:[<off>] */
+ 	EMIT2(0x65, 0x4c);
+ 	EMIT3(0x03, 0x0c, 0x25);
+@@ -1754,7 +1760,7 @@
+ 			} else if (insn_is_mov_percpu_addr(insn)) {
+ 				/* mov <dst>, <src> (if necessary) */
+ 				EMIT_mov(dst_reg, src_reg);
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_SMP) && !defined(CONFIG_L4H)
+ 				/* add <dst>, gs:[<off>] */
+ 				EMIT2(0x65, add_2mod(0x48, 0, dst_reg));
+ 				EMIT3(0x03, add_2reg(0x04, 0, dst_reg), 0x25);
+@@ -2144,6 +2150,10 @@
+ 				emit_stx_r12(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);
+ 			}
+ populate_extable:
++#ifdef CONFIG_L4H
++			/* Unreachable: bpf_jit_supports_arena() */
++			return -EOPNOTSUPP;
++#else
+ 			{
+ 				struct exception_table_entry *ex;
+ 				u8 *_insn = image + proglen + (start_of_ldx - temp);
+@@ -2197,6 +2207,7 @@
+ 				ex->data |= FIELD_PREP(DATA_ARENA_OFFSET_MASK, insn->off);
+ 			}
+ 			break;
++#endif
+ 
+ 			/* LDX: dst_reg = *(u8*)(src_reg + off) */
+ 		case BPF_LDX | BPF_MEM | BPF_B:
+@@ -2218,6 +2229,15 @@
+ 
+ 			if (BPF_MODE(insn->code) == BPF_PROBE_MEM ||
+ 			    BPF_MODE(insn->code) == BPF_PROBE_MEMSX) {
++#ifdef CONFIG_L4H
++				/*
++				 * A fault of the l4h guest kernel stops the
++				 * guest: there is no exception table to
++				 * recover from one.  Leave the program to the
++				 * interpreter, which checks the address first.
++				 */
++				return -EOPNOTSUPP;
++#else
+ 				/* Conservatively check that src_reg + insn->off is a kernel address:
+ 				 *   src_reg + insn->off > TASK_SIZE_MAX + PAGE_SIZE
+ 				 *   and
+@@ -2264,12 +2284,14 @@
+ 				/* populate jmp_offset for JAE above to jump to start_of_ldx */
+ 				start_of_ldx = prog;
+ 				end_of_jmp[-1] = start_of_ldx - end_of_jmp;
++#endif
+ 			}
+ 			if (BPF_MODE(insn->code) == BPF_PROBE_MEMSX ||
+ 			    BPF_MODE(insn->code) == BPF_MEMSX)
+ 				emit_ldsx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn_off);
+ 			else
+ 				emit_ldx(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn_off);
++#ifndef CONFIG_L4H
+ 			if (BPF_MODE(insn->code) == BPF_PROBE_MEM ||
+ 			    BPF_MODE(insn->code) == BPF_PROBE_MEMSX) {
+ 				struct exception_table_entry *ex;
+@@ -2315,6 +2337,7 @@
+ 				ex->fixup = FIELD_PREP(FIXUP_INSN_LEN_MASK, prog - start_of_ldx) |
+ 					    FIELD_PREP(FIXUP_REG_MASK, reg2pt_regs[dst_reg]);
+ 			}
++#endif
+ 			break;
+ 
+ 		case BPF_STX | BPF_ATOMIC | BPF_B:
+@@ -3875,7 +3898,8 @@
+ 
+ bool bpf_jit_supports_percpu_insn(void)
+ {
+-	return true;
++	/* l4h has no %gs-based per-CPU data. */
++	return !IS_ENABLED(CONFIG_L4H);
+ }
+ 
+ void bpf_jit_free(struct bpf_prog *prog)
+@@ -3924,7 +3948,7 @@
+ 
+ bool bpf_jit_supports_private_stack(void)
+ {
+-	return true;
++	return !IS_ENABLED(CONFIG_L4H);
+ }
+ 
+ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie)
+@@ -3991,7 +4015,8 @@
+ 
+ bool bpf_jit_supports_arena(void)
+ {
+-	return true;
++	/* Arena accesses rely on exception tables. */
++	return !IS_ENABLED(CONFIG_L4H);
+ }
+ 
+ bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
+@@ -4022,5 +4047,6 @@
+ 
+ bool bpf_jit_supports_timed_may_goto(void)
+ {
+-	return true;
++	/* l4h does not build bpf_timed_may_goto.S. */
++	return !IS_ENABLED(CONFIG_L4H);
+ }

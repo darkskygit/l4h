@@ -6,6 +6,7 @@
 obj-y = bugs_64.o delay.o fpu.o ptrace.o ptrace_64.o setjmp_64.o signal.o \
 	sys_call_table_64.o sysrq_64.o tls_64.o mem_64.o syscalls_64.o \
 	lib/ vdso/
+obj-$(CONFIG_BPF_JIT) += bpf_jit.o
 
 USER_OBJS :=
 

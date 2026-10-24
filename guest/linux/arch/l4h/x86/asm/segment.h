@@ -17,4 +17,10 @@ extern int host_gdt_entry_tls_min;
 #define __USER_CS 0x33
 #define __USER_DS 0x2b
 
+/*
+ * For arch/x86 headers that the BPF JIT includes (nospec-branch.h); the
+ * guest kernel loads no selectors.
+ */
+#define __KERNEL_DS 0
+
 #endif
