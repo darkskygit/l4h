@@ -68,6 +68,12 @@ else
     terminal_output serial
 fi
 $acpi_cmd
+# GRUB 2.12 grows its heap through the firmware's boot services, even after
+# multiboot2 has exited them: booting then faults if the relocator's last
+# allocations no longer fit (it did under OvmfXen).  Have GRUB grow the
+# heap now by reading a large file whole, which load_env does before it
+# rejects the file and frees the buffer.
+if load_env --file (memdisk)/boot/vmlinux; then true; fi
 multiboot2 (memdisk)/boot/kernel.elf console_port=\$serial_port debug_port=\$serial_port\$fbcon
 module2 (memdisk)/boot/l4h-root.elf
 module2 (memdisk)/boot/vmlinux guest-kernel
@@ -85,7 +91,7 @@ objcopy --strip-debug "$guest_kernel" "$work/vmlinux"
 memdisk=("boot/vmlinux=$work/vmlinux")
 [ -n "$guest_kmods" ] && memdisk+=("boot/kmods.erofs=$guest_kmods")
 grub-mkstandalone -O x86_64-efi -o "$out" --compress=xz \
-    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
+    --modules="part_gpt fat search search_fs_file multiboot2 serial terminal normal configfile test regexp echo loadenv efi_gop video video_fb tpm${acpi_cmd:+ acpi}" \
     --locales= --fonts= --themes= \
     "boot/grub/grub.cfg=$work/grub.cfg" \
     "boot/kernel.elf=$kernel" \
