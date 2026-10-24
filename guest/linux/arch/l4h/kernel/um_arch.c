@@ -213,13 +213,37 @@ static void __init l4h_mask_xsave_features(void)
 		cap[CPUID_7_ECX] &= ~(BIT(3) | BIT(4));
 }
 
+/*
+ * As arch/x86 (intel.c's zmm_exclusion_list): 512-bit vectors lower these
+ * cores' clock, so crypto prefers its 256-bit code (X86_FEATURE_PREFER_YMM).
+ */
+static bool __init l4h_zmm_downclocks(u32 b, u32 c, u32 d, u32 sig)
+{
+	/* Skylake-X; Ice Lake X, D, client, L, NNPI; Tiger Lake L, client. */
+	static const u8 models[] __initconst = {
+		0x55, 0x6a, 0x6c, 0x7d, 0x7e, 0x9d, 0x8c, 0x8d,
+	};
+	unsigned int model = ((sig >> 4) & 0xf) | ((sig >> 12) & 0xf0), i;
+
+	/* "GenuineIntel", family 6 */
+	if (b != 0x756e6547 || d != 0x49656e69 || c != 0x6c65746e ||
+	    ((sig >> 8) & 0xf) != 6)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(models); i++)
+		if (model == models[i])
+			return true;
+	return false;
+}
+
 /* CPU features as seen by user code: cpuid is not intercepted. */
 static void __init l4h_cpu_features(void)
 {
-	u32 a, b, c, d, max;
+	u32 a, b, c, d, max, vendor[3];
 
-	cpuid(0, 0, &max, &b, &c, &d);
+	cpuid(0, 0, &max, &vendor[0], &vendor[1], &vendor[2]);
 	cpuid(1, 0, &a, &b, &c, &d);
+	if (l4h_zmm_downclocks(vendor[0], vendor[1], vendor[2], a))
+		set_cpu_cap(&boot_cpu_data, X86_FEATURE_PREFER_YMM);
 	elf_aux_hwcap = d;
 	boot_cpu_data.x86_capability[CPUID_1_EDX] = d;
 	boot_cpu_data.x86_capability[CPUID_1_ECX] = c;

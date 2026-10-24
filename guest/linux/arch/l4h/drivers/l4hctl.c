@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/gfp.h>
+#include <linux/capability.h>
 #include <asm/page.h>
 #include <l4h_sys.h>
 
@@ -81,8 +82,16 @@ out:
 	return ret;
 }
 
+/* Control of the whole host: the node's mode is not enough (a container's
+ * bind-mounted /dev, CAP_DAC_OVERRIDE alone). */
+static int l4hctl_open(struct inode *inode, struct file *f)
+{
+	return capable(CAP_SYS_ADMIN) ? 0 : -EPERM;
+}
+
 static const struct file_operations l4hctl_fops = {
 	.owner = THIS_MODULE,
+	.open = l4hctl_open,
 	.unlocked_ioctl = l4hctl_ioctl,
 };
 

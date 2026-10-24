@@ -89,6 +89,10 @@ static int __init l4h_hvc_init(void)
 
 		if (irq < 0 || request_irq(irq, l4h_power_interrupt, 0, "l4h-power", NULL))
 			pr_warn("l4h: no power request interrupt\n");
+		else
+			/* The event of a request made before there was a
+			 * handler was dropped as spurious: look once. */
+			l4h_power_interrupt(irq, NULL);
 	}
 	return PTR_ERR_OR_ZERO(hp);
 }

@@ -141,6 +141,9 @@ static int as_add_table(struct l4h_as *as, int level, unsigned long va)
 	if (err) {
 		l4h_obj_free(&t->obj);
 		kfree(t);
+		/* A parent's -ENOMEM must reach the callers that wait for memory. */
+		if (err < 0)
+			return err;
 		return err == L4H_ERR_DELETE_FIRST ? 0 : -EFAULT;
 	}
 	t->level = level;
@@ -347,8 +350,9 @@ bool l4h_kernel_range_ok(unsigned long addr, unsigned long size)
 
 	if (end < addr)
 		return false;
+	/* Blocks converted to seL4 objects left holes in the direct map. */
 	if (addr >= uml_physmem && end <= high_physmem)
-		return true;
+		return l4h_ram_mapped(addr - uml_physmem, size);
 	if (addr >= l4h_io_pool_start && end <= l4h_io_pool_end)
 		return true;
 	if (addr >= L4H_SPECIAL_BASE && end <= L4H_SPECIAL_BASE + L4H_BOOTINFO_SIZE)
@@ -578,11 +582,11 @@ static struct mm_struct *idp_mm(struct mm_id *mm_idp)
 
 /*
  * Map [virt, virt+len) to physical `phys` with UM_PROT_* `prot`.  For a TLB
- * sync (`from_sync`), a page that cannot be mapped for lack of seL4 objects
- * is left unmapped (any old mapping of it is gone) and the others are still
- * done: its next access faults, and the fault path waits for memory.  The
- * sync also defers the TLB flush of lowered rights to its end
- * (l4h_mm_flush_deferred()).
+ * sync (`from_sync`), a page that cannot be mapped, for lack of seL4 objects
+ * or otherwise, is left unmapped (any old mapping of it is removed) and the
+ * others are still done: its next access faults, and the fault path waits
+ * for memory.  The sync also defers the TLB flush of lowered rights to its
+ * end (l4h_mm_flush_deferred()).
  */
 static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len, int prot,
 		     unsigned long phys, bool from_sync)
@@ -601,8 +605,11 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 		} else {
 			for (off = 0; off < len && !err; off += PAGE_SIZE) {
 				err = as_map_page(as, virt + off, phys + off, prot, from_sync);
-				if (err == -ENOMEM && from_sync)
+				if (err && from_sync) {
+					/* A failed remap keeps the old rights. */
+					as_unmap_range(as, virt + off, virt + off + PAGE_SIZE);
 					err = 0;
+				}
 			}
 		}
 		as_charge(as, mm);

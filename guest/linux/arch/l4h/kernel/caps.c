@@ -708,6 +708,29 @@ static int block_make_frames(unsigned int b)
 	return 0;
 }
 
+/*
+ * Are the direct-map pages of guest-physical [gpa, gpa+size) there?  Object
+ * blocks, and blocks being converted, have no frames to map.  Before
+ * l4h_caps_init() the block table does not exist yet: trust the caller.
+ */
+bool l4h_ram_mapped(unsigned long gpa, unsigned long size)
+{
+	unsigned long b, last = (gpa + size - 1) >> L4H_BLOCK_SHIFT;
+
+	if (!blocks)
+		return true;
+	for (b = gpa >> L4H_BLOCK_SHIFT; b <= last; b++) {
+		u8 state;
+
+		if (b >= nr_blocks)
+			return false;
+		state = READ_ONCE(blocks[b].state);
+		if (state != BLK_BOOT && state != BLK_FRAMES)
+			return false;
+	}
+	return true;
+}
+
 /* ---- conversion between frame blocks and object blocks */
 
 static DEFINE_MUTEX(objmem_mutex);

@@ -117,11 +117,17 @@ void l4h_idle_wait(void)
 void l4h_wait_briefly(void)
 {
 	struct l4h_vcpu *v = l4h_this_vcpu();
-	unsigned long long saved = v->timer_deadline;
-	unsigned long long dl = l4h_rdtsc() + l4h_tsc_hz / 10000;
+	unsigned long long now = l4h_rdtsc(), saved = v->timer_deadline;
+	unsigned long long dl = now + l4h_tsc_hz / 10000;
 	seL4_Word badge = 0;
+	int due = saved && saved <= now;
 
-	if (saved && saved < dl)
+	/* A deadline already past is an expiry the caller's events take.
+	 * Arming it would end this wait, and every one after it, at once:
+	 * bind_sc() then spun until SC_U's budget came back. */
+	if (due)
+		__atomic_or_fetch(&v->ntfn_pending, L4H_BADGE_TIMER, __ATOMIC_RELEASE);
+	else if (saved && saved < dl)
 		dl = saved;
 	seL4_TCB_SetTimer(v->ktcb, dl, L4H_BADGE_TIMER);
 	seL4_Wait(v->ntfn, &badge);
@@ -130,7 +136,8 @@ void l4h_wait_briefly(void)
 	if (dl != saved)
 		badge &= ~L4H_BADGE_TIMER;
 	__atomic_or_fetch(&v->ntfn_pending, badge, __ATOMIC_RELEASE);
-	seL4_TCB_SetTimer(v->ktcb, saved, L4H_BADGE_TIMER);
+	if (!due)
+		seL4_TCB_SetTimer(v->ktcb, saved, L4H_BADGE_TIMER);
 }
 
 /* Steal time of vCPU `cpu` in ns, as published by the host. */

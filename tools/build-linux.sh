@@ -19,10 +19,14 @@ ln -sfn "$root/guest/linux/arch/l4h" "$src/arch/l4h"
 # each patch applied: from the first one that changed or went away, the
 # applied patches are reverted (last first) and the current ones applied.
 # Each patch is tried with --dry-run first, so one that does not apply
-# leaves the tree as the copies describe instead of half patched.
+# leaves the tree as the copies describe instead of half patched, and
+# without fuzz, so a stable update cannot move a hunk unnoticed.  The
+# x86_64 and aarch64 builds share the tree: one patches it at a time.
 shopt -s nullglob
 applied=$src/.l4h-patches
 mkdir -p "$applied"
+exec 9>"$src/.l4h-patches.lock"
+flock 9
 # Trees patched before the copies were kept have only stamps.
 for s in "$src"/.l4h-applied-*.patch; do
     n=${s##*/.l4h-applied-}
@@ -42,16 +46,26 @@ while [ $keep -lt ${#have[@]} ] && [ $keep -lt ${#want[@]} ] &&
       [ "$(basename "${have[$keep]}")" = "$(basename "${want[$keep]}")" ]; do
     keep=$((keep + 1))
 done
+# A tree extracted again over the old one keeps the copies: a kept patch
+# that applies again is not in the tree.
+for ((i = 0; i < keep; i++)); do
+    if patch -d "$src" -p1 --forward -F0 --dry-run -s -f < "${have[$i]}" >/dev/null 2>&1; then
+        echo "$src: $(basename "${have[$i]}") is recorded as applied but is not:" \
+            "remove $applied or extract linux-6.18.y afresh" >&2
+        exit 1
+    fi
+done
 for ((i = ${#have[@]} - 1; i >= keep; i--)); do
-    patch -d "$src" -p1 -R -f -s --dry-run < "${have[$i]}"
-    patch -d "$src" -p1 -R -f -s < "${have[$i]}"
+    patch -d "$src" -p1 -R -F0 -f -s --dry-run < "${have[$i]}"
+    patch -d "$src" -p1 -R -F0 -f -s < "${have[$i]}"
     rm "${have[$i]}"
 done
 for p in "${want[@]:$keep}"; do
-    patch -d "$src" -p1 --forward -s --dry-run < "$p"
-    patch -d "$src" -p1 --forward -s < "$p"
+    patch -d "$src" -p1 --forward -F0 -s --dry-run < "$p"
+    patch -d "$src" -p1 --forward -F0 -s < "$p"
     cp "$p" "$applied/"
 done
+exec 9>&-
 mkdir -p "$out"
 mk=(make -C "$src" O="$out" ARCH=l4h SUBARCH="$arch"
     L4H_SEL4_INCLUDE="$sel4/libsel4/include"

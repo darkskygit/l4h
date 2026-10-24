@@ -56,8 +56,11 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 	if (test_thread_flag(TIF_SINGLESTEP) && (current->ptrace & PT_PTRACED))
 		singlestep = 1;
 
-	/* Did we come from a system call? */
-	if (PT_REGS_SYSCALL_NR(regs) >= 0) {
+	/* Did we come from a system call?  As syscall_get_nr(), only the low
+	 * 32 bits count: they are what was dispatched.  aarch64's do_signal()
+	 * prepared the restart already, and a tracer at the signal stop may
+	 * have set a syscall number since. */
+	if (!IS_ENABLED(CONFIG_UML_ARM64) && (int)PT_REGS_SYSCALL_NR(regs) >= 0) {
 		/* If so, check system call restarting.. */
 		switch (PT_REGS_SYSCALL_RET(regs)) {
 		case -ERESTART_RESTARTBLOCK:
@@ -153,7 +156,7 @@ void do_signal(struct pt_regs *regs)
 	}
 
 	/* Did we come from a system call? */
-	if (!handled_sig && (PT_REGS_SYSCALL_NR(regs) >= 0)) {
+	if (!handled_sig && ((int)PT_REGS_SYSCALL_NR(regs) >= 0)) {
 		/* Restart the system call - no handlers present */
 		switch (PT_REGS_SYSCALL_RET(regs)) {
 		case -ERESTARTNOHAND:

@@ -465,9 +465,12 @@ x86, `kernel_fpu_begin()` disables bottom halves and preemption, sets a
 per-CPU busy flag that makes `irq_fpu_usable()` false, and loads the
 default MXCSR (`arch/l4h/x86/fpu.c`). CPU features come from CPUID masked
 by the XCR0 that seL4 sets (§4), and `cpu_has_xfeatures()` checks that XCR0.
+As on x86, Skylake-X, Ice Lake and Tiger Lake get `X86_FEATURE_PREFER_YMM`,
+so the AES code prefers 256-bit vectors, which do not lower their clock.
 With this, `arch/x86/crypto` (AES-NI, VAES/AVX2 XTS for dm-crypt) is built
 for l4h (patch 0004 opens its Kconfig menu). AArch64 does the same in
-`kernel_neon_begin()` (`arch/l4h/arm64/neon.c`); the rest of the kernel is
+`kernel_neon_begin()` (`arch/l4h/arm64/neon.c`), and `may_use_simd()` asks
+it too; the rest of the kernel is
 built with `-mgeneral-regs-only` and never touches V0–V31 or FPCR.
 `arch/arm64/crypto` (ARMv8 Crypto Extensions AES for dm-crypt, bit-sliced
 NEON without them) is built with a small `asm/assembler.h` of the macros it
@@ -539,6 +542,10 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
     copy, so an unmap on another vCPU cannot free and reuse it meanwhile.
   - In atomic context (futex operations, `*_nofault`) `mmap_lock` is only
     tried and nothing faults: callers fault the page in and retry.
+- Kernel `*_nofault` accesses check that the address is mapped in the
+  guest-kernel VSpace, since a fault there stops the guest. The direct map
+  has holes where RAM blocks became seL4 objects (§15.3), so its range is
+  checked block by block (`/dev/mem`, BPF `probe_read_kernel`).
 
 ### 5.3 Memory management: Linux page tables mirrored into seL4
 
@@ -570,9 +577,14 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   The old implementation left old pages readable but never observed reads,
   so reclaim treated read-hot code and data as cold. Software dirty
   tracking is retained because losing a dirty bit can lose data.
-  A remap or VSpace eviction can lose one accessed sample. Callers that
-  only inspect `pte_young()` see the software bit: in this configuration
-  that includes smaps' cosmetic `Referenced` count. Reclaim and `clear_refs`
+  A remap or VSpace eviction can lose one accessed sample; on aarch64,
+  where seL4 maps every page with AF set, a remap that only changes
+  rights (fork's write-protect, `mprotect`, writeback's `page_mkclean`)
+  adds one instead. Callers that only inspect `pte_young()` see the
+  software bit: in this configuration that includes smaps' cosmetic
+  `Referenced` count, `MADV_COLD`, which then leaves a page's hardware
+  bit set for reclaim to find, and the unmapping of file pages, which
+  marks them accessed only on the software bit. Reclaim and `clear_refs`
   use test-and-clear. MGLRU, DAMON, idle-page tracking and NUMA balancing
   are disabled and would need hardware-bit support before being enabled.
   `page_aging` uses a test-only module to sample reclaim's hook; it checks
@@ -619,6 +631,11 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   tree: the PTEs it had cleared were never synced, and other threads kept
   reaching the pages it then freed. The sync walk reads each page-table
   entry once, since it runs while `munmap` may clear entries.
+
+  *Revised:* a user sync leaves any page it cannot map unmapped and goes
+  on. Running out of memory for a parent page table was reported as
+  `-EFAULT`, which ended the walk: the unmaps after it in the range were
+  skipped, and `munmap` freed pages other threads could still reach.
 - **VSpace pool.** x86_64 seL4 has only 4096 ASIDs in total (8 pools of
   512). Each guest therefore gets a fixed pool of pre-assigned VSpace roots,
   and the guest kernel recycles them least recently used first. An mm that
@@ -704,7 +721,11 @@ receives that thread's faults into it.
   `evtchn_pending`) and then signal `N_v`. The guest checks the event word, a
   cheap memory load, when it re-enables interrupts, in `cond_resched`
   (patch 0005, so also in every `might_sleep` under
-  `CONFIG_PREEMPT_VOLUNTARY`), and before blocking. The E3 timer only
+  `CONFIG_PREEMPT_VOLUNTARY`), in `cpu_relax()` when interrupts are on,
+  and before blocking. Without the `cpu_relax()` poll, two vCPUs that
+  wait in `csd_lock_wait()` for each other's `smp_call_function()`, or
+  one that spins on a lock held by the other while it waits so, never
+  take the IPI they wait for. The E3 timer only
   signals `N_v`, so the same check also compares `rdtsc` against the
   vCPU's armed deadline. Events delivered on the way back to user mode
   can set work flags after they were checked, so the flags are checked
@@ -765,7 +786,8 @@ core's, so the guest takes the timer badge as the expiry, not only a
 `rdtsc` past the deadline: otherwise such a signal left the vCPU with no
 timer armed. Rates go to Linux in kHz and the clockevent counts in units
 of 8 TSC ticks, as on x86: Linux takes them as 32-bit values in Hz, which
-TSCs of 4.3 GHz and more overflow. `udelay` waits on the TSC too.
+TSCs of 4.3 GHz and more overflow. `udelay` waits on the TSC too, and
+on aarch64 on the counter, a constant `ndelay` included.
 
 *Revised (v1):* the wall clock at boot comes from `L4H_HC_GET_TIME`:
 `l4h-root` reads the CMOS RTC once at boot, and each VMM adds the TSC time
@@ -800,6 +822,11 @@ with EIO; debuggers use software breakpoints (`int3`). CS and SS read as
 Linux's 64-bit user selectors (0x33, 0x2b; seL4's own are 0x2b and 0x33),
 which is how gdb tells a 64-bit inferior, and `NT_X86_XSTATE` carries XCR0
 in its software bytes, as on x86.
+Seccomp filters and `SIGSYS` see the user instruction pointer
+(`KSTK_EIP`, which UML takes from the kernel context switch), and
+`SECCOMP_RET_TRAP` leaves the syscall number in RAX, as x86's
+`syscall_rollback()` does: sandboxes such as Chromium's check both. The
+syscall-restart checks use the low 32 bits of RAX, which is what runs.
 `PTRACE_ARCH_PRCTL`, and the fs/gs base in `PEEKUSER`/`POKEUSER` and
 `GETREGS`/`SETREGS`, act on the tracee: its fs/gs base is read back from
 its TCB (user code may have changed it with `wrfsbase`), and a new value
@@ -997,6 +1024,10 @@ including pool addresses, device indices and lifecycle state.
     thread. The guest therefore waits for the refill, on 100 µs timers,
     when it moves a capped SC_U to another process: not with
     `seL4_Yield`, which charges SC_K all of its remaining budget.
+    *Revised:* a kernel timer deadline that passed during those waits
+    was armed again by each of them, so every wait ended at once and the
+    vCPU spun on SC_K until the refill. A deadline already past is now
+    kept as a pending timer event for after the bind.
   - Under a cap, `P_K > P_U` no longer means that a user context runs
     only once kTCB blocks: when SC_K is out of budget and SC_U is not,
     the context bound to SC_U runs. The guest therefore writes a
@@ -1515,7 +1546,10 @@ external orchestration can run in dom0.
 - `vm_shutdown` (`l4hctl shutdown [--reboot]`) is the ACPI-power-button
   equivalent. `l4h-root` sets `power_request` in the guest's console page
   and raises the console's event line on vCPU 0. The guest runs
-  `orderly_poweroff()` or `orderly_reboot()`, which signals init.
+  `orderly_poweroff()` or `orderly_reboot()`, which signals init. The
+  guest also reads `power_request` once its handler is installed: an
+  event raised before that, while it boots, finds no handler.
+  `/dev/l4hctl` needs `CAP_SYS_ADMIN` as well as its 0600 mode.
   `vm_pause` is not implemented: suspending the vCPU kernel thread does
   not stop a user thread that holds SC_U.
 - `host_reboot` (`l4hctl host-reboot`) resets the machine, so that dom0

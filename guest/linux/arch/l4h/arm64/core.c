@@ -29,9 +29,13 @@ int arch_set_tls(struct task_struct *t, unsigned long tls)
 	l4h_seg_dirty(t);
 	return 0;
 }
+/* loops_per_jiffy is in counter ticks (lpj_fine, kernel/time.c), as on
+ * arm64: wait for the counter to advance by `loops`. */
 void __delay(unsigned long loops)
 {
-	while (loops--)
+	unsigned long long start = l4h_rdtsc();
+
+	while (l4h_rdtsc() - start < loops)
 		cpu_relax();
 }
 EXPORT_SYMBOL(__delay);
@@ -49,9 +53,11 @@ void __ndelay(unsigned long ns)
 		cpu_relax();
 }
 EXPORT_SYMBOL(__ndelay);
+/* xloops is in 2^-32 s (asm-generic/delay.h): a constant ndelay() passes
+ * it too, so it must not be rounded down to whole microseconds. */
 void __const_udelay(unsigned long xloops)
 {
-	__udelay((xloops * 1000000ULL) >> 32);
+	__delay(((xloops * l4h_tsc_hz) >> 32) + 1);
 }
 EXPORT_SYMBOL(__const_udelay);
 void show_regs(struct pt_regs *r)
