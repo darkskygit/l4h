@@ -597,7 +597,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         rtc,
     };
     h.scan_disks();
-    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, h.iommu.poll_serial());
+    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
     if h.kernel.is_none() {
@@ -812,7 +812,6 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
             last_balance = now;
             dashboard::Dashboard::tick(h);
             h.iommu.poll();
-            monitor::Monitor::poll(h);
             if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                 watchdog_dump(h);
                 next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;

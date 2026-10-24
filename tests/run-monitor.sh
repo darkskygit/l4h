@@ -26,6 +26,9 @@ wait_for() { # pattern count timeout
     done
 }
 wait_for "GUEST: ready" 1 120
+if [ "${L4H_QEMU_IOMMU:-}" = intel ]; then
+    grep -aq "serial monitor on port 0x3f8 (remapped interrupts" "$log"
+fi
 printf 'list\r' >&3
 wait_for "monitor: vm 0 'dom0'" 1 30
 printf 'restart-dom0\r' >&3
@@ -41,7 +44,7 @@ if [ "${L4H_ARCH:-x86_64}" = x86_64 ]; then
     # Direct multiboot keeps the kernel's debug console on COM1. Point
     # root's monitor at absent COM2 so a UART-polling hang is observable
     # without relying on serial output from the missing device. The VT-d
-    # suite runs this with interrupt remapping, which selects polling.
+    # suite runs this with interrupt remapping enabled too.
     config=$out/monitor-absent.conf
     cat > "$config" <<'CONF'
 serial_port=0x2f8
@@ -52,8 +55,8 @@ CONF
     L4H_CONFIG="$config" "$l4h_qemu" "$root/host/target/$l4h_target/debug/l4h-root.elf" \
         </dev/null >"$log" 2>&1 &
     qemu=$!
-    # Root must keep handling timer notifications after its first UART
-    # poll; the old loop never returned when the line status was 0xff.
+    # Root must keep handling timer notifications with no UART. Before
+    # the absent-device check, VT-d's polling loop spun on status 0xff.
     wait_for "l4h-root: watchdog: netd used" 3 30
     wait_for "GUEST: ready" 1 30
     kill "$qemu" 2>/dev/null || true

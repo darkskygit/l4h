@@ -776,8 +776,9 @@ serial log says why). With it on, \texttt{interrupts} says whether each
 device can raise only its own interrupts (\texttt{iommu\_intremap}), a
 device \texttt{behind no IOMMU} reaches all memory, and \texttt{events}
 counts the faults and errors the IOMMU logged since boot, which the serial
-log shows. With VT-d interrupt remapping the serial monitor polls input
-instead of using the I/O APIC, whose legacy interrupts are blocked. If the
+log shows. With VT-d interrupt remapping the serial monitor uses a remapped
+I/O APIC interrupt. If firmware omits the I/O APIC's routing information,
+the monitor is disabled and the serial log explains why. If the
 hardware cannot remap interrupts, DMA confinement still works and
 \texttt{interrupts} reports that remapping is unavailable.
 

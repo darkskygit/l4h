@@ -166,11 +166,77 @@ fn rejects_bad_addresses_paths_and_reserved_ranges() {
 }
 
 #[test]
-fn ignores_future_structures_and_interrupt_only_scopes() {
+fn interrupt_scopes_never_grant_dma_access() {
     let d = Dmar::parse(&table(&[vec![99, 0, 4, 0], drhd(false, 0, 0xfed9_0000,
         &[scope(3, 0, &[(31, 0)]), scope(4, 0, &[(31, 1)])])]), pci).unwrap();
     assert_eq!(d.owner(248), None);
     assert_eq!(d.owner(249), None);
+    assert_eq!(d.ioapics.len(), 1);
+    assert_eq!((d.ioapics[0].id, d.ioapics[0].sid, d.ioapics[0].unit), (0, 248, 0));
+}
+
+#[test]
+fn ioapic_sources_use_firmware_ids_and_do_not_require_a_pci_function() {
+    let mut a = scope(3, 0, &[(1, 0), (7, 3)]);
+    a[4] = 12;
+    let mut b = scope(3, 0, &[(31, 0)]);
+    b[4] = 2;
+    let read = |bus, dev, func, off| match (bus, dev, func, off) {
+        (0, 1, 0, 0) => 0x1234_8086,
+        (0, 1, 0, 8) => 0x0604_0000,
+        (0, 1, 0, 0x18) => 0x0005_0200,
+        _ => u32::MAX,
+    };
+    let d = Dmar::parse(&table(&[drhd(true, 0, 0xfed9_0000, &[b]),
+        drhd(false, 0, 0xfed9_1000, &[a])]), read).unwrap();
+    assert_eq!(d.ioapics.len(), 2);
+    assert_eq!((d.ioapics[0].id, d.ioapics[0].sid, d.ioapics[0].unit), (2, 248, 0));
+    assert_eq!((d.ioapics[1].id, d.ioapics[1].sid, d.ioapics[1].unit), (12, 0x23b, 1));
+    // The interrupt scope does not divert PCI DMA from INCLUDE_PCI_ALL.
+    assert_eq!(d.owner(0x23b), Some(0));
+}
+
+#[test]
+fn rejects_ambiguous_ioapic_ids_and_interrupt_scopes_in_reserved_memory() {
+    let a = scope(3, 0, &[(31, 0)]);
+    let b = scope(3, 1, &[(2, 0)]);
+    for blocks in [
+        vec![drhd(true, 0, 0xfed9_0000, &[a.clone(), b.clone()])],
+        vec![drhd(true, 0, 0xfed9_0000, &[a.clone()]), drhd(false, 0, 0xfed9_1000, &[b])],
+        vec![rmrr(0xa0000, 0xbffff, &[a])],
+    ] {
+        assert!(Dmar::parse(&table(&blocks), pci).is_none());
+    }
+}
+
+fn madt(entries: &[&[u8]]) -> Vec<u8> {
+    let mut b = vec![0; 44];
+    b[..4].copy_from_slice(b"APIC");
+    for e in entries { b.extend_from_slice(e); }
+    let len = b.len() as u32;
+    b[4..8].copy_from_slice(&len.to_le_bytes());
+    checksum(&mut b);
+    b
+}
+
+#[test]
+fn madt_ioapic_indices_follow_table_order_not_firmware_ids() {
+    let a = [1, 12, 12, 0, 0, 0, 0xc0, 0xfe, 0, 0, 0, 0];
+    let b = [1, 12, 2, 0, 0, 0x10, 0xc0, 0xfe, 24, 0, 0, 0];
+    let ids = dmar::madt_ioapics(&madt(&[&[99, 2], &a, &b])).unwrap();
+    assert_eq!(&*ids, &[12, 2]);
+    assert!(dmar::madt_ioapics(&madt(&[&a, &a])).is_none());
+}
+
+#[test]
+fn madt_rejects_bad_lengths_and_checksum() {
+    let mut b = madt(&[&[1, 12, 0, 0, 0, 0, 0xc0, 0xfe, 0, 0, 0, 0]]);
+    for len in 0..b.len() { assert!(dmar::madt_ioapics(&b[..len]).is_none()); }
+    b[9] ^= 1;
+    assert!(dmar::madt_ioapics(&b).is_none());
+    for entry in [&[1, 2][..], &[99, 0][..], &[1, 255][..], &[0][..]] {
+        assert!(dmar::madt_ioapics(&madt(&[entry])).is_none());
+    }
 }
 
 #[test]
