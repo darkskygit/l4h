@@ -1,0 +1,24 @@
+#!/bin/sh
+# dom0 init of each l4h partition in tests/run-xentest.sh.  Configured
+# through kernel command line variables (passed to init as environment):
+#   IP0    address/prefix of eth0, on the switch whose uplink is the NIC
+#          Xen passed through
+#   PEER   the other partition's address, pinged until it answers
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+ip link set lo up
+ip addr add "$IP0" dev eth0
+ip link set eth0 up
+echo "XENVM: up, $(nproc) vCPU(s), $IP0"
+i=0
+until ping -c 1 -W 1 "$PEER" >/dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -ge 180 ]; then
+        echo "XENVM: ping $PEER failed"
+        break
+    fi
+done
+[ "$i" -lt 180 ] && echo "XENVM: ping $PEER ok"
+# Stay up: the peer may still be pinging this partition.
+while true; do sleep 1000; done
