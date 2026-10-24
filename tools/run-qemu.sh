@@ -13,16 +13,24 @@ objcopy -O elf32-i386 "$root/build/sel4/bin/kernel.elf" "$root/build/kernel32.el
 # (L4H_BALLOON=0 leaves the device out).
 balloon=()
 [ "${L4H_BALLOON:-1}" = 1 ] && balloon=(-device virtio-balloon-pci,free-page-reporting=on,disable-legacy=on)
-# L4H_QEMU_IOMMU=amd adds an AMD IOMMU, which needs the q35 machine and
+# L4H_QEMU_IOMMU=amd|intel adds an IOMMU, which needs the q35 machine and
 # must come before the devices it translates.  NVMe always goes through
 # it; virtio disks and NICs are made to (iommu_platform), not the
 # balloon, whose free page reports name memory it is not given.  Root
 # remaps interrupts, which QEMU does only with the I/O APIC in QEMU
 # (kernel-irqchip=split).
 iommu=()
-[ "${L4H_QEMU_IOMMU:-}" = amd ] && iommu=(-machine q35,kernel-irqchip=split -device amd-iommu,intremap=on
-    -global virtio-blk-pci.iommu_platform=on -global virtio-scsi-pci.iommu_platform=on
-    -global virtio-net-pci.iommu_platform=on)
+case "${L4H_QEMU_IOMMU:-}" in
+    amd) iommu=(-device amd-iommu,intremap=on) ;;
+    intel) iommu=(-device intel-iommu,intremap=on,caching-mode=on) ;;
+    '') ;;
+    *) echo "unsupported L4H_QEMU_IOMMU: $L4H_QEMU_IOMMU (use amd or intel)" >&2; exit 1 ;;
+esac
+if [ ${#iommu[@]} -ne 0 ]; then
+    iommu=(-machine q35,kernel-irqchip=split "${iommu[@]}"
+        -global virtio-blk-pci.iommu_platform=on -global virtio-scsi-pci.iommu_platform=on
+        -global virtio-net-pci.iommu_platform=on)
+fi
 exec qemu-system-x86_64 \
     -enable-kvm -cpu host,-vmx,+invtsc \
     -smp "${L4H_SMP:-4}" -m "${L4H_MEM:-4G}" \

@@ -28,6 +28,7 @@ mod devmem;
 mod elf;
 mod font;
 mod guest;
+mod iommu;
 mod kimage;
 mod layout;
 mod mem;
@@ -40,6 +41,8 @@ mod rtc;
 mod sched;
 mod trustd;
 mod vmm;
+#[cfg(target_arch = "x86_64")]
+mod vtd;
 mod vspace;
 mod window;
 
@@ -201,7 +204,7 @@ pub struct Host {
     pub wins: Windows,
     pub asids: AsidPools,
     pub pci: pci::Pci,
-    pub iommu: amdvi::AmdVi,
+    pub iommu: iommu::Iommu,
     pub devmem: devmem::DevMem,
     /// Disk controllers, and their units as host disks.
     pub ctrls: &'static mut ArrayVec<Controller, { pci::MAX_DISK_CTRLS }>,
@@ -495,17 +498,17 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     // PCI devices: disks can be passed through to guests.
     let pci = pci::Pci::new(&mut alloc, &mut devmem);
     // The IOMMU before any device is enabled: from here on, a device
-    // reaches only memory root gives it (amdvi.rs).
+    // reaches only memory root gives it (iommu.rs).
     #[cfg(target_arch = "x86_64")]
     let mut iommu = if cfg.iommu {
         let mut phys = acpi::Phys::new(&mut alloc, &mut devmem, &mut wins.a, &mut acpi_frames);
-        amdvi::AmdVi::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000, cfg.iommu_intremap)
+        iommu::Iommu::init(bootinfo, &mut phys, &pci, info.tsc_hz / 1000, cfg.iommu_intremap)
     } else {
         sel4::debug_println!("l4h-root: iommu=0: DMA is not confined");
-        amdvi::AmdVi::off()
+        iommu::Iommu::off()
     };
     #[cfg(not(target_arch = "x86_64"))]
-    let mut iommu = if cfg.iommu { amdvi::AmdVi::none() } else { amdvi::AmdVi::off() };
+    let mut iommu = if cfg.iommu { iommu::Iommu::none() } else { iommu::Iommu::off() };
     // The statics' only references, taken once here; the root task is
     // single-threaded.
     let ctrls = unsafe { &mut *(&raw mut CTRLS) };
@@ -594,7 +597,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         rtc,
     };
     h.scan_disks();
-    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq);
+    h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, h.iommu.poll_serial());
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
     if h.kernel.is_none() {
@@ -809,6 +812,7 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
             last_balance = now;
             dashboard::Dashboard::tick(h);
             h.iommu.poll();
+            monitor::Monitor::poll(h);
             if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
                 watchdog_dump(h);
                 next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;

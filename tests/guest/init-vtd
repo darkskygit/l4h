@@ -1,0 +1,6 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+echo 'VTDTEST: ready'
+while :; do sleep 1; done

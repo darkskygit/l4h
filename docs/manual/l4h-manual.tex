@@ -160,7 +160,7 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
 \texttt{l4h-blkd} and \texttt{l4h-netd} are trusted by everyone. dom0 is trusted to decide what
 runs, and nothing more. Guest kernels are untrusted, and capabilities confine
 them. The trusted drivers validate every DMA address, and guests never touch
-device registers. On an AMD host, \texttt{l4h-root} also confines every
+device registers. On an AMD or Intel host with a supported IOMMU, \texttt{l4h-root} also confines every
 device with the IOMMU to the memory it was given (the setting
 \texttt{iommu}); elsewhere nothing confines a device.
 
@@ -447,7 +447,7 @@ Variable & Meaning & Default \\
 \texttt{fb\_console} & 1: GRUB and seL4 also print on the screen & 0 \\
 \texttt{watchdog\_secs} & print every guest's vCPU state every $n$ seconds
   & 0 \\
-\texttt{iommu} & 1: confine devices with the AMD IOMMU, if the host has
+\texttt{iommu} & 1: confine devices with an AMD-Vi or Intel VT-d IOMMU, if the host has
   one; 0: do not, e.g.\ for an integrated GPU that shows the framebuffer
   console & 1 \\
 \texttt{iommu\_intremap} & 1: with \texttt{iommu}, also let each device raise
@@ -769,14 +769,17 @@ a Git description (with \texttt{-dirty} for tracked changes), or
 command return \texttt{not supported}.
 
 \cmd{iommu} shows whether devices are confined. The state is \texttt{on}
-on an AMD host whose IOMMU l4h drives, \texttt{off} with \texttt{iommu=0},
-\texttt{none} without one (Intel hosts, cloud VMs, aarch64), and
+on a host whose AMD-Vi or Intel VT-d IOMMU l4h drives, \texttt{off} with \texttt{iommu=0},
+\texttt{none} without one (e.g.\ cloud VMs without a vIOMMU, aarch64), and
 \texttt{failed} if the firmware's description of it cannot be used (the
 serial log says why). With it on, \texttt{interrupts} says whether each
 device can raise only its own interrupts (\texttt{iommu\_intremap}), a
 device \texttt{behind no IOMMU} reaches all memory, and \texttt{events}
 counts the faults and errors the IOMMU logged since boot, which the serial
-log shows.
+log shows. With VT-d interrupt remapping the serial monitor polls input
+instead of using the I/O APIC, whose legacy interrupts are blocked. If the
+hardware cannot remap interrupts, DMA confinement still works and
+\texttt{interrupts} reports that remapping is unavailable.
 
 \section{Creating a VM}
 
@@ -991,7 +994,7 @@ up to two minutes, or a virtio device that does not reset within two
 seconds), the serial log shows \texttt{device did not reset}, \cmd{l4hctl
 disks} marks it \texttt{failed}, and attaching it fails with \texttt{I/O
 error}. The driver's DMA memory stays out of use, since the device may still
-write to it, and so does the destroyed VM's I/O pool unless an AMD IOMMU cuts
+write to it, and so does the destroyed VM's I/O pool unless a supported IOMMU cuts
 the device off from it; \cmd{l4hctl info} then shows less free memory.
 Reboot the host to recover it. The VM's RAM is reused
 at once: a device is never given guest RAM.
@@ -1371,7 +1374,7 @@ path; PCRs~8 and~9 change with dom0's files and \file{l4h.conf}.
 
 \begin{caveat}
 A report is only as trustworthy as the host: seL4, the host components and
-the hardware. Without an AMD IOMMU a malicious device could change any
+the hardware. Without a supported IOMMU a malicious device could change any
 memory; with one, it is confined to its own memory and interrupts. On a cloud VM, the provider's hypervisor and virtual TPM are
 trusted as well. Disks and networks are dom0's choice and are not measured.
 Hosts without a TPM, and aarch64 hosts, offer no attestation.

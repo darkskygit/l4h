@@ -25,7 +25,7 @@ pub struct Monitor {
     /// The UART's first I/O port (x86).
     #[cfg(target_arch = "x86_64")]
     base: u16,
-    irq: sel4::cap::IrqHandler,
+    irq: Option<sel4::cap::IrqHandler>,
     /// The input line so far: printable ASCII.
     line: [u8; LINE_MAX],
     len: usize,
@@ -33,11 +33,19 @@ pub struct Monitor {
 
 impl Monitor {
     #[cfg(target_arch = "x86_64")]
-    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, base: u16, irq: u64) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, _devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, base: u16, irq: u64, poll: bool) -> Option<Self> {
         use sel4::init_thread::slot;
         let abs = |s: usize| slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(s).cap());
         let port = alloc.slots.alloc();
         slot::IO_PORT_CONTROL.cap().ioport_control_issue(base as u64, base as u64 + 7, &abs(port)).ok()?;
+        if poll {
+            // VT-d blocks compatibility interrupts, including the I/O
+            // APIC's. Keep its pin masked and collect input on root's tick.
+            let m = Self { port: port as u64, base, irq: None, line: [0; LINE_MAX], len: 0 };
+            m.out(1, 0);
+            info!("l4h-root: serial monitor on port {:#x} (polled, type 'help')", base);
+            return Some(m);
+        }
         let irq_slot = alloc.slots.alloc();
         slot::IRQ_CONTROL.cap().irq_control_get_ioapic(0, irq, 0, 0, VECTOR, &abs(irq_slot)).ok()?;
         let irq = sel4::init_thread::Slot::<cap_type::IrqHandler>::from_index(irq_slot).cap();
@@ -46,7 +54,7 @@ impl Monitor {
             .mint(&slot::CNODE.cap().absolute_cptr(ntfn), sel4::CapRights::write_only(), MONITOR_BADGE)
             .ok()?;
         irq.irq_handler_set_notification(sel4::init_thread::Slot::<cap_type::Notification>::from_index(badged).cap()).ok()?;
-        let m = Monitor { port: port as u64, base, irq, line: [0; LINE_MAX], len: 0 };
+        let m = Monitor { port: port as u64, base, irq: Some(irq), line: [0; LINE_MAX], len: 0 };
         // Receive-data interrupt; OUT2 routes UART interrupts to the PIC/IOAPIC.
         m.out(1, 0x01);
         m.out(4, m.inb(4) | 0x08);
@@ -55,7 +63,7 @@ impl Monitor {
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _base: u16, _irq: u64) -> Option<Self> {
+    pub fn new(alloc: &mut Alloc, devmem: &mut crate::devmem::DevMem, ntfn: sel4::cap::Notification, _base: u16, _irq: u64, _poll: bool) -> Option<Self> {
         use sel4::init_thread::slot;
         use sel4::{CapRights, VmAttributes};
         use crate::mem::ObjCtx;
@@ -77,7 +85,7 @@ impl Monitor {
         }
         irq.irq_handler_ack().ok()?;
         info!("l4h-root: serial monitor on PL011 (type 'help')");
-        Some(Self { port: UART_VA as u64, irq, line: [0; LINE_MAX], len: 0 })
+        Some(Self { port: UART_VA as u64, irq: Some(irq), line: [0; LINE_MAX], len: 0 })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -125,8 +133,12 @@ impl Monitor {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe { ((m.port + 0x44) as *mut u32).write_volatile(0x7ff); }
-        let _ = m.irq.irq_handler_ack();
+        if let Some(irq) = m.irq { let _ = irq.irq_handler_ack(); }
         h.monitor = Some(m);
+    }
+
+    pub fn poll(h: &mut Host) {
+        if h.monitor.as_ref().is_some_and(|m| m.irq.is_none()) { Self::interrupt(h); }
     }
 }
 

@@ -36,7 +36,7 @@ pub const F_VERSION_1: u64 = 1 << 32;
 pub const F_INDIRECT_DESC: u64 = 1 << 28;
 /// The device's DMA goes through the platform's IOMMU.  Host drivers
 /// accept it when offered: the addresses they give are physical ones,
-/// which root maps 1:1 in the device's IOMMU domain (l4h-root amdvi.rs).
+/// which root maps 1:1 in the device's IOMMU domain (l4h-root iommu.rs).
 pub const F_ACCESS_PLATFORM: u64 = 1 << 33;
 
 pub const DESC_F_NEXT: u16 = 1;

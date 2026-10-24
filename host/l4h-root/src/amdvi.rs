@@ -9,7 +9,7 @@
 //! interrupts it may send, and its MSI data is an index into it; any
 //! other device's MSIs are dropped.
 //!
-//! No IOMMU (no IVRS table, an Intel host, aarch64, `iommu=0`) leaves
+//! No AMD IOMMU (no IVRS table, aarch64, `iommu=0`) leaves
 //! every operation a no-op: devices then reach all memory, as before.
 
 use core::sync::atomic::{Ordering, compiler_fence};
@@ -299,7 +299,7 @@ impl AmdVi {
         me.intremap = intremap;
         let mut buf = [0u8; 32 << 10];
         let Some(ivrs) = crate::acpi::find(bootinfo, phys, b"IVRS", &mut buf) else {
-            info!("l4h-root: no AMD IOMMU (IVRS): DMA is not confined");
+            info!("l4h-root: no IOMMU (DMAR/IVRS): DMA is not confined");
             return me;
         };
         if ivrs.len() < 48 || (u32_at(ivrs, 4) as usize) > ivrs.len() {
