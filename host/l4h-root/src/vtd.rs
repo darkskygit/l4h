@@ -14,7 +14,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 use l4h_host::fixed::{ArrayVec, StaticCell};
 use l4h_abi as abi;
 use crate::{mem::Alloc, pci};
-use dmar::{Dmar, MAX_UNITS};
+use dmar::{Dmar, MAX_IOAPICS, MAX_UNITS};
 use format::{ADDR, PRESENT, READ, WRITE};
 
 const PAGE: usize = 4096;
@@ -96,6 +96,7 @@ static DMAR: StaticCell<Dmar> = StaticCell::new(Dmar::empty());
 
 pub struct Vtd {
     dmar: &'static mut Dmar,
+    ioapic_ids: ArrayVec<u8, MAX_IOAPICS>,
     units: ArrayVec<Unit, MAX_UNITS>,
     chunks: Option<&'static mut ArrayVec<(usize, usize), MAX_CHUNKS>>,
     used: usize,
@@ -117,7 +118,7 @@ impl Vtd {
         let mut buf = [0u8; 32 << 10];
         let table = crate::acpi::find(bootinfo, phys, b"DMAR", &mut buf)?;
         let mut me = Self {
-            dmar: DMAR.take(), units: ArrayVec::new(), chunks: None, used: CHUNK_PAGES,
+            dmar: DMAR.take(), ioapic_ids: ArrayVec::new(), units: ArrayVec::new(), chunks: None, used: CHUNK_PAGES,
             coherent: true, cache_line: 64, ticks_per_ms, intremap: false, state: abi::IOMMU_FAILED,
             confined: 0, unconfined: 0, events: 0,
         };
@@ -126,6 +127,9 @@ impl Vtd {
             return Some(me);
         };
         *me.dmar = dmar;
+        if let Some(ids) = crate::acpi::find(bootinfo, phys, b"APIC", &mut buf).and_then(dmar::madt_ioapics) {
+            me.ioapic_ids = ids;
+        }
         if me.dmar.units.is_empty() {
             sel4::debug_println!("l4h-root: VT-d: no unit on PCI segment 0: DMA is not confined");
             return Some(me);
@@ -423,19 +427,32 @@ impl Vtd {
     pub fn msi(&mut self, d: Domain, vector: u64) -> (u64, u32) {
         let data = pci::msi_data(vector);
         if !self.intremap { return (pci::msi_address(), data); }
+        format::msi(self.interrupt(d.unit, d.sid, data))
+    }
+
+    /// None selects a legacy I/O APIC entry. With remapping enabled,
+    /// missing firmware routing is an error, never a compatibility bypass.
+    pub fn ioapic_irq(&mut self, index: usize, vector: u64) -> Result<Option<u16>, &'static str> {
+        if self.state != abi::IOMMU_ON || !self.intremap { return Ok(None); }
+        let id = *self.ioapic_ids.get(index).ok_or("I/O APIC missing from MADT")?;
+        let a = *self.dmar.ioapics.iter().find(|a| a.id == id).ok_or("I/O APIC missing from DMAR")?;
+        Ok(Some(self.interrupt(a.unit, a.sid, pci::msi_data(vector))))
+    }
+
+    fn interrupt(&mut self, unit: usize, sid: u16, data: u32) -> u16 {
         assert!(data <= 255);
-        let table = self.units[d.unit].irt as *mut u64;
-        let entry = format::irte(d.sid, data as u8);
+        let table = self.units[unit].irt as *mut u64;
+        let entry = format::irte(sid, data as u8);
         for index in 0..format::IR_ENTRIES {
             let ptr = unsafe { table.add(index * 2) };
             let old = unsafe { [ptr.read_volatile(), ptr.add(1).read_volatile()] };
-            if old == entry { return format::msi(index as u16); }
+            if old == entry { return index as u16; }
             if old[0] & PRESENT == 0 {
                 self.store(unsafe { ptr.add(1) }, entry[1]);
                 self.store(ptr, entry[0]);
-                self.submit(d.unit, format::invalidate_interrupts());
-                self.sync(d.unit);
-                return format::msi(index as u16);
+                self.submit(unit, format::invalidate_interrupts());
+                self.sync(unit);
+                return index as u16;
             }
         }
         panic!("VT-d: interrupt table full");

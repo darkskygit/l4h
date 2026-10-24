@@ -459,6 +459,12 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   MSR. Intel CPUs that are not vulnerable report RDCL_NO, which needs the
   MSR, so such a CPU is vulnerable (Linux treats it so too), and l4h runs
   without the SKIM window (0004). It now refuses to boot there as well.
+- **0025, remapped I/O APIC handlers (x86).** `GetIOAPICRemapped` adds a
+  16-bit interrupt-remapping table index to the ordinary I/O APIC handler
+  arguments. Root publishes the matching VT-d IRTE before invoking it.
+  seL4 writes the remappable RTE format and retains its normal pin masking,
+  acknowledgement and capability lifecycle; it does not manage the IOMMU.
+  The vector and trigger mode must agree with the IRTE for EOI broadcasts.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -1167,8 +1173,8 @@ and tcx attachment through `tests/guest/bpftest.c`. On x86_64 the guest has
 - **Serial monitor.** `l4h-root` reads COM1 (I/O ports and IOAPIC IRQ 4)
   and runs `help`, `list`, `info`, `destroy <vm>` and `restart-dom0`. The
   kernel keeps using the port for output (`tests/run-monitor.sh`). An
-  absent UART (line status reads as `0xff`) disables the monitor, including
-  when VT-d interrupt remapping would otherwise select polled input.
+  absent UART (line status reads as `0xff`) disables the monitor. Input
+  uses interrupts, including a remapped I/O APIC entry under Intel VT-d.
 - **dom0 restart.** If dom0 reboots or crashes, `l4h-root` destroys it and
   boots it again from the boot image. Other guests keep running, and the
   new dom0 sees them through the control API (`tests/run-m6test.sh`).
@@ -1524,9 +1530,13 @@ Intel VT-d uses the same driver-facing operations, with these differences:
   `Iommu::msi` interface returns both address and data: VT-d puts the table
   index in the remappable MSI address (SHV=0), while AMD-Vi uses MSI data.
   Compatibility interrupts are blocked globally, so they cannot bypass
-  source validation. seL4 owns the I/O APIC and programs compatibility
-  entries; root leaves the UART's pin masked and polls input every balance
-  tick instead. Local APIC timers and IPIs are unaffected. Extended interrupt
+  source validation. Root matches DMAR's I/O APIC scopes to MADT IDs and
+  allocates an IRTE for the UART's vector. seL4's `GetIOAPICRemapped`
+  extension (patch 0025) programs the pin with that table index and keeps
+  ownership of masking and acknowledgement. The UART remains interrupt
+  driven; if firmware lacks its I/O APIC scope, root disables the monitor
+  with a diagnostic instead of allowing compatibility interrupts. Local
+  APIC timers and IPIs are unaffected. Extended interrupt
   mode is not supported. If interrupt remapping is unavailable, DMA remains
   confined and the status reports interrupts as not remapped. As with
   AMD-Vi, requester validation relies on the PCI fabric: root does not
@@ -1543,7 +1553,9 @@ source validation and command encodings on the host; `--qemu` also runs
 virtio-blk, NVMe, VM lifecycle/unmapping, NIC and serial-monitor tests,
 including boot with interrupt remapping or the whole IOMMU disabled.
 An unattached QEMU EDU device also attempts DMA and forged MSIs: its DMA,
-another device's valid IRTE, and a non-present IRTE must all fault. QEMU
+another device's valid IRTE, the UART I/O APIC's IRTE, and a non-present
+IRTE must all fault. The UART's redirection entry must use remappable
+format, and serial commands must arrive through interrupts. QEMU
 10 passes compatibility-format interrupts through regardless of CFIS
 (`hw/i386/intel_iommu.c`, `vtd_interrupt_remap_msi`), so that test checks
 CFIS is clear but cannot verify compatibility blocking in this emulator.

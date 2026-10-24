@@ -1,0 +1,212 @@
+From 71c25cab2280a2ccbc6ab4ed285e3b7893a44fc5 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Sat, 24 Oct 2026 03:43:38 -0700
+Subject: [PATCH] x86: expose remapped I/O APIC IRQ handlers to root
+
+---
+ include/plat/pc99/plat/machine/ioapic.h       |  5 ++
+ .../x86/interfaces/object-api-arch.xml        | 61 +++++++++++++++++++
+ src/arch/x86/object/interrupt.c               | 29 +++++++--
+ src/plat/pc99/machine/ioapic.c                | 22 ++++++-
+ 4 files changed, 110 insertions(+), 7 deletions(-)
+
+diff --git a/include/plat/pc99/plat/machine/ioapic.h b/include/plat/pc99/plat/machine/ioapic.h
+index b89017192..f0a25a1d2 100644
+--- a/include/plat/pc99/plat/machine/ioapic.h
++++ b/include/plat/pc99/plat/machine/ioapic.h
+@@ -20,3 +20,8 @@ exception_t ioapic_decode_map_pin_to_vector(word_t ioapic, word_t pin, word_t le
+  * any checks, use ioapic_decode_map_pin_to_vector first */
+ void ioapic_map_pin_to_vector(word_t ioapic, word_t pin, word_t level, word_t polarity, word_t vector);
+ 
++/* VT-d remappable format; the caller owns and publishes the referenced IRTE.
++ * The vector and trigger mode must match the IRTE, including for EOI broadcasts. */
++void ioapic_map_pin_to_remapped(word_t ioapic, word_t pin, word_t level, word_t polarity,
++                              word_t vector, word_t handle);
++
+diff --git a/libsel4/arch_include/x86/interfaces/object-api-arch.xml b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+index 835927d7b..ecdbbeff7 100644
+--- a/libsel4/arch_include/x86/interfaces/object-api-arch.xml
++++ b/libsel4/arch_include/x86/interfaces/object-api-arch.xml
+@@ -878,6 +878,67 @@
+                 </description>
+             </error>
+         </method>
++        <method id="X86IRQIssueIRQHandlerIOAPICRemapped" name="GetIOAPICRemapped" manual_name="Get Remapped I/O APIC Handler">
++            <brief>
++                Create an IRQ handler for an I/O APIC pin in VT-d remappable format.
++                The caller must publish a matching interrupt-remapping table entry first.
++                This does not enable or manage the IOMMU in the kernel.
++            </brief>
++            <description>
++                <docref>See <autoref label='sec:interrupts'/> and <autoref label='sec:x86_interrupts'/>.</docref>
++            </description>
++            <param dir="in" name="root" type="seL4_CNode"
++                description='CPtr to the CNode that forms the root of the destination CSpace. Must be at a depth equivalent to the wordsize.'/>
++            <param dir="in" name="index" type="seL4_Word"
++                description='CPtr to the destination slot. Resolved from the root of the destination CSpace.'/>
++            <param dir="in" name="depth" type="seL4_Uint8"
++                description='Number of bits of index to resolve to find the destination slot.'/>
++
++            <param dir="in" name="ioapic" type="seL4_Word"
++                description='Zero based index of IOAPIC to get interrupt from,
++                             ordered the same as in ACPI tables'/>
++            <param dir="in" name="pin" type="seL4_Word" description='IOAPIC pin that generates the interrupt.'/>
++            <param dir="in" name="level" type="seL4_Word" description='Indicates whether the IOAPIC should be programmed to treat this interrupt as level triggered.'/>
++            <param dir="in" name="polarity" type="seL4_Word" description='Indicates whether the IOAPIC should be programmed to treat this interrupt as high or
++                     low triggered'/>
++            <param dir="in" name="vector" type="seL4_Word" description='CPU vector to deliver the interrupt to.'/>
++            <param dir="in" name="handle" type="seL4_Word" description='16-bit interrupt-remapping table index. The entry must use the requested vector and trigger mode.'/>
++            <error name="seL4_DeleteFirst">
++                <description>
++                    The destination slot contains a capability.
++                </description>
++            </error>
++            <error name="seL4_FailedLookup">
++                <description>
++                    The <texttt text="index"/> or <texttt text="depth"/> is invalid <docref>(see <autoref label="s:cspace-addressing"/>)</docref>.
++                    Or, <texttt text="root"/> is a CPtr to a capability of the wrong type.
++                </description>
++            </error>
++            <error name="seL4_IllegalOperation">
++                <description>
++                    The <texttt text="_service"/> is a CPtr to a capability of the wrong type.
++                    Or, an IOAPIC is not in use.
++                </description>
++            </error>
++            <error name="seL4_InvalidCapability">
++                <description>
++                    The <texttt text="_service"/> is a CPtr to a capability of the wrong type.
++                </description>
++            </error>
++            <error name="seL4_RangeError">
++                <description>
++                    The <texttt text="vector"/>, <texttt text="ioapic"/>, or <texttt text="pin"/> is invalid.
++                    Or, <texttt text="level"/> or <texttt text="polarity"/> is not 0 or 1.
++                    Or, <texttt text="handle"/> is larger than 65535.
++                    Or, <texttt text="depth"/> is invalid <docref>(see <autoref label="s:cspace-addressing"/>)</docref>.
++                </description>
++            </error>
++            <error name="seL4_RevokeFirst">
++                <description>
++                    An IRQ handler capability for <texttt text="vector"/> has already been created.
++                </description>
++            </error>
++        </method>
+     </interface>
+     <interface name="seL4_TCB" manual_name="TCB" cap_description="Capability to the TCB which is being operated on.">
+         <method id="TCBSetEPTRoot" name="SetEPTRoot" manual_name="Set EPT Root" manual_label="set_eptroot">
+diff --git a/src/arch/x86/object/interrupt.c b/src/arch/x86/object/interrupt.c
+index 464591efd..0a79d5653 100644
+--- a/src/arch/x86/object/interrupt.c
++++ b/src/arch/x86/object/interrupt.c
+@@ -58,11 +58,15 @@ static exception_t Arch_invokeIRQControl(irq_t irq, cte_t *handlerSlot, cte_t *c
+ }
+ 
+ static exception_t invokeIssueIRQHandlerIOAPIC(irq_t irq, word_t ioapic, word_t pin, word_t level, word_t polarity,
+-                                               word_t vector,
++                                               word_t vector, bool_t remapped, word_t handle,
+                                                cte_t *handlerSlot, cte_t *controlSlot)
+ {
+     x86_irq_state_t irqState = x86_irq_state_irq_ioapic_new(ioapic, pin, level, polarity, 1);
+-    ioapic_map_pin_to_vector(ioapic, pin, level, polarity, vector);
++    if (remapped) {
++        ioapic_map_pin_to_remapped(ioapic, pin, level, polarity, vector, handle);
++    } else {
++        ioapic_map_pin_to_vector(ioapic, pin, level, polarity, vector);
++    }
+     return Arch_invokeIRQControl(irq, handlerSlot, controlSlot, irqState);
+ }
+ 
+@@ -83,7 +87,8 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_
+     }
+ 
+     /* ensure we have a valid invocation before continuing any decoding */
+-    if (invLabel != X86IRQIssueIRQHandlerIOAPIC && invLabel != X86IRQIssueIRQHandlerMSI) {
++    if (invLabel != X86IRQIssueIRQHandlerIOAPIC && invLabel != X86IRQIssueIRQHandlerMSI &&
++        invLabel != X86IRQIssueIRQHandlerIOAPICRemapped) {
+         userError("IRQControl: Illegal operation");
+         current_syscall_error.type = seL4_IllegalOperation;
+         return EXCEPTION_SYSCALL_ERROR;
+@@ -91,7 +96,8 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_
+ 
+     /* check the common parameters */
+ 
+-    if (length < 7 || current_extra_caps.excaprefs[0] == NULL) {
++    if (length < (invLabel == X86IRQIssueIRQHandlerIOAPICRemapped ? 8 : 7) ||
++        current_extra_caps.excaprefs[0] == NULL) {
+         userError("IRQControl: Truncated message");
+         current_syscall_error.type = seL4_TruncatedMessage;
+         return EXCEPTION_SYSCALL_ERROR;
+@@ -130,11 +136,21 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_
+     }
+ 
+     switch (invLabel) {
+-    case X86IRQIssueIRQHandlerIOAPIC: {
++    case X86IRQIssueIRQHandlerIOAPIC:
++    case X86IRQIssueIRQHandlerIOAPICRemapped: {
+         word_t ioapic = getSyscallArg(2, buffer);
+         word_t pin = getSyscallArg(3, buffer);
+         word_t level = getSyscallArg(4, buffer);
+         word_t polarity = getSyscallArg(5, buffer);
++        bool_t remapped = invLabel == X86IRQIssueIRQHandlerIOAPICRemapped;
++        word_t handle = remapped ? getSyscallArg(7, buffer) : 0;
++
++        if (handle >= BIT(16)) {
++            current_syscall_error.type = seL4_RangeError;
++            current_syscall_error.rangeErrorMin = 0;
++            current_syscall_error.rangeErrorMax = MASK(16);
++            return EXCEPTION_SYSCALL_ERROR;
++        }
+ 
+         status = ioapic_decode_map_pin_to_vector(ioapic, pin, level, polarity, vector);
+         if (status != EXCEPTION_NONE) {
+@@ -142,7 +158,8 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_
+         }
+ 
+         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
+-        return invokeIssueIRQHandlerIOAPIC(irq, ioapic, pin, level, polarity, vector, destSlot, srcSlot);
++        return invokeIssueIRQHandlerIOAPIC(irq, ioapic, pin, level, polarity, vector, remapped, handle,
++                                          destSlot, srcSlot);
+     }
+     break;
+     case X86IRQIssueIRQHandlerMSI: {
+diff --git a/src/plat/pc99/machine/ioapic.c b/src/plat/pc99/machine/ioapic.c
+index cfe5232dc..049f79c22 100644
+--- a/src/plat/pc99/machine/ioapic.c
++++ b/src/plat/pc99/machine/ioapic.c
+@@ -182,7 +182,8 @@ void ioapic_map_pin_to_vector(word_t ioapic, word_t pin, word_t level,
+ 
+     index = ioapic * IOAPIC_IRQ_LINES + pin;
+     ioapic_write(ioapic, IOAPIC_REGSEL, IOREDTBL_HIGH(pin));
+-    ioredtbl_high = ioapic_read(ioapic, IOAPIC_WINDOW) & MASK(IOREDTBL_HIGH_RESERVED_BITS);
++    /* Clear a previous remappable-format bit and interrupt handle. */
++    ioredtbl_high = ioapic_read(ioapic, IOAPIC_WINDOW) & MASK(16);
+     /* delivery mode: physical mode only, using APIC ID */
+     ioredtbl_high |= (ioapic_target_cpu << IOREDTBL_HIGH_RESERVED_BITS);
+     ioapic_write(ioapic, IOAPIC_WINDOW, ioredtbl_high);
+@@ -197,3 +198,22 @@ void ioapic_map_pin_to_vector(word_t ioapic, word_t pin, word_t level,
+     ioredtbl_state[index] |= ioapic_read(ioapic, IOAPIC_WINDOW) & ~MASK(16);
+     ioapic_write(ioapic, IOAPIC_WINDOW, ioredtbl_state[index]);
+ }
++
++void ioapic_map_pin_to_remapped(word_t ioapic, word_t pin, word_t level,
++                              word_t polarity, word_t vector, word_t handle)
++{
++    uint32_t index = ioapic * IOAPIC_IRQ_LINES + pin;
++    /* Never expose a partially updated redirection entry. */
++    ioapic_mask(true, ioapic, pin);
++    /* Intel VT-d spec 5.1.5.1: IF=1, handle[14:0] in bits 63:49,
++     * handle[15] in bit 11, fixed delivery (SHV=0). Keep the CPU vector
++     * in bits 7:0 for both EOI broadcasts and ioapic_mask's invariant. */
++    ioapic_write(ioapic, IOAPIC_REGSEL, IOREDTBL_HIGH(pin));
++    ioapic_write(ioapic, IOAPIC_WINDOW, BIT(16) | ((handle & MASK(15)) << 17));
++    ioredtbl_state[index] = IOREDTBL_LOW_INTERRUPT_MASK |
++                           (level << IOREDTBL_LOW_TRIGGER_MODE_SHIFT) |
++                           (polarity << IOREDTBL_LOW_POLARITY_SHIFT) |
++                           ((handle >> 15) << 11) | vector;
++    ioapic_write(ioapic, IOAPIC_REGSEL, IOREDTBL_LOW(pin));
++    ioapic_write(ioapic, IOAPIC_WINDOW, ioredtbl_state[index]);
++}
+-- 
+2.47.3
+

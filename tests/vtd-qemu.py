@@ -82,14 +82,27 @@ def main():
         try:
             wait_for(lambda: "VTDTEST: ready" in log.read_text(), "guest boot", 120)
             assert "interrupts remapped" in log.read_text()
+            assert "serial monitor on port 0x3f8 (remapped interrupts" in log.read_text()
             q = Qtest(sock)
+            fault_counts = {}
             def fault(reason, name):
-                wait_for(lambda: f"00:06.0: fault {reason:#x}," in log.read_text(), name)
+                fault_counts[reason] = fault_counts.get(reason, 0) + 1
+                wait_for(lambda: log.read_text().count(f"00:06.0: fault {reason:#x},") >= fault_counts[reason], name)
                 # Root prints before clearing F. Injecting the next fault
                 # in that interval would legitimately be compressed away.
                 wait_for(lambda: q.read(0xfed90034) & 2 == 0, "fault acknowledgement")
 
             assert q.config(6, 0) == 0x11e81234
+            # The UART's I/O APIC pin must carry a remapping handle,
+            # with compatibility interrupts still globally disabled.
+            q.write(0xfec00000, 0x10 + 4 * 2)
+            rte_low = q.read(0xfec00010)
+            q.write(0xfec00000, 0x11 + 4 * 2)
+            rte_high = q.read(0xfec00010)
+            assert rte_high & (1 << 16), "UART I/O APIC entry is not remappable"
+            assert rte_low & 255 == 0x38, "UART vector does not match the IRTE"
+            assert rte_low & ((1 << 16) | (1 << 15) | (7 << 8)) == 0, "UART is masked or not fixed/edge"
+            uart_index = (rte_high >> 17) | ((rte_low >> 11 & 1) << 15)
             bar = q.config(6, 0x10) & ~15
             assert bar != 0
             q.config(6, 4, (q.config(6, 4) & 0xffff) | 0x406)  # memory, master, INTx off
@@ -125,6 +138,8 @@ def main():
             # table index must fail when another requester sends it.
             for address, data, reason, name in [
                 (0xfee00010, 0, 0x26, "another device's IRTE"),
+                (0xfee00010 | ((uart_index & 0x7fff) << 5) | ((uart_index >> 15) << 2),
+                 0, 0x26, "UART I/O APIC's IRTE"),
                 (0xfee01ff0, 0, 0x22, "absent IRTE"),
             ]:
                 q.config(6, cap + 4, address)

@@ -45,14 +45,12 @@ impl Iommu {
         }
     }
 
-    /// VT-d blocks compatibility-format interrupts globally. seL4 owns
-    /// the I/O APIC and cannot program remappable entries, so root polls
-    /// the UART instead of enabling its pin in that mode.
-    pub fn poll_serial(&self) -> bool {
+    /// None selects a legacy entry; Some contains a VT-d remapping index.
+    #[cfg(target_arch = "x86_64")]
+    pub fn ioapic_irq(&mut self, index: usize, vector: u64) -> Result<Option<u16>, &'static str> {
         match self {
-            #[cfg(target_arch = "x86_64")]
-            Self::Intel(i) => i.info()[1] != 0,
-            _ => false,
+            Self::Intel(i) => i.ioapic_irq(index, vector),
+            _ => Ok(None),
         }
     }
 
