@@ -127,19 +127,20 @@ static void send_sigtrap(struct uml_pt_regs *regs, int error_code)
  */
 int syscall_trace_enter(struct pt_regs *regs)
 {
+	/* The tracer first, as in generic entry: the tracepoint and audit see
+	 * the syscall it may have changed, and none it skipped. */
+	if (test_thread_flag(TIF_SYSCALL_TRACE) && ptrace_report_syscall_entry(regs))
+		return 1;
+
+	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
+		trace_sys_enter(regs, UPT_SYSCALL_NR(&regs->regs));
+
 	audit_syscall_entry(UPT_SYSCALL_NR(&regs->regs),
 			    UPT_SYSCALL_ARG1(&regs->regs),
 			    UPT_SYSCALL_ARG2(&regs->regs),
 			    UPT_SYSCALL_ARG3(&regs->regs),
 			    UPT_SYSCALL_ARG4(&regs->regs));
-
-	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
-		trace_sys_enter(regs, UPT_SYSCALL_NR(&regs->regs));
-
-	if (!test_thread_flag(TIF_SYSCALL_TRACE))
-		return 0;
-
-	return ptrace_report_syscall_entry(regs);
+	return 0;
 }
 
 void syscall_trace_leave(struct pt_regs *regs)

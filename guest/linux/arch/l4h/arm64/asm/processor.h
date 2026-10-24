@@ -28,11 +28,18 @@ static inline void arch_copy_thread(struct arch_thread *f,
 		asm("mov %0, x29" : "=r"(fp)); \
 		fp;                            \
 	})
+/* arch/l4h/os-sel4/events.c: deliver pending events if interrupts are on. */
+void l4h_poll_events(void);
+
+/* Spinning with interrupts on polls for them, as on x86 (asm/processor.h
+ * there): a CPU would take them. */
 static inline void cpu_relax(void)
 {
 	asm volatile("yield" ::: "memory");
+	l4h_poll_events();
 }
-#define KSTK_EIP(t) KSTK_REG(t, HOST_IP)
+/* The user PC, as on arm64 (seccomp, SIGSYS); KSTK_ESP is the kernel's. */
+#define KSTK_EIP(t) PT_REGS_IP(task_pt_regs(t))
 #define KSTK_ESP(t) KSTK_REG(t, HOST_SP)
 #define KSTK_EBP(t) KSTK_REG(t, HOST_BP)
 #define ARCH_IS_STACKGROW(a) ((a) + 65536 >= UPT_SP(&current->thread.regs.regs))

@@ -29,7 +29,12 @@ static inline void syscall_set_nr(struct task_struct *task, struct pt_regs *regs
 static inline void syscall_rollback(struct task_struct *task,
 				    struct pt_regs *regs)
 {
-	/* do nothing */
+#ifndef CONFIG_UML_ARM64
+	/* As x86: entry set RAX to -ENOSYS, and a SIGSYS handler (seccomp's
+	 * SECCOMP_RET_TRAP) must find the syscall number there.  arm64 keeps
+	 * x0, the first argument, until the syscall returns. */
+	PT_REGS_SYSCALL_RET(regs) = PT_REGS_SYSCALL_NR(regs);
+#endif
 }
 
 static inline long syscall_get_error(struct task_struct *task,

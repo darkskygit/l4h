@@ -39,7 +39,8 @@ void handle_syscall(struct uml_pt_regs *r)
 
 	/* Initialize the syscall number and default return value.  arm64
 	 * takes the number from w8, so the restart checks see the number
-	 * that is dispatched (x86 keeps all of orig_ax, as on x86). */
+	 * that is dispatched (x86 keeps all of orig_ax, as on x86, and its
+	 * restart checks use the low 32 bits). */
 	if (IS_ENABLED(CONFIG_UML_ARM64))
 		UPT_SYSCALL_NR(r) = (int)PT_SYSCALL_NR(r->gp);
 	else

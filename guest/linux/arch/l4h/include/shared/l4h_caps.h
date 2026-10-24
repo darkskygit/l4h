@@ -20,5 +20,7 @@ void l4h_caps_init(void);
 bool l4h_objmem_wait(void);
 /* No memory for seL4 objects: the OOM killer. */
 void l4h_objmem_oom(void);
+/* Is guest RAM [gpa, gpa+size) in the direct map (not an object block)? */
+bool l4h_ram_mapped(unsigned long gpa, unsigned long size);
 
 #endif

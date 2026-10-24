@@ -19,6 +19,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/personality.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -34,7 +35,9 @@
 #include <sys/uio.h>
 #include <elf.h>
 #endif
+#include <linux/filter.h>
 #include <linux/futex.h>
+#include <linux/seccomp.h>
 #include "page-aging/page-aging.h"
 
 static int failures;
@@ -801,6 +804,141 @@ static void test_syscall_restart(void)
  signal(SIGUSR1, SIG_DFL);
 }
 
+#ifdef __x86_64__
+/* read() with bit 63 of its number set: x86 runs the low 32 bits' syscall,
+ * and must restart it as that one, not return -ERESTARTSYS. */
+static long read_hi(int fd, void *buf, size_t n)
+{
+	long ret;
+
+	asm volatile("syscall"
+		     : "=a"(ret)
+		     : "a"(__NR_read | (1ul << 63)), "D"(fd), "S"(buf), "d"(n)
+		     : "rcx", "r11", "memory");
+	return ret;
+}
+
+static void test_syscall_restart_hi(void)
+{
+	int fd[2], status;
+	long n;
+	char c = 0;
+	struct sigaction sa = { .sa_handler = usr1_handler, .sa_flags = SA_RESTART };
+
+	CHECK(pipe(fd) == 0, "pipe");
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGUSR1, &sa, NULL);
+	sig_count = 0;
+	pid_t child = fork();
+	CHECK(child >= 0, "fork");
+	if (!child) {
+		close(fd[0]);
+		usleep(20000);
+		kill(getppid(), SIGUSR1);
+		usleep(20000);
+		if (write(fd[1], "R", 1) != 1)
+			_exit(1);
+		_exit(0);
+	}
+	close(fd[1]);
+	n = read_hi(fd[0], &c, 1);
+	CHECK(n == 1 && c == 'R', "restarted read returned %ld", n);
+	CHECK(sig_count == 1, "restart handler count %d", sig_count);
+	CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "restart child");
+	close(fd[0]);
+	signal(SIGUSR1, SIG_DFL);
+}
+#endif
+
+/* ---- seccomp */
+/* The address after the syscall instruction of trapped_getppid(). */
+extern const char seccomp_trap_ip[];
+
+static __attribute__((noinline)) long trapped_getppid(void)
+{
+#ifdef __x86_64__
+	long ret;
+
+	asm volatile("syscall\n.globl seccomp_trap_ip\nseccomp_trap_ip:"
+		     : "=a"(ret) : "a"(__NR_getppid) : "rcx", "r11", "memory");
+	return ret;
+#else
+	register long x8 asm("x8") = __NR_getppid;
+	register long x0 asm("x0");
+
+	asm volatile("svc #0\n.globl seccomp_trap_ip\nseccomp_trap_ip:"
+		     : "=r"(x0) : "r"(x8) : "memory");
+	return x0;
+#endif
+}
+
+static volatile unsigned long sigsys_addr, sigsys_pc, sigsys_ax;
+static volatile int sigsys_nr;
+
+static void sigsys_handler(int sig, siginfo_t *si, void *ctx)
+{
+	ucontext_t *uc = ctx;
+
+	sigsys_addr = (unsigned long)si->si_call_addr;
+	sigsys_nr = si->si_syscall;
+#ifdef __x86_64__
+	sigsys_pc = uc->uc_mcontext.gregs[REG_RIP];
+	sigsys_ax = uc->uc_mcontext.gregs[REG_RAX];
+#else
+	sigsys_pc = uc->uc_mcontext.pc;
+#endif
+}
+
+/* Trap getppid() made at seccomp_trap_ip only, as a filter keyed on the
+ * caller's address (Chromium's) does.  Returns which check failed. */
+static int seccomp_trap_child(void)
+{
+	unsigned long ip = (unsigned long)seccomp_trap_ip;
+	pid_t parent = getppid();
+	struct sock_filter f[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getppid, 0, 5),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)ip, 0, 3),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)(ip >> 32), 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog prog = { .len = sizeof(f) / sizeof(f[0]), .filter = f };
+	struct sigaction sa = { .sa_sigaction = sigsys_handler, .sa_flags = SA_SIGINFO };
+
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGSYS, &sa, NULL) || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+	    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog))
+		return 10;
+	if (getppid() != parent || sigsys_nr)
+		return 11;	/* trapped at another address */
+	trapped_getppid();
+	if (sigsys_nr != __NR_getppid)
+		return 12;	/* not trapped: the filter saw another address */
+	if (sigsys_addr != ip || sigsys_pc != ip)
+		return 13;
+#ifdef __x86_64__
+	if (sigsys_ax != __NR_getppid)
+		return 14;	/* syscall_rollback() */
+#endif
+	return 0;
+}
+
+static void test_seccomp_trap(void)
+{
+	int status;
+	pid_t child = fork();
+
+	CHECK(child >= 0, "fork");
+	if (!child)
+		_exit(seccomp_trap_child());
+	CHECK(waitpid(child, &status, 0) == child, "waitpid");
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "seccomp child status %#x (exit code: which check failed)", status);
+}
+
 /* ---- threads, futexes, TLS */
 static __thread int tls_value;
 static atomic_int counter;
@@ -1316,6 +1454,10 @@ static const struct test tests[] = {
 #endif
 	{ "timers", test_timers },
 	{ "syscall_restart", test_syscall_restart },
+#ifdef __x86_64__
+	{ "syscall_restart_hi", test_syscall_restart_hi },
+#endif
+	{ "seccomp_trap", test_seccomp_trap },
 	{ "threads", test_threads },
 	{ "futex", test_futex },
 	{ "futex_wake_op", test_futex_wake_op },
