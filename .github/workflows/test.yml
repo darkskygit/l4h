@@ -206,6 +206,8 @@ jobs:
         run: tests/run-modtest.sh
       - name: BPF JIT
         run: tests/run-bpftest.sh
+      - name: BPF JIT (LSE atomics)
+        run: L4H_QEMU_CPU=max tests/run-bpftest.sh
       - name: Block pass-through (virtio-blk and NVMe)
         run: tests/run-blktest.sh && BLKTEST_DEV=nvme tests/run-blktest.sh
       - name: Control API
