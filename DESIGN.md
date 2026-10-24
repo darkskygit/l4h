@@ -1813,6 +1813,47 @@ a locality, so a command only runs if trustd ran the `_DSM`.
   - C3's gVNIC is revision 0 (admin queue by page frame number) with DQO
     RDA, 1024-entry rings, MTU 1460 and 9 MSI-X entries.
 
+### 10.2 Partitioning large machines with Xen
+
+seL4's big kernel lock limits how far one l4h scales across cores, so a
+machine with many cores runs several l4h instances side by side, as Xen
+HVM guests. l4h needs no VT-x of its own (§10.1), so an ordinary HVM
+guest suffices. Each instance gets a slice of the cores and memory and
+its own NIC, passed through whole: no SR-IOV.
+
+- **Xen and dom0.** `tools/build-xen-dom0.sh` builds, from Debian 13
+  packages, the Xen 4.20 hypervisor and a minimal dom0. That dom0 is
+  Debian's kernel plus a 22 MiB initramfs with busybox, the `xl`
+  toolstack, QEMU as the device model and the Xen driver modules.
+  - Its init (`tools/xen/dom0-init`) starts xenstored, xenconsoled and a
+    QEMU that serves the guests' disks (`backendtype=qdisk`).
+  - It hands each device named with `xen-pciback.hide=(BB:DD.F)...` on
+    dom0's command line to pciback. Built-in drivers such as virtio-pci
+    have already bound them by the time the module loads.
+  - It then starts the `xl` configurations in `/etc/l4h-xen`.
+  - dom0 serves no guest traffic: it only creates the partitions.
+- **Firmware.** The guests boot the usual l4h application and image
+  (§10) under OVMF, as on GCE.
+  - It must be the Xen build, OvmfXen (`tools/build-ovmf-xen.sh`, from
+    edk2-stable202502), referenced with `bios_path_override`.
+  - Debian's OVMF does not support Xen anymore: it finds none of the
+    ACPI tables hvmloader builds, so GRUB has no RSDP to give seL4.
+  - OvmfXen also changes GRUB's heap use enough to trip a GRUB 2.12 bug,
+    which `tools/mkefi.sh` works around: GRUB grows its heap through boot
+    services even after multiboot2 has exited them.
+- **Passthrough.** Each partition's `pci = [...]` names its NIC. Xen maps
+  the NIC's DMA through the IOMMU and its MSI-X through interrupt
+  remapping, and l4h's netd drives it as on bare metal.
+  - libxl warns that the kernel cannot reset a device that has no
+    function-level reset. This applies to QEMU's virtio-net, not to NICs
+    such as the X550.
+- **Test.** `tests/run-xentest.sh` nests the whole setup in QEMU/KVM.
+  - The outer machine is q35 with an emulated VT-d IOMMU (interrupt
+    remapping, caching mode) and two virtio-net NICs on one hub.
+    `iommu_platform` makes the NICs' DMA go through the IOMMU.
+  - Xen starts two l4h partitions, each with one NIC and a disk image.
+  - Each partition's dom0 pings the other's across the hub.
+
 ---
 
 ## 11. Portability to aarch64

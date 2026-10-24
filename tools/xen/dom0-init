@@ -1,0 +1,45 @@
+#!/bin/sh
+# Init of the minimal Xen dom0 (tools/build-xen-dom0.sh): starts the Xen
+# services, creates the guests in /etc/l4h-xen/*.cfg, then runs
+# /etc/l4h-xen/run if there is one, else a shell on the console.
+# Devices for passthrough are named on dom0's command line with
+# xen-pciback.hide=(BB:DD.F)..., as for a built-in pciback.  The module is
+# loaded after the drivers built into the kernel, such as virtio-pci, have
+# taken the devices, so init hands each one to pciback itself.
+export PATH=/usr/lib/xen-4.20/bin:/bin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs run /run
+mount -t tmpfs tmp /tmp
+mkdir -p /run/xen /run/xenstored /var/run /dev/pts
+mount -t devpts devpts /dev/pts
+ln -sfn /run/xen /var/run/xen
+ln -sfn /run/xenstored /var/run/xenstored
+for m in xen-evtchn xen-gntdev xen-gntalloc xen-privcmd xenfs xen-pciback virtio_blk; do
+    modprobe "$m" || echo "dom0: modprobe $m failed"
+done
+mount -t xenfs xenfs /proc/xen
+xenstored --pid-file /run/xenstored.pid
+xen-init-dom0 || echo "dom0: xen-init-dom0 failed"
+xenconsoled --pid-file=/run/xenconsoled.pid
+# dom0's own QEMU serves the guests' disks as PV backends (qdisk); each
+# guest's device model emulates them for the firmware.
+/usr/libexec/xen-qemu-system-i386 -xen-domid 0 -xen-attach -name dom0 \
+    -nographic -M xenpv -daemonize -monitor /dev/null -serial /dev/null \
+    -parallel /dev/null -pidfile /run/qemu-dom0.pid
+for bdf in $(tr ' ' '\n' < /proc/cmdline | sed -n 's/^xen[-_]pciback\.hide=//p' | tr '()' '  '); do
+    xl pci-assignable-add "$bdf" || echo "dom0: cannot assign $bdf"
+done
+echo "dom0: Xen $(xl info | sed -n 's/^xen_version *: //p'), $(xl info | sed -n 's/^nr_cpus *: //p') CPUs," \
+    "assignable: $(xl pci-assignable-list | tr '\n' ' ')"
+for cfg in /etc/l4h-xen/*.cfg; do
+    [ -e "$cfg" ] || continue
+    xl create "$cfg" || echo "dom0: xl create $cfg failed"
+done
+if [ -x /etc/l4h-xen/run ]; then
+    /etc/l4h-xen/run
+else
+    setsid cttyhack sh
+fi
+poweroff -f
