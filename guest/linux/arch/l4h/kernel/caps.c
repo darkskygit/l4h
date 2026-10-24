@@ -46,6 +46,7 @@
 #include <linux/mm.h>
 #include <linux/seq_file.h>
 #include <linux/mutex.h>
+#include <linux/uaccess.h>
 #include <linux/gfp.h>
 #include <linux/oom.h>
 #include <linux/sched/signal.h>
@@ -708,6 +709,9 @@ static int block_make_frames(unsigned int b)
 	return 0;
 }
 
+/* *_nofault accesses between their check and their access (uaccess.h). */
+static atomic_t nofault_accesses;
+
 /*
  * Are the direct-map pages of guest-physical [gpa, gpa+size) there?  Object
  * blocks, and blocks being converted, have no frames to map.  Before
@@ -729,6 +733,39 @@ bool l4h_ram_mapped(unsigned long gpa, unsigned long size)
 			return false;
 	}
 	return true;
+}
+
+/*
+ * A *_nofault access: the check that its range is mapped and the access
+ * itself, which faults the guest if a block's frames went in between.  A
+ * conversion marks the block BLK_BUSY, then waits for the accesses in
+ * progress (wait_nofault_accesses()), so none that found it mapped runs
+ * after its frames are revoked.
+ */
+bool l4h_nofault_begin(unsigned long addr, unsigned long size)
+{
+	atomic_inc(&nofault_accesses);
+	smp_mb__after_atomic();
+	if (l4h_kernel_range_ok(addr, size))
+		return true;
+	atomic_dec(&nofault_accesses);
+	return false;
+}
+EXPORT_SYMBOL(l4h_nofault_begin);
+
+void l4h_nofault_end(void)
+{
+	smp_mb__before_atomic();
+	atomic_dec(&nofault_accesses);
+}
+EXPORT_SYMBOL(l4h_nofault_end);
+
+static void wait_nofault_accesses(void)
+{
+	/* Orders the caller's BLK_BUSY before the read of the count. */
+	smp_mb();
+	while (atomic_read(&nofault_accesses))
+		cpu_relax();
 }
 
 /* ---- conversion between frame blocks and object blocks */
@@ -753,6 +790,7 @@ static void block_to_objects(unsigned int b, int origin)
 	/* Deletes the 512 frames and every mapping and copy of them: the
 	 * direct map, the RAM CNode slots, any process mapping left.  Nothing
 	 * outside the guest has them: devices only see the I/O pool. */
+	wait_nofault_accesses();
 	WARN_ON(l4h_cnode_revoke(block_cptr(b), 64));
 	raw_spin_lock_irqsave(&caps_lock, flags);
 	blocks[b].state = BLK_OBJECTS;

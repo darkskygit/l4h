@@ -580,7 +580,10 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
 - Kernel `*_nofault` accesses check that the address is mapped in the
   guest-kernel VSpace, since a fault there stops the guest. The direct map
   has holes where RAM blocks became seL4 objects (§15.3), so its range is
-  checked block by block (`/dev/mem`, BPF `probe_read_kernel`).
+  checked block by block (`/dev/mem`, BPF `probe_read_kernel`). A block
+  being converted is marked busy first, and its frames are revoked only
+  once no access that found it mapped is still between its check and its
+  access.
 
 ### 5.3 Memory management: Linux page tables mirrored into seL4
 
