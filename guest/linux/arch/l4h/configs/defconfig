@@ -28,8 +28,7 @@ CONFIG_NET_SCHED=y
 CONFIG_NET_SCH_FQ=y
 CONFIG_NET_SCH_CAKE=y
 # BPF programs on tc (the clsact qdisc, cls_bpf, act_bpf) and XDP, with
-# AF_XDP sockets. There is no BPF JIT for ARCH=l4h: programs run in the
-# interpreter.
+# AF_XDP sockets.
 CONFIG_NET_CLS_ACT=y
 CONFIG_NET_SCH_INGRESS=y
 CONFIG_NET_CLS_BPF=y
@@ -79,6 +78,9 @@ CONFIG_CGROUP_CPUACCT=y
 CONFIG_BLK_CGROUP=y
 CONFIG_BPF_SYSCALL=y
 CONFIG_CGROUP_BPF=y
+# The x86-64 and arm64 JITs (arch/l4h/x86/bpf_jit.c, arch/l4h/arm64/bpf_jit.c),
+# on by default.
+CONFIG_BPF_JIT=y
 CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_TMPFS_XATTR=y
 CONFIG_EXT4_FS_POSIX_ACL=y

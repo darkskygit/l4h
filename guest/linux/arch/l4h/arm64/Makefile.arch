@@ -21,6 +21,8 @@ SEL4_CFLAGS := -O2 -g -std=gnu11 -ffreestanding -fno-common -fno-strict-aliasing
 core-y += $(ARCH_DIR)/arm64/
 # NEON crypto (ARMv8 Crypto Extensions AES, ...), selected per algorithm.
 core-$(CONFIG_CRYPTO) += arch/arm64/crypto/
+# The arm64 BPF JIT, with arm64/bpf_jit.c.
+core-$(CONFIG_BPF_JIT) += arch/arm64/net/
 all: vmlinux
 archheaders:
 	$(Q)$(MAKE) -f $(srctree)/Makefile ARCH=arm64 asm-generic archheaders

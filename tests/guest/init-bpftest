@@ -1,0 +1,13 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
+/bin/busybox ip link set lo up
+# test_bpf.ko runs its vectors (and tail calls) through the JIT; loading
+# fails if any fails.
+if /bin/busybox insmod /bin/test_bpf.ko; then
+    /bin/bpftest
+else
+    echo 'BPFTEST: FAIL test_bpf'
+fi
+/bin/busybox poweroff -f

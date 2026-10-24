@@ -14,3 +14,4 @@ $(obj)/vdso.so: $(src)/sigreturn.S $(src)/vdso.lds FORCE
 	$(call if_changed,vdso)
 
 obj-$(CONFIG_MODULES) += module.o
+obj-$(CONFIG_BPF_JIT) += bpf_jit.o

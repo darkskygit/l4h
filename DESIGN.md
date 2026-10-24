@@ -553,6 +553,7 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
   - a **direct map of frame-backed guest RAM**: guest-physical address (GPA) *g* maps
     to `PAGE_OFFSET + g`, using 4 KiB frames (see §5.3);
   - vmalloc/module area;
+  - on x86_64, BPF JIT images in the 1 GiB below the kernel image (§5.7);
   - per-vCPU event pages;
   - virtio-l4h device pages.
 
@@ -929,6 +930,54 @@ including pool addresses, device indices and lifecycle state.
 - **Measured.** The kernel and the module image are part of the UEFI
   application, which PCR 4 covers. Launch digests (§9.2) still cover the
   kernel image in guest RAM, which is the same for every guest of a host.
+
+### 5.7 BPF JIT
+
+The guest kernel uses the upstream x86-64 and arm64 BPF JITs
+(`arch/x86/net`, `arch/arm64/net`), on by default. Patches 0006 and 0007
+adapt them, and `arch/l4h/{x86,arm64}/bpf_jit.c` provide what they need
+from the architecture:
+
+- **Reach (x86_64).** The JIT calls helpers in the kernel image with a
+  rel32 `call` and leaves a program to the interpreter when a target is
+  beyond ±2 GiB. vmalloc follows all of RAM and the I/O pool, which puts it
+  out of reach in a guest with more than about 1.5 GiB. So BPF images
+  (`EXECMEM_BPF`) go in the 1 GiB below the kernel image, which nothing
+  else in the guest-kernel VSpace uses. Modules keep vmalloc: they are built
+  with the large code model. The arm64 JIT loads call targets into a
+  register, so it keeps vmalloc as well. It builds them with `movz`
+  instead of `movn`, since the guest kernel's addresses are in the lower
+  half.
+- **Code patching.** Guest-kernel memory is mapped writable and
+  executable, so new images are written in place. On x86, code that other
+  vCPUs may be running (direct tail calls, trampolines) is patched without
+  int3, since a breakpoint in the guest kernel goes to the host. Instead,
+  `stop_machine()` holds every vCPU with interrupts off, one vCPU writes,
+  and each then runs `cpuid` (serializing) before it returns. On arm64 the
+  JIT patches only branches and NOPs, which one word-sized store and
+  instruction-cache maintenance through seL4 (`flush_icache_range`) make
+  safe while other vCPUs run them.
+- **No exception tables.** A fault of the guest kernel stops the guest
+  (§5.2), so a JIT may not emit loads that rely on a fixup.
+  Programs with `BPF_PROBE_MEM` loads (BTF pointers, which need
+  `CONFIG_DEBUG_INFO_BTF`) are left to the interpreter, which checks the
+  address with `l4h_kernel_range_ok()` first. Arena accesses are not offered.
+- **What the guest kernel has not.** There is no `%gs` or `TPIDR_EL1`
+  per-CPU base, and the guest kernel cannot read `SP_EL0`. So there are no
+  per-CPU instructions or private stacks, and on arm64
+  `bpf_get_smp_processor_id()` and `bpf_get_current_task()` are not
+  inlined. BPF exceptions need an unwinder (`arch_bpf_stack_walk()`), and
+  the timed `may_goto` needs x86 per-CPU assembly, so neither is offered.
+  The mitigation flags (retpolines, return thunks, IBT, BHB clearing) are
+  never set: `cpu_feature_enabled()` folds to 0 every feature that l4h
+  does not set (the `x86_capability[]` words CPUID fills, and
+  `X86_FEATURE_PREFER_YMM`). arm64 skips its Spectre-BHB sequence for
+  classic BPF, which relies on firmware calls.
+
+`tests/run-bpftest.sh` runs the kernel's BPF test vectors (`lib/test_bpf.c`)
+through the JIT, and the verifier, JIT, direct tail calls and XDP (generic)
+and tcx attachment through `tests/guest/bpftest.c`. On x86_64 the guest has
+2 GiB.
 
 ---
 

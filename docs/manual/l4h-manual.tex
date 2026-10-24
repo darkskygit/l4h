@@ -320,8 +320,8 @@ use them in either build.
 
 \file{guest/linux/arch/l4h/configs/defconfig} gives a kernel that can boot a
 general-purpose distribution: virtio-blk and virtio-net, ext4, overlayfs,
-namespaces and cgroups (enough for systemd and containers), BPF (in the
-interpreter, as l4h has no BPF JIT) with tc and XDP programs, netfilter
+namespaces and cgroups (enough for systemd and containers), BPF with the
+JIT and tc and XDP programs, netfilter
 with NAT and nftables, bridges and veth, and paravirtual steal-time
 accounting, all built in. It also has what l4h-sandbox needs for its dom0 (a
 router with a firewall, tagged VLANs, XFS and FAT) and its sandboxes
