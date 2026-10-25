@@ -12,6 +12,7 @@
 
 #include <asm/ptrace.h>
 #include <linux/err.h>
+#include <linux/kemu.h>
 #include <linux/sched.h>
 #include <sysdep/ptrace.h>
 
@@ -29,6 +30,10 @@ static inline void syscall_set_nr(struct task_struct *task, struct pt_regs *regs
 static inline void syscall_rollback(struct task_struct *task,
 				    struct pt_regs *regs)
 {
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(task))
+		kemu_syscall_rollback(task);
+#endif
 #ifndef CONFIG_UML_ARM64
 	/* As x86: entry set RAX to -ENOSYS, and a SIGSYS handler (seccomp's
 	 * SECCOMP_RET_TRAP) must find the syscall number there.  arm64 keeps
