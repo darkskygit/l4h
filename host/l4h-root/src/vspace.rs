@@ -69,6 +69,10 @@ mod aarch64 {
             }
         }
     }
+
+    /// x86_64's TLB bitmaps have no counterpart: seL4 invalidates the
+    /// TLBs of all cores with broadcast instructions, without IPIs.
+    pub fn flush_tlb_bitmap(_vspace: cap::VSpace) {}
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -87,6 +91,24 @@ pub const LARGE_PAGE_BP: ObjectBlueprint = ObjectBlueprint::Arch(ObjectBlueprint
 
 #[allow(dead_code)]
 const _: Option<ObjectBlueprintArch> = None;
+
+/// Drop the cores that are not running `vspace` from its TLB bitmap.
+///
+/// seL4 adds a core to a VSpace's bitmap when the core first switches to
+/// it, and each page unmap in the VSpace then interrupts every core in
+/// the bitmap and waits, holding the kernel lock, until all have
+/// answered.  A core leaves the bitmap only when the VSpace's whole PCID
+/// is flushed (it then drops the stale entries it may still hold), which
+/// is what this does (seL4_X64_PML4_Flush, patch 0017): one round of
+/// IPIs to the cores in the bitmap, and the VSpace's TLB entries lost on
+/// those running it.  Call it when threads of the VSpace have left cores
+/// for good.
+pub fn flush_tlb_bitmap(vspace: cap::VSpace) {
+    let err = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_X64_PML4_Flush(vspace.bits()));
+    if err != 0 {
+        sel4::debug_println!("l4h-root: PML4_Flush({:#x}) failed: {}", vspace.bits(), err);
+    }
+}
 
 /// Map `frame` at `vaddr` in `vspace`, creating intermediate tables from
 /// `ctx` as needed.

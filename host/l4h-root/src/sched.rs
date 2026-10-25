@@ -191,8 +191,13 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
             "l4h-root: balancer: guest {} vCPU {}: core {} -> {} (physical {} -> {})",
             gid, v, src, dst, h.info.topology.core(src), h.info.topology.core(dst)
         );
-        let vcpu = &mut h.guests[gid].as_mut().unwrap().vcpus[v];
+        let g = h.guests[gid].as_mut().unwrap();
+        let vcpu = &mut g.vcpus[v];
         vcpu.core = dst;
         vcpu.cooldown = COOLDOWN;
+        // The vCPU has left `src`: unmaps in the guest's VSpaces need not
+        // interrupt that core any longer, unless another of its vCPUs is
+        // there.
+        g.flush_tlb_bitmaps();
     }
 }

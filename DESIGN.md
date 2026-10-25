@@ -1177,24 +1177,22 @@ bootconfig and a display stay off.
 
 - **Placement and balancing.** New vCPUs are placed round-robin, visiting
   one logical CPU per physical core before its other SMT threads. At boot,
-  a probe thread visits each seL4 CPU and reads CPUID topology (x86
-  leaves 1F/0B, or AMD topology extensions on Zen and later). This maps
-  actual CPU IDs, including gaps and multiple sockets, without assuming
-  seL4 CPU numbering describes siblings.
+  root visits each seL4 CPU using its own SC and reads CPUID topology
+  (x86 leaves 1F/0B, or AMD topology extensions on Zen and later), then
+  returns to its boot CPU. This maps actual CPU IDs, including gaps and
+  multiple sockets, without assuming seL4 CPU numbering describes siblings.
 
-  *Revised:* root first visited the CPUs itself, moving its own SC. On
-  x86_64 every CPU a VSpace has run on stays in its TLB bitmap until a
-  flush of the VSpace's whole PCID clears the CPUs not running it, which
-  only unmapping a page table or invalidating the ASID does, and root
-  never does either. So from then on each page unmap in root's VSpace
-  sent every other CPU a shootdown IPI and waited for all of them,
-  holding the kernel lock. Root unmaps
-  its window once per page it copies into a guest, and on a loaded
-  hypervisor, whose vCPUs wait to be scheduled, a boot's image load and
-  launch measurement took 13 to 48 s instead of 0.2 s, and boots looked
-  hung. The probe runs in a VSpace of its own that maps only its code
-  page (`l4h_cpuid_probe`, CPUID of a list of leaves and then `ud2`, a
-  fault that root takes) and one page of results, and is destroyed after.
+  *Revised:* on x86_64 every CPU a VSpace has run on stays in its TLB
+  bitmap until a flush of the VSpace's whole PCID clears the CPUs not
+  running it, which only unmapping a page table or invalidating the ASID
+  does, and root never does either. So after the visit each page unmap
+  in root's VSpace sent every other CPU a shootdown IPI and waited for
+  all of them, holding the kernel lock. Root unmaps its window once per
+  page it copies into a guest, and on a loaded hypervisor, whose vCPUs
+  wait to be scheduled, a boot's image load and launch measurement took
+  13 to 48 s instead of 0.2 s, and boots looked hung. Root now flushes
+  its VSpace (`seL4_X64_PML4_Flush`, patch 0017) once back on its boot
+  CPU, which drops the others (`vspace::flush_tlb_bitmap`).
   Missing or inconsistent topology falls back to independent CPUs; AArch64
   currently uses that flat topology. Every 100 ms `l4h-root` reads
   `SchedContext_Consumed` for both SCs of every vCPU.
@@ -1212,6 +1210,28 @@ bootconfig and a display stay off.
     for 1 s. vCPUs in cooldown still count towards contention.
   - The interval is measured, not assumed: root work such as building a
     guest can delay a period.
+  - After moving a vCPU, root flushes the guest kernel's VSpace and all
+    of its process VSpaces (`Guest::flush_tlb_bitmaps`), for the same
+    reason: threads of a guest's VSpaces run only on its vCPUs' cores, so
+    after the flush their bitmaps hold those cores and no others, and
+    page unmaps in them no longer interrupt cores the guest has left. A
+    VSpace with no other core in its bitmap (unused, or recycled by the
+    guest, which empties its page tables) costs only the call; one with
+    others costs one IPI round to them. Processes that Linux moves between
+    the guest's own vCPUs keep those vCPUs' cores until they exit or the
+    next migration: the cores are the guest's, and tracking them would
+    need the guest. Measured (QEMU/KVM, 4 cores, a 1-vCPU dom0 moved to
+    the next core every 100 ms, a process mapping, touching and unmapping
+    8 pages in a loop):
+
+    | | idle host | loaded host |
+    |---|---|---|
+    | no migration | 39 µs | 157 µs |
+    | migrations, no flush | 290 µs | 80 ms |
+    | migrations, flush | 42 µs | 609 µs |
+
+    A migration's flushes (65 VSpaces) took a median 157 µs idle and
+    415 µs loaded (90th percentile 33 ms, wall time on a preempted vCPU).
 - **CPU caps** (`vm_set_sched`, `l4hctl sched`) give a vCPU one budget,
   a percentage of the 5 ms period, split between its SC_K and SC_U, so
   that the vCPU as a whole stays within the cap. Weights are not
