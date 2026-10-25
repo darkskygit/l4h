@@ -9,6 +9,7 @@ endmenu
 
 config UML_X86
 	def_bool y
+	select HAVE_KEMU
 	select HAVE_RUST
 	select DCACHE_WORD_ACCESS
 	select GENERIC_GETTIMEOFDAY

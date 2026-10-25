@@ -136,10 +136,10 @@ image scripts remain specific to x86_64. `L4H_MEM` accepts MiB, `M` or `G`;
 
 The x86_64 guest kernel includes [kemu](https://github.com/losfair/kemu)
 to run AArch64 Linux userspace directly. `tools/build-linux.sh` imports its
-patches and source overlay, then applies l4h's port; `CONFIG_KEMU=y` and
-`CONFIG_RUST=y` are enabled by default on x86_64. AArch64 guest kernels
-continue to execute AArch64 programs natively. `tests/run-kemutest.sh`
-checks the emulated ABI (requires `gcc-aarch64-linux-gnu` and cross libc
+patches and source overlay, then applies l4h's kernel patches.
+`CONFIG_KEMU=y` and `CONFIG_RUST=y` are enabled by default on x86_64.
+AArch64 guest kernels continue to execute AArch64 programs natively.
+`tests/run-kemutest.sh` checks the emulated ABI (requires `gcc-aarch64-linux-gnu` and cross libc
 headers); `KEMU_CMDLINE=kemu.jit=0` checks the interpreter instead.
 
 An assembled `build/l4h-aarch64.img` also boots directly on Apple Silicon
