@@ -252,8 +252,12 @@ static bool prepare_user(struct task_struct *t)
 		panic("l4h: out of seL4 objects creating a user context\n");
 
 	if (u->fault_ep_vcpu != cpu) {
-		if (u->fault_ep_vcpu >= 0)
+		/* The task moved here from another vCPU: the next unmap in
+		 * its VSpace flushes it first (vspace.c, mm_flush_moved()). */
+		if (u->fault_ep_vcpu >= 0) {
+			WRITE_ONCE(mm->context.l4h.moved, true);
 			WARN_ON(l4h_cnode_delete(u->fault_ep, 64));
+		}
 		if (l4h_cnode_mint(u->fault_ep, 64, L4H_SLOT_VCPU(cpu) + L4H_VCPU_EP,
 				   L4H_ROOT_DEPTH, L4H_RIGHTS_ALL, u->badge))
 			panic("l4h: cannot mint a fault endpoint\n");

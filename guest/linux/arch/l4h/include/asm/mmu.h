@@ -12,6 +12,9 @@ struct l4h_mm {
 	int vs;			/* VSpace pool index, -1 if none */
 	u64 gen;		/* changes whenever vs is (re)assigned */
 	atomic_t running;	/* threads that may be executing user code */
+	/* A thread moved to another vCPU since the VSpace was last flushed:
+	 * the old vCPU's core may be left in its TLB bitmap (vspace.c). */
+	bool moved;
 };
 
 typedef struct mm_context {
