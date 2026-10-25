@@ -225,13 +225,18 @@ nested virtualization.
 
 \begin{lstlisting}[language=bash]
 git clone <l4h repository> l4h && cd l4h
-git submodule update --init      # seL4, rust-sel4, sDDF
+git submodule update --init      # seL4, rust-sel4, sDDF, kemu
 python3 -m venv .venv && .venv/bin/pip install sel4-deps   # seL4's build tools
 \end{lstlisting}
 
 Linux itself is not a submodule. Extract a Linux 6.18 tree into
 \file{build/linux-6.18}. The build links \file{guest/linux/arch/l4h} into it
-and applies the patches in \file{guest/linux/patches} once.
+and imports kemu's patches and source overlay before applying
+\file{guest/linux/patches}. Applied patch copies and an overlay checksum
+allow repeated builds and updates without extracting Linux again.
+The x86\_64 guest build also needs Rust's \texttt{rust-src} component,
+Clang/libclang and \texttt{bindgen-cli} 0.71.1; \cmd{tools/ci-setup.sh}
+installs them.
 
 \section{AArch64}
 
@@ -341,6 +346,12 @@ software and has no output of its own, so you see it through screen
 capture in the guest, such as scrcpy over adb. Android itself has not
 been booted yet; the kernel has no suspend and no 32-bit compatibility,
 so Android needs a 64-bit-only build (DESIGN.md \S5.8).
+
+On x86\_64, \texttt{CONFIG\_KEMU=y} and \texttt{CONFIG\_RUST=y} build
+\href{https://github.com/losfair/kemu}{kemu} into the guest kernel, so
+AArch64 Linux binaries can be executed directly. Native AArch64 guest
+kernels leave kemu disabled. \cmd{tests/run-kemutest.sh} exercises the
+emulated ABI; it needs the AArch64 cross compiler and libc headers.
 
 Every guest runs this kernel: the one in the host's UEFI application
 (Chapter~\ref{ch:dom0}), or the one appended to \texttt{l4h-root} under

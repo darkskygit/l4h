@@ -6,6 +6,7 @@
  * the l4h boot info instead of the host process.
  */
 
+#include <linux/kemu.h>
 #include <linux/cpu.h>
 #include <linux/delay.h>
 #include <linux/init.h>
@@ -62,6 +63,11 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 	int cpu = (struct cpuinfo_um *)v - &boot_cpu_data;
 #ifdef CONFIG_UML_X86
 	int i;
+#endif
+
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(current))
+		return kemu_show_cpuinfo(m, cpu);
 #endif
 
 	seq_printf(m, "processor\t: %d\n", cpu);

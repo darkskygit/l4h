@@ -1,0 +1,22 @@
+Teach the Rust bindings and Clang builds about ARCH=l4h.
+
+--- a/rust/Makefile
++++ b/rust/Makefile
+@@ -306,6 +306,7 @@
+ BINDGEN_TARGET_arm	:= arm-linux-gnueabi
+ BINDGEN_TARGET_loongarch	:= loongarch64-linux-gnusf
+ BINDGEN_TARGET_um	:= $(BINDGEN_TARGET_$(SUBARCH))
++BINDGEN_TARGET_l4h	:= $(if $(CONFIG_UML_ARM64),aarch64-linux-gnu,x86_64-linux-gnu)
+ BINDGEN_TARGET		:= $(BINDGEN_TARGET_$(SRCARCH))
+ 
+ # All warnings are inhibited since GCC builds are very experimental,
+--- a/scripts/Makefile.clang
++++ b/scripts/Makefile.clang
+@@ -15,6 +15,7 @@
+ # This is only for i386 UM builds, which need the 32-bit target not -m32
+ CLANG_TARGET_FLAGS_i386		:= i386-linux-gnu
+ CLANG_TARGET_FLAGS_um		:= $(CLANG_TARGET_FLAGS_$(SUBARCH))
++CLANG_TARGET_FLAGS_l4h		:= $(if $(filter aarch64,$(SUBARCH)),aarch64-linux-gnu,x86_64-linux-gnu)
+ CLANG_TARGET_FLAGS		:= $(CLANG_TARGET_FLAGS_$(SRCARCH))
+ 
+ ifeq ($(CLANG_TARGET_FLAGS),)

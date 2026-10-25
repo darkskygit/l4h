@@ -98,6 +98,11 @@ extern long arch_prctl(struct task_struct *task, int option,
 
 #define user_stack_pointer(regs) PT_REGS_SP(regs)
 
+#ifdef CONFIG_KEMU
+unsigned long kemu_current_user_sp(void);
+#define current_user_stack_pointer() kemu_current_user_sp()
+#endif
+
 extern void arch_switch_to(struct task_struct *to);
 
 #endif /* __UM_X86_PTRACE_H */

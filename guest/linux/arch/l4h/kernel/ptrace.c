@@ -3,6 +3,7 @@
  * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
  */
 
+#include <linux/kemu.h>
 #include <linux/audit.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
@@ -15,6 +16,12 @@
 
 void user_enable_single_step(struct task_struct *child)
 {
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(child)) {
+		kemu_user_step(child, true);
+		return;
+	}
+#endif
 	set_tsk_thread_flag(child, TIF_SINGLESTEP);
 
 #ifdef SUBARCH_SET_SINGLESTEPPING
@@ -24,6 +31,12 @@ void user_enable_single_step(struct task_struct *child)
 
 void user_disable_single_step(struct task_struct *child)
 {
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(child)) {
+		kemu_user_step(child, false);
+		return;
+	}
+#endif
 	clear_tsk_thread_flag(child, TIF_SINGLESTEP);
 
 #ifdef SUBARCH_SET_SINGLESTEPPING
@@ -46,7 +59,15 @@ long arch_ptrace(struct task_struct *child, long request,
 	unsigned long __user *p = (void __user *)data;
 	void __user *vp = p;
 
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(child))
+		return kemu_arch_ptrace(child, request, addr, data);
+#endif
+
 	switch (request) {
+	case PTRACE_SINGLESTEP:
+		/* Hardware single-step remains unavailable for native tasks. */
+		return -EIO;
 	/* read the word at location addr in the USER area. */
 	case PTRACE_PEEKUSR:
 		ret = peek_user(child, addr, data);

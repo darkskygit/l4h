@@ -7,6 +7,7 @@
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/ftrace.h>
+#include <linux/kemu.h>
 #include <asm/siginfo.h>
 #include <asm/signal.h>
 #include <asm/unistd.h>
@@ -148,6 +149,11 @@ void do_signal(struct pt_regs *regs)
 {
 	struct ksignal ksig;
 	int handled_sig = 0;
+
+	if (task_is_kemu(current)) {
+		kemu_do_signal(regs);
+		return;
+	}
 
 	while (get_signal(&ksig)) {
 		handled_sig = 1;

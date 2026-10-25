@@ -4,6 +4,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/build/linux-6.18
+kemu=$root/third_party/kemu
 arch=${L4H_ARCH:-x86_64}
 case "$arch" in
     x86_64) out=$root/build/linux-l4h; sel4=$root/build/sel4 ;;
@@ -12,6 +13,10 @@ case "$arch" in
 esac
 if [ ! -d "$src" ]; then
     echo "missing $src: extract linux-6.18.y there (see DESIGN.md §13)" >&2
+    exit 1
+fi
+if [ ! -f "$kemu/overlay/kernel/kemu/Kconfig" ]; then
+    echo "missing kemu: run git submodule update --init third_party/kemu" >&2
     exit 1
 fi
 ln -sfn "$root/guest/linux/arch/l4h" "$src/arch/l4h"
@@ -38,14 +43,32 @@ for s in "$src"/.l4h-applied-*.patch; do
     cp "$p" "$applied/$n"
     rm "$s"
 done
+# Refresh upstream patch context for the stable Linux version we build.
+# Keep the imported submodule untouched.
+mkdir -p "$src/.l4h-kemu-patches"
+rsync -a --checksum --delete "$kemu/patches/" "$src/.l4h-kemu-patches/"
+patch -d "$src/.l4h-kemu-patches" -p1 -F0 -s < "$root/guest/linux/kemu-patches.patch"
 have=("$applied"/*.patch)
-want=("$root"/guest/linux/patches/*.patch)
+want=("$src"/.l4h-kemu-patches/*.patch "$root"/guest/linux/patches/*.patch)
+# Number the combined series so upstream and l4h patches have unique,
+# ordered snapshot names. Old, unnumbered snapshots are reverted once.
+names=()
+for ((i = 0; i < ${#want[@]}; i++)); do
+    printf -v name '%04d-%s' "$i" "${want[$i]##*/}"
+    names+=("$name")
+done
+overlay_hash=$(cd "$kemu" && git ls-files -z overlay | xargs -0 sha256sum | sha256sum)
 keep=0
 while [ $keep -lt ${#have[@]} ] && [ $keep -lt ${#want[@]} ] &&
       cmp -s "${have[$keep]}" "${want[$keep]}" &&
-      [ "$(basename "${have[$keep]}")" = "$(basename "${want[$keep]}")" ]; do
+      [ "${have[$keep]##*/}" = "${names[$keep]}" ]; do
     keep=$((keep + 1))
 done
+# An overlay update must first undo the l4h port on the old sources.
+if [ ! -f "$src/.l4h-kemu-overlay" ] ||
+   [ "$(cat "$src/.l4h-kemu-overlay")" != "$overlay_hash" ]; then
+    keep=0
+fi
 # A tree extracted again over the old one keeps the copies: a kept patch
 # that applies again is not in the tree.
 for ((i = 0; i < keep; i++)); do
@@ -60,10 +83,20 @@ for ((i = ${#have[@]} - 1; i >= keep; i--)); do
     patch -d "$src" -p1 -R -F0 -f -s < "${have[$i]}"
     rm "${have[$i]}"
 done
-for p in "${want[@]:$keep}"; do
+if [ "$keep" = 0 ]; then
+    for dir in kernel/kemu arch/x86/kemu rust/kemu_core; do
+        mkdir -p "$src/$dir"
+        rsync -a --checksum --delete --exclude target/ --exclude Cargo.lock \
+            "$kemu/overlay/$dir/" "$src/$dir/"
+    done
+    cp "$kemu"/overlay/include/linux/kemu*.h "$src/include/linux/"
+    echo "$overlay_hash" >"$src/.l4h-kemu-overlay"
+fi
+for ((i = keep; i < ${#want[@]}; i++)); do
+    p=${want[$i]}
     patch -d "$src" -p1 --forward -F0 -s --dry-run < "$p"
     patch -d "$src" -p1 --forward -F0 -s < "$p"
-    cp "$p" "$applied/"
+    cp "$p" "$applied/${names[$i]}"
 done
 exec 9>&-
 mkdir -p "$out"
@@ -79,6 +112,13 @@ if [ -n "${L4H_LINUX_CC:-}" ]; then
 fi
 # Regenerate the config when the defconfig changed.
 if [ ! -f "$out/.config" ] || [ "$root/guest/linux/arch/l4h/configs/defconfig" -nt "$out/.config" ]; then
+    if [ "$arch" = x86_64 ]; then
+        "${mk[@]}" rustavailable
+    fi
     "${mk[@]}" defconfig
+    if [ "$arch" = x86_64 ] && ! grep -q '^CONFIG_KEMU=y' "$out/.config"; then
+        echo "the default x86_64 guest kernel requires CONFIG_KEMU=y (check the Rust toolchain)" >&2
+        exit 1
+    fi
 fi
 "${mk[@]}" -j"${L4H_JOBS:-$(nproc)}" "${@:-vmlinux}"

@@ -89,7 +89,7 @@ host/                Rust workspace: l4h-root (root task), l4h-vmm (per guest),
                      l4h-blkd (disks), l4h-netd (switches, NICs), shared crates
 tools/               build and run scripts, l4hctl (dom0 CLI)
 tests/               integration tests (QEMU) and fuzzing
-third_party/         rust-sel4, sDDF submodules; patches/ for rust-sel4
+third_party/         rust-sel4, sDDF, kemu submodules; patches/ for rust-sel4
 ```
 
 ## Building and running
@@ -100,6 +100,9 @@ The host needs:
   guest;
 - gcc, Rust (stable, plus the nightly pinned by rust-sel4), cmake, ninja
   and the Python modules seL4 needs, in `.venv`;
+- Rust's `rust-src` component, Clang/libclang and `bindgen-cli` 0.71.1 for
+  kemu in the x86_64 guest kernel (`rustup component add rust-src` and
+  `cargo install --locked bindgen-cli --version 0.71.1`);
 - busybox, e2fsprogs and erofs-utils;
 - for the UEFI image: GRUB EFI, mtools, sfdisk and OVMF;
 - for aarch64: `gcc-aarch64-linux-gnu`, cross libc headers,
@@ -130,6 +133,14 @@ The same selection works with `tools/build-linux.sh`, `tools/run-dom0.sh`,
 `L4H_QEMU_VIRTUALIZATION=on` also exercises entry from EL2. UEFI/GCE
 image scripts remain specific to x86_64. `L4H_MEM` accepts MiB, `M` or `G`;
 `run-dom0.sh` rebuilds the seL4 RAM map and loader when its size changes.
+
+The x86_64 guest kernel includes [kemu](https://github.com/losfair/kemu)
+to run AArch64 Linux userspace directly. `tools/build-linux.sh` imports its
+patches and source overlay, then applies l4h's port; `CONFIG_KEMU=y` and
+`CONFIG_RUST=y` are enabled by default on x86_64. AArch64 guest kernels
+continue to execute AArch64 programs natively. `tests/run-kemutest.sh`
+checks the emulated ABI (requires `gcc-aarch64-linux-gnu` and cross libc
+headers); `KEMU_CMDLINE=kemu.jit=0` checks the interpreter instead.
 
 An assembled `build/l4h-aarch64.img` also boots directly on Apple Silicon
 macOS with QEMU installed (`brew install qemu`):
@@ -172,6 +183,7 @@ without it, the host reports `unknown`.
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim and fixed-container panic safety |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
+| `tests/run-kemutest.sh [vcpus]` | AArch64 userspace on x86_64: kemu syscalls, signals, TLS, threads, fork/exec, ptrace and single-step |
 | `tests/run-reclaimtest.sh [secs]` | 128 MiB checking workload in a 64 MiB memcg, with 32 MiB read-only hot data and swap; `RECLAIM_SWAP_DIR=/dev/shm` puts swap in host RAM |
 | `tests/run-objtest.sh [vcpus]` | object memory growth under fragmentation, block conversion, SMP memory stress, OOM recovery |
 | `tests/run-cryptotest.sh [vcpus] [secs] [MiB]` | dm-crypt with AES-NI (x86_64) or the ARMv8 Crypto Extensions (aarch64) vs generic C (cross-check, throughput), user SIMD state under concurrent kernel crypto |

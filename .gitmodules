@@ -10,3 +10,6 @@
 [submodule "third_party/rust-sel4"]
 	path = third_party/rust-sel4
 	url = https://github.com/seL4/rust-sel4.git
+[submodule "third_party/kemu"]
+	path = third_party/kemu
+	url = https://github.com/losfair/kemu.git

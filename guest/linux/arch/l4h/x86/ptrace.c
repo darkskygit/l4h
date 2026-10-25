@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/kemu.h>
 #include <linux/sched.h>
 #include <l4h_uctx.h>
 #include <linux/elf.h>
@@ -374,6 +375,10 @@ static const struct user_regset_view user_uml_view = {
 const struct user_regset_view *
 task_user_regset_view(struct task_struct *tsk)
 {
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(tsk))
+		return &kemu_regset_view;
+#endif
 	return &user_uml_view;
 }
 

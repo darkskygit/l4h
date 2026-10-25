@@ -14,9 +14,13 @@ struct pt_regs {
 	struct uml_pt_regs regs;
 };
 
-/* seL4 clears TF in user flags and l4h builds it without the hardware
- * debug API: PTRACE_SINGLESTEP fails (EIO) rather than run to the next stop. */
+/* seL4 clears TF in user flags: native PTRACE_SINGLESTEP fails with EIO
+ * in arch_ptrace(). kemu can step an emulated instruction in software. */
+#ifdef CONFIG_KEMU
+#define arch_has_single_step()	(1)
+#else
 #define arch_has_single_step()	(0)
+#endif
 
 #define EMPTY_REGS { .regs = EMPTY_UML_PT_REGS }
 
