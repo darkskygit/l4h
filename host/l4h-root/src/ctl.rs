@@ -214,7 +214,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                     },
                     vcpus: g.vcpus.len() as u32,
                     reserved: 0,
-                    ram: g.ram_size() as u64,
+                    ram: g.owned_ram() as u64,
                     name: [0; abi::CTL_NAME_MAX],
                 };
                 let nb = g.name.as_bytes();

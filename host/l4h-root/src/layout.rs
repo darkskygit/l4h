@@ -93,8 +93,6 @@ regions! {
     MODULES = 0x7300_0000_0000, 64 * GIB;
     /// trustd's guest registry (trustd.rs).
     TRUSTD_REGISTRY = 0x7500_0000_0000, PAGE;
-    /// The guest kernel's module image, in 2 MiB pages (kimage.rs).
-    KMOD_IMAGE = 0x7600_0000_0000, l4h_abi::KMOD_MAX as usize;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
     /// IOMMU registers: 16 KiB per AMD-Vi unit, 64 KiB per VT-d unit.

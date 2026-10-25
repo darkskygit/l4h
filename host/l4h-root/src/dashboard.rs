@@ -282,7 +282,7 @@ impl Dashboard {
             w.fg = color;
             let _ = write!(w, "{:<8}", state);
             w.fg = FG;
-            let _ = write!(w, " {:>5} {:>6}M {:>5}.{} ", g.vcpus.len(), g.ram_size() >> 20, cpu / 10, cpu % 10);
+            let _ = write!(w, " {:>5} {:>6}M {:>5}.{} ", g.vcpus.len(), g.owned_ram() >> 20, cpu / 10, cpu % 10);
             let _ = if g.cpu_cap_pct == 0 { write!(w, "{:>5}  ", "-") } else { write!(w, "{:>5}  ", g.cpu_cap_pct) };
             for (i, v) in g.vcpus.iter().take(8).enumerate() {
                 let _ = write!(w, "{}{}", if i == 0 { "" } else { "," }, v.core);

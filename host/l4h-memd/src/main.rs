@@ -159,14 +159,18 @@ impl Memd {
         0
     }
 
-    fn guest_give(&mut self, g: usize, first: usize) -> u64 {
+    fn guest_give(&mut self, g: usize, first: usize, skip: usize) -> u64 {
         let Some(r) = self.guest(g) else { return EINVAL };
+        if r.blocks.len + skip > 1 << r.radix {
+            return EINVAL;
+        }
         let bcn = cap::<cap_type::CNode>(memd::SLOT_GUEST_BCN + g as u64);
         for (b, i) in self.mem.iter(r.blocks).enumerate().skip(first) {
             // A block without children: its copy is a sibling Untyped
             // that the guest can retype and revoke, and revoking the
             // original still deletes everything made from either.
-            if bcn.absolute_cptr_from_bits_with_depth(b as u64, r.radix).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
+            let to = bcn.absolute_cptr_from_bits_with_depth((b + skip) as u64, r.radix);
+            if to.copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
                 return EINVAL;
             }
         }
@@ -258,7 +262,7 @@ fn main(info: &'static Info) -> ! {
                 len = 2;
                 d.guest_copy(mr(0) as usize, mr(1) as usize)
             }
-            memd::MEMD_GUEST_GIVE => d.guest_give(mr(0) as usize, mr(1) as usize),
+            memd::MEMD_GUEST_GIVE => d.guest_give(mr(0) as usize, mr(1) as usize, mr(2) as usize),
             memd::MEMD_GUEST_DESTROY => d.guest_destroy(mr(0) as usize),
             memd::MEMD_BALLOON => d.balloon(),
             _ => EINVAL,

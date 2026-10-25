@@ -170,7 +170,7 @@ fn run(h: &mut Host, line: &str) {
             for g in h.guests.iter().flatten() {
                 sel4::debug_println!(
                     "monitor: vm {} '{}': {:?}, {} vCPU(s), {} MiB{}",
-                    g.id, g.name, g.state, g.vcpus.len(), g.ram_size() >> 20,
+                    g.id, g.name, g.state, g.vcpus.len(), g.owned_ram() >> 20,
                     if g.dom0 { ", dom0" } else { "" }
                 );
             }

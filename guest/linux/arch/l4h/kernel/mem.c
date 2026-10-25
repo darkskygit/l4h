@@ -111,7 +111,10 @@ DECLARE_VM_GET_PAGE_PROT
 
 void mark_rodata_ro(void)
 {
-	/* The host maps guest RAM read-write; rodata stays writable. */
+	/*
+	 * The host maps text and rodata read-only, shared by all guests
+	 * (vmlinux.lds.S); __ro_after_init data is with the data, writable.
+	 */
 }
 
 /*

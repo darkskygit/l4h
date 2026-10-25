@@ -129,9 +129,10 @@ pub fn guest_copy(alloc: &Alloc, g: usize, b: usize, slot: Slot) -> usize {
     paddr
 }
 
-/// Give guest `g` its blocks from `first` on.
-pub fn guest_give(alloc: &Alloc, g: usize, first: usize) -> bool {
-    link(alloc).call(memd::MEMD_GUEST_GIVE, &[g as u64, first as u64]) == 0
+/// Give guest `g` its blocks from `first` on, block b at index b + `skip`
+/// of its block CNode (past its shared blocks, guest.rs).
+pub fn guest_give(alloc: &Alloc, g: usize, first: usize, skip: usize) -> bool {
+    link(alloc).call(memd::MEMD_GUEST_GIVE, &[g as u64, first as u64, skip as u64]) == 0
 }
 
 /// Revoke and free all the RAM of guest `g`.

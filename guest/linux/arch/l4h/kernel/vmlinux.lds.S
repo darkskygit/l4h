@@ -2,8 +2,14 @@
 /*
  * Linker script of the l4h guest kernel: a static ELF image whose first
  * byte is guest-physical address 0 (see l4h/abi.h, ram_base_va).
+ *
+ * The host maps the pages of its read-only segments (text and rodata)
+ * read-only from one copy that every guest shares (DESIGN.md §5.6), so
+ * nothing the kernel writes may be in them: __ro_after_init data and
+ * the exception table, which is sorted at boot, go with the data.
  */
 #define RUNTIME_DISCARD_EXIT
+#define RO_AFTER_INIT_DATA
 #include <asm/vmlinux.lds.h>
 #include <asm/page.h>
 
@@ -43,9 +49,17 @@ SECTIONS
   init.data : { INIT_DATA }
   __init_end = .;
 
+  EXCEPTION_TABLE(16)
+
   .data    :
   {
     INIT_TASK_DATA(KERNEL_STACK_SIZE)
+    . = ALIGN(8);
+    __start_ro_after_init = .;
+    *(.data..ro_after_init)
+    JUMP_TABLE_DATA
+    STATIC_CALL_DATA
+    __end_ro_after_init = .;
     DATA_DATA
     CONSTRUCTORS
   }

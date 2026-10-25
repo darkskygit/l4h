@@ -255,14 +255,16 @@ impl Host {
     }
 
     pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
-        let bytes = cfg.ram.checked_add(cfg.io_pool)?;
+        let kernel = self.kernel.as_ref()?;
+        let kmods = self.kmods.as_ref().map_or(0, |k| k.bytes());
+        let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(kmods)?;
         if !self.can_afford(bytes, cfg.vspaces + 4, 0) {
             return None;
         }
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
         self.alloc.slots.track(id);
         let asids = self.asids.in_use;
-        let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info);
+        let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel);
         if let (Ok(g), Some(t)) = (&mut g, &self.trustd) {
             t.give(g, &mut self.alloc, &mut self.wins.a);
         }
@@ -505,11 +507,11 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
     let cfg = config::Config::new(module("l4h-config"));
     let kernel = module("guest-kernel").and_then(|k| {
-        kimage::Kernel::parse(k)
+        kimage::Kernel::parse(k, &modules)
             .inspect_err(|e| sel4::debug_println!("l4h-root: the guest kernel cannot be loaded: {}", e))
             .ok()
     });
-    let kmods = module("guest-kmods").and_then(|m| kimage::Kmods::new(&mut alloc, m));
+    let kmods = module("guest-kmods").and_then(|m| kimage::Kmods::new(&modules, m));
     let dom0_initrd = module("dom0-initrd").unwrap_or(&[]);
     // ACPI table frames are shared by RTC discovery, reset and trustd.
     #[cfg(target_arch = "x86_64")]
