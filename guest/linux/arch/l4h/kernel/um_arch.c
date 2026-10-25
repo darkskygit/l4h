@@ -134,9 +134,11 @@ long elf_aux_hwcap2;
 unsigned long end_iomem;
 EXPORT_SYMBOL(end_iomem);
 
-/* Process address spaces end below the last 512 GiB of the seL4 user
- * address range (PGDIR aligned, as UML requires). */
-#define L4H_TASK_SIZE	0x00007f8000000000UL
+/* Use seL4's x86_64 limit on both ISAs: x86_64 reserves the final page
+ * below 2^47.  Process and kernel VSpaces are separate, so userspace can
+ * use the last PGD slot too.  USER_PTRS_PER_PGD rounds up to include it;
+ * TASK_SIZE need not be PGDIR aligned. */
+#define L4H_TASK_SIZE	0x00007ffffffff000UL
 
 static int panic_exit(struct notifier_block *self, unsigned long unused1,
 		      void *unused2)

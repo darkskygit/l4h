@@ -569,7 +569,10 @@ virtio-l4h code. The Linux base is 6.18; patches outside arch/l4h are in
 - **Guest-process VSpaces** cache Linux `mm_struct` mappings in a fixed
   pool of host-provided VSpace roots (§5.3). The guest makes their page
   tables and mapping slots from its own RAM. They hold only user mappings,
-  plus vDSO and vvar.
+  plus vDSO and vvar. Userspace extends to `0x7ffffffff000` (exclusive)
+  on both ISAs, leaving the final page below 2^47 reserved as seL4 requires
+  on x86_64.
+  Fixed mappings such as `0x7fffffe00000` can use the last 512 GiB too.
 - The two kinds are disjoint, and that disjointness is what isolates the guest
   kernel from guest user code. Every seL4 mapping is user-accessible, so the
   kernel's memory must not be mapped into a process VSpace at all. Kernel and
