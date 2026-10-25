@@ -136,6 +136,84 @@ static void test_mmap(void)
 	CHECK(munmap(p, len) == 0, "munmap");
 }
 
+/* Run after exec without ASLR, so the stack cannot land on the fixed
+ * address near the top of user space. */
+static void mmap_high_child(void)
+{
+	const uintptr_t addrs[] = {
+		0x7f7ffffff000ul, /* crosses the old limit / PGD boundary */
+		0x7ff000000000ul, /* special pages in the separate kernel VSpace */
+		0x7fffffe00000ul,
+	};
+	const size_t len = 2 * 4096;
+	int fds[2], status;
+	char buf[16];
+	pid_t pid;
+
+	CHECK(pipe(fds) == 0, "pipe: %s", strerror(errno));
+	for (size_t i = 0; i < sizeof(addrs) / sizeof(addrs[0]); i++) {
+		unsigned char *p = mmap((void *)addrs[i], len, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+
+		CHECK(p == (void *)addrs[i], "mmap at %#lx: %p (%s)", addrs[i], p,
+		      strerror(errno));
+		CHECK(p[0] == 0 && p[len - 1] == 0, "anonymous pages not zeroed");
+		memset(p, 0x5a, len);
+		CHECK(write(fds[1], p, sizeof(buf)) == sizeof(buf), "copy from high address");
+		memset(p + 4096, 0, sizeof(buf));
+		CHECK(read(fds[0], p + 4096, sizeof(buf)) == sizeof(buf), "copy to high address");
+		CHECK(p[4096] == 0x5a, "high address data");
+
+		pid = fork();
+		CHECK(pid >= 0, "fork: %s", strerror(errno));
+		if (!pid) {
+			if (p[0] != 0x5a || p[len - 1] != 0x5a)
+				_exit(1);
+			memset(p, 0xa5, len);
+			_exit(p[0] != 0xa5 || p[len - 1] != 0xa5);
+		}
+		CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0, "high address child: status %#x", status);
+		CHECK(p[0] == 0x5a && p[len - 1] == 0x5a, "high address COW");
+		CHECK(mprotect(p, len, PROT_NONE) == 0, "mprotect high address");
+		CHECK(write(fds[1], p, 1) == -1 && errno == EFAULT, "high address protection");
+		CHECK(munmap(p, len) == 0, "munmap high address");
+		p = mmap((void *)addrs[i], len, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+		CHECK(p == (void *)addrs[i], "remap high address: %s", strerror(errno));
+		CHECK(p[0] == 0 && p[len - 1] == 0, "stale high address mapping");
+		CHECK(munmap(p, len) == 0, "munmap high address again");
+	}
+	close(fds[0]);
+	close(fds[1]);
+
+	/* The final page remains reserved, including mappings that
+	 * start below it and extend into it. */
+	const uintptr_t invalid[] = { 0x7ffffffff000ul, 0x7fffffffe000ul, 0x800000000000ul };
+	for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+		void *p = mmap((void *)invalid[i], len, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+
+		CHECK(p == MAP_FAILED && errno == ENOMEM, "mmap past user limit at %#lx: %p (%s)",
+		      invalid[i], p, strerror(errno));
+	}
+}
+
+static void test_mmap_high(void)
+{
+	int status;
+	pid_t pid = fork();
+
+	CHECK(pid >= 0, "fork: %s", strerror(errno));
+	if (!pid) {
+		if (personality(ADDR_NO_RANDOMIZE) != -1)
+			execl("/proc/self/exe", "selftest", "--mmap-high-child", NULL);
+		_exit(99);
+	}
+	CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "high address test: status %#x", status);
+}
+
 /* Kernel copies to and from user memory honour its protection. */
 static void test_uaccess_prot(void)
 {
@@ -1439,6 +1517,7 @@ static const struct test tests[] = {
 	{ "arm_exceptions", test_arm_exceptions },
 #endif
 	{ "mmap", test_mmap },
+	{ "mmap_high", test_mmap_high },
 	{ "segv", test_segv },
 	{ "nx", test_nx },
 #ifndef __aarch64__
@@ -1481,6 +1560,10 @@ int main(int argc, char **argv)
 	unsigned i;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
+	if (argc == 2 && !strcmp(argv[1], "--mmap-high-child")) {
+		mmap_high_child();
+		return failures != 0;
+	}
 	printf("SELFTEST: start (%ld CPUs online)\n", sysconf(_SC_NPROCESSORS_ONLN));
 	for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
 		int before = failures, j, want = argc < 2;
