@@ -46,8 +46,9 @@ pub const MEMD_GUEST_CREATE: u64 = 3;
 /// slot 0, for l4h-root to fill with frames (a boot block); reply MR1 =
 /// its physical address.  Once per block, before MEMD_GUEST_GIVE.
 pub const MEMD_GUEST_COPY: u64 = 4;
-/// MR0 = guest, MR1 = first block: copies of the Untypeds of blocks
-/// [first, blocks) into the guest's block CNode, at their index.
+/// MR0 = guest, MR1 = first block, MR2 = skip: copies of the Untypeds of
+/// blocks [first, blocks) into the guest's block CNode, block b at index
+/// b + skip (the guest's blocks of the shared kernel image have none).
 pub const MEMD_GUEST_GIVE: u64 = 5;
 /// MR0 = guest: revoke every block of its RAM, which deletes all that was
 /// made of them (its frames and objects, l4h-root's frames of its boot

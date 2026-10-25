@@ -12,6 +12,12 @@
 //! retype (all but the boot blocks, of which l4h-root gets a copy to fill
 //! with frames for the image).  memd revokes the originals at destroy,
 //! which deletes whatever the guest and l4h-root made of them.
+//!
+//! The blocks of the kernel image that every guest shares (kimage.rs) are
+//! not among them: they hold read-only copies of the boot module's
+//! frames, and are guest-physical space on top of the RAM the guest was
+//! given.  Guest block b is memd's block b less the shared blocks below
+//! it (`memd_block`).
 
 use core::ptr;
 
@@ -86,7 +92,8 @@ const IO_POOL_ALIGN: usize = 2 << 20;
 
 pub struct GuestConfig<'a> {
     pub name: &'a str,
-    /// Bytes of RAM, rounded up to whole blocks.
+    /// Bytes of RAM, rounded up to whole blocks.  The shared blocks of the
+    /// kernel image come on top.
     pub ram: usize,
     pub vcpus: usize,
     /// Bytes of I/O pool (a power of two, IO_POOL_MIN..=IO_POOL_MAX).
@@ -214,10 +221,13 @@ pub struct Guest {
     pub cnode: cap::CNode,
     pub vspace: cap::VSpace,
     pub ram_base: usize,
-    /// Blocks of RAM (memd holds their Untypeds).
+    /// Blocks of guest-physical RAM: memd's (it holds their Untypeds) and
+    /// the shared ones.
     pub nr_blocks: usize,
-    /// Blocks l4h-root filled with frames (boot blocks), one bit each;
-    /// their level-2 RAM CNodes are in `ram_l1`.
+    /// Shared blocks of the kernel image, one bit each (Kernel::shared).
+    shared: u64,
+    /// Blocks l4h-root filled with frames (boot blocks, shared blocks),
+    /// one bit each; their level-2 RAM CNodes are in `ram_l1`.
     filled: [u64; abi::MAX_BLOCKS / 64],
     /// Level-1 RAM CNodes, one per GiB of guest-physical space.
     ram_l1: ArrayVec<cap::CNode, { abi::MAX_RAM_L1 }>,
@@ -281,12 +291,32 @@ impl Guest {
         ObjCtx::arena(alloc, &mut self.arena)
     }
 
+    /// Bytes of guest-physical RAM, shared blocks included.
     pub fn ram_size(&self) -> usize {
         self.nr_blocks * BLOCK
     }
 
+    /// Bytes of RAM the guest was given: without the shared blocks.
+    pub fn owned_ram(&self) -> usize {
+        (self.nr_blocks - self.shared.count_ones() as usize) * BLOCK
+    }
+
     fn is_filled(&self, b: usize) -> bool {
         self.filled[b / 64] & (1 << (b % 64)) != 0
+    }
+
+    fn is_shared(&self, b: usize) -> bool {
+        b < 64 && self.shared & (1 << b) != 0
+    }
+
+    /// Shared blocks below block `b`.
+    fn shared_below(&self, b: usize) -> usize {
+        (self.shared & 1u64.checked_shl(b as u32).map_or(u64::MAX, |m| m - 1)).count_ones() as usize
+    }
+
+    /// memd's index of guest block `b`, which is not shared.
+    fn memd_block(&self, b: usize) -> usize {
+        b - self.shared_below(b)
     }
 
     /// Destination for a capability in the guest's root CNode.
@@ -337,7 +367,7 @@ impl Guest {
             .expect("level-2 RAM CNode");
         // A copy of the block's Untyped, which memd revokes at destroy.
         let ut = alloc.slots.alloc();
-        let paddr = memd::guest_copy(alloc, self.id, b, ut);
+        let paddr = memd::guest_copy(alloc, self.id, self.memd_block(b), ut);
         UtRegion::fresh(root_cap::<cap_type::Untyped>(ut), paddr, abi::BLOCK_SHIFT)
             .retype(&FRAME_BP, BLOCK_FRAMES, Dest { cnode: abs(l2), offset: 0 })
             .expect("RAM frames");
@@ -356,14 +386,41 @@ impl Guest {
         alloc.slots.free(tmp);
     }
 
+    /// Fill shared block `b` with read-only copies of the kernel's frames
+    /// for it, mapped in the direct map.  It has no Untyped: nothing of it
+    /// is the guest's.
+    fn share_block(&mut self, alloc: &mut Alloc, kernel: &Kernel, b: usize) {
+        let l2 = self.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::RAM_L2_BITS });
+        self.ram_l1[b >> abi::RAM_L2_BITS]
+            .absolute_cptr_from_bits_with_depth((b & ((1 << abi::RAM_L2_BITS) - 1)) as u64, abi::RAM_L2_BITS)
+            .copy(&abs(l2), CapRights::all())
+            .expect("level-2 RAM CNode");
+        self.filled[b / 64] |= 1 << (b % 64);
+        let tmp = alloc.slots.alloc();
+        for i in 0..BLOCK_FRAMES {
+            let gpa = b * BLOCK + i * PAGE;
+            kernel.copy_frame(gpa, tmp);
+            let frame = root_cap::<cap_type::Granule>(tmp);
+            let (vspace, va) = (self.vspace, self.ram_base + gpa);
+            map_frame(&mut self.ctx(alloc), vspace, frame, va, CapRights::read_only(), VmAttributes::DEFAULT);
+            self.ram_frame(gpa).move_(&abs(frame)).expect("move shared frame");
+        }
+        alloc.slots.free(tmp);
+    }
+
     /// Make guest RAM [gpa, gpa + len) host frames, to load an image into
-    /// it before the guest runs.
+    /// it before the guest runs.  Shared blocks are read-only: nothing is
+    /// loaded into them.
     fn prepare_ram(&mut self, alloc: &mut Alloc, gpa: usize, len: usize) -> bool {
         if !self.valid_gpa(gpa, len) || self.state != State::Created || self.boot_blocks != 0 {
             return false;
         }
         if len != 0 {
-            for b in gpa / BLOCK..=(gpa + len - 1) / BLOCK {
+            let blocks = gpa / BLOCK..=(gpa + len - 1) / BLOCK;
+            if blocks.clone().any(|b| self.is_shared(b)) {
+                return false;
+            }
+            for b in blocks {
                 self.block_frames(alloc, b);
             }
         }
@@ -527,7 +584,11 @@ impl Guest {
         if len == 0 {
             return Some((0, 0));
         }
-        Some(self.block_frames_cost(gpa / BLOCK..(gpa + len).div_ceil(BLOCK)))
+        let blocks = gpa / BLOCK..(gpa + len).div_ceil(BLOCK);
+        if blocks.clone().any(|b| self.is_shared(b)) {
+            return None;
+        }
+        Some(self.block_frames_cost(blocks))
     }
 
     /// The boot blocks for an image ending at `kernel_end` and `initrd`: a
@@ -591,7 +652,11 @@ impl Guest {
         for b in 0..boot {
             self.block_frames(alloc, b);
         }
-        if !memd::guest_give(alloc, self.id, boot) {
+        // memd gives its blocks from the first after the boot blocks on, at
+        // their guest index: past the shared blocks, which are all in the
+        // image.
+        let shared = self.shared_below(boot);
+        if shared != self.shared.count_ones() as usize || !memd::guest_give(alloc, self.id, boot - shared, shared) {
             return false;
         }
         self.boot_blocks = boot;
@@ -764,20 +829,37 @@ pub fn create(
     alloc: &mut Alloc,
     asids: &mut AsidPools,
     host_info: &HostInfo,
+    kernel: &Kernel,
 ) -> Result<Guest, Option<Guest>> {
     // Every value comes from the control API: check before computing.
     if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < (8 << 20) || cfg.ram > abi::MAX_BLOCKS * BLOCK {
         return Err(None);
     }
-    if cfg.ram_base % PAGE != 0 {
+    if cfg.ram_base % PAGE != 0 || cfg.ram_base != kernel.ram_base {
         return Err(None);
     }
     if !cfg.io_pool.is_power_of_two() || cfg.io_pool < IO_POOL_MIN || cfg.io_pool > IO_POOL_MAX {
         return Err(None);
     }
     let ram_base = cfg.ram_base;
-    let ram = cfg.ram.next_multiple_of(BLOCK);
-    let nr_blocks = ram / BLOCK;
+    // The guest's own blocks, and the kernel's shared blocks on top, of
+    // those that fall within them (all, unless RAM is too small for the
+    // image to boot).
+    let owned = cfg.ram.next_multiple_of(BLOCK) / BLOCK;
+    let mut shared = kernel.shared;
+    loop {
+        let n = owned + shared.count_ones() as usize;
+        let within = shared & 1u64.checked_shl(n as u32).map_or(u64::MAX, |m| m - 1);
+        if within == shared {
+            break;
+        }
+        shared = within;
+    }
+    let nr_blocks = owned + shared.count_ones() as usize;
+    if nr_blocks > abi::MAX_BLOCKS {
+        return Err(None);
+    }
+    let ram = nr_blocks * BLOCK;
     // The I/O pool follows RAM in guest-physical space and in the direct map.
     let pool_gpa = ram.next_multiple_of(IO_POOL_ALIGN);
     if ram_base == 0 || ram_base.checked_add(pool_gpa + cfg.io_pool).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
@@ -797,7 +879,7 @@ pub fn create(
     let estimate = (32 << abi::ROOT_CNODE_BITS) * 4
         + n_l1 * (32 << abi::RAM_L2_BITS)
         + (32 << block_radix)
-        + 16 * ((32 << abi::RAM_L2_BITS) + PAGE)
+        + (16 + shared.count_ones() as usize) * ((32 << abi::RAM_L2_BITS) + PAGE)
         + 2 * 32 * pool_pages
         + (cfg.io_pool / 512 + 2 * PAGE)
         + cfg.vcpus * (16 << 10)
@@ -805,7 +887,7 @@ pub fn create(
         + abi::BOOTINFO_SIZE as usize
         + if cfg.dom0 { abi::CTL_LOAD_MAX as usize } else { 0 }
         + vmm::arena_bytes(cfg.io_pool, cfg.vcpus, MAX_GUEST_DEVICES);
-    if alloc.free_bytes() < estimate + ram + cfg.io_pool {
+    if alloc.free_bytes() < estimate + owned * BLOCK + cfg.io_pool {
         return Err(None);
     }
     let mut arena = alloc.arena(estimate).ok_or(None)?;
@@ -827,6 +909,7 @@ pub fn create(
         vspace,
         ram_base,
         nr_blocks: 0,
+        shared,
         filled: [0; abi::MAX_BLOCKS / 64],
         ram_l1: ArrayVec::new(),
         boot_blocks: 0,
@@ -875,6 +958,7 @@ pub fn create(
     // memory (physically contiguous within the block only).  Nothing is
     // retyped yet: the image is loaded into blocks that become host
     // frames (boot blocks), and the guest gets the others as Untypeds.
+    // The shared blocks of the image are filled now.
     // Level-1 RAM CNodes (one per GiB, resolving 9 bits) for the guest's
     // level-2 RAM CNodes, and the block CNode for the Untyped copies.
     let guard0 = CNodeCapData::new(0, 0).into_word();
@@ -886,10 +970,15 @@ pub fn create(
     let block_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: block_radix });
     let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix).into_word();
     g.give_badged(abi::SLOT_BLOCKS, block_cn, CapRights::all(), guard);
-    if !memd::guest_create(alloc, id, nr_blocks, block_cn, block_radix) {
+    if !memd::guest_create(alloc, id, owned, block_cn, block_radix) {
         return Err(Some(g));
     }
     g.nr_blocks = nr_blocks;
+    for b in 0..nr_blocks.min(64) {
+        if g.is_shared(b) {
+            g.share_block(alloc, kernel, b);
+        }
+    }
     let tmp = alloc.slots.alloc();
 
     // ---- I/O pool: one physically contiguous Untyped retyped into frames,
@@ -1023,8 +1112,8 @@ pub fn create(
     }
 
     info!(
-        "l4h-root: guest {} '{}' created: {} MiB RAM in {} blocks, {} vCPU(s), {} MiB I/O pool, {} KiB host objects",
-        id, g.name, ram >> 20, nr_blocks, cfg.vcpus, g.pool.size >> 20, g.arena.bytes() >> 10
+        "l4h-root: guest {} '{}' created: {} MiB RAM in {} blocks (and {} shared), {} vCPU(s), {} MiB I/O pool, {} KiB host objects",
+        id, g.name, owned * BLOCK >> 20, owned, nr_blocks - owned, cfg.vcpus, g.pool.size >> 20, g.arena.bytes() >> 10
     );
     info!("l4h-root: guest {} '{}' initial CPUs {:?}", id, g.name, crate::sched::Cores(&g.vcpus));
     Ok(g)
@@ -1039,9 +1128,16 @@ pub fn boot(g: &mut Guest, alloc: &mut Alloc, win: &mut Window, host_info: &Host
     if g.ram_base != kernel.ram_base || (initrd.1 != 0 && initrd.0 < kernel.end) || !g.loaded.iter().all(within) {
         return false;
     }
+    // Into every block but the shared ones, which already hold the image.
     for seg in kernel.elf.segments() {
-        if !g.write_ram(alloc, win, seg.vaddr as usize - g.ram_base, seg.data) {
-            return false;
+        let gpa = seg.vaddr as usize - g.ram_base;
+        let mut off = 0;
+        while off < seg.data.len() {
+            let n = (BLOCK - (gpa + off) % BLOCK).min(seg.data.len() - off);
+            if !g.is_shared((gpa + off) / BLOCK) && !g.write_ram(alloc, win, gpa + off, &seg.data[off..off + n]) {
+                return false;
+            }
+            off += n;
         }
     }
     g.write_boot_info(alloc, win, host_info, kernel.elf.entry, kernel.end, initrd, cmdline)

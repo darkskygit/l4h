@@ -925,12 +925,40 @@ including pool addresses, device indices and lifecycle state.
   `ARCH=l4h`, so `make -C /lib/modules/$(uname -r)/build M=$PWD` works in
   a guest as on any distribution. The image is the boot module
   `guest-kmods`, and is optional.
-- **Shared read-only.** Root copies the image into 2 MiB pages at boot and
-  maps them read-only into every guest at `L4H_KMOD_VA` (bootinfo
-  `kmod_va`, `kmod_size`): one copy in host memory for all guests, and a
-  few capability slots per guest. `drivers/kmod.c` makes it the read-only
-  block device `/dev/l4hkmod`, and `mount -t erofs -o ro /dev/l4hkmod
-  /lib/modules` gives modprobe the modules and module builds the tree.
+- **Shared read-only.** Root maps the boot module's own pages read-only
+  into every guest at `L4H_KMOD_VA` (bootinfo `kmod_va`, `kmod_size`):
+  one copy in host memory for all guests, the one the boot loader
+  loaded, with nothing allocated or copied at boot. Each guest's copies
+  of the frame capabilities are in a CNode of its arena, about 150 KiB
+  with the page tables mapping them for a 9 MiB image. Root knows the
+  frame of each module page (`bootmod.rs`): it carved a boot loader's
+  modules into frames itself, and modules appended to its image are in
+  the image frames seL4 gives it. `drivers/kmod.c` makes the image the
+  read-only block device `/dev/l4hkmod`, and `mount -t erofs -o ro
+  /dev/l4hkmod /lib/modules` gives modprobe the modules and module
+  builds the tree.
+- **The kernel's text and rodata are shared too.** Every guest maps the
+  pages of the kernel's read-only segments from the boot module's frames,
+  read-only, so a guest can no longer change its own kernel's code. A
+  page is shared when it is all file data of a read-only segment; the
+  host saves memory for RAM blocks (§15.2) whose every page is: such a
+  block holds only those copies, and memd has no block for it. The
+  linker script keeps whatever the kernel writes out of those segments
+  (`__ro_after_init` data and the exception table, which is sorted at
+  boot, go with the data) and pads text to a page and rodata to a block,
+  so the 11.7 MiB of text and 2.3 MiB of rodata on x86_64 are seven
+  blocks: 14 MiB per guest. Shared blocks do not count against a guest's
+  RAM: they are guest-physical space on top of the RAM it is given, so a
+  guest of 256 MiB has 256 MiB of its own and 270 MiB of RAM in its boot
+  info. Blocks that are only partly read-only (none with this layout)
+  get private copies, as all blocks did before. Writes to shared pages
+  fault, which stops the guest (§5.2): a kernel change that writes text
+  or rodata shows at boot.
+- **Side channel.** Guests share the physical pages of kernel code, as
+  with the module image, so one guest can time its access to them to
+  learn which kernel code another runs (Flush+Reload). Pages shared this
+  way are never written, so the kernel's data and other guests' memory
+  stay out of reach.
 - **Modules may use the l4h ABI.** A module comes from the kernel's own
   build, so it can call seL4 and use the ABI directly. The kernel exports
   its capability allocator (`l4h_slot_alloc`, `l4h_obj_alloc`, …), process
@@ -959,8 +987,9 @@ from the architecture:
   register, so it keeps vmalloc as well. It builds them with `movz`
   instead of `movn`, since the guest kernel's addresses are in the lower
   half.
-- **Code patching.** Guest-kernel memory is mapped writable and
-  executable, so new images are written in place. On x86, code that other
+- **Code patching.** Guest-kernel memory other than the image's text and
+  rodata (§5.6) is mapped writable and executable, so new images are
+  written in place. On x86, code that other
   vCPUs may be running (direct tail calls, trampolines) is patched without
   int3, since a breakpoint in the guest kernel goes to the host. Instead,
   `stop_machine()` holds every vCPU with interrupts off, one vCPU writes,
@@ -2720,10 +2749,13 @@ memory the guest can retype.
   longer physically contiguous at all, and the chunk table and
   `VMM_MAX_RAM_CHUNKS` are gone. The originals stay in the guest's arena
   (`Arena::owned`), so destroy revokes them as before. Each block costs the
-  host one root CNode slot.
+  host one root CNode slot. The kernel image's shared blocks (§5.6) are
+  added to these, and have no Untyped.
 - **Boot blocks.** `l4h-root` turns a block into host frames (a level-2 RAM
   CNode, 512 frames, mapped in the direct map) when an image is loaded into
-  it (the kernel, or an initramfs). At `VM_START` the boot blocks
+  it (the kernel, or an initramfs). Shared blocks get their level-2 CNode
+  at create, holding read-only copies of the kernel's frames; nothing is
+  loaded into them (`VM_LOAD` there fails). At `VM_START` the boot blocks
   are the prefix of RAM up to the end of the kernel, the initrd (if it is
   not empty) and anything loaded, plus `BOOT_SLACK` (one) block for the
   guest kernel's memory until it has mapped the rest; at least one block
@@ -3042,7 +3074,9 @@ Behaviour is unchanged.
   2 MiB blocks. When an image is loaded into a block, memd gives root a
   copy of its Untyped, which root fills with frames as before (a boot
   block). At boot, memd copies the Untypeds of the other blocks into the
-  block CNode. At destroy, once root has reclaimed its arena, memd revokes
+  block CNode, past the shared blocks of the kernel image (§5.6), which
+  memd has no block for: its block b is the guest's b plus the shared
+  blocks below it. At destroy, once root has reclaimed its arena, memd revokes
   every original: that deletes the guest's copies, everything the guest
   made of them, and root's copies of boot blocks with their frames. The
   order matters: with the VSpace roots (in the arena) gone first,

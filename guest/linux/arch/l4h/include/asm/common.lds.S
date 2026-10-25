@@ -5,18 +5,25 @@
   _etext = .;
   PROVIDE (etext = .);
 
-  . = ALIGN(4096);
+  /*
+   * Text and rodata fill whole pages of their segments, and rodata ends
+   * at a RAM block (L4H_BLOCK_SIZE): the host shares only pages that a
+   * read-only segment's file data covers, and saves memory only for
+   * blocks of them.
+   */
+  .text.l4h_pad : { BYTE(0) . = ALIGN(4096); } =0
   _sdata = .;
   PROVIDE (sdata = .);
 
   RO_DATA(4096)
+
+  .rodata.l4h_pad : { BYTE(0) . = ALIGN(0x200000); } =0
 
   .unprotected : { *(.unprotected) }
   . = ALIGN(4096);
   PROVIDE (_unprotected_end = .);
 
   . = ALIGN(4096);
-  EXCEPTION_TABLE(0)
 
   BUG_TABLE
 

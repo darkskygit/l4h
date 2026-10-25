@@ -367,7 +367,7 @@ impl Trustd {
         let Some(launch) = g.launch else { return };
         let r = GuestRecord {
             instance: 0,
-            ram: g.ram_size() as u64,
+            ram: g.owned_ram() as u64,
             vcpus: g.vcpus.len() as u32,
             flags: if g.dom0 { trust::RECORD_DOM0 } else { 0 },
             launch,

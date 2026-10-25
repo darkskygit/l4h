@@ -87,7 +87,7 @@ const unsigned char * const x86_nops[ASM_NOP_MAX + 1] = {
 };
 
 /*
- * Guest-kernel memory is mapped writable and executable, so code that no
+ * BPF images are mapped writable and executable, so code that no
  * CPU runs yet (a new BPF image, or the freed part of one) is written
  * directly.
  */
