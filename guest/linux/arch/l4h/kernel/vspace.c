@@ -393,6 +393,7 @@ void l4h_mm_init(struct mm_struct *mm)
 	m->vs = -1;
 	m->gen = 0;
 	atomic_set(&m->running, 0);
+	m->moved = false;
 }
 
 /*
@@ -408,6 +409,7 @@ static void vs_detach(struct vs_slot *s)
 	s->as.charged = 0;
 	m->vs = -1;
 	m->gen = 0;
+	m->moved = false;
 	s->owner = NULL;
 	list_del_init(&s->lru);
 	nr_resetting++;
@@ -517,6 +519,8 @@ unsigned long l4h_mm_activate(struct mm_struct *mm, u64 *gen)
 	s->owner = mm;
 	m->vs = s - vs_pool;
 	m->gen = atomic64_inc_return(&vs_generation);
+	/* An emptied entry: as_reset() cleared its TLB bitmap. */
+	m->moved = false;
 	raw_spin_unlock(&m->lock);
 	list_move_tail(&s->lru, &vs_lru);
 out:
@@ -580,6 +584,27 @@ static struct mm_struct *idp_mm(struct mm_id *mm_idp)
 }
 
 /*
+ * Before removing or replacing mappings of `m` (its lock held, a VSpace
+ * assigned), after one of its threads moved to another vCPU: flush the
+ * VSpace.  seL4 keeps every core the VSpace ran on in its TLB bitmap, and
+ * each page unmap interrupts them all and waits, holding the kernel lock;
+ * only a flush of the whole VSpace drops the cores that are not running
+ * it, here the core of the vCPU a thread left (unless another of the
+ * mm's threads runs there).  Doing it here rather than at the move costs
+ * nothing to processes that move and do not unmap, and once per move to
+ * those that do.  The host does the same for every VSpace of the guest
+ * when it moves a vCPU between cores.
+ */
+static void mm_flush_moved(struct l4h_mm *m)
+{
+	/* Set without the lock by the vCPU the task moved to (uctx.c). */
+	if (!READ_ONCE(m->moved))
+		return;
+	WARN_ON(l4h_vspace_flush(vs_pool[m->vs].as.root));
+	m->moved = false;
+}
+
+/*
  * Map [virt, virt+len) to physical `phys` with UM_PROT_* `prot`.  For a TLB
  * sync (`from_sync`), a page that cannot be mapped, for lack of seL4 objects
  * or otherwise, is left unmapped (any old mapping of it is removed) and the
@@ -599,6 +624,10 @@ static int map_pages(struct mm_id *mm_idp, unsigned long virt, unsigned long len
 	if (m->vs >= 0) {
 		struct l4h_as *as = &vs_pool[m->vs].as;
 
+		/* A sync can replace and remove mappings; the fault path only
+		 * adds them (and may raise rights). */
+		if (!prot || from_sync)
+			mm_flush_moved(m);
 		if (!prot) {
 			as_unmap_range(as, virt, virt + len);
 		} else {
@@ -636,6 +665,8 @@ void l4h_mm_flush_deferred(struct mm_struct *mm)
 
 		WARN_ON(l4h_vspace_flush(as->root));
 		as->flush_pending = false;
+		/* That flush dropped the cores of vCPUs threads left, too. */
+		m->moved = false;
 	}
 	raw_spin_unlock_irqrestore(&m->lock, flags);
 }
@@ -648,6 +679,7 @@ int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len)
 
 	raw_spin_lock_irqsave(&m->lock, flags);
 	if (m->vs >= 0) {
+		mm_flush_moved(m);
 		as_unmap_range(&vs_pool[m->vs].as, addr, addr + len);
 		as_charge(&vs_pool[m->vs].as, mm);
 	}

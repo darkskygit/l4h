@@ -1218,9 +1218,8 @@ bootconfig and a display stay off.
     VSpace with no other core in its bitmap (unused, or recycled by the
     guest, which empties its page tables) costs only the call; one with
     others costs one IPI round to them. Processes that Linux moves between
-    the guest's own vCPUs keep those vCPUs' cores until they exit or the
-    next migration: the cores are the guest's, and tracking them would
-    need the guest. Measured (QEMU/KVM, 4 cores, a 1-vCPU dom0 moved to
+    the guest's own vCPUs are the guest's to flush (below). Measured
+    (QEMU/KVM, 4 cores, a 1-vCPU dom0 moved to
     the next core every 100 ms, a process mapping, touching and unmapping
     8 pages in a loop):
 
@@ -1232,6 +1231,18 @@ bootconfig and a display stay off.
 
     A migration's flushes (65 VSpaces) took a median 157 µs idle and
     415 µs loaded (90th percentile 33 ms, wall time on a preempted vCPU).
+  - The guest flushes a process VSpace itself after Linux moves one of
+    its threads to another vCPU: the move marks the mm (`moved`, set by
+    `prepare_user()` when the thread's fault endpoint changes vCPU), and
+    the next TLB sync or unmap of the mm flushes its VSpace first
+    (`mm_flush_moved()`), which drops the core of the vCPU the thread left
+    unless another of its threads runs there. A process that moves and
+    does not unmap pays nothing; one that does, one flush per move. A
+    flush for lowered rights (`L4H_PROT_DEFER_FLUSH`) or emptying the
+    VSpace clears the mark too. Measured in a 4-vCPU dom0 on 4 cores, the
+    same loop in a process that `sched_setaffinity()` moves to the next
+    vCPU every 10 ms: 380 µs a cycle without the flush, 66 µs with it
+    (60 µs for either without the moves).
 - **CPU caps** (`vm_set_sched`, `l4hctl sched`) give a vCPU one budget,
   a percentage of the 5 ms period, split between its SC_K and SC_U, so
   that the vCPU as a whole stays within the cap. Weights are not
