@@ -9,6 +9,7 @@
  * Kernel thread switching keeps UML's setjmp/longjmp scheme.
  */
 #include <linux/kernel.h>
+#include <linux/kemu.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/sched/signal.h>
@@ -364,6 +365,10 @@ static void handle_exception(struct uml_pt_regs *regs, struct l4h_uctx *u)
 		code = BUS_ADRALN;
 		break;
 	case 13:	/* #GP (also int $0x80 without a gate) */
+		/* kemu handles tagged or out-of-range AArch64 data addresses. */
+		if (task_is_kemu(current) && kemu_user_gp(&current->thread.regs))
+			return;
+		fallthrough;
 	default:
 		sig = SIGSEGV;
 		code = SI_KERNEL;

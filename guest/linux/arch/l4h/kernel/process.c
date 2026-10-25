@@ -108,8 +108,13 @@ void interrupt_end(void)
 		thread_flags = read_thread_flags();
 	}
 	if (task_is_kemu(current)) {
+		unsigned long flags;
+
+		/* kemu publishes the recovered state and epoch with IRQs off. */
+		local_irq_save(flags);
 		l4h_sync_regs(current);
 		kemu_exit_to_user(regs);
+		local_irq_restore(flags);
 	}
 }
 

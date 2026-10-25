@@ -10,6 +10,9 @@
 
 #include <l4h_uctx.h>
 
+#define KEMU_ARCH_VECTOR_CACHE 1
+void kemu_arch_read_xmm(u64 xmm[8][2]);
+
 /*
  * l4h keeps registers in an array and the syscall number separately.
  * Keep these accessors as lvalues for assignments and swap().
