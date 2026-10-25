@@ -8,6 +8,7 @@
 #include <linux/sched.h>
 #include <linux/ptrace.h>
 #include <linux/seccomp.h>
+#include <linux/kemu.h>
 #include <kern_util.h>
 #include <sysdep/ptrace.h>
 #include <sysdep/ptrace_user.h>
@@ -45,6 +46,12 @@ void handle_syscall(struct uml_pt_regs *r)
 		UPT_SYSCALL_NR(r) = (int)PT_SYSCALL_NR(r->gp);
 	else
 		UPT_SYSCALL_NR(r) = PT_SYSCALL_NR(r->gp);
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(current)) {
+		kemu_do_syscall(regs, UPT_SYSCALL_NR(r));
+		return;
+	}
+#endif
 	/* ARM x0 is also the first argument, visible at a ptrace entry stop. */
 	if (!IS_ENABLED(CONFIG_UML_ARM64) || UPT_SYSCALL_NR(r) == -1)
 		PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);

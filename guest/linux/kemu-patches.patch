@@ -1,0 +1,13 @@
+Refresh kemu patch context for Linux 6.18.y (exec.c gained futex.h).
+
+--- a/0007-kemu-fork-exit-exec.patch
++++ b/0007-kemu-fork-exit-exec.patch
+@@ -9,7 +9,7 @@
+ +#include <linux/kemu.h>
+  #include <linux/stat.h>
+  #include <linux/fcntl.h>
+- #include <linux/swap.h>
++ #include <linux/futex.h>
+ @@ -869,6 +870,7 @@ static int exec_mmap(struct mm_struct *mm)
+  			return ret;
+  		}

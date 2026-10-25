@@ -1,0 +1,13 @@
+#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t tmpfs tmp /tmp
+/bin/busybox mount -t devtmpfs dev /dev
+/bin/busybox ln -sf busybox /bin/true
+echo 'KEMUTEST: start'
+if /bin/kemu-abi; then
+    echo 'KEMUTEST: PASS'
+else
+    echo 'KEMUTEST: FAIL'
+fi
+/bin/busybox poweroff -f

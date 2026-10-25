@@ -4,6 +4,7 @@
 
 #include <asm/syscall-generic.h>
 #include <uapi/linux/audit.h>
+#include <linux/kemu.h>
 
 typedef asmlinkage long (*sys_call_ptr_t)(unsigned long, unsigned long,
 					  unsigned long, unsigned long,
@@ -13,6 +14,8 @@ extern const sys_call_ptr_t sys_call_table[];
 
 static inline int syscall_get_arch(struct task_struct *task)
 {
+	if (task_is_kemu(task))
+		return AUDIT_ARCH_AARCH64;
 #ifdef CONFIG_X86_32
 	return AUDIT_ARCH_I386;
 #else

@@ -4,6 +4,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/kemu.h>
 #include <linux/sched/signal.h>
 #include <linux/hardirq.h>
 #include <linux/module.h>
@@ -319,6 +320,14 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
 
 	if (current->mm == NULL)
 		panic("Segfault with no mm");
+
+#ifdef CONFIG_KEMU
+	if (task_is_kemu(current)) {
+		l4h_sync_regs(current);
+		if (kemu_user_fault(&current->thread.regs, address))
+			return 0;
+	}
+#endif
 
 	if (SEGV_IS_FIXABLE(&fi))
 		err = handle_page_fault(address, ip, is_write, FAULT_EXEC(fi), is_user, &si_code);

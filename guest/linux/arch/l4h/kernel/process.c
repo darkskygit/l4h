@@ -36,6 +36,7 @@
 #include <skas.h>
 #include <registers.h>
 #include <linux/elfcore.h>
+#include <linux/kemu.h>
 #include <l4h_uctx.h>
 
 /*
@@ -105,6 +106,10 @@ void interrupt_end(void)
 		if (thread_flags & _TIF_NOTIFY_RESUME)
 			resume_user_mode_work(regs);
 		thread_flags = read_thread_flags();
+	}
+	if (task_is_kemu(current)) {
+		l4h_sync_regs(current);
+		kemu_exit_to_user(regs);
 	}
 }
 
@@ -194,8 +199,10 @@ int copy_thread(struct task_struct * p, const struct kernel_clone_args *args)
 		/*
 		 * Set a new TLS for the child thread?
 		 */
-		if (clone_flags & CLONE_SETTLS)
+		if ((clone_flags & CLONE_SETTLS) && !task_is_kemu(current))
 			ret = arch_set_tls(p, tls);
+		if (!ret)
+			ret = kemu_copy_thread(p, args);
 	}
 
 	return ret;
@@ -232,6 +239,7 @@ void um_idle_sleep(void)
 
 void exit_thread(struct task_struct *tsk)
 {
+	kemu_thread_exit(tsk);
 	l4h_uctx_destroy(tsk);
 }
 

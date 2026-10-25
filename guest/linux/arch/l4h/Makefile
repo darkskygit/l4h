@@ -44,6 +44,8 @@ KBUILD_AFLAGS += -m64 $(ARCH_INCLUDE)
 KBUILD_CPPFLAGS += -m64
 KBUILD_LDFLAGS += -m elf_x86_64
 KBUILD_RUSTFLAGS += --target=$(objtree)/scripts/target.json
+KBUILD_RUSTFLAGS += -Ccode-model=large -Crelocation-model=static -Cno-redzone=y
+KBUILD_RUSTFLAGS += -Ctarget-feature=-sse,-sse2
 CHECKFLAGS += -m64 -D__x86_64__
 
 START := 0x60000000
