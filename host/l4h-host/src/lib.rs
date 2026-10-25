@@ -27,8 +27,17 @@ pub const INFO_SIZE: usize = 0x4000;
 pub const IPCBUF_VA: usize = 0x1001_0000;
 /// The keeper's (has_keeper kinds).
 pub const KEEPER_IPCBUF_VA: usize = IPCBUF_VA + 0x1000;
+/// The main thread's stack, [STACK_TOP - STACK_SIZE, STACK_TOP), and the
+/// keeper's: l4h-root maps fresh frames there, and nothing below either,
+/// so an overflow faults instead of writing over other memory.  The ELF
+/// image lies below INFO_VA.
 pub const STACK_TOP: usize = 0x1100_0000;
-pub const STACK_SIZE: usize = 512 * 1024;
+pub const STACK_SIZE: usize = 256 * 1024;
+pub const KEEPER_STACK_TOP: usize = 0x1080_0000;
+pub const KEEPER_STACK_SIZE: usize = 16 * 1024;
+// Unmapped pages below each stack.
+const _: () = assert!(KEEPER_IPCBUF_VA + 0x1000 < KEEPER_STACK_TOP - KEEPER_STACK_SIZE);
+const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - STACK_SIZE);
 /// Shared regions (device pages, queues, buffers) are mapped from here.
 pub const SHARED_VA: usize = 0x2000_0000_0000;
 /// Device MMIO (drivers).

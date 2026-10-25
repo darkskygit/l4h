@@ -330,13 +330,24 @@ pub struct Alloc {
     pub slots: Slots,
     /// Small objects of the root task itself.
     pub pool: UtPool<POOL_REGIONS>,
-    blocks: ArrayVec<UtRegion, ALLOC_BLOCKS>,
+    blocks: &'static mut ArrayVec<UtRegion, ALLOC_BLOCKS>,
     /// Split blocks: (paddr, size bits, slot of their Untyped), sorted.
-    parents: ArrayVec<(usize, usize, Slot), ALLOC_BLOCKS>,
+    parents: &'static mut ArrayVec<(usize, usize, Slot), ALLOC_BLOCKS>,
     pub memd: Option<MemdLink>,
     /// Grants from memd that we hold, whole or split: (paddr, size bits).
+    grants: &'static mut ArrayVec<(usize, usize), ALLOC_GRANTS>,
+}
+
+/// The allocator's tables, in .bss: about 240 KiB, too large for the root
+/// task's stack, where `Alloc` is.
+struct AllocTables {
+    blocks: ArrayVec<UtRegion, ALLOC_BLOCKS>,
+    parents: ArrayVec<(usize, usize, Slot), ALLOC_BLOCKS>,
     grants: ArrayVec<(usize, usize), ALLOC_GRANTS>,
 }
+
+static ALLOC_TABLES: StaticCell<AllocTables> =
+    StaticCell::new(AllocTables { blocks: ArrayVec::new(), parents: ArrayVec::new(), grants: ArrayVec::new() });
 
 const SMALL_POOL_BITS: usize = 24;
 /// Regions of the global pool: SMALL_POOL_BITS each, refilled when it has
@@ -359,7 +370,8 @@ fn untyped_at(s: Slot) -> cap::Untyped {
 
 impl Alloc {
     pub fn new(slots: Slots, bootinfo: &sel4::BootInfo) -> Self {
-        let mut a = Alloc { slots, pool: UtPool::empty(), blocks: ArrayVec::new(), parents: ArrayVec::new(), memd: None, grants: ArrayVec::new() };
+        let AllocTables { blocks, parents, grants } = ALLOC_TABLES.take();
+        let mut a = Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants };
         for (i, desc) in bootinfo.untyped_list().iter().enumerate() {
             if !desc.is_device() {
                 a.blocks.must_push(UtRegion::fresh(bootinfo.untyped().index(i).cap(), desc.paddr(), desc.size_bits()));

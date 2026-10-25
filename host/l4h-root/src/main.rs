@@ -479,8 +479,12 @@ impl Host {
     }
 }
 
-#[root_task(stack_size = 1024 * 1024)]
+/// The root task's stack, its lowest page a guard (layout::guard_stack).
+pub const ROOT_STACK: usize = 1024 * 1024;
+
+#[root_task(stack_size = ROOT_STACK)]
 fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
+    layout::guard_stack(bootinfo);
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
     let topology = sched::topology::discover(bootinfo);

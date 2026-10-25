@@ -91,21 +91,15 @@ pub fn init() -> &'static Info {
     &INFO
 }
 
-const KEEPER_STACK: usize = 16 * 1024;
-
-#[repr(C, align(16))]
-struct KeeperStack([u8; KEEPER_STACK]);
-
-static mut KEEPER_STACK_MEM: KeeperStack = KeeperStack([0; KEEPER_STACK]);
-
 #[repr(align(64))]
 struct KeeperTlsAlign;
 
 static KEEPER_TLS: sel4_initialize_tls::StaticTlsAllocation<4096, KeeperTlsAlign> =
     sel4_initialize_tls::StaticTlsAllocation::new();
 
-/// Start the keeper (host::SLOT_KEEPER) on its own stack, TLS and IPC
-/// buffer: it shares nothing with this thread.
+/// Start the keeper (host::SLOT_KEEPER) on its own stack (at
+/// host::KEEPER_STACK_TOP, which l4h-root maps), TLS and IPC buffer: it
+/// shares nothing with this thread.
 fn start_keeper() {
     let phdr = sel4_phdrs::locate_phdrs()
         .ok()
@@ -121,7 +115,7 @@ fn start_keeper() {
     .expect("keeper: bad TLS image");
     let tp = unsafe { image.initialize_inexact_reservation_region(&KEEPER_TLS.region()) }.expect("keeper TLS space");
     let k = cap::<sel4::cap_type::Tcb>(host::SLOT_KEEPER);
-    let top = core::ptr::addr_of_mut!(KEEPER_STACK_MEM) as usize + KEEPER_STACK;
+    let top = host::KEEPER_STACK_TOP;
     let mut regs = sel4::UserContext::default();
     *regs.pc_mut() = keeper as *const () as u64;
     // As if called: x86-64 expects a return address pushed.
@@ -205,7 +199,10 @@ macro_rules! component {
         $crate::sel4_panicking_env::register_debug_put_char!($crate::sel4::debug_put_char);
         $crate::sel4_panicking_env::register_abort_trap!($crate::abort_trap);
 
-        $crate::sel4_runtime_common::declare_stack!(256 * 1024);
+        // The stack l4h-root maps, with a guard below it, rather than one
+        // in .bss (declare_stack!): the entry point loads this word.
+        #[unsafe(no_mangle)]
+        static __sel4_runtime_common__stack_bottom: usize = $crate::host::STACK_TOP;
         $crate::sel4_runtime_common::declare_entrypoint_with_stack_init!();
         $crate::sel4_runtime_common::declare_rust_entrypoint! {
             __l4h_component_entrypoint()
