@@ -151,8 +151,10 @@ l4h_cpuid_probe:
 /// assumptions about seL4's enumeration or disabled threads.
 ///
 /// Root itself never leaves its boot CPU to do it: on x86_64 every CPU a
-/// VSpace has run on stays in its TLB bitmap, and each unmap in it then
-/// interrupts all of them and waits for their answers.  Root unmaps a
+/// VSpace has run on stays in its TLB bitmap until a flush of its whole
+/// PCID (when a page table is unmapped, or the ASID goes), which root's
+/// VSpace never has, and each unmap of a page in it interrupts all those
+/// CPUs and waits for their answers.  Root unmaps a
 /// page for every page it copies into a guest (window.rs), and on a busy
 /// hypervisor, whose vCPUs wait to be scheduled, a guest's boot slowed
 /// from 0.2 s to tens of seconds, and l4h appeared to hang.  So a probe
