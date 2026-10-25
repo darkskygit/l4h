@@ -9,7 +9,12 @@ fail() { echo "LIMITS: FAIL: $*"; poweroff -f; }
 ids=""
 n=0
 while [ $n -lt 80 ]; do
-    id=$(l4hctl create "g$n" --initrd /bin/vm.cpio.gz --mem 32 2>/tmp/err) || break
+    # The full guest kernel needs more than 32 MiB to boot.  Keep these
+    # guests alive while exhausting host resources.
+    id=$(l4hctl create "g$n" --initrd /bin/vm.cpio.gz --mem 64 \
+        --cmdline "console=hvc0 quiet" 2>/tmp/err) || break
+    l4hctl console "$id" --until "GUEST: ready" --timeout "$((60 * slow))" >/dev/null \
+        || fail "guest $id did not boot"
     ids="$ids $id"
     n=$((n + 1))
 done
