@@ -160,6 +160,7 @@ pub fn create(
     for seg in elf.segments() {
         let range = page_range(seg.vaddr, seg.memsz);
         assert!(last.is_none_or(|(p, _)| p <= range.start), "component ELF segments out of order");
+        assert!(range.end <= host::INFO_VA, "component ELF reaches its info area and stacks");
         for page in range.step_by(PAGE) {
             let frame = match last {
                 Some((p, f)) if p == page => f,
@@ -232,6 +233,19 @@ pub fn create(
             CapRights::read_write(),
             VmAttributes::DEFAULT,
         );
+    }
+
+    // ---- Stacks: fresh frames, with nothing mapped below them.
+    let mut stacks = [(host::STACK_TOP, host::STACK_SIZE), (0, 0)];
+    if keeper.is_some() {
+        stacks[1] = (host::KEEPER_STACK_TOP, host::KEEPER_STACK_SIZE);
+    }
+    for (top, size) in stacks {
+        for va in (top - size..top).step_by(PAGE) {
+            let mut ctx = ObjCtx::arena(alloc, &mut *arena);
+            let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
+            map_frame(&mut ctx, vspace, f, va, CapRights::read_write(), VmAttributes::DEFAULT);
+        }
     }
 
     // ---- CSpace.

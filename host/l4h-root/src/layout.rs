@@ -120,3 +120,29 @@ pub fn check_image(bootinfo: &sel4::BootInfoPtr) {
         assert!(va < IMAGE.end(), "l4h-root: {} at {:#x}, outside its region", what, va);
     }
 }
+
+/// The lowest page of the root task's image, where its ELF header is:
+/// seL4 gives the image's frames in order from it (`user_image_frames`).
+pub fn image_base() -> usize {
+    unsafe extern "C" {
+        static __ehdr_start: u8;
+    }
+    (&raw const __ehdr_start) as usize & !(PAGE - 1)
+}
+
+/// Unmap the lowest whole page of the root task's stack, which is in
+/// .bss among other statics: an overflow then faults instead of writing
+/// over them.  Stack probes touch every page of a large frame in order,
+/// so one page catches any overflow.
+pub fn guard_stack(bootinfo: &sel4::BootInfoPtr) {
+    unsafe extern "C" {
+        /// The top of the stack (declare_stack!).
+        static __sel4_runtime_common__stack_bottom: *const u8;
+    }
+    let top = unsafe { __sel4_runtime_common__stack_bottom } as usize;
+    let guard = (top - crate::ROOT_STACK).next_multiple_of(PAGE);
+    let frames = bootinfo.user_image_frames();
+    let i = (guard - image_base()) / PAGE;
+    assert!(guard + PAGE <= top && i < frames.len(), "l4h-root: no stack guard page");
+    frames.index(i).cap().frame_unmap().expect("unmap the stack guard page");
+}

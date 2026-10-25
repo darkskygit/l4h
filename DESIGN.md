@@ -1794,8 +1794,16 @@ made per request on a path whose size a guest or a client controls.
 A component without a heap says so (`component!(main, no_heap)`), and
 does not link `alloc`. The root task, memd, netd, blkd and the VMM have
 no heap; per-request state is in fixed tables, and state too large for
-a stack is in statics (`l4h_host::fixed::{StaticCell, Scratch}`). The
-one heap is trustd's, for the third-party AML interpreter of the TPM
+a stack is in statics (`l4h_host::fixed::{StaticCell, Scratch}`).
+Every stack has an unmapped page below it, so an overflow faults rather
+than writing over statics: root maps each component's stacks (its main
+thread's and its keeper's) in a region of their own (`l4h_host::STACK_TOP`),
+and unmaps the lowest page of its own stack, which seL4 places in its
+`.bss`, at boot. Stack probes touch every page of a large frame in
+order, so one page catches any overflow. This was missing until root's
+1 MiB stack overflowed into its disk table: its allocator's 240 KiB of
+tables, now a static, were on the stack, in several copies in a debug
+build. The one heap is trustd's, for the third-party AML interpreter of the TPM
 start method: its size (`aml::HEAP`) is bounded by the firmware's
 tables, which trustd checks first, never by a guest.
 
