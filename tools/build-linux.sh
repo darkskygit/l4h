@@ -64,11 +64,6 @@ while [ $keep -lt ${#have[@]} ] && [ $keep -lt ${#want[@]} ] &&
       [ "${have[$keep]##*/}" = "${names[$keep]}" ]; do
     keep=$((keep + 1))
 done
-# An overlay update must first undo the l4h port on the old sources.
-if [ ! -f "$src/.l4h-kemu-overlay" ] ||
-   [ "$(cat "$src/.l4h-kemu-overlay")" != "$overlay_hash" ]; then
-    keep=0
-fi
 # A tree extracted again over the old one keeps the copies: a kept patch
 # that applies again is not in the tree.
 for ((i = 0; i < keep; i++)); do
@@ -83,13 +78,17 @@ for ((i = ${#have[@]} - 1; i >= keep; i--)); do
     patch -d "$src" -p1 -R -F0 -f -s < "${have[$i]}"
     rm "${have[$i]}"
 done
-if [ "$keep" = 0 ]; then
+# The overlay consists of new files; architecture adaptations live in
+# arch/l4h, so refreshing it does not require reapplying the kernel patches.
+if [ "$keep" = 0 ] || [ ! -f "$src/.l4h-kemu-overlay" ] ||
+   [ "$(cat "$src/.l4h-kemu-overlay")" != "$overlay_hash" ]; then
     for dir in kernel/kemu arch/x86/kemu rust/kemu_core; do
         mkdir -p "$src/$dir"
         rsync -a --checksum --delete --exclude target/ --exclude Cargo.lock \
             "$kemu/overlay/$dir/" "$src/$dir/"
     done
-    cp "$kemu"/overlay/include/linux/kemu*.h "$src/include/linux/"
+    rsync -a --checksum "$kemu"/overlay/include/linux/kemu*.h "$src/include/linux/"
+    rsync -a --checksum "$kemu/overlay/arch/x86/include/asm/kemu.h" "$src/arch/x86/include/asm/"
     echo "$overlay_hash" >"$src/.l4h-kemu-overlay"
 fi
 for ((i = keep; i < ${#want[@]}; i++)); do
