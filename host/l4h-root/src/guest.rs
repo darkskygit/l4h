@@ -52,6 +52,8 @@ const BLOCK_FRAMES_BYTES: usize = 2 * (32 << abi::RAM_L2_BITS);
 const BLOCK_FRAMES_SLOTS: usize = 3;
 /// Devices a guest can have (console, control, virtio).
 pub const MAX_GUEST_DEVICES: usize = 16;
+/// VSpaces of a guest's processes (the guest's VSpace pool), at most.
+pub const MAX_VSPACES: usize = 64;
 
 /// Badge layout of the root fault endpoint for guest kernels.
 pub const HYP_BADGE_FAULT: u64 = 1 << 24;
@@ -240,7 +242,8 @@ pub struct Guest {
     pub vcpus: ArrayVec<Vcpu, { abi::MAX_VCPUS }>,
     pub state: State,
     pub dom0: bool,
-    vspaces: usize,
+    /// Its processes' VSpaces (the pool it recycles, abi::SLOT_VSPACE_POOL).
+    vspaces: ArrayVec<cap::VSpace, MAX_VSPACES>,
     bootinfo: ArrayVec<cap::Granule, { abi::BOOTINFO_SIZE as usize / PAGE }>,
     entry: u64,
     /// Objects l4h-vmm serves the guest with: its endpoint (the guest's
@@ -694,7 +697,7 @@ impl Guest {
         bi.cpu_id = host_info.cpu_id;
         bi.nr_blocks = self.nr_blocks as u64;
         bi.boot_blocks = self.boot_blocks as u64;
-        bi.nr_vspaces = self.vspaces as u64;
+        bi.nr_vspaces = self.vspaces.len() as u64;
         if self.kmod_size != 0 {
             bi.kmod_va = abi::KMOD_VA;
             bi.kmod_size = self.kmod_size as u64;
@@ -773,6 +776,19 @@ impl Guest {
         h.finalize().into()
     }
 
+    /// Drop the cores none of its vCPUs is on from the TLB bitmaps of its
+    /// VSpaces, the kernel's and its processes', after the balancer moved
+    /// a vCPU (vspace::flush_tlb_bitmap).  A VSpace's threads run only on
+    /// the cores of the guest's vCPUs, so its bitmap holds those cores and
+    /// no others.  Processes moving between the guest's vCPUs are left to
+    /// it: their VSpaces may still name the cores of other vCPUs.
+    pub fn flush_tlb_bitmaps(&self) {
+        crate::vspace::flush_tlb_bitmap(self.vspace);
+        for &vs in &self.vspaces {
+            crate::vspace::flush_tlb_bitmap(vs);
+        }
+    }
+
     /// Start vCPU 0 at the kernel entry point.
     pub fn start(&mut self) {
         let mut regs = sel4::UserContext::default();
@@ -833,6 +849,9 @@ pub fn create(
 ) -> Result<Guest, Option<Guest>> {
     // Every value comes from the control API: check before computing.
     if cfg.vcpus < 1 || cfg.vcpus > abi::MAX_VCPUS || cfg.ram < (8 << 20) || cfg.ram > abi::MAX_BLOCKS * BLOCK {
+        return Err(None);
+    }
+    if cfg.vspaces > MAX_VSPACES {
         return Err(None);
     }
     if cfg.ram_base % PAGE != 0 || cfg.ram_base != kernel.ram_base {
@@ -918,7 +937,7 @@ pub fn create(
         vcpus: ArrayVec::new(),
         state: State::Created,
         dom0: cfg.dom0,
-        vspaces: cfg.vspaces,
+        vspaces: ArrayVec::new(),
         bootinfo: ArrayVec::new(),
         entry: 0,
         vmm_ep: cap::Endpoint::from_bits(0),
@@ -1015,6 +1034,7 @@ pub fn create(
     for i in 0..cfg.vspaces {
         let vs = g.arena.object_cap::<cap_type::VSpace>(alloc, PML4_BP);
         asids.assign(alloc, vs);
+        g.vspaces.must_push(vs);
         pool_cn
             .absolute_cptr_from_bits_with_depth(i as u64, abi::ROOT_CNODE_BITS)
             .copy(&abs(vs), CapRights::all())

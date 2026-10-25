@@ -69,6 +69,11 @@ fn smt_id(eax: u32, ebx: u32, ecx: u32, edx: u32) -> Option<u32> {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn physical_id() -> Option<(u32, u32)> {
+    physical_id_from(core::arch::x86_64::__cpuid_count)
+}
+
+#[cfg(target_arch = "x86_64")]
 fn physical_id_from(cpuid: impl Fn(u32, u32) -> core::arch::x86_64::CpuidResult) -> Option<(u32, u32)> {
     // Intel SDM, CPUID extended topology enumeration: prefer 1F to 0B.
     let max = cpuid(0, 0).eax;
@@ -97,90 +102,53 @@ fn physical_id_from(cpuid: impl Fn(u32, u32) -> core::arch::x86_64::CpuidResult)
     None
 }
 
-/// The CPUID leaves physical_id_from reads, which the probe reads on each
-/// CPU (subleaf 0 of each).
+/// Visit the CPUs before starting any components. Reading CPUID on each
+/// CPU avoids assumptions about seL4's enumeration or disabled threads.
+/// Restore root's SC to its boot CPU before doing anything else, and drop
+/// the other CPUs from its VSpace's TLB bitmap: else every page root
+/// unmaps from then on (one per page it copies into a guest, window.rs)
+/// interrupts them all, and on a loaded hypervisor, whose vCPUs wait to
+/// be scheduled, a guest's boot slowed from 0.2 s to tens of seconds.
 #[cfg(all(target_arch = "x86_64", not(test)))]
-const PROBE_LEAVES: [u32; 6] = [0, 0x0b, 0x1f, 0x8000_0000, 0x8000_0001, 0x8000_001e];
+pub fn discover(bootinfo: &sel4::BootInfoPtr) -> Topology {
+    use sel4::{
+        cap_type,
+        init_thread::{Slot, slot},
+    };
 
-/// The probe's page: the leaves to read, then what CPUID returned for
-/// each (eax, ebx, ecx, edx), as l4h_cpuid_probe lays them out.
-#[cfg(all(target_arch = "x86_64", not(test)))]
-#[repr(C)]
-struct ProbePage {
-    n: u64,
-    queries: [(u32, u32); PROBE_LEAVES.len()],
-    results: [[u32; 4]; PROBE_LEAVES.len()],
-}
-
-// The probe: CPUID of each (leaf, subleaf) of the page at rdi, then a
-// fault (ud2) for l4h-root to collect the results.  It uses no stack and
-// no memory but that page, and has a code page of its own, so that it
-// can run in a VSpace that maps nothing else.
-#[cfg(all(target_arch = "x86_64", not(test)))]
-core::arch::global_asm!(
-    r#"
-    .pushsection .text.l4h_cpuid_probe, "ax", @progbits
-    .balign 4096
-    .global l4h_cpuid_probe
-l4h_cpuid_probe:
-    mov r8, [rdi]
-    lea r9, [rdi + 8]
-    lea r10, [r9 + r8 * 8]
-2:
-    test r8, r8
-    jz 3f
-    mov eax, [r9]
-    mov ecx, [r9 + 4]
-    cpuid
-    mov [r10], eax
-    mov [r10 + 4], ebx
-    mov [r10 + 8], ecx
-    mov [r10 + 12], edx
-    add r9, 8
-    add r10, 16
-    dec r8
-    jmp 2b
-3:
-    ud2
-    .balign 4096
-    .popsection
-    "#
-);
-
-/// Read CPUID on each CPU before starting any components, which avoids
-/// assumptions about seL4's enumeration or disabled threads.
-///
-/// Root itself never leaves its boot CPU to do it: on x86_64 every CPU a
-/// VSpace has run on stays in its TLB bitmap until a flush of its whole
-/// PCID (when a page table is unmapped, or the ASID goes), which root's
-/// VSpace never has, and each unmap of a page in it interrupts all those
-/// CPUs and waits for their answers.  Root unmaps a
-/// page for every page it copies into a guest (window.rs), and on a busy
-/// hypervisor, whose vCPUs wait to be scheduled, a guest's boot slowed
-/// from 0.2 s to tens of seconds, and l4h appeared to hang.  So a probe
-/// thread in a VSpace of its own, mapping only the probe's code and its
-/// page, visits the CPUs, and is destroyed after.
-#[cfg(all(target_arch = "x86_64", not(test)))]
-pub fn discover(bootinfo: &sel4::BootInfoPtr, alloc: &mut crate::mem::Alloc, win: &mut crate::window::Window) -> Topology {
     let cpus = bootinfo.inner().numNodes as usize;
+    let boot_cpu = bootinfo.inner().nodeID as usize;
+    let base = bootinfo.sched_control().range().start;
+    let move_to = |cpu| {
+        Slot::<cap_type::SchedControl>::from_index(base + cpu).cap().sched_control_configure_flags(
+            slot::SC.cap(),
+            5000,
+            5000,
+            0,
+            0,
+            0,
+        )
+    };
+    if physical_id().is_none() {
+        return Topology::flat(cpus);
+    }
     let mut ids = [0; MAX_CPUS];
     let mut apics = [0; MAX_CPUS];
     let mut n = 0;
-    probe_cpus(bootinfo, alloc, win, |cpu, page| {
-        let leaf = |leaf: u32, sub: u32| {
-            let i = PROBE_LEAVES.iter().position(|&l| l == leaf).filter(|_| sub == 0).expect("CPUID leaf not probed");
-            let [eax, ebx, ecx, edx] = page.results[i];
-            core::arch::x86_64::CpuidResult { eax, ebx, ecx, edx }
-        };
-        let Some((apic, id)) = physical_id_from(leaf) else { return false };
-        if n != cpu || apics[..n].contains(&apic) {
-            return false;
+    for cpu in 0..cpus {
+        if move_to(cpu).is_err() {
+            break;
+        }
+        let Some((apic, id)) = physical_id() else { break };
+        if apics[..n].contains(&apic) {
+            break;
         }
         apics[n] = apic;
         ids[n] = id;
         n += 1;
-        true
-    });
+    }
+    move_to(boot_cpu).expect("restore root CPU after topology discovery");
+    crate::vspace::flush_tlb_bitmap(slot::VSPACE.cap());
     if n == cpus {
         Topology::from_ids(&ids[..n])
     } else {
@@ -189,91 +157,8 @@ pub fn discover(bootinfo: &sel4::BootInfoPtr, alloc: &mut crate::mem::Alloc, win
     }
 }
 
-/// Run the probe on each CPU in turn, passing its page to `f`, until `f`
-/// returns false or a CPU cannot be reached.
-#[cfg(all(target_arch = "x86_64", not(test)))]
-fn probe_cpus(
-    bootinfo: &sel4::BootInfoPtr,
-    alloc: &mut crate::mem::Alloc,
-    win: &mut crate::window::Window,
-    mut f: impl FnMut(usize, &ProbePage) -> bool,
-) {
-    use sel4::init_thread::{Slot, slot};
-    use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
-
-    use crate::mem::ObjCtx;
-    use crate::vspace::{FRAME_BP, PML4_BP, map_frame};
-
-    unsafe extern "C" {
-        fn l4h_cpuid_probe();
-    }
-    /// Where the probe's VSpace maps its page.
-    const PAGE_VA: usize = 0x1000_0000;
-    let abs = |s: usize| slot::CNODE.cap().absolute_cptr(Slot::<cap_type::Null>::from_index(s).cap());
-
-    // Its slots are recorded as guest 0's, which does not exist yet, to
-    // free them all after.
-    alloc.slots.track(0);
-    let Some(mut arena) = alloc.arena(64 << 10) else {
-        alloc.slots.untrack();
-        return;
-    };
-    let mut ctx = ObjCtx::arena(alloc, &mut arena);
-    let vspace = ctx.cap::<cap_type::VSpace>(PML4_BP);
-    let tcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
-    let sc = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
-        size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
-    });
-    let ep = ctx.cap::<cap_type::Endpoint>(ObjectBlueprint::Endpoint);
-    let reply = ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply);
-    let page = ctx.cap::<cap_type::Granule>(FRAME_BP);
-    slot::ASID_POOL.cap().asid_pool_assign(vspace).expect("probe ASID");
-    // The probe's code page, one of root's image frames.
-    let entry = l4h_cpuid_probe as *const () as usize;
-    let image = bootinfo.user_image_frames().index((entry - crate::layout::image_base()) / 4096);
-    let code = ctx.alloc.slots.alloc();
-    abs(code).copy(&slot::CNODE.cap().absolute_cptr(image.cap()), CapRights::read_only()).expect("probe code copy");
-    map_frame(&mut ctx, vspace, Slot::<cap_type::Granule>::from_index(code).cap(), entry, CapRights::read_only(), VmAttributes::DEFAULT);
-    map_frame(&mut ctx, vspace, page, PAGE_VA, CapRights::read_write(), VmAttributes::DEFAULT);
-    drop(ctx);
-    tcb.tcb_configure(slot::CNODE.cap(), CNodeCapData::new(0, 0), vspace, 0, cap::Granule::from_bits(0))
-        .expect("probe TCB configure");
-
-    let base = bootinfo.sched_control().range().start;
-    for cpu in 0..bootinfo.inner().numNodes as usize {
-        let control = Slot::<cap_type::SchedControl>::from_index(base + cpu).cap();
-        if control.sched_control_configure_flags(sc, 5000, 5000, 0, 0, 0).is_err() {
-            break;
-        }
-        if cpu == 0 {
-            tcb.tcb_set_sched_params(slot::TCB.cap(), 0, l4h_abi::PRIO_KERNEL + 2, sc, ep)
-                .expect("probe sched params");
-        }
-        win.with_frame(&slot::CNODE.cap().absolute_cptr(page), |p| unsafe {
-            let p = p.cast::<ProbePage>();
-            (*p).n = PROBE_LEAVES.len() as u64;
-            (*p).queries = PROBE_LEAVES.map(|l| (l, 0));
-        });
-        let mut regs = sel4::UserContext::default();
-        *regs.pc_mut() = entry as u64;
-        *regs.c_param_mut(0) = PAGE_VA as u64;
-        tcb.tcb_write_all_registers(true, &mut regs).expect("probe start");
-        let (info, _) = ep.recv(reply);
-        let done = sel4::with_ipc_buffer(|b| matches!(sel4::Fault::new(b, &info), sel4::Fault::UserException(_)));
-        tcb.tcb_suspend().expect("probe stop");
-        if !done || !win.with_frame(&slot::CNODE.cap().absolute_cptr(page), |p| f(cpu, unsafe { &*p.cast::<ProbePage>() })) {
-            break;
-        }
-    }
-    // Destroying the objects frees the ASID with the VSpace; the arena's
-    // memory goes back to the free pool, in untracked slots.
-    alloc.slots.untrack();
-    alloc.reclaim(arena);
-    alloc.slots.free_owned(0);
-}
-
 #[cfg(all(target_arch = "aarch64", not(test)))]
-pub fn discover(bootinfo: &sel4::BootInfoPtr, _alloc: &mut crate::mem::Alloc, _win: &mut crate::window::Window) -> Topology {
+pub fn discover(bootinfo: &sel4::BootInfoPtr) -> Topology {
     Topology::flat(bootinfo.inner().numNodes as usize)
 }
 
@@ -307,7 +192,7 @@ mod tests {
         assert_eq!(smt_id(1, 0, 1 << 8, 3), None);
         assert_eq!(smt_id(1, 2, 2 << 8, 3), None);
         // Exercise the host's CPUID path as well.
-        let _ = physical_id_from(core::arch::x86_64::__cpuid_count);
+        let _ = physical_id();
     }
 
     #[cfg(target_arch = "x86_64")]
