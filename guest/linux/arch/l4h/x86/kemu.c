@@ -1,17 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* kemu enters through seL4's syscall fault, like native l4h processes. */
 #include <linux/highmem.h>
+#include <linux/irqflags.h>
 #include <linux/kemu.h>
 #include <linux/kemu_abi.h>
 #include <linux/mm.h>
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/timekeeping.h>
+#include <asm/fpu/api.h>
+#include <asm/kemu.h>
+#include <asm/sigcontext.h>
 #include <asm/syscall.h>
 #include <asm/unistd.h>
 
 void kemu_svc(struct pt_regs *regs);
 void kemu_op(struct pt_regs *regs, unsigned long op);
+
+void kemu_arch_read_xmm(u64 xmm[8][2])
+{
+	const struct _xstate *fp = (void *)current->thread.regs.regs.fp;
+	unsigned long flags;
+
+	/* User SIMD state belongs to its seL4 TCB, not the kernel TCB.
+	 * Keep the per-vCPU ReadFPU scratch area stable while fetching it;
+	 * kemu also calls this with interrupts already disabled. */
+	local_irq_save(flags);
+	l4h_fpu_fetch(current);
+	/* XSAVE may leave stale bytes for a component in its init state. */
+	if (host_fp_size > sizeof(fp->fpstate) &&
+	    !(fp->xstate_hdr.xfeatures & XFEATURE_MASK_SSE))
+		memset(xmm, 0, 8 * 16);
+	else
+		memcpy(xmm, fp->fpstate.xmm_space, 8 * 16);
+	local_irq_restore(flags);
+}
 
 bool kemu_do_syscall(struct pt_regs *regs, int nr)
 {
