@@ -489,8 +489,6 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     layout::guard_stack(bootinfo);
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
-    let topology = sched::topology::discover(bootinfo);
-    info!("l4h-root: CPU physical cores {:?}", topology.physical());
     let mut alloc = Alloc::new(Slots::new(bootinfo.empty().range()), bootinfo);
     let total_bytes = alloc.free_bytes();
     info!("l4h-root: {} core(s), {} MiB free memory", cores, total_bytes >> 20);
@@ -502,6 +500,8 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     slot::TCB.cap().tcb_bind_notification(wd_ntfn).expect("bind watchdog notification");
     let reply = ReplySlot::new(&mut alloc);
     let mut wins = Windows { a: Window::new(&mut alloc, 0), b: Window::new(&mut alloc, 1) };
+    let topology = sched::topology::discover(bootinfo, &mut alloc, &mut wins.a);
+    info!("l4h-root: CPU physical cores {:?}", topology.physical());
     let mut devmem = devmem::DevMem::from_bootinfo(bootinfo);
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
