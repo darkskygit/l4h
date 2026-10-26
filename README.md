@@ -99,6 +99,55 @@ tests/               integration tests (QEMU) and fuzzing
 third_party/         rust-sel4, sDDF, kemu submodules; patches/ for rust-sel4
 ```
 
+## Installing under an existing Linux
+
+On a supported **x86_64, 64-bit UEFI** machine, the installer boots your
+existing Linux userspace as dom0 with L4H's paravirtual kernel:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash
+```
+
+It uses `sudo` when needed, installs missing dependencies with apt, dnf or
+yum, and downloads a tagged GitHub release with SHA-256 verification.
+The release must include the installer (older releases are rejected).
+No source build or hardware virtualization extensions are needed.
+
+Preflight checks CPU features, Meltdown status, Secure Boot, EFI variables,
+the ESP, storage, network and userspace. Automatic migration currently
+supports headless systemd installations with a plain ext4/XFS root,
+NVMe namespace 1 or supported virtio disks, and one physical virtio-net,
+gVNIC, ENA or Intel X550 uplink. Other layouts need a custom deployment:
+in particular LVM, encrypted volumes, RAID, Btrfs, separate `/usr`,
+SATA/USB storage, active AppArmor profiles and DKMS modules are rejected.
+Secure Boot must be disabled. Firmware and application compatibility still
+need a boot test.
+
+The default installation sets **BootNext for one L4H boot**, preserves the
+existing BootOrder and native EFI loaders, and does not reboot. After
+testing dom0, stop workloads and run `sudo sync; sudo l4hctl host-reboot`
+to return to native Linux, then rerun with `--make-default`
+to put L4H first permanently. Existing configurations and replaced files
+are backed up under `/var/lib/l4h/backups`; a failed installation attempts
+to restore both files and EFI settings.
+Ordinary `reboot` inside dom0 restarts only dom0.
+
+```sh
+# Read-only compatibility check (dependencies must already be installed).
+curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash -s -- --check
+# Optional: pin a release, select an ESP, and allocate dom0 resources.
+# Append --make-default only when a permanent boot selection is wanted.
+curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | \
+    bash -s -- --release vYYYY.MM.N --esp /boot/efi --memory 2048 --vcpus 2
+```
+
+For recovery, select native Linux in the firmware boot menu. From native
+Linux, `sudo efibootmgr` shows the L4H entry; cancel its pending trial with
+`sudo efibootmgr --delete-bootnext`, or remove its entry with
+`sudo efibootmgr --bootnum XXXX --delete-bootnum` (substitute the L4H entry
+number). See the installation section of the
+[user manual](docs/manual/l4h-manual.tex) for requirements and boot behavior.
+
 ## Building and running
 
 The host needs:
@@ -188,6 +237,8 @@ without it, the host reports `unknown`.
 
 | Test | What it checks |
 |------|----------------|
+| `python3 tests/test_installer.py` | installer preflight, verified downloads, EFI changes, updates and rollback without touching the host |
+| `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory]` | in a disposable UEFI/KVM VM, install from native Debian, boot its existing userspace under L4H, then return to native Linux; uses prebuilt release artifacts and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user) |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

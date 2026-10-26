@@ -499,6 +499,93 @@ Variable & Meaning & Default \\
 \label{tab:settings}
 \end{table}
 
+\section{Installing under an existing Linux}
+
+\file{tools/install.sh} installs a tagged x86\_64 release on a running
+Linux machine. The existing root filesystem and userspace become dom0;
+the distribution's kernel is replaced for that boot by the paravirtual
+kernel in the L4H EFI application. Native Linux remains available through
+its original firmware boot entry.
+
+\begin{lstlisting}
+curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash
+\end{lstlisting}
+
+The script elevates through \cmd{sudo} if necessary and installs missing
+dependencies with apt, dnf or yum: Python 3.9 or later, curl, efibootmgr,
+util-linux and iproute2 (iproute on RPM distributions). It resolves the
+latest tagged release once, verifies downloads against that release's
+\file{SHA256SUMS}, and uses its installer and static initramfs. Releases
+from before this installer was added are rejected. No compiler is needed.
+An explicit \texttt{--release TAG} pins the release. Checksums protect
+download integrity; their authenticity relies on HTTPS and the GitHub
+release account.
+
+\texttt{--check} runs the same compatibility probes without installing
+packages, publishing files or writing EFI variables. It still downloads
+the installer into a temporary directory; the dependencies must already
+be installed. The checks cover:
+\begin{itemize}
+  \item 64-bit UEFI with writable efivarfs, Secure Boot disabled, and ACPI;
+  \item Intel or AMD CPUs with the seL4 release's required features
+        (including FSGSBASE, XSAVEOPT, AVX and 1 GiB pages), unaffected by
+        Meltdown, and APIC IDs below 256. VMX/SVM and an IOMMU are not
+        required;
+  \item at least 3 GiB usable RAM (normally 4 GiB installed). By default
+        dom0 gets half the RAM, capped at 8192 MiB, while leaving at least
+        2 GiB for L4H. \texttt{--memory MiB} and \texttt{--vcpus N}
+        override the allocation; the default is up to four vCPUs;
+  \item a writable mounted FAT ESP on a plain GPT disk, selected with
+        \texttt{--esp PATH} if more than one is mounted;
+  \item a plain ext4 or XFS root on NVMe namespace 1, modern virtio-blk,
+        or virtio-scsi, with MSI-X. Required fstab volumes must also be
+        supported and use UUIDs, PARTUUIDs or unique labels. The shipped
+        initramfs does not assemble LVM, RAID or encrypted volumes;
+  \item a headless systemd userspace, with \file{/usr}, \file{/etc},
+        \file{/lib/modules} and init on root; no active AppArmor profiles
+        or DKMS modules. An active SELinux mode is carried into dom0's
+        command line;
+  \item exactly one physical Ethernet interface, driven by virtio-net,
+        gVNIC, ENA or Intel X550. Automatic migration rejects bonds,
+        bridges, VLAN interfaces, changed MACs and multiple NICs.
+\end{itemize}
+
+The installer chooses the generic application when PCID and x2APIC are
+available, otherwise xapic-nopcid. \texttt{--variant NAME} overrides this
+choice. CPU capabilities cannot prove the firmware's APIC state at the
+next boot: test the selected variant before making it permanent.
+Likewise, applications depending on native devices or kernel features,
+and network profiles matching a PCI path or native driver rather than
+an interface name or MAC, may need adaptation. A passing preflight is
+not a guarantee of compatibility with every application or firmware.
+
+After preflight and download verification, the installer writes
+\file{EFI/L4H/l4h.efi}, \file{l4h/dom0/initrd}, and \file{l4h/l4h.conf} on
+the ESP, and \file{/usr/local/bin/l4hctl} with its license on root. It
+does not format partitions or replace the native EFI loaders, including
+\file{EFI/BOOT/BOOTX64.EFI}. Replaced files and EFI settings are backed
+up under \file{/var/lib/l4h/backups}; errors trigger rollback. Each backup
+has \file{boot.json}, \file{manifest.json}, and numbered copies of prior
+files. Keep it if the installer reports incomplete rollback.
+
+The default is a one-time \texttt{BootNext} selection. Reboot when ready:
+the initramfs locates root by filesystem UUID despite changed disk names,
+mounts the matching module tree read-only over \file{/lib/modules},
+preserves the uplink's name and MAC, and starts the existing init.
+The distribution's fstab and network configuration are retained. After
+testing, stop workloads, run \cmd{sync}, then \cmd{l4hctl host-reboot}
+as root to return to native Linux, and rerun with \texttt{--make-default}
+to put L4H first in \texttt{BootOrder}. Updates reuse the managed entry.
+Ordinary \cmd{reboot} inside dom0 restarts dom0, not the physical host.
+
+If a trial hangs before dom0 starts, reset the machine: firmware has
+consumed BootNext, so the next boot uses the previous BootOrder. For a
+permanent installation, select the native Linux entry in the firmware
+menu. From native Linux, \cmd{efibootmgr --delete-bootnext} cancels a
+pending trial; \cmd{efibootmgr --bootnum XXXX --delete-bootnum} removes
+the L4H entry (substitute its number). EFI-variable management must run
+under native Linux; dom0 does not expose the firmware's EFI runtime.
+
 \section{dom0 on the EFI system partition}
 \label{sec:esp}
 
