@@ -184,7 +184,19 @@ pub struct VmmConfig {
     /// epoch_ticks.
     pub epoch_ns: u64,
     pub epoch_ticks: u64,
+    /// The guest's memory device (DESIGN.md §17): its boot info index plus
+    /// one (0: none); its page is at vmm_device_page_va(index).  Hotplug
+    /// calls go to memd on VMM_SLOT_MEMD_EP.
+    pub mem_dev: u32,
+    /// Hotplug blocks in the guest's region.
+    pub hp_count: u32,
+    /// Event line of the memory device.
+    pub mem_event: u32,
+    pub reserved1: u32,
 }
+
+/// The VMM's capability to memd's service endpoint, badged for its guest.
+pub const VMM_SLOT_MEMD_EP: u64 = 30;
 
 pub const VCPU_NTFN_SLOT_BASE: u64 = 64;
 pub const fn vmm_event_page_va(v: usize) -> usize {
@@ -216,6 +228,9 @@ const _: () = assert!(gpu::SHARED_VA == SHARED_VA && vmm_chan_va(VMM_MAX_DEVICES
 /// bit 32 + d = completion from the backend of device d.
 pub const VMM_BADGE_KICK_SHIFT: u32 = 0;
 pub const VMM_BADGE_DONE_SHIFT: u32 = 32;
+/// From l4h-root: the guest's hotplug target changed.
+pub const VMM_BADGE_MEM: u64 = 1 << 31;
+const _: () = assert!(VMM_MAX_DEVICES <= 31);
 
 /// The architectural time counter that seL4 deadlines (seL4_TCB_SetTimer)
 /// are expressed in: the TSC on x86_64, the virtual counter on aarch64.

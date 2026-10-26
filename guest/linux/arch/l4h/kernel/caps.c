@@ -31,6 +31,11 @@
  * is gone (l4h_objmem_wait()), and call the OOM killer if no 2 MiB range can be
  * found, or no capability slot is left (l4h_objmem_oom()).
  *
+ * Hotplug blocks (DESIGN.md §17) are 64 blocks above the I/O pool that the
+ * host plugs while the guest runs (drivers/memhp.c).  Their blocks are
+ * never object blocks of the allocator: the last one holds the seL4
+ * objects that map the other 63 (l4h_hp_map()), and goes with them.
+ *
  * Slots live in second-level CNodes (radix 12, guard 6) that we create in
  * root slots [L4H_SLOT_DYN_BASE, 4096), and delete again when they are empty
  * and enough slots are free elsewhere.  A slot is named by
@@ -672,6 +677,22 @@ static int map_kernel(unsigned long frame, unsigned long va)
 	}
 }
 
+/*
+ * Map a copy of frame `frame` read-write at `va` for good, before the slab
+ * allocator exists: the boot memmap (mem.c), whose kernel PTEs the TLB sync
+ * cannot map yet (its mappings need xarray nodes).
+ */
+void __init l4h_map_kernel_early(unsigned long frame, unsigned long va)
+{
+	unsigned long flags, slot;
+
+	raw_spin_lock_irqsave(&caps_lock, flags);
+	slot = __slot_alloc();
+	raw_spin_unlock_irqrestore(&caps_lock, flags);
+	if (!slot || l4h_cnode_copy(slot, 64, frame, 64, L4H_RIGHTS_ALL) || map_kernel(slot, va))
+		panic("l4h: cannot map %#lx at boot\n", va);
+}
+
 /* Give block `b` (BLK_BUSY; its Untyped has no children) its frames: its
  * RAM CNode, 512 frames, mapped in the direct map. */
 static int block_make_frames(unsigned int b)
@@ -712,6 +733,180 @@ static int block_make_frames(unsigned int b)
 /* *_nofault accesses between their check and their access (uaccess.h). */
 static atomic_t nofault_accesses;
 
+/* ---- hotplug blocks */
+
+/* The block of a hotplug block that holds its seL4 objects. */
+#define HP_OBJ_BLOCK	(L4H_HP_BLOCKS - 1)
+
+enum { HP_ABSENT, HP_MAPPED, HP_BUSY };
+static void wait_nofault_accesses(void);
+static u8 hp_state[L4H_HP_MAX];
+static unsigned long hp_first;		/* block index of hotplug block 0 */
+static unsigned int hp_count;
+/* Level-2 hotplug CNodes we made (kept across unplugs), and level-1 RAM
+ * CNodes that exist (the host's, below the end of boot RAM, or ours). */
+static DECLARE_BITMAP(hp_l2_made, L4H_HP_MAX);
+static DECLARE_BITMAP(ram_l1_made, L4H_MAX_RAM_L1);
+/* Slots of the direct-map page tables of each mapped hotplug block. */
+static unsigned long *hp_tables[L4H_HP_MAX];
+static DEFINE_MUTEX(hp_mutex);
+
+static_assert(L4H_HP_SHIFT == SECTION_SIZE_BITS);
+static_assert(L4H_GPA_END == 1ull << MAX_PHYSMEM_BITS);
+
+/* Is block `b` (above boot RAM) in a mapped hotplug block, and a frame block? */
+static bool hp_block_mapped(unsigned long b)
+{
+	unsigned long m = (b - hp_first) >> L4H_HP_BITS;
+
+	if (b < hp_first || m >= hp_count)
+		return false;
+	return READ_ONCE(hp_state[m]) == HP_MAPPED && (b & (L4H_HP_BLOCKS - 1)) != HP_OBJ_BLOCK;
+}
+
+/* Is guest-physical [gpa, gpa+size) in the hotplug region? */
+bool l4h_hp_contains(unsigned long gpa, unsigned long size)
+{
+	unsigned long start = hp_first << L4H_BLOCK_SHIFT;
+
+	return hp_count && gpa >= start && gpa + size >= gpa &&
+	       gpa + size <= start + (unsigned long)hp_count * L4H_HP_SIZE;
+}
+
+static unsigned long hp_gpa(unsigned int m)
+{
+	return (hp_first << L4H_BLOCK_SHIFT) + (unsigned long)m * L4H_HP_SIZE;
+}
+
+/**
+ * l4h_hp_prepare() - make the CNodes plugging hotplug block @m needs
+ *
+ * Its level-2 hotplug CNode, into which the host copies its Untypeds, and
+ * the level-1 RAM CNode of its GiB, from object memory.  They are kept
+ * after an unplug.  May sleep.
+ */
+int l4h_hp_prepare(unsigned int m)
+{
+	unsigned long n = hp_gpa(m) >> 30, flags;
+	bool ok;
+
+	if (m >= hp_count)
+		return -EINVAL;
+	for (;;) {
+		raw_spin_lock_irqsave(&caps_lock, flags);
+		ok = true;
+		if (!test_bit(n, ram_l1_made)) {
+			ok = __obj_retype(L4H_OBJ_CNODE, L4H_RAM_L2_BITS, 0, 0, L4H_SLOT_RAM_L1_BASE + n);
+			if (ok)
+				__set_bit(n, ram_l1_made);
+		}
+		if (ok && !test_bit(m, hp_l2_made)) {
+			ok = __obj_retype(L4H_OBJ_CNODE, L4H_HP_BITS, L4H_SLOT_HP, L4H_ROOT_DEPTH, m);
+			if (ok)
+				__set_bit(m, hp_l2_made);
+		}
+		raw_spin_unlock_irqrestore(&caps_lock, flags);
+		if (ok)
+			return 0;
+		if (!l4h_objmem_wait())
+			return -ENOMEM;
+	}
+}
+
+/**
+ * l4h_hp_map() - map a hotplug block the host has just plugged
+ *
+ * Its blocks' Untypeds are in its level-2 hotplug CNode.  From the last
+ * block, the level-2 RAM CNodes of the other 63 and the page tables that
+ * map them in the direct map; from those, their frames, mapped.  Nothing
+ * comes from object memory but a higher-level table for a new GiB.
+ */
+int l4h_hp_map(unsigned int m)
+{
+	unsigned long gpa = hp_gpa(m), base = gpa >> L4H_BLOCK_SHIFT;
+	unsigned long objs = L4H_HP_BLOCK_CPTR(m, HP_OBJ_BLOCK);
+	unsigned long l1 = L4H_SLOT_RAM_L1_BASE + (gpa >> 30);
+	unsigned long *tables, i, k, flags;
+	int err = 0;
+
+	tables = kcalloc(HP_OBJ_BLOCK, sizeof(*tables), GFP_KERNEL);
+	if (!tables)
+		return -ENOMEM;
+	mutex_lock(&hp_mutex);
+	hp_tables[m] = tables;
+	/* All the CNodes first, then the page tables: interleaved, each CNode
+	 * would skip 12 KiB to its alignment. */
+	for (i = 0; i < HP_OBJ_BLOCK && !err; i++) {
+		unsigned long b = base + i, bgpa = b << L4H_BLOCK_SHIFT;
+
+		err = l4h_retype(objs, L4H_OBJ_CNODE, L4H_RAM_L2_BITS, l1, L4H_ROOT_DEPTH,
+				 b & ((1u << L4H_RAM_L2_BITS) - 1), 1);
+		if (!err)
+			err = l4h_retype(L4H_HP_BLOCK_CPTR(m, i), L4H_OBJ_FRAME, 0,
+					 L4H_FRAME_CPTR(bgpa) >> L4H_RAM_L2_BITS,
+					 L4H_ROOT_DEPTH + L4H_RAM_L2_BITS, 0, RAM_BLOCK_PAGES);
+	}
+	for (i = 0; i < HP_OBJ_BLOCK && !err; i++) {
+		unsigned long bgpa = gpa + i * RAM_BLOCK, va = uml_physmem + bgpa;
+		unsigned long slot = l4h_slot_alloc();
+		int pt = l4h_pt_level_obj[0];
+
+		if (!slot) {
+			err = -ENOMEM;
+			break;
+		}
+		tables[i] = slot;
+		err = l4h_retype(objs, pt, 0, slot >> L4H_L2_INDEX_BITS, L4H_ROOT_DEPTH, slot & (L2_SLOTS - 1), 1);
+		while (!err && (err = l4h_pt_map(pt, slot, L4H_CPTR(L4H_SLOT_VSPACE), va)) == L4H_ERR_FAILED_LOOKUP) {
+			raw_spin_lock_irqsave(&caps_lock, flags);
+			err = __add_kernel_table(1, va);
+			raw_spin_unlock_irqrestore(&caps_lock, flags);
+		}
+		for (k = 0; k < RAM_BLOCK_PAGES && !err; k++)
+			err = l4h_page_map(L4H_FRAME_CPTR(bgpa + k * PAGE_SIZE), L4H_CPTR(L4H_SLOT_VSPACE),
+					   va + k * PAGE_SIZE, L4H_PROT_READ | L4H_PROT_WRITE);
+	}
+	if (!err)
+		WRITE_ONCE(hp_state[m], HP_MAPPED);
+	mutex_unlock(&hp_mutex);
+	if (err) {
+		pr_err("l4h: hotplug block %u: cannot map it: %d\n", m, err);
+		l4h_hp_unmap(m);
+		return err < 0 ? err : -EFAULT;
+	}
+	return 0;
+}
+
+/**
+ * l4h_hp_unmap() - take a hotplug block out of the direct map
+ *
+ * Linux no longer uses its memory.  Revoking the copy of the last block
+ * deletes the page tables (which unmaps the rest with one flush each) and
+ * the RAM CNodes with their frames; then the other copies are childless.
+ * The copies stay, for the host to revoke when it unplugs.
+ */
+void l4h_hp_unmap(unsigned int m)
+{
+	unsigned long *tables, i;
+
+	mutex_lock(&hp_mutex);
+	WRITE_ONCE(hp_state[m], HP_BUSY);
+	wait_nofault_accesses();
+	WARN_ON(l4h_cnode_revoke(L4H_HP_BLOCK_CPTR(m, HP_OBJ_BLOCK), 64));
+	for (i = 0; i < HP_OBJ_BLOCK; i++)
+		WARN_ON(l4h_cnode_revoke(L4H_HP_BLOCK_CPTR(m, i), 64));
+	tables = hp_tables[m];
+	hp_tables[m] = NULL;
+	for (i = 0; tables && i < HP_OBJ_BLOCK; i++) {
+		/* The revoke deleted the tables: only the slots are left. */
+		if (tables[i])
+			l4h_slot_free(tables[i]);
+	}
+	kfree(tables);
+	WRITE_ONCE(hp_state[m], HP_ABSENT);
+	mutex_unlock(&hp_mutex);
+}
+
 /*
  * Are the direct-map pages of guest-physical [gpa, gpa+size) there?  Object
  * blocks, and blocks being converted, have no frames to map.  Before
@@ -726,8 +921,11 @@ bool l4h_ram_mapped(unsigned long gpa, unsigned long size)
 	for (b = gpa >> L4H_BLOCK_SHIFT; b <= last; b++) {
 		u8 state;
 
-		if (b >= nr_blocks)
-			return false;
+		if (b >= nr_blocks) {
+			if (!hp_block_mapped(b))
+				return false;
+			continue;
+		}
 		state = READ_ONCE(blocks[b].state);
 		if (state != BLK_BOOT && state != BLK_FRAMES)
 			return false;
@@ -1092,6 +1290,12 @@ void __init l4h_caps_init(void)
 	}
 	rest = nr_blocks - boot_blocks;
 	reserve_target = spare_watermark = default_target();
+	hp_first = bi->hp_gpa >> L4H_BLOCK_SHIFT;
+	hp_count = min_t(unsigned long, bi->hp_count, L4H_HP_MAX);
+	if (hp_count && (bi->hp_gpa % L4H_HP_SIZE || bi->hp_gpa < bi->io_pool_gpa + bi->io_pool_size ||
+			 bi->hp_gpa + (u64)hp_count * L4H_HP_SIZE > L4H_GPA_END))
+		panic("l4h: bad hotplug region %#llx, %u blocks\n", bi->hp_gpa, hp_count);
+	bitmap_set(ram_l1_made, 0, DIV_ROUND_UP(nr_blocks, 1u << L4H_RAM_L2_BITS));
 	/* A 16 KiB RAM CNode and a 4 KiB page table per frame block, in
 	 * blocks of their classes, a capability CNode, and the reserve. */
 	want = DIV_ROUND_UP(rest * (16ul << 10) + (256ul << 10), RAM_BLOCK) +

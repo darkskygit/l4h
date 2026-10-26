@@ -17,18 +17,24 @@
 /// MEMD_GUEST_DESTROY.
 pub const SLOT_GUEST_BCN: u64 = 32;
 pub const MAX_GUESTS: usize = 64;
+/// Slot of guest g's hotplug CNode (L4H_SLOT_HP of the guest, without its
+/// guard), SLOT_GUEST_HCN + g, which l4h-root puts there before
+/// MEMD_GUEST_CREATE and memd deletes at MEMD_GUEST_DESTROY.
+pub const SLOT_GUEST_HCN: u64 = SLOT_GUEST_BCN + MAX_GUESTS as u64;
 /// Exchange slots: Untypeds passed by MEMD_ALLOC, MEMD_FREE and
 /// MEMD_GUEST_COPY, slot SLOT_XCHG + i for the i-th.  A call passes at
 /// most XCHG_SLOTS (MEMD_FREE takes two message registers for each).
-pub const SLOT_XCHG: u64 = 128;
+pub const SLOT_XCHG: u64 = 160;
 pub const XCHG_SLOTS: usize = 32;
 /// The blocks' slots start here (`block_slots`).
 pub const SLOT_DYN_BASE: u64 = 256;
-const _: () = assert!(SLOT_GUEST_BCN as usize + MAX_GUESTS <= SLOT_XCHG as usize);
+const _: () = assert!(SLOT_GUEST_HCN as usize + MAX_GUESTS <= SLOT_XCHG as usize);
 const _: () = assert!(SLOT_XCHG as usize + XCHG_SLOTS <= SLOT_DYN_BASE as usize);
 
 /// Labels of l4h-root's calls on memd's service endpoint.  The reply's
-/// MR0 is 0 or an errno (ENOMEM, EINVAL).
+/// MR0 is 0 or an errno (ENOMEM, EINVAL).  l4h-root calls with an
+/// unbadged capability; a guest's l4h-vmm with one badged
+/// `BADGE_VMM | guest`, which may make the MEMD_HP_* calls only.
 ///
 /// MR0 = size bits (BLOCK_BITS..=MAX_BITS), MR1 = count (<= XCHG_SLOTS): `count` Untypeds of
 /// 2^bits bytes without children, in the exchange slots; MR1.. of the
@@ -39,8 +45,10 @@ pub const MEMD_ALLOC: u64 = 1;
 /// slots, returned to the free memory.  Each is a block memd gave, or one
 /// of at least 2^BLOCK_BITS bytes in the units of the table.
 pub const MEMD_FREE: u64 = 2;
-/// MR0 = guest, MR1 = blocks, MR2 = radix of its block CNode: take the
-/// guest's RAM, `blocks` 2 MiB blocks.  Nothing is given yet.
+/// MR0 = guest, MR1 = blocks, MR2 = radix of its block CNode, MR3 =
+/// hotplug blocks in its region (at most abi::HP_MAX): take the guest's
+/// RAM, `blocks` 2 MiB blocks.  Nothing is given yet, and its hotplug
+/// target is 0.
 pub const MEMD_GUEST_CREATE: u64 = 3;
 /// MR0 = guest, MR1 = block: a copy of the block's Untyped in exchange
 /// slot 0, for l4h-root to fill with frames (a boot block); reply MR1 =
@@ -58,6 +66,30 @@ pub const MEMD_GUEST_DESTROY: u64 = 6;
 /// l4h-root has mapped: drive it.  Reply MR0 = 0, or ENODEV if it cannot
 /// report.
 pub const MEMD_BALLOON: u64 = 7;
+/// MR0 = guest, MR1 = hotplug blocks: its target, clamped to its region.
+pub const MEMD_SET_TARGET: u64 = 8;
+
+/// From a guest's l4h-vmm (the guest is the badge's), DESIGN.md §17.  The
+/// reply's MR0 is 0 or an errno: EINVAL, ENOSPC, EBUSY.
+/// MR0 = m: plug hotplug block m, copying the Untypeds of its 64 blocks
+/// into the guest's level-2 hotplug CNode in slot m of its hotplug CNode.
+pub const MEMD_HP_PLUG: u64 = 16;
+/// MR0 = m: revoke and free the blocks of hotplug block m.
+pub const MEMD_HP_UNPLUG: u64 = 17;
+/// Reply MR1 = target, MR2 = plugged, MR3.. = the plugged bitmap
+/// (HP_MAP_WORDS words).
+pub const MEMD_HP_STATE: u64 = 18;
+
+/// Badge bit of a VMM's capability to memd's service endpoint; the low 16
+/// bits are its guest.
+pub const BADGE_VMM: u64 = 1 << 62;
+/// Hotplug blocks of a region, at most, and the words of its bitmap.
+pub const HP_MAX: usize = 512;
+pub const HP_MAP_WORDS: usize = HP_MAX / 64;
+/// A guest plugs or unplugs at most HP_RATE hotplug blocks a second, after
+/// a burst of HP_BURST.
+pub const HP_RATE: u64 = 8;
+pub const HP_BURST: u64 = 16;
 
 /// Guest RAM comes in blocks of 2^BLOCK_BITS bytes, the smallest memd
 /// handles: a unit of its table.
@@ -101,7 +133,7 @@ pub const fn cnode_bits(units: u64) -> usize {
 pub const STATUS_VA: usize = crate::SHARED_VA;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Status {
     /// Bytes in free blocks (not given to l4h-root or a guest).
     pub free_bytes: u64,
@@ -110,9 +142,24 @@ pub struct Status {
     /// Free blocks, and the size of the largest.
     pub free_blocks: u64,
     pub largest_block: u64,
-    /// Bytes of guest RAM memd holds.
+    /// Bytes of guest RAM memd holds, plugged memory included.
     pub guest_bytes: u64,
+    /// Of those, plugged (hotplug blocks).
+    pub plugged_bytes: u64,
+    /// Per guest: hotplug target and plugged hotplug blocks.
+    pub hp: [GuestHp; MAX_GUESTS],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GuestHp {
+    pub target: u16,
+    pub plugged: u16,
+    pub count: u16,
+    pub reserved: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<Status>() <= 4096);
 
 /// The free page reporting device (a virtio-balloon on PCI): its BARs are
 /// mapped at BALLOON_VA + bar * BAR_STRIDE, three DMA pages at DMA_VA.

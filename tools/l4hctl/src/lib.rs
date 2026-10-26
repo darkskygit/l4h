@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 
-pub const CTL_VERSION: u32 = 2;
+pub const CTL_VERSION: u32 = 3;
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: usize = 1 << 20;
 pub const CTL_NAME_MAX: usize = 32;
@@ -43,6 +43,8 @@ pub const CTL_IOMMU_INFO: u32 = 24;
 pub const CTL_HOST_VERSION: u32 = 25;
 pub const CTL_GPU_ATTACH: u32 = 26;
 pub const CTL_GPU_READ: u32 = 27;
+pub const CTL_VM_SET_MEM: u32 = 28;
+pub const CTL_VM_MEM_INFO: u32 = 29;
 pub const GPU_POOL_IMAGES: u64 = 4;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
@@ -358,6 +360,29 @@ pub fn parse_num(s: &str) -> Result<u64> {
 /// A size in MiB, as bytes.
 pub fn parse_mib(s: &str) -> Result<u64> {
     parse_num(s)?.checked_mul(1 << 20).ok_or(Error(format!("too large: {s} MiB")))
+}
+
+/// A VM's memory (CTL_VM_MEM_INFO), in bytes of host memory: boot RAM,
+/// its hotplug region, and the target and plugged part of the region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemInfo {
+    pub boot: u64,
+    pub region: u64,
+    pub target: u64,
+    pub plugged: u64,
+}
+
+impl Ctl {
+    pub fn mem_info(&self, vm: u64) -> Result<MemInfo> {
+        let r = self.call(CTL_VM_MEM_INFO, &[vm], &[], &[])?;
+        Ok(MemInfo { boot: r.vals[0], region: r.vals[1], target: r.vals[2], plugged: r.vals[3] })
+    }
+
+    /// Plug or unplug memory until the VM has `bytes` (boot RAM included,
+    /// the rest in whole hotplug blocks of 128 MiB).  Returns at once.
+    pub fn set_mem(&self, vm: u64, bytes: u64) -> Result<()> {
+        self.call(CTL_VM_SET_MEM, &[vm, bytes], &[], &[]).map(|_| ())
+    }
 }
 
 /// A VM to create and start with [`Ctl::create_vm`].

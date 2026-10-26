@@ -1,0 +1,28 @@
+#!/bin/sh
+# Guest of tests/guest/init-hotplugtest: report memory when asked (a line
+# "mem" on the console), fill and check tmpfs ("fill N", "check"), empty it
+# ("free").
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /tmp/t && mount -t tmpfs -o size=3g tmp /tmp/t
+kib() { sed -n "s/^$1: *\([0-9]*\) kB/\1/p" /proc/meminfo; }
+report() {
+    echo "HPVM: mem total $(( $(kib MemTotal) >> 10 )) objects $(( $(kib L4hObjects) >> 10 )) blocks $(ls -d /sys/devices/system/memory/memory* | wc -l)"
+}
+report
+echo "HPVM: ready"
+while read -r cmd arg; do
+    case "$cmd" in
+    mem) report ;;
+    fill)
+        yes l4h-hotplug | head -c $((arg << 20)) > /tmp/t/fill || echo "HPVM: fill failed"
+        md5sum < /tmp/t/fill > /tmp/want
+        echo "HPVM: filled" ;;
+    check)
+        if md5sum < /tmp/t/fill | cmp -s - /tmp/want; then echo "HPVM: data ok"; else echo "HPVM: data differs"; fi ;;
+    free)
+        rm -f /tmp/t/fill
+        echo "HPVM: freed" ;;
+    esac
+done

@@ -145,6 +145,9 @@ fn create(
     cfg.serial = host::VERBOSE as u32;
     cfg.epoch_ns = host_info.epoch_ns;
     cfg.epoch_ticks = host_info.epoch_ticks;
+    cfg.mem_dev = g.mem_dev.map_or(0, |d| d as u32 + 1);
+    cfg.hp_count = g.hp_count as u32;
+    cfg.mem_event = g.mem_dev.map_or(0, dev_event);
     assert!(backends.len() <= host::VMM_MAX_DEVICES);
     cfg.nr_devices = backends.len() as u32;
     for (i, (d, b)) in backends.iter().enumerate() {
@@ -227,6 +230,10 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     for (d, dev) in g.devices.iter().enumerate() {
         let p = crate::component::abs_of(dev.page);
         comp.map_copy(alloc, &mut g.arena, &p, host::vmm_device_page_va(d), CapRights::read_write(), attrs, keep_slot());
+    }
+    if g.mem_dev.is_some() {
+        let dst = comp.slot(host::VMM_SLOT_MEMD_EP);
+        crate::memd::mint_vmm_ep(alloc, g.id, &dst);
     }
     for (i, f) in g.console_ring.iter().enumerate() {
         let p = crate::component::abs_of(*f);

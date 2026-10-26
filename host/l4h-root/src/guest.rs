@@ -18,6 +18,11 @@
 //! frames, and are guest-physical space on top of the RAM the guest was
 //! given.  Guest block b is memd's block b less the shared blocks below
 //! it (`memd_block`).
+//!
+//! Above the I/O pool, every guest has a hotplug region (DESIGN.md §17):
+//! guest-physical space up to abi::GPA_END in hotplug blocks of 128 MiB,
+//! which its l4h-vmm plugs and unplugs with memd while it runs.  All the
+//! host makes for it is the level-1 hotplug CNode (16 KiB).
 
 use core::ptr;
 
@@ -113,6 +118,8 @@ pub enum DevKind {
     Virtio(u32),
     /// Served by trustd, which owns the page (trustd.rs).
     Attest,
+    /// Memory hotplug (abi::MemPage), written by l4h-vmm.
+    Mem,
 }
 
 pub struct GuestDev {
@@ -278,6 +285,11 @@ pub struct Guest {
     /// Its virtio-gpu's scanout size, if it has one; the display area is
     /// mapped at gpu::root_display_va(id).
     pub gpu: Option<(u32, u32)>,
+    /// Its hotplug region: hp_count hotplug blocks from hp_gpa.
+    pub hp_gpa: usize,
+    pub hp_count: usize,
+    /// Its memory device (DevKind::Mem).
+    pub mem_dev: Option<usize>,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -496,7 +508,7 @@ impl Guest {
         let root_va = match kind {
             DevKind::Ctl => Some(root_guest_va(self.id)),
             DevKind::Console => Some(root_guest_va(self.id) + PAGE),
-            DevKind::Virtio(_) | DevKind::Attest => None,
+            DevKind::Virtio(_) | DevKind::Attest | DevKind::Mem => None,
         };
         if let Some(va) = root_va {
             self.map_in_root(alloc, page, va);
@@ -554,6 +566,16 @@ impl Guest {
         abs(badged).mint(&abs(self.vcpus[0].ntfn), CapRights::write_only(), abi::BADGE_EVENT).expect("event cap");
         badged.signal();
         abs(badged).delete().expect("delete event cap");
+        alloc.slots.free(s);
+    }
+
+    /// Signal the guest's l4h-vmm with `badge` (host::VMM_BADGE_*).
+    pub fn signal_vmm(&self, alloc: &mut Alloc, badge: u64) {
+        let s = alloc.slots.alloc();
+        let badged = root_cap::<cap_type::Notification>(s);
+        abs(badged).mint(&abs(self.vmm_ntfn), CapRights::write_only(), badge).expect("VMM signal cap");
+        badged.signal();
+        abs(badged).delete().expect("delete VMM signal cap");
         alloc.slots.free(s);
     }
 
@@ -706,6 +728,8 @@ impl Guest {
         bi.flags = if self.dom0 { abi::BOOT_DOM0 } else { 0 };
         bi.io_pool_gpa = self.pool.gpa as u64;
         bi.io_pool_size = self.pool.size as u64;
+        bi.hp_gpa = self.hp_gpa as u64;
+        bi.hp_count = self.hp_count as u64;
         bi.nr_devices = self.devices.len() as u64;
         for (d, dev) in self.devices.iter().enumerate() {
             let (ty, virtio_id) = match dev.kind {
@@ -713,6 +737,7 @@ impl Guest {
                 DevKind::Ctl => (abi::DEV_CTL, 0),
                 DevKind::Virtio(id) => (abi::DEV_VIRTIO, id),
                 DevKind::Attest => (abi::DEV_ATTEST, 0),
+                DevKind::Mem => (abi::DEV_MEM, 0),
             };
             let (data_va, data_size) = match dev.kind {
                 DevKind::Ctl => (abi::CTL_DATA_VA, abi::CTL_LOAD_MAX),
@@ -884,6 +909,12 @@ pub fn create(
     if ram_base == 0 || ram_base.checked_add(pool_gpa + cfg.io_pool).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
         return Err(None);
     }
+    // The hotplug region fills guest-physical space above the pool.
+    let hp_gpa = (pool_gpa + cfg.io_pool).next_multiple_of(abi::HP_SIZE);
+    let hp_count = (abi::GPA_END.saturating_sub(hp_gpa) / abi::HP_SIZE).min(abi::HP_MAX);
+    if ram_base.checked_add(hp_gpa + hp_count * abi::HP_SIZE).is_none_or(|end| end as u64 > abi::SPECIAL_BASE) {
+        return Err(None);
+    }
 
     // Host-side objects for this guest (its arena grows if this is too
     // little): CNodes, the RAM CNodes of the boot blocks and the paging
@@ -898,6 +929,7 @@ pub fn create(
     let estimate = (32 << abi::ROOT_CNODE_BITS) * 4
         + n_l1 * (32 << abi::RAM_L2_BITS)
         + (32 << block_radix)
+        + (32 << abi::HP_L1_BITS)
         + (16 + shared.count_ones() as usize) * ((32 << abi::RAM_L2_BITS) + PAGE)
         + 2 * 32 * pool_pages
         + (cfg.io_pool / 512 + 2 * PAGE)
@@ -957,6 +989,9 @@ pub fn create(
         launch: None,
         kmod_size: 0,
         gpu: None,
+        hp_gpa,
+        hp_count,
+        mem_dev: None,
     };
 
     let Some(cnodes) = vmm::Cnodes::new(&mut g.arena, alloc, cfg.io_pool) else {
@@ -989,7 +1024,11 @@ pub fn create(
     let block_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: block_radix });
     let guard = CNodeCapData::new(0, abi::L2_INDEX_BITS - block_radix).into_word();
     g.give_badged(abi::SLOT_BLOCKS, block_cn, CapRights::all(), guard);
-    if !memd::guest_create(alloc, id, owned, block_cn, block_radix) {
+    // The hotplug CNode: the guest makes a level-2 CNode in slot m before
+    // plugging hotplug block m, and memd copies its blocks into it.
+    let hp_cn = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: abi::HP_L1_BITS });
+    g.give_badged(abi::SLOT_HP, hp_cn, CapRights::all(), CNodeCapData::new(0, abi::HP_L1_GUARD).into_word());
+    if !memd::guest_create(alloc, id, owned, block_cn, block_radix, hp_cn, hp_count) {
         return Err(Some(g));
     }
     g.nr_blocks = nr_blocks;
@@ -1129,6 +1168,9 @@ pub fn create(
     }
     if cfg.dom0 {
         g.add_device(alloc, DevKind::Ctl).unwrap();
+    }
+    if hp_count != 0 {
+        g.mem_dev = g.add_device(alloc, DevKind::Mem);
     }
 
     info!(

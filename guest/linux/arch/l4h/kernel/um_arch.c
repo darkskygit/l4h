@@ -366,8 +366,11 @@ void __init l4h_linux_main(void)
 	physmem_size = bi->ram_size;
 	uml_reserved = uml_physmem + bi->kernel_end_gpa;
 	high_physmem = uml_physmem + physmem_size;
-	/* The direct map ends after the I/O pool, which follows RAM. */
+	/* The direct map ends after the I/O pool, which follows RAM, and the
+	 * hotplug region above it: vmalloc starts beyond. */
 	end_iomem = max(high_physmem, uml_physmem + bi->io_pool_gpa + bi->io_pool_size);
+	if (bi->hp_count)
+		end_iomem = max(end_iomem, uml_physmem + bi->hp_gpa + bi->hp_count * L4H_HP_SIZE);
 
 	task_size = L4H_TASK_SIZE;
 	start_vm = VMALLOC_START;
@@ -382,6 +385,21 @@ void __init l4h_linux_main(void)
 	start_uml();
 }
 
+/*
+ * Hotplugged memory (drivers/memhp.c) carries its memmap (DESIGN.md §17).
+ * The option goes first: the command line can override it.
+ */
+static void __init hotplug_options(void)
+{
+	static const char opts[] = "memory_hotplug.memmap_on_memory=1 ";
+	size_t n = strlen(command_line);
+
+	if (!IS_ENABLED(CONFIG_L4H_MEMHP) || !l4h_bootinfo->hp_count || n + sizeof(opts) > COMMAND_LINE_SIZE)
+		return;
+	memmove(command_line + sizeof(opts) - 1, command_line, n + 1);
+	memcpy(command_line, opts, sizeof(opts) - 1);
+}
+
 void __init setup_arch(char **cmdline_p)
 {
 	u8 rng_seed[32];
@@ -394,6 +412,7 @@ void __init setup_arch(char **cmdline_p)
 	l4h_caps_init();
 	l4h_vspace_init();
 	paging_init();
+	hotplug_options();
 	strscpy(boot_command_line, command_line, COMMAND_LINE_SIZE);
 	*cmdline_p = command_line;
 	setup_hostinfo(host_info, sizeof host_info);
