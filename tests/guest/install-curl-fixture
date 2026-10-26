@@ -1,0 +1,21 @@
+#!/bin/bash
+# Test-only transport for unpublished release assets in a disposable VM.
+set -euo pipefail
+out='' url=''
+original=("$@")
+while (($#)); do
+    case "$1" in
+        -o|--output) out=$2; shift ;;
+        https://github.com/losfair/l4h/releases/download/v0-install-test/*) url=$1 ;;
+    esac
+    shift
+done
+if [[ -n $url && -n $out ]]; then
+    case ${url##*/} in
+        SHA256SUMS|l4h-dom0-x86_64.tar.xz|l4h-generic.efi)
+            cp "/opt/l4h-install-test/release/${url##*/}" "$out" ;;
+        *) exit 22 ;;
+    esac
+else
+    exec /usr/bin/curl "${original[@]}"
+fi

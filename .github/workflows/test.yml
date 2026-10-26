@@ -28,6 +28,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  installer:
+    name: Linux installer safety checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Preflight, downloads, EFI transactions and rollback
+        run: python3 tests/test_installer.py
+      - name: Shell lint
+        run: shellcheck tools/install.sh tools/install/init tests/run-install-vm.sh tests/guest/install-test tests/guest/install-curl-fixture
+
   x86_64:
     name: x86_64 (QEMU/KVM)
     runs-on: ubuntu-24.04

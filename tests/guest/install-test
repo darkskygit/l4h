@@ -1,0 +1,97 @@
+#!/bin/bash
+# Runs only in the disposable native-Linux installer test VM.
+set -euo pipefail
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+work=/opt/l4h-install-test
+exec > >(tee -a "$work/result.log" /dev/console) 2>&1
+trap 'echo "INSTALLVM: FAIL at line $LINENO"; sync; systemctl poweroff' ERR
+cd "$work"
+if [[ $(uname -r) == *-l4h ]]; then
+    echo "INSTALLVM: dom0 kernel $(uname -r)"
+    [[ $(cat phase) == installed ]]
+    sha256sum --check native-files.sha256
+    [[ $(cat marker) == native-linux ]]
+    test -c /dev/l4hctl
+    test -b /dev/l4hkmod
+    test -d "/lib/modules/$(uname -r)"
+    [[ $(findmnt -n -o FSTYPE -T /lib/modules) == erofs ]]
+    [[ $(findmnt -n -o OPTIONS -T /lib/modules) == *ro* ]]
+    l4hctl version
+    l4hctl info
+    read -r name mac < native-nic
+    [[ $(cat "/sys/class/net/$name/address") == "$mac" ]]
+    ip -br address
+    ping -c 2 -W 10 10.0.2.2
+    getent hosts deb.debian.org
+    if ! systemctl is-system-running --wait; then
+        systemctl --failed --no-pager
+        false
+    fi
+    echo l4h-dom0 > marker
+    echo dom0 > phase
+    echo 'INSTALLVM: existing userspace, modules, network and persistent root passed'
+    sync
+    l4hctl host-reboot
+elif [[ ! -f phase ]]; then
+    echo "INSTALLVM: native kernel $(uname -r)"
+    echo native-linux > marker
+    # Remember the native EFI payloads and distribution configuration.
+    find /boot/efi/EFI -type f -print0 | sort -z | xargs -0 sha256sum > native-files.sha256
+    sha256sum /etc/fstab >> native-files.sha256
+    for net in /sys/class/net/*; do
+        [[ ${net##*/} == lo ]] || echo "${net##*/} $(cat "$net/address")" > native-nic
+    done
+    # Local release fixtures exercise the unchanged bootstrap, checksum and
+    # extraction paths before these artifacts have been published on GitHub.
+    # /usr/sbin precedes /usr/bin; package installation cannot replace this shim.
+    install -m 755 curl-fixture /usr/sbin/curl
+    # Dependency bootstrap may run, but a corrupt release must never change
+    # the ESP or firmware. Also exercise the download cleanup on failure.
+    sha256sum /sys/firmware/efi/efivars/BootOrder-* > native-order.sha256
+    cp release/SHA256SUMS release/SHA256SUMS.good
+    sed -i 's/^[0-9a-f]/x/' release/SHA256SUMS
+    # shellcheck disable=SC2002
+    if cat install.sh | bash -s -- --release v0-install-test; then
+        echo 'INSTALLVM: invalid checksum was accepted'
+        false
+    fi
+    sha256sum --check native-order.sha256
+    sha256sum --check native-files.sha256
+    mv release/SHA256SUMS.good release/SHA256SUMS
+    echo 'INSTALLVM: corrupt release rejected before EFI changes'
+    # Exercise curl | bash's unprivileged entry point and sudo re-execution.
+    command -v sudo >/dev/null || apt-get install -y sudo
+    useradd --no-create-home --shell /bin/bash l4h-install-test
+    echo 'l4h-install-test ALL=(root) NOPASSWD: ALL' > /etc/sudoers.d/l4h-install-test
+    chmod 440 /etc/sudoers.d/l4h-install-test
+    sudo -u l4h-install-test bash -c 'cat install.sh | bash -s -- --release v0-install-test --memory 2048 --vcpus 2'
+    # shellcheck disable=SC2002
+    cat install.sh | bash -s -- --check --release v0-install-test --memory 2048 --vcpus 2
+    sha256sum --check native-files.sha256
+    efibootmgr --verbose | tee installed-boot.txt
+    python3 - <<'PY'
+import json
+from pathlib import Path
+import re
+state = json.loads(Path('/var/lib/l4h/install.json').read_text())
+saved = json.loads(next(Path('/var/lib/l4h/backups').glob('*/boot.json')).read_text())
+boot = Path('installed-boot.txt').read_text()
+assert re.search(r'^BootOrder: (.+)$', boot, re.M)[1] == saved['order']
+assert re.search(r'^BootNext: (.+)$', boot, re.M)[1] == state['entry']
+Path('native-boot-order').write_text(saved['order'])
+PY
+    echo installed > phase
+    echo 'INSTALLVM: installed; rebooting through BootNext'
+    sync
+    systemctl reboot
+else
+    echo "INSTALLVM: returned to native kernel $(uname -r)"
+    [[ $(cat phase) == dom0 && $(cat marker) == l4h-dom0 ]]
+    efibootmgr | tee returned-boot.txt
+    if grep -q '^BootNext:' returned-boot.txt; then false; fi
+    [[ $(sed -n 's/^BootOrder: //p' returned-boot.txt) == "$(cat native-boot-order)" ]]
+    sha256sum --check native-files.sha256
+    echo 'INSTALLVM: PASS (native -> L4H dom0 -> native)'
+    sync
+    systemctl poweroff
+fi
