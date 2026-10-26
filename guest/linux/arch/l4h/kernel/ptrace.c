@@ -59,6 +59,9 @@ long arch_ptrace(struct task_struct *child, long request,
 	unsigned long __user *p = (void __user *)data;
 	void __user *vp = p;
 
+	if (request == PTRACE_SYSEMU_SINGLESTEP)
+		return -EIO;
+
 #ifdef CONFIG_KEMU
 	if (task_is_kemu(child))
 		return kemu_arch_ptrace(child, request, addr, data);
@@ -76,11 +79,6 @@ long arch_ptrace(struct task_struct *child, long request,
 	/* write the word at location addr in the USER area */
 	case PTRACE_POKEUSR:
 		ret = poke_user(child, addr, data);
-		break;
-
-	case PTRACE_SYSEMU:
-	case PTRACE_SYSEMU_SINGLESTEP:
-		ret = -EIO;
 		break;
 
 #ifdef PTRACE_GETREGS
@@ -148,10 +146,18 @@ static void send_sigtrap(struct uml_pt_regs *regs, int error_code)
  */
 int syscall_trace_enter(struct pt_regs *regs)
 {
+	unsigned long flags = read_thread_flags();
+
 	/* The tracer first, as in generic entry: the tracepoint and audit see
 	 * the syscall it may have changed, and none it skipped. */
-	if (test_thread_flag(TIF_SYSCALL_TRACE) && ptrace_report_syscall_entry(regs))
-		return 1;
+	if (flags & (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_EMU)) {
+		int ret = ptrace_report_syscall_entry(regs);
+
+		/* Use the flags from before the stop: this syscall stays skipped
+		 * even if the tracer resumes with CONT, SYSCALL or DETACH. */
+		if (ret || (flags & _TIF_SYSCALL_EMU))
+			return 1;
+	}
 
 	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
 		trace_sys_enter(regs, UPT_SYSCALL_NR(&regs->regs));

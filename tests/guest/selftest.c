@@ -4,6 +4,7 @@
  * guest; prints "SELFTEST: PASS" or "SELFTEST: FAIL <test>".
  */
 #define _GNU_SOURCE
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -24,6 +25,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -32,8 +34,6 @@
 #include <asm/prctl.h>
 #else
 #include <asm/ptrace.h>
-#include <sys/uio.h>
-#include <elf.h>
 #endif
 #include <linux/filter.h>
 #include <linux/futex.h>
@@ -736,6 +736,220 @@ static void test_ptrace_syscall(void)
 }
 
 #endif
+
+/* ---- ptrace syscall emulation (also used with AArch64 under kemu) */
+#ifndef PTRACE_SYSEMU
+#define PTRACE_SYSEMU 31
+#endif
+#ifndef PTRACE_SYSEMU_SINGLESTEP
+#define PTRACE_SYSEMU_SINGLESTEP 32
+#endif
+
+#ifdef __x86_64__
+typedef struct user_regs_struct sysemu_regs;
+#define SYSEMU_NR(r) ((r).orig_rax)
+#define SYSEMU_RET(r) ((r).rax)
+#else
+typedef struct user_pt_regs sysemu_regs;
+#define SYSEMU_NR(r) ((r).regs[8])
+#define SYSEMU_RET(r) ((r).regs[0])
+#endif
+
+static volatile sig_atomic_t sysemu_signal;
+
+static void sysemu_signal_handler(int sig)
+{
+	sysemu_signal = sig;
+}
+
+/* SIGUSR1 denotes resuming with SYSEMU while a signal is pending. */
+static void sysemu_child(int fd, int resume, int filtered)
+{
+	struct sigaction sa = { .sa_handler = sysemu_signal_handler };
+	struct sock_filter filter[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_write, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog prog = { .len = sizeof(filter) / sizeof(filter[0]), .filter = filter };
+	long ret;
+
+	sysemu_signal = 0;
+	if (sigaction(SIGUSR1, &sa, NULL))
+		_exit(10);
+	if (filtered && (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+			 prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)))
+		_exit(11);
+	if (ptrace(PTRACE_TRACEME, 0, NULL, NULL))
+		_exit(12);
+	raise(SIGSTOP);
+	if (syscall(SYS_write, fd, "S", 1UL) != 123)
+		_exit(13);
+	if (resume == PTRACE_SYSEMU) {
+		/* The tracer changes this to write(fd, "S", 1), which must
+		 * still be skipped even when it resumes with CONT. */
+		if (syscall(SYS_getpid, fd, "S", 1UL) != 456)
+			_exit(14);
+	}
+	ret = syscall(SYS_write, fd, "R", 1UL);
+	if (filtered ? (ret != -1 || errno != EACCES) : ret != 1)
+		_exit(15);
+	if (resume == PTRACE_SYSCALL && syscall(SYS_getpid) != 789)
+		_exit(17);
+	if (sysemu_signal != (resume == SIGUSR1 ? SIGUSR1 : 0))
+		_exit(16);
+	_exit(0);
+}
+
+static int sysemu_stop(pid_t pid, int sig)
+{
+	int status;
+
+	return waitpid(pid, &status, 0) == pid && WIFSTOPPED(status) &&
+	       WSTOPSIG(status) == sig;
+}
+
+static int sysemu_emulate(pid_t pid, long nr, long ret, int change_nr)
+{
+	sysemu_regs regs;
+	struct iovec iov = { &regs, sizeof(regs) };
+
+	if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov))
+		return -1;
+	if (SYSEMU_NR(regs) != nr) {
+		errno = EPROTO;
+		return -1;
+	}
+	SYSEMU_RET(regs) = ret;
+	if (change_nr) {
+#ifdef __x86_64__
+		SYSEMU_NR(regs) = SYS_write;
+#else
+		int replacement = SYS_write;
+		struct iovec syscall_iov = { &replacement, sizeof(replacement) };
+
+		if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &syscall_iov))
+			return -1;
+#endif
+	}
+	return ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+}
+
+static void sysemu_tracer(pid_t pid, int resume, int *reaped)
+{
+	sysemu_regs regs;
+	struct iovec iov = { &regs, sizeof(regs) };
+	int status;
+
+	CHECK(sysemu_stop(pid, SIGSTOP), "initial stop");
+	CHECK(ptrace(PTRACE_SETOPTIONS, pid, NULL,
+		     (void *)(uintptr_t)(PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL)) == 0,
+	      "trace options: %s", strerror(errno));
+	CHECK(ptrace(PTRACE_SYSEMU, pid, NULL, NULL) == 0, "SYSEMU: %s", strerror(errno));
+	CHECK(sysemu_stop(pid, SIGTRAP | 0x80), "SYSEMU entry stop");
+	CHECK(sysemu_emulate(pid, SYS_write, 123, 0) == 0, "emulate write: %s", strerror(errno));
+	if (resume == SIGUSR1) {
+		CHECK(kill(pid, SIGUSR1) == 0, "queue signal");
+		CHECK(ptrace(PTRACE_SYSEMU, pid, NULL, NULL) == 0, "resume before signal");
+		CHECK(sysemu_stop(pid, SIGUSR1), "signal delivery stop");
+		CHECK(ptrace(PTRACE_CONT, pid, NULL, (void *)(uintptr_t)SIGUSR1) == 0,
+		      "deliver signal");
+	} else {
+		CHECK(ptrace(resume, pid, NULL, NULL) == 0, "resume %d: %s", resume, strerror(errno));
+		if (resume == PTRACE_SYSEMU) {
+			/* No exit stop in SYSEMU mode; the next stop is getpid. */
+			CHECK(sysemu_stop(pid, SIGTRAP | 0x80), "second SYSEMU entry");
+			CHECK(sysemu_emulate(pid, SYS_getpid, 456, 1) == 0,
+			      "emulate changed syscall: %s", strerror(errno));
+			CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "CONT after SYSEMU");
+		} else if (resume == PTRACE_SYSCALL) {
+			/* Switching to SYSCALL produces an exit stop for the skipped
+			 * call. Switching back at the next entry must execute that
+			 * call and suppress the one after it. */
+			CHECK(sysemu_stop(pid, SIGTRAP | 0x80), "skipped syscall exit");
+			CHECK(ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0 &&
+			      SYSEMU_RET(regs) == 123, "skipped syscall return value");
+			CHECK(ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == 0, "resume to real entry");
+			CHECK(sysemu_stop(pid, SIGTRAP | 0x80), "real syscall entry");
+			CHECK(ptrace(PTRACE_SYSEMU, pid, NULL, NULL) == 0, "SYSEMU after SYSCALL");
+			CHECK(sysemu_stop(pid, SIGTRAP | 0x80), "SYSEMU after real syscall");
+			CHECK(sysemu_emulate(pid, SYS_getpid, 789, 0) == 0, "emulate after SYSCALL");
+			CHECK(ptrace(PTRACE_CONT, pid, NULL, NULL) == 0, "CONT after emulation");
+		}
+	}
+	CHECK(waitpid(pid, &status, 0) == pid, "wait for exit");
+	*reaped = WIFEXITED(status) || WIFSIGNALED(status);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	      "resume %d: child status %#x", resume, status);
+}
+
+static void sysemu_test(int filtered)
+{
+	const int resumes[] = { PTRACE_SYSEMU, PTRACE_CONT, PTRACE_SYSCALL, PTRACE_DETACH, SIGUSR1 };
+
+	for (unsigned i = 0; i < sizeof(resumes) / sizeof(resumes[0]); i++) {
+		int fds[2], reaped = 0, before = failures;
+		char buf[8];
+		ssize_t n;
+		pid_t pid;
+
+		CHECK(pipe2(fds, O_NONBLOCK) == 0, "pipe");
+		pid = fork();
+		if (pid < 0) {
+			close(fds[0]);
+			close(fds[1]);
+			CHECK(0, "fork: %s", strerror(errno));
+		}
+		if (!pid)
+			sysemu_child(fds[1], resumes[i], filtered);
+		close(fds[1]);
+		sysemu_tracer(pid, resumes[i], &reaped);
+		if (!reaped) {
+			kill(pid, SIGKILL);
+			waitpid(pid, NULL, 0);
+		}
+		n = read(fds[0], buf, sizeof(buf));
+		close(fds[0]);
+		if (failures != before)
+			return;
+		CHECK(filtered ? n == 0 : (n == 1 && buf[0] == 'R'),
+		      "resume %d: syscall side effects (%zd bytes)", resumes[i], n);
+	}
+}
+
+static void test_ptrace_sysemu(void)
+{
+	sysemu_test(0);
+}
+
+static void test_ptrace_sysemu_seccomp(void)
+{
+	sysemu_test(1);
+}
+
+static void test_ptrace_sysemu_nostep(void)
+{
+	pid_t pid = fork();
+	int stopped, ret, err;
+
+	CHECK(pid >= 0, "fork");
+	if (!pid) {
+		if (ptrace(PTRACE_TRACEME, 0, NULL, NULL))
+			_exit(10);
+		raise(SIGSTOP);
+		_exit(0);
+	}
+	stopped = sysemu_stop(pid, SIGSTOP);
+	ret = ptrace(PTRACE_SYSEMU_SINGLESTEP, pid, NULL, NULL);
+	err = errno;
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	CHECK(stopped && ret == -1 && err == EIO, "SYSEMU_SINGLESTEP: %d, errno %d", ret, err);
+}
+
+#undef SYSEMU_NR
+#undef SYSEMU_RET
 
 static void test_many_forks(void)
 {
@@ -1527,6 +1741,9 @@ static const struct test tests[] = {
 	{ "fork", test_fork },
 	{ "many_forks", test_many_forks },
 	{ "ptrace", test_ptrace },
+	{ "ptrace_sysemu", test_ptrace_sysemu },
+	{ "ptrace_sysemu_seccomp", test_ptrace_sysemu_seccomp },
+	{ "ptrace_sysemu_nostep", test_ptrace_sysemu_nostep },
 #ifdef __aarch64__
 	{ "ptrace_syscall", test_ptrace_syscall },
 #endif
