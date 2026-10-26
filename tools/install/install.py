@@ -243,10 +243,6 @@ class Preflight:
             need(block.get("fstype") == kind, "fstab filesystem differs from the disk: " + spec)
             if target == "/":
                 need(block["name"] == root["name"], "fstab root differs from the mounted root")
-        # Dom0 can hold 16 devices total, including its vNIC. Count every disk
-        # L4H could attach, not just fstab entries, to avoid silently losing root.
-        disks = [b for b in self.blocks.values() if b["type"] == "disk"]
-        need(len(disks) <= 15, "automatic installation supports at most 15 disks")
         candidates = []
         for mount in self.mounts():
             if mount["fstype"] != "vfat":
@@ -272,34 +268,50 @@ class Preflight:
                     esp=esp["target"], esp_disk=disk["name"], esp_part=partnum, esp_partuuid=partuuid)
 
     def network(self):
-        # One physical NIC retains its MAC; initramfs preserves its Linux name.
-        # Bonds, bridges, VLANs and multiple NICs need an explicit migration plan.
+        # Each physical NIC gets its own switch and a dom0 vNIC with its MAC.
+        # The initramfs uses those MACs to restore names independent of ordering.
         links = json.loads(self.run("ip", "-json", "link", "show"))
         links = [link for link in links if link["ifname"] != "lo"]
-        need(len(links) == 1, "automatic migration requires exactly one physical NIC (no bonds, bridges or VLANs)")
-        link = links[0]
-        name = link["ifname"]
-        need(re.fullmatch(r"[A-Za-z0-9_-]{1,15}", name), "unsupported interface name: " + name)
-        need(link.get("link_type") == "ether" and "master" not in link and
-             not self.path("/sys/class/net/" + name + "/wireless").exists(), "need a plain Ethernet uplink")
-        pci = self.pci("/sys/class/net/" + name + "/device")
-        vendor, device = pci["vendor"], pci["device"]
-        mem = lambda bar: pci["bars"][bar][0] > 0 and not pci["bars"][bar][1]
-        supported = (
-            vendor == 0x1AF4 and device in (0x1000, 0x1041) and pci["msix"] >= 1
-            and (pci["modern"] or device == 0x1000 and pci["legacy"]) or
-            vendor == 0x1AE0 and device == 0x0042 and mem(0) and mem(2) and pci["msix"] >= 3 or
-            vendor == 0x8086 and device in (0x1563, 0x15D1) and mem(0) and pci["msix"] >= 2 or
-            vendor == 0x1D0F and device in (0x0EC2, 0x1EC2, 0xEC20, 0xEC21, 0x0051) and mem(0) and pci["msix"] >= 2)
-        need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA and Intel X550")
-        assigned = self.path("/sys/class/net/" + name + "/addr_assign_type")
-        need(assigned.read_text().strip() == "0", "uplink MAC has been changed; restore its permanent MAC first")
-        return name, pci["bdf"]
+        need(1 <= len(links) <= 2,
+             "automatic migration requires one or two physical NICs (no bonds, bridges or VLANs)")
+        uplinks = []
+        for link in links:
+            name = link["ifname"]
+            need(re.fullmatch(r"[A-Za-z0-9_-]{1,15}", name), "unsupported interface name: " + name)
+            base = "/sys/class/net/" + name
+            need(link.get("link_type") == "ether" and "master" not in link and
+                 not link.get("linkinfo", {}).get("info_kind") and not self.path(base + "/wireless").exists(),
+                 name + ": need a plain Ethernet uplink (no bonds, bridges or VLANs)")
+            pci = self.pci(base + "/device")
+            vendor, device = pci["vendor"], pci["device"]
+            mem = lambda bar: pci["bars"][bar][0] > 0 and not pci["bars"][bar][1]
+            supported = (
+                vendor == 0x1AF4 and device in (0x1000, 0x1041) and pci["msix"] >= 1
+                and (pci["modern"] or device == 0x1000 and pci["legacy"]) or
+                vendor == 0x1AE0 and device == 0x0042 and mem(0) and mem(2) and pci["msix"] >= 3 or
+                vendor == 0x8086 and device in (0x1563, 0x15D1) and mem(0) and pci["msix"] >= 2 or
+                vendor == 0x1D0F and device in (0x0EC2, 0x1EC2, 0xEC20, 0xEC21, 0x0051) and mem(0) and pci["msix"] >= 2)
+            need(supported, name + ": supported uplinks are virtio-net, gVNIC, ENA and Intel X550")
+            need(self.read(base + "/addr_assign_type") == "0",
+                 name + ": uplink MAC has been changed; restore its permanent MAC first")
+            mac = self.read(base + "/address").lower()
+            need(re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac) and
+                 mac != "00:00:00:00:00:00" and not int(mac[:2], 16) & 1,
+                 name + ": invalid Ethernet MAC")
+            need(not any(n["mac"] == mac or n["bdf"] == pci["bdf"] for n in uplinks),
+                 "uplinks need distinct MAC addresses and PCI devices")
+            uplinks.append(dict(ifname=name, bdf=pci["bdf"], mac=mac))
+        return sorted(uplinks, key=lambda n: n["bdf"])
 
     def check(self):
         variant, memory, vcpus = self.hardware()
         plan = self.storage()
-        name, uplink = self.network()
+        uplinks = self.network()
+        # Dom0 has 16 device slots shared by disks and vNICs. Count all disks
+        # L4H could attach, not just fstab entries, so none are silently omitted.
+        max_disks = 16 - len(uplinks)
+        need(sum(b["type"] == "disk" for b in self.blocks.values()) <= max_disks,
+             "automatic installation supports at most {} disks with {} uplink(s)".format(max_disks, len(uplinks)))
         need(self.read("/proc/1/comm") == "systemd", "automatic migration currently requires systemd as PID 1")
         if self.run("systemctl", "get-default") == "graphical.target":
             # Debian cloud images use graphical.target even without a display
@@ -335,17 +347,21 @@ class Preflight:
             need(not self.path(STATE).exists() and not self.path(plan["esp"] + "/l4h").exists() and
                  not self.path(plan["esp"] + "/EFI/L4H").exists(),
                  "unmanaged L4H files exist; preserve or remove them before installing")
-        plan.update(variant=variant, memory=memory, vcpus=vcpus, ifname=name,
-                    uplink=uplink, lsm=lsm, boot=boot, entry=existing)
+        plan.update(variant=variant, memory=memory, vcpus=vcpus, uplinks=uplinks,
+                    dom0_disks=max_disks, lsm=lsm, boot=boot, entry=existing)
         return plan
 
 
 def configuration(plan):
+    nic_config = "".join("{}={}\n".format(key, nic["bdf"]) for key, nic in
+                         zip(("uplink_nic", "uplink2_nic"), plan["uplinks"]))
+    net_cmdline = " ".join("l4h.net={mac},{ifname}".format(**nic) for nic in plan["uplinks"])
+    # dom0_nics counts only switch 0's ports; uplink2_nic adds switch 1's vNIC.
     return ("# Generated by the L4H Linux installer.\n"
             "dom0_mem_mb={memory}\ndom0_vcpus={vcpus}\ndom0_io_pool_mb=0\n"
-            "dom0_disks=15\ndom0_nics=1\nboot_disk={boot_disk}\nuplink_nic={uplink}\n"
+            "dom0_disks={dom0_disks}\ndom0_nics=1\nboot_disk={boot_disk}\n{nic_config}"
             'dom0_cmdline="console=hvc0 root=UUID={root_uuid} rootfstype={root_type} '
-            'ro net.ifnames=0 l4h.ifname={ifname}{lsm}"\n').format(**plan)
+            'ro net.ifnames=0 {net_cmdline}{lsm}"\n').format(**plan, nic_config=nic_config, net_cmdline=net_cmdline)
 
 
 def verify_efi(path):
@@ -527,8 +543,10 @@ def main():
     need(os.geteuid() == 0, "run as root to read PCI configuration and EFI variables")
     package = Path(__file__).resolve().parent.parent
     plan = Preflight(args).check()
-    print("Compatible: {} on {}, root UUID={}, uplink {} ({}), dom0 {} MiB / {} CPUs".format(
-        plan["variant"], plan["esp"], plan["root_uuid"], plan["ifname"], plan["uplink"], plan["memory"], plan["vcpus"]))
+    print("Compatible: {} on {}, root UUID={}, dom0 {} MiB / {} CPUs".format(
+        plan["variant"], plan["esp"], plan["root_uuid"], plan["memory"], plan["vcpus"]))
+    for switch, nic in enumerate(plan["uplinks"]):
+        print("  Switch {}: uplink {} (PCI {}, MAC {})".format(switch, nic["ifname"], nic["bdf"], nic["mac"]))
     print("Firmware behavior and application compatibility still require a boot test.")
     if args.check:
         return

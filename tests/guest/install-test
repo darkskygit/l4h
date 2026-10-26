@@ -18,10 +18,27 @@ if [[ $(uname -r) == *-l4h ]]; then
     [[ $(findmnt -n -o OPTIONS -T /lib/modules) == *ro* ]]
     l4hctl version
     l4hctl info
-    read -r name mac < native-nic
-    [[ $(cat "/sys/class/net/$name/address") == "$mac" ]]
+    l4hctl nics | tee host-nics.txt
     ip -br address
-    ping -c 2 -W 10 10.0.2.2
+    switch=0
+    while read -r name mac bdf; do
+        [[ $(cat "/sys/class/net/$name/address") == "$mac" ]]
+        case "$mac" in
+            52:54:00:12:34:56) subnet=10.0.2 ;;
+            52:54:00:12:34:57) subnet=10.0.3 ;;
+            *) false ;;
+        esac
+        ip -4 -o address show dev "$name" | grep -F "inet $subnet.15/24"
+        ping -I "$name" -c 2 -W 10 "$subnet.2"
+        grep -F "pci $bdf, mac $mac, uplink of switch $switch" host-nics.txt
+        l4hctl switch "$switch" | tee "switch-$switch.txt"
+        # Each switch must contain exactly one dom0 port, with this MAC.
+        awk -v mac="$mac" 'NR > 2 { count++; if ($2 != 0 || $3 != mac) exit 1 }
+                           END { if (count != 1) exit 1 }' "switch-$switch.txt"
+        echo "INSTALLVM: switch $switch, uplink $bdf, dom0 $name ($mac), DHCP and gateway passed"
+        switch=$((switch + 1))
+    done < native-nics
+    [[ $switch == "$(cat nic-count)" ]]
     getent hosts deb.debian.org
     if ! systemctl is-system-running --wait; then
         systemctl --failed --no-pager
@@ -35,12 +52,53 @@ if [[ $(uname -r) == *-l4h ]]; then
 elif [[ ! -f phase ]]; then
     echo "INSTALLVM: native kernel $(uname -r)"
     echo native-linux > marker
+    if [[ -e swap-names ]]; then
+        # Establish a native configuration whose names are the reverse of
+        # dom0's initial eth0/eth1 enumeration, before taking any snapshots.
+        systemctl stop systemd-networkd
+        for net in /sys/class/net/*; do
+            case "$(cat "$net/address")" in
+                52:54:00:12:34:56) index=0 ;;
+                52:54:00:12:34:57) index=1 ;;
+                *) continue ;;
+            esac
+            ip link set "${net##*/}" down
+            ip link set "${net##*/}" name "test-nic$index"
+        done
+        mkdir -p /etc/systemd/network
+        for index in 0 1; do
+            ip link set "test-nic$index" name "eth$((1 - index))"
+            printf '[Match]\nMACAddress=52:54:00:12:34:%02x\n[Link]\nNamePolicy=\nName=eth%d\n' \
+                "$((0x56 + index))" "$((1 - index))" > "/etc/systemd/network/10-test-$index.link"
+        done
+        printf '[Match]\nName=eth*\n[Network]\nDHCP=yes\n' > /etc/systemd/network/10-test.network
+        systemctl start systemd-networkd
+        for name in eth0 eth1; do
+            for ((attempt=0; attempt<60; attempt++)); do
+                if ip -4 -o address show dev "$name" | grep -q 'scope global'; then break; fi
+                sleep 1
+            done
+            [[ $attempt -lt 60 ]]
+        done
+        echo 'INSTALLVM: native eth0/eth1 swap fixture configured'
+    fi
     # Remember the native EFI payloads and distribution configuration.
     find /boot/efi/EFI -type f -print0 | sort -z | xargs -0 sha256sum > native-files.sha256
     sha256sum /etc/fstab >> native-files.sha256
-    for net in /sys/class/net/*; do
-        [[ ${net##*/} == lo ]] || echo "${net##*/} $(cat "$net/address")" > native-nic
+    for directory in /etc/systemd/network /etc/NetworkManager /etc/network; do
+        if [[ -d $directory ]]; then
+            find "$directory" -type f -exec sha256sum '{}' + >> native-files.sha256
+        fi
     done
+    : > native-nics.unsorted
+    for net in /sys/class/net/*; do
+        if [[ -e $net/device ]]; then
+            bdf=$(basename "$(readlink -f "$net/device/..")")
+            printf '%s %s %s\n' "${net##*/}" "$(cat "$net/address")" "${bdf#0000:}" >> native-nics.unsorted
+        fi
+    done
+    sort -k3 native-nics.unsorted > native-nics
+    [[ $(wc -l < native-nics) == "$(cat nic-count)" ]]
     # Local release fixtures exercise the unchanged bootstrap, checksum and
     # extraction paths before these artifacts have been published on GitHub.
     # /usr/sbin precedes /usr/bin; package installation cannot replace this shim.

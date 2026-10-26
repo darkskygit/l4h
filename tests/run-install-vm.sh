@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Full native Linux -> installer -> L4H -> native round trip in OVMF/KVM.
-# Usage: tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory]
+# Usage: tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1|2]
+# INSTALL_VM_SWAP_NAMES=1 with two NICs also exercises an eth0/eth1 name swap.
 # Requires prebuilt release artifacts, sudo, QEMU/KVM, OVMF and util-linux.
 # The input image is never modified. Only the new test image is mounted.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 base=$(realpath "$1")
 release=$(realpath "${2:-$root/build/efi}")
+nics=${3:-1}
+[[ $nics == 1 || $nics == 2 ]] || { echo 'NIC count must be 1 or 2' >&2; exit 1; }
+[[ ${INSTALL_VM_SWAP_NAMES:-0} != 1 || $nics == 2 ]] || { echo 'name swap needs two NICs' >&2; exit 1; }
 work=$root/build/install-vm-run
 mkdir -p "$work"
 [[ ! -e $work/disk.raw ]] || { echo "move $work aside before rerunning" >&2; exit 1; }
@@ -38,6 +42,10 @@ sudo mount "$rootpart" "$work/root"
 mounted=1
 guest=$work/root
 sudo mkdir -p "$guest/opt/l4h-install-test/release"
+printf '%s\n' "$nics" | sudo tee "$guest/opt/l4h-install-test/nic-count" >/dev/null
+if [[ ${INSTALL_VM_SWAP_NAMES:-0} == 1 ]]; then
+    sudo touch "$guest/opt/l4h-install-test/swap-names"
+fi
 sudo cp "$root/tools/install.sh" "$guest/opt/l4h-install-test/"
 sudo cp "$release/l4h-dom0-x86_64.tar.xz" "$release/l4h-generic.efi" "$guest/opt/l4h-install-test/release/"
 (cd "$release" && sha256sum l4h-dom0-x86_64.tar.xz l4h-generic.efi) | sudo tee "$guest/opt/l4h-install-test/release/SHA256SUMS" >/dev/null
@@ -66,14 +74,18 @@ sudo losetup -d "$loop"
 loop=''
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
 qemu_user=${L4H_QEMU_USER:-${SUDO_USER:-$(id -un)}}
-echo "Running KVM as $qemu_user; serial log: $work/serial.log"
+network=(-netdev 'user,id=net' -device 'virtio-net-pci,netdev=net,disable-legacy=on,mac=52:54:00:12:34:56')
+if [[ $nics == 2 ]]; then
+    network+=(-netdev 'user,id=net2,net=10.0.3.0/24' -device 'virtio-net-pci,netdev=net2,disable-legacy=on,mac=52:54:00:12:34:57')
+fi
+echo "Running KVM as $qemu_user with $nics NIC(s); serial log: $work/serial.log"
 timeout "${INSTALL_VM_TIMEOUT:-600}" sudo -u "$qemu_user" qemu-system-x86_64 \
     -enable-kvm -cpu host,-vmx -m 6G -smp 2 -machine q35 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file="$work/vars.fd" \
     -drive if=none,id=disk,format=raw,file="$work/disk.raw" \
     -device nvme,drive=disk,serial=l4h-install-test \
-    -netdev user,id=net -device virtio-net-pci,netdev=net,disable-legacy=on \
+    "${network[@]}" \
     -display none -serial "file:$work/serial.log" -monitor none &
 qemu=$!
 while kill -0 "$qemu" 2>/dev/null; do
