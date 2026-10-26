@@ -210,6 +210,7 @@ without it, the host reports `unknown`.
 | `tests/run-limits.sh` | the root task refuses what it cannot afford and recovers |
 | `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon) is dropped: QEMU's memory use idle, with a guest and after destroying it |
 | `tests/run-hotplugtest.sh` | memory hotplug: a VM grows from 256 MiB to 2 GiB and shrinks again under `l4hctl mem`, falling short while its data needs the memory; host memory comes back |
+| `tests/run-hotplugstress.sh [rounds]` | memory hotplug under stress: three VMs under memory load resized at random, oversubscribing the host, destroyed mid-resize; data checked, all memory back |
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`), continued operation with an absent UART |
 | `tests/run-uefitest.sh` | UEFI/GRUB boot image with NVMe and virtio-net, as on GCE |
 | `tests/run-xentest.sh` | two l4h partitions as Xen HVM guests, nested in KVM, each with a passed-through NIC, ping each other (DESIGN.md §10.2) |

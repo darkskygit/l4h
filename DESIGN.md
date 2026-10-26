@@ -3218,7 +3218,9 @@ through `l4h-root`.
   slab memory), and its PTEs are left up to date so that later syncs skip
   them. `end_iomem`, and so `VMALLOC_START`, moved above the region.
   `arch_add_memory` and `arch_remove_memory` only add and remove the
-  memmap: the driver maps the frames first.
+  memmap: the driver maps the frames first. Nothing can allocate more
+  than 2 MiB at once any more: patch 0002's swiotlb slot array, 3 MiB for
+  a 256 MiB I/O pool, is now `kvcalloc`ed.
 - **A plugged hotplug block** (`drivers/memhp.c`, `l4h_hp_map`):
 
   | Blocks | Use |
@@ -3241,13 +3243,19 @@ through `l4h-root`.
   `L4H_HC_MEM(UNPLUG)`. A guest that skips that only harms itself.
 - **Zones.** The guest boots with `memory_hotplug.memmap_on_memory=1` in
   front of its command line, and memory is added offline
-  (`MHP_DEFAULT_ONLINE_TYPE_OFFLINE`): the driver onlines each hotplug
-  block itself, to `ZONE_MOVABLE`, which can always be offlined, while
-  movable memory stays within three times boot RAM, and beyond that to
-  `ZONE_NORMAL`, for the kernel memory a bigger VM's processes need. (The
-  kernel's `auto-movable` policy, which the design named, put every block
-  in `ZONE_NORMAL` here.) Unplug tries `ZONE_MOVABLE` blocks first,
-  highest first.
+  (`MHP_DEFAULT_ONLINE_TYPE_OFFLINE`): the driver onlines every hotplug
+  block to `ZONE_MOVABLE`, which can always be offlined. The design had
+  the kernel's `auto-movable` policy (movable up to three times boot RAM,
+  then `ZONE_NORMAL`), for the kernel memory a bigger VM's processes
+  need. That policy put every block in `ZONE_NORMAL` here; with the driver
+  choosing zones on the same ratio instead, the stress test left VMs
+  stuck above their target for good: a block in `ZONE_NORMAL` collects
+  unmovable kernel pages, and offlining it fails (`EBUSY`) long after the
+  VM is idle. In l4h the kernel memory that grows most with a VM's
+  processes, their seL4 page tables and slots, comes from boot RAM anyway
+  (hotplug blocks are never object blocks, below), so `ZONE_NORMAL` in
+  hotplugged memory would serve only Linux's page tables and slabs.
+  Unplug tries the highest block first, then the others.
 - **Headroom.** Offlining moves whatever it can elsewhere, and memory
   that cannot be reclaimed (tmpfs without swap) then fills what is left:
   a guest shrunk to just above its tmpfs panicked, deadlocked on memory.
@@ -3263,4 +3271,11 @@ through `l4h-root`.
   falls by the plugged amount), fills 1200 MiB of tmpfs, shrinks short of
   512 MiB without losing the data, empties tmpfs and reaches 512 MiB (the
   host gets the memory back), grows to 1 GiB and is destroyed, after which
-  all host memory is back.
+  all host memory is back. `tests/run-hotplugstress.sh [rounds]`: three
+  2-vCPU VMs under memory load (`tests/guest/hpstress.c`, which checks
+  anonymous memory that unplugging migrates; `smp_mm_stress`; tmpfs
+  files) get random targets from 256 MiB to 1.5 GiB every few seconds,
+  4.5 GiB in all on a host with 3.7 GiB free, and one is destroyed in the
+  middle of a resize every 15 rounds. Then the workloads stop and every
+  VM must get back to 256 MiB, with no bad data, no kernel BUG or
+  WARNING, and all host memory back after destroy.
