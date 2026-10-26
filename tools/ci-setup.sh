@@ -52,6 +52,7 @@ if [[ $want == *" aarch64 "* ]]; then
     apt-get update -q
     busybox_pkg=$(mktemp -d)
     (cd "$busybox_pkg" && apt-get download busybox-static:arm64)
+    mkdir -p "$root/build/busybox-aarch64"
     dpkg-deb -x "$busybox_pkg"/busybox-static_*_arm64.deb "$root/build/busybox-aarch64"
     rm -rf "$busybox_pkg"
 fi
