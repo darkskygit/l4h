@@ -1,0 +1,60 @@
+#!/bin/sh
+# dom0 init for tests/run-hotplugtest.sh: grow a 256 MiB VM to 2 GiB, fill
+# it, shrink it (which must fall short while the data is there), empty it
+# and shrink again; host memory must come back each time.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "HOTPLUGTEST: FAIL: $*"; poweroff -f; }
+free_mib() { l4hctl info | sed -n 's/^memory: *\([0-9]*\) MiB free.*/\1/p'; }
+field() { echo "$1" | sed -n "s/.* $2 \([0-9]*\).*/\1/p"; }
+# Ask the VM ($id) and wait for its answer.
+ask() { l4hctl send "$id" --wait "$2" --timeout "${3:-60}" "$1" >/dev/null || fail "vm: no '$2' after '$1'"; }
+mem() { ask mem "HPVM: mem"; l4hctl console "$id" | grep "HPVM: mem" | tail -1; }
+plugged() { l4hctl mem "$id" | sed -n 's|^[0-9]*/[0-9]*/\([0-9]*\)/.*|\1|p'; }
+
+free0=$(free_mib)
+id=$(l4hctl create hp --initrd /bin/hotplugvm.cpio.gz --mem 256) || fail "create"
+l4hctl console "$id" --until "HPVM: ready" --timeout 120 >/dev/null || fail "the VM did not boot"
+m0=$(mem)
+echo "HOTPLUGTEST: boot: $m0; $(l4hctl mem "$id") (boot/target/plugged/region)"
+
+# Grow: 14 hotplug blocks.
+l4hctl mem "$id" 2048 --wait=60 || fail "grow to 2048 MiB"
+m1=$(mem)
+free1=$(free_mib)
+echo "HOTPLUGTEST: grown: $m1; host free $free0 -> $free1 MiB"
+[ "$(field "$m1" total)" -ge 1900 ] || fail "MemTotal $(field "$m1" total) MiB after growing to 2048"
+# Each block brings its own memmap and seL4 objects.
+[ $(( $(field "$m1" objects) - $(field "$m0" objects) )) -le 4 ] \
+    || fail "object memory grew from $(field "$m0" objects) to $(field "$m1" objects) MiB"
+[ $((free0 - free1)) -ge 2000 ] || fail "the host gave only $((free0 - free1)) MiB"
+
+# Shrinking falls short while tmpfs holds 1200 MiB, and loses nothing.
+ask "fill 1200" "HPVM: filled" 120
+if l4hctl mem "$id" 512 --wait=30; then fail "shrank to 512 MiB with 1200 MiB in tmpfs"; fi
+p=$(plugged)
+echo "HOTPLUGTEST: partial shrink: $(l4hctl mem "$id") (boot/target/plugged/region)"
+[ "$p" -ge 1200 ] && [ "$p" -lt 2048 ] || fail "plugged $p MiB after a partial shrink"
+ask check "HPVM: data" 120
+l4hctl console "$id" | grep -q "HPVM: data ok" || fail "data lost in a partial shrink"
+
+# Emptied, it reaches the target, and the host gets the memory back.
+ask free "HPVM: freed"
+l4hctl mem "$id" 512 --wait=60 || fail "shrink to 512 MiB"
+m2=$(mem)
+free2=$(free_mib)
+echo "HOTPLUGTEST: shrunk: $m2; host free $free2 MiB"
+[ "$(field "$m2" total)" -le 600 ] || fail "MemTotal $(field "$m2" total) MiB after shrinking to 512"
+[ $((free2 - free1)) -ge 1400 ] || fail "the host got only $((free2 - free1)) MiB back"
+
+# Again, then destroy: everything comes back.
+l4hctl mem "$id" 1024 --wait=60 || fail "grow again to 1024 MiB"
+echo "HOTPLUGTEST: regrown: $(mem)"
+l4hctl destroy "$id" || fail "destroy"
+free3=$(free_mib)
+echo "HOTPLUGTEST: destroyed: host free $free3 MiB (was $free0)"
+[ $((free0 - free3)) -le 16 ] || fail "$((free0 - free3)) MiB not returned after destroy"
+echo "HOTPLUGTEST: PASS"
+poweroff -f

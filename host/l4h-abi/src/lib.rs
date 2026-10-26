@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 4;
+pub const ABI_VERSION: u64 = 5;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -46,6 +46,16 @@ pub const SLOT_RAM_L1_BASE: usize = 576;
 pub const MAX_RAM_L1: usize = 64;
 pub const MAX_BLOCKS: usize = MAX_RAM_L1 << RAM_L2_BITS;
 pub const SLOT_BLOCKS: usize = 642;
+
+pub const HP_SHIFT: usize = 27;
+pub const HP_SIZE: usize = 1 << HP_SHIFT;
+pub const HP_BITS: usize = HP_SHIFT - BLOCK_SHIFT;
+pub const HP_BLOCKS: usize = 1 << HP_BITS;
+pub const HP_L1_BITS: usize = 9;
+pub const HP_MAX: usize = 1 << HP_L1_BITS;
+pub const HP_L1_GUARD: usize = L2_INDEX_BITS - HP_L1_BITS - HP_BITS;
+pub const SLOT_HP: usize = 643;
+pub const GPA_END: usize = MAX_RAM_L1 << 30;
 
 pub const SLOT_VSPACE_POOL: usize = 640;
 pub const SLOT_DEV_CNODE: usize = 641;
@@ -99,6 +109,7 @@ pub const DEV_VIRTIO: u32 = 1;
 pub const DEV_CONSOLE: u32 = 2;
 pub const DEV_CTL: u32 = 3;
 pub const DEV_ATTEST: u32 = 4;
+pub const DEV_MEM: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -136,7 +147,9 @@ pub struct BootInfo {
     pub cpu_id: [u64; 5],
     pub kmod_va: u64,
     pub kmod_size: u64,
-    pub reserved: [u64; 8],
+    pub hp_gpa: u64,
+    pub hp_count: u64,
+    pub reserved: [u64; 6],
     pub devices: [DevDesc; MAX_DEVICES],
     pub cmdline: [u8; CMDLINE_SIZE],
 }
@@ -198,7 +211,21 @@ pub struct ConsolePage {
     pub input: [u8; CONSOLE_IN_SIZE],
 }
 
-pub const CTL_VERSION: u32 = 2;
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemPage {
+    pub generation: u32,
+    pub target: u32,
+    pub plugged: u32,
+    pub reserved0: u32,
+    pub plugged_map: [u64; HP_MAX / 64],
+    pub reserved: [u64; 6],
+}
+
+pub const MEM_PLUG: u64 = 1;
+pub const MEM_UNPLUG: u64 = 2;
+
+pub const CTL_VERSION: u32 = 3;
 pub const CTL_RESP_OFF: usize = 2048;
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: u64 = 1 << 20;
@@ -248,6 +275,8 @@ pub const CTL_IOMMU_INFO: u32 = 24;
 pub const CTL_HOST_VERSION: u32 = 25;
 pub const CTL_GPU_ATTACH: u32 = 26;
 pub const CTL_GPU_READ: u32 = 27;
+pub const CTL_VM_SET_MEM: u32 = 28;
+pub const CTL_VM_MEM_INFO: u32 = 29;
 /// CTL_GPU_ATTACH: scanout sizes, and the I/O pool a VM with a GPU needs
 /// (in images of its scanout).
 pub const GPU_MIN: u32 = 64;
@@ -296,6 +325,7 @@ pub const HC_DEV_READ: u64 = 4;
 pub const HC_SET_IRQ_AFFINITY: u64 = 5;
 pub const HC_GET_TIME: u64 = 6;
 pub const HC_CTL: u64 = 7;
+pub const HC_MEM: u64 = 8;
 pub const HC_CONSOLE_MAX_WORDS: usize = 32;
 
 pub const ATTEST_REPORT: u32 = 1;
@@ -340,3 +370,5 @@ const _: () = assert!(core::mem::size_of::<ConsolePage>() == 4096);
 const _: () = assert!(core::mem::size_of::<CtlReq>() <= CTL_RESP_OFF);
 const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
 const _: () = assert!(core::mem::size_of::<CtlVm>() == 56);
+const _: () = assert!(core::mem::size_of::<MemPage>() == 128);
+const _: () = assert!(HP_L1_GUARD == 3 && MAX_RAM_L1 << 30 >> HP_SHIFT == HP_MAX);

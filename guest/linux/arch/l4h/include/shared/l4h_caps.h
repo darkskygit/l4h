@@ -22,5 +22,11 @@ bool l4h_objmem_wait(void);
 void l4h_objmem_oom(void);
 /* Is guest RAM [gpa, gpa+size) in the direct map (not an object block)? */
 bool l4h_ram_mapped(unsigned long gpa, unsigned long size);
+void l4h_map_kernel_early(unsigned long frame, unsigned long va);
+/* Hotplug blocks (DESIGN.md §17, drivers/memhp.c). */
+bool l4h_hp_contains(unsigned long gpa, unsigned long size);
+int l4h_hp_prepare(unsigned int m);
+int l4h_hp_map(unsigned int m);
+void l4h_hp_unmap(unsigned int m);
 
 #endif

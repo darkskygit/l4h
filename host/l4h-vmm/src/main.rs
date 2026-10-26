@@ -10,6 +10,7 @@ mod dev;
 mod gpu;
 mod guest;
 mod mem;
+mod memhp;
 mod net;
 mod virtq;
 
@@ -21,6 +22,7 @@ use sel4::cap_type;
 
 use crate::dev::Device;
 use crate::guest::{GuestMem, Vcpus};
+use crate::memhp::MemDev;
 
 enum Dev {
     Blk(Device<blk::Blk>),
@@ -157,6 +159,12 @@ fn main(info: &'static Info) -> ! {
         devs[idx] = Some(dev);
     }
 
+    let mut memdev = (cfg.mem_dev != 0)
+        .then(|| MemDev::new(host::vmm_device_page_va(cfg.mem_dev as usize - 1), cfg.mem_event, cfg.hp_count as usize));
+    if let Some(m) = memdev.as_mut() {
+        m.refresh();
+    }
+
     let mut console = Console {
         ring: host::VMM_CONSOLE_RING_VA as *mut host::ConsoleRing,
         serial: cfg.serial != 0,
@@ -173,6 +181,11 @@ fn main(info: &'static Info) -> ! {
     let (mut info, mut badge) = ep.recv(reply);
     loop {
         if badge & host::VMM_BADGE_HYPERCALL == 0 {
+            if badge & host::VMM_BADGE_MEM != 0 {
+                if let Some(m) = memdev.as_mut() {
+                    m.target_changed(&vcpus);
+                }
+            }
             // Notification: device kicks and backend completions.
             for idx in devices.iter().map(|d| d.guest_index as usize) {
                 let Some(d) = devs[idx].as_mut() else { continue };
@@ -218,6 +231,10 @@ fn main(info: &'static Info) -> ! {
                 }
             }
             abi::HC_GET_TIME => wall_clock_ns(cfg, tsc_hz),
+            abi::HC_MEM => match memdev.as_mut() {
+                Some(m) => m.hypercall(mr(0), mr(1)) as u64,
+                None => u64::MAX,
+            },
             _ => u64::MAX,
         };
         set_mr(0, resp);

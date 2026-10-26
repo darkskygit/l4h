@@ -214,7 +214,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                     },
                     vcpus: g.vcpus.len() as u32,
                     reserved: 0,
-                    ram: g.owned_ram() as u64,
+                    ram: (g.owned_ram() + crate::memd::hotplug(g.id).plugged as usize * abi::HP_SIZE) as u64,
                     name: [0; abi::CTL_NAME_MAX],
                 };
                 let nb = g.name.as_bytes();
@@ -355,6 +355,36 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             resp.vals[0] = g.vcpus.iter().map(|v| v.usage as u64).sum();
             resp.vals[1] = g.cpu_cap_pct as u64;
+            Ok(())
+        }
+        abi::CTL_VM_SET_MEM => {
+            let id = vm_arg(a[0])?;
+            h.with_guest(id, |h, g| {
+                if g.mem_dev.is_none() {
+                    return Err(EINVAL);
+                }
+                // In hotplug blocks above its boot RAM.
+                let above = a[1].saturating_sub(g.owned_ram() as u64);
+                let blocks = above.div_ceil(abi::HP_SIZE as u64).min(g.hp_count as u64) as usize;
+                if !crate::memd::set_target(&h.alloc, id, blocks) {
+                    return Err(EINVAL);
+                }
+                // Before it runs, its VMM reads the target when it starts.
+                if g.vmm.is_some() {
+                    g.signal_vmm(&mut h.alloc, host::VMM_BADGE_MEM);
+                }
+                Ok(())
+            })
+            .ok_or(ENOENT)?
+        }
+        abi::CTL_VM_MEM_INFO => {
+            let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
+            let hp = crate::memd::hotplug(g.id);
+            let hp_size = abi::HP_SIZE as u64;
+            resp.vals[0] = g.owned_ram() as u64;
+            resp.vals[1] = g.hp_count as u64 * hp_size;
+            resp.vals[2] = hp.target as u64 * hp_size;
+            resp.vals[3] = hp.plugged as u64 * hp_size;
             Ok(())
         }
         abi::CTL_VM_INFO => {

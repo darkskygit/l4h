@@ -12,8 +12,8 @@ block and network I/O, dom0 control, CPU caps and balancing, and GCE N2
 bring-up. AArch64 runs the host and native Linux guests on QEMU `virt`,
 including SMP and PCI block/network drivers, with virtualization disabled (§11). The original
 review decisions are recorded in §14. Future work is identified below;
-§15 records the implemented guest-owned memory design, and §16 the
-memory owner, `l4h-memd`.
+§15 records the implemented guest-owned memory design, §16 the
+memory owner, `l4h-memd`, and §17 memory hotplug.
 
 ---
 
@@ -3152,3 +3152,115 @@ Behaviour is unchanged.
 - **Limits.** None but the table: its size follows the host's memory,
   and no request makes memd use more of anything. A 1 TiB host needs
   12 MiB of table and 64 MiB of CNode.
+
+## 17. Memory hotplug
+
+dom0 can add memory to a running VM and take it back, 128 MiB at a time.
+dom0 gets the mechanism only: it sets a VM's target and reads how much is
+plugged; deciding the sizes is left to it. Memory that is not plugged
+costs nothing: no frames, seL4 objects or struct pages, only guest
+address space. The properties of §15 hold: a guest's host overhead is
+fixed (16 KiB more), no host component reads guest RAM, and revoking a
+guest's Untypeds reclaims everything it made. Plugging does not go
+through `l4h-root`.
+
+- **Region and units.** Every guest has a hotplug region, from its I/O
+  pool's end rounded up to 128 MiB to the 64 GiB guest-physical limit
+  (`L4H_GPA_END`), in *hotplug blocks* of 128 MiB (`L4H_HP_SIZE`, 64 RAM
+  blocks, one Linux memory block). Boot info: `hp_gpa`, `hp_count` (at
+  most 512). ABI version 5.
+- **Capabilities.** Root slot `L4H_SLOT_HP` holds a level-1 hotplug CNode
+  (radix 9, guard 3) that root makes, the only host memory the region
+  costs. Before plugging hotplug block m, the guest retypes a level-2
+  CNode (radix 6, 2 KiB) into its slot m from its own object memory;
+  memd copies the Untypeds of the block's 64 blocks into it
+  (`L4H_HP_BLOCK_CPTR(m, i)`). Frames of hotplugged memory are named by
+  `L4H_FRAME_CPTR` like the rest of RAM: the guest makes the level-1 RAM
+  CNodes of the region's GiBs (16 KiB each) when it first plugs there.
+- **Control** (control version 3). `VM_SET_MEM` (vm, bytes): root rounds
+  the part above boot RAM up to whole hotplug blocks, clamps it to the
+  region, sets memd's target (`MEMD_SET_TARGET`), signals the VMM
+  (`VMM_BADGE_MEM`) and returns. `VM_MEM_INFO`: boot, region, target and
+  plugged bytes, from memd's status page; `VM_LIST` counts plugged memory.
+  `l4hctl mem VM [MB] [--wait[=SECS]]`. Lowering a target revokes
+  nothing: the guest gives back what it can, and `plugged > target` tells
+  dom0 that it cannot give back more (it may wait or destroy the VM).
+  Targets and plugged state live in memd, so a dom0 restart changes no VM.
+  A reboot (destroy and create) starts with an empty region.
+- **memd.** Per guest: the region's size, the target, a bitmap of plugged
+  hotplug blocks, and for each the head of a list of its 64 units through
+  the table (`HP_HEADS`, 128 KiB of BSS for all guests). VMMs call memd
+  on its service endpoint with capabilities badged `BADGE_VMM | guest`,
+  for their own guest's `MEMD_HP_PLUG`, `MEMD_HP_UNPLUG` and
+  `MEMD_HP_STATE` only; memd still calls no one. A plug checks the range,
+  the bitmap and the target, takes 64 free blocks and copies them into the
+  guest's level-2 CNode; a copy that fails (no CNode, or something in the
+  slot) undoes the plug. It takes only blocks that need no free page
+  report to come back, so a guest never holds memd waiting: short of
+  128 MiB of them it answers `EBUSY`. An unplug revokes and frees the 64
+  originals; destroy revokes every plugged block with the rest. A token
+  bucket per guest allows 8 plugs or unplugs a second after a burst of 16
+  (`EBUSY` beyond): memd runs on core 0 above every guest, and this bounds
+  the time one guest can take from it.
+- **VMM.** The memory device (`L4H_DEV_MEM`, `struct l4h_mem_page`) is
+  one more device page: target, plugged count and bitmap, which the VMM
+  refreshes from memd (`MEMD_HP_STATE`) at start, after each request and
+  when root signals a new target, raising the device's event then. The
+  hypercall `L4H_HC_MEM` (op, m) becomes one memd call; memd does every
+  check.
+- **Guest kernel.** `arch/l4h` moved from FLATMEM to `SPARSEMEM_VMEMMAP`
+  with 128 MiB sections, and `ARCH_FORCE_MAX_ORDER` 9: Linux puts a memory
+  block's memmap in the block (`memmap_on_memory`) only if it is whole
+  pageblocks, and a 128 MiB block's memmap is 2 MiB. The vmemmap is 2 GiB
+  of VA below the last PGD slot, mirrored into seL4 by the kernel TLB sync
+  like vmalloc; the boot memmap is mapped directly at boot
+  (`l4h_map_kernel_early`), before the sync can work (its mappings need
+  slab memory), and its PTEs are left up to date so that later syncs skip
+  them. `end_iomem`, and so `VMALLOC_START`, moved above the region.
+  `arch_add_memory` and `arch_remove_memory` only add and remove the
+  memmap: the driver maps the frames first.
+- **A plugged hotplug block** (`drivers/memhp.c`, `l4h_hp_map`):
+
+  | Blocks | Use |
+  |---|---|
+  | 0 | its memmap (`MHP_MEMMAP_ON_MEMORY`) |
+  | 1–62 | RAM |
+  | 63 | the level-2 RAM CNodes of blocks 0–62 and the page tables mapping them in the direct map (1.26 MiB), retyped straight from its Untyped; its pages stay `PageOffline` |
+
+  The guest sees 124 MiB of each block. A plug takes from its other
+  memory only the 2 KiB level-2 hotplug CNode, a level-1 RAM CNode per
+  new GiB, a 1 KiB table of page-table slots, and the vmemmap's page
+  tables (a Linux and an seL4 page table per hotplug block, kept for the
+  next plug there). Plug: those CNodes, `L4H_HC_MEM(PLUG)`, map,
+  `add_memory_driver_managed`. Block 63's pages are skipped by an online
+  page callback, and a memory notifier drops and restores their
+  reference around offlining, as virtio-mem does for unplugged ranges, so
+  offlining skips them. Unplug: `offline_and_remove_memory`, then
+  revoking the copy of block 63 deletes the page tables and RAM CNodes
+  (and with them every frame), then the other copies, then
+  `L4H_HC_MEM(UNPLUG)`. A guest that skips that only harms itself.
+- **Zones.** The guest boots with `memory_hotplug.memmap_on_memory=1` in
+  front of its command line, and memory is added offline
+  (`MHP_DEFAULT_ONLINE_TYPE_OFFLINE`): the driver onlines each hotplug
+  block itself, to `ZONE_MOVABLE`, which can always be offlined, while
+  movable memory stays within three times boot RAM, and beyond that to
+  `ZONE_NORMAL`, for the kernel memory a bigger VM's processes need. (The
+  kernel's `auto-movable` policy, which the design named, put every block
+  in `ZONE_NORMAL` here.) Unplug tries `ZONE_MOVABLE` blocks first,
+  highest first.
+- **Headroom.** Offlining moves whatever it can elsewhere, and memory
+  that cannot be reclaimed (tmpfs without swap) then fills what is left:
+  a guest shrunk to just above its tmpfs panicked, deadlocked on memory.
+  The driver unplugs a block only if available memory stays above a
+  sixteenth of RAM (at least 64 MiB) without it; otherwise the guest stays
+  above its target, and retries every 10 s. Hotplug blocks
+  are never object blocks of the allocator (§15.3): the order-9 fast path
+  sets those pages aside, and the fallback scans boot RAM only. Seen
+  from the allocator, hotplugged memory is page cache and anonymous
+  memory; object memory still comes from boot RAM.
+- **Test.** `tests/run-hotplugtest.sh`: a 256 MiB VM grows to 2 GiB
+  (MemTotal follows, object memory does not grow, the host's free memory
+  falls by the plugged amount), fills 1200 MiB of tmpfs, shrinks short of
+  512 MiB without losing the data, empties tmpfs and reaches 512 MiB (the
+  host gets the memory back), grows to 1 GiB and is destroyed, after which
+  all host memory is back.

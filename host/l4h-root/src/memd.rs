@@ -6,7 +6,9 @@
 //! grants of memd's (mem.rs).  A guest's RAM is taken by memd at create;
 //! l4h-root gets copies of the blocks it fills with frames for the image
 //! (the boot blocks), memd gives the guest copies of the others at boot,
-//! and revokes all of them at destroy.
+//! and revokes all of them at destroy.  Memory a guest plugs while it runs
+//! (DESIGN.md §17) is between its l4h-vmm and memd: l4h-root only sets
+//! the target.
 
 use l4h_abi as abi;
 use l4h_host as host;
@@ -25,6 +27,8 @@ use crate::{AsidPools, HostInfo};
 static MEMD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-memd.elf"));
 
 pub const MEMD_ID: u32 = 0x400;
+// memd keeps state (and a status record) for every guest id.
+const _: () = assert!(crate::MAX_GUESTS <= memd::MAX_GUESTS);
 /// memd's status page in the root task.
 const STATUS_VA: usize = crate::layout::MEMD_STATUS.base;
 /// Mapping capabilities besides the table's: the status page, and the
@@ -112,11 +116,31 @@ fn link(alloc: &Alloc) -> MemdLink {
 
 /// Take the RAM of guest `g`: `blocks` 2 MiB blocks.  `block_cn` is its
 /// block CNode, of radix `radix`, into which memd gives the guest its
-/// blocks at boot.
-pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, block_cn: cap::CNode, radix: usize) -> bool {
+/// blocks at boot; `hp_cn` its hotplug CNode, for `hp_count` hotplug
+/// blocks.
+pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, block_cn: cap::CNode, radix: usize, hp_cn: cap::CNode, hp_count: usize) -> bool {
     let m = link(alloc);
     m.slot(memd::SLOT_GUEST_BCN + g as u64).copy(&abs_of(block_cn), CapRights::all()).expect("memd: give block CNode");
-    m.call(memd::MEMD_GUEST_CREATE, &[g as u64, blocks as u64, radix as u64]) == 0
+    m.slot(memd::SLOT_GUEST_HCN + g as u64).copy(&abs_of(hp_cn), CapRights::all()).expect("memd: give hotplug CNode");
+    m.call(memd::MEMD_GUEST_CREATE, &[g as u64, blocks as u64, radix as u64, hp_count as u64]) == 0
+}
+
+/// Set the hotplug target of guest `g`, in hotplug blocks.
+pub fn set_target(alloc: &Alloc, g: usize, target: usize) -> bool {
+    link(alloc).call(memd::MEMD_SET_TARGET, &[g as u64, target as u64]) == 0
+}
+
+/// Hotplug target and plugged hotplug blocks of guest `g`.
+pub fn hotplug(g: usize) -> memd::GuestHp {
+    let st = STATUS_VA as *const Status;
+    unsafe { core::ptr::addr_of!((*st).hp[g]).read_volatile() }
+}
+
+/// Mint the capability guest `g`'s l4h-vmm calls memd with into `dst`.
+pub fn mint_vmm_ep(alloc: &Alloc, g: usize, dst: &sel4::AbsoluteCPtr) {
+    let m = link(alloc);
+    dst.mint(&abs_of(m.ep), sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(), memd::BADGE_VMM | g as u64)
+        .expect("memd: VMM endpoint");
 }
 
 /// A copy of block `b` of guest `g`, into root slot `slot`: its physical

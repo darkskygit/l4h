@@ -48,6 +48,25 @@ config L4H
 	# Object memory grows by isolating and migrating whole RAM blocks.
 	select COMPACTION
 	select MEMORY_ISOLATION
+	# Memory hotplug in 128 MiB blocks, each with its memmap in its
+	# first 2 MiB (DESIGN.md §17).
+	select ARCH_ENABLE_MEMORY_HOTPLUG
+	select ARCH_ENABLE_MEMORY_HOTREMOVE
+	select ARCH_MHP_MEMMAP_ON_MEMORY_ENABLE
+
+# Sparse memory with a virtually mapped memmap: hotplug needs SPARSEMEM,
+# and a memmap in hotplugged memory needs the vmemmap.  128 MiB sections
+# are the hotplug blocks.
+config ARCH_SPARSEMEM_ENABLE
+	def_bool y
+	select SPARSEMEM_VMEMMAP_ENABLE
+
+# The largest buddy order, and the pageblock, is a RAM block (2 MiB): a
+# hotplug block's memmap (2 MiB) must be whole pageblocks to go in the
+# block itself, and object blocks are order-9 pages (§15.3).
+config ARCH_FORCE_MAX_ORDER
+	int
+	default 9
 
 config MMU
 	bool
@@ -148,6 +167,14 @@ config L4H_KMOD
 	  The read-only block device /dev/l4hkmod: an EROFS image of this
 	  kernel's /lib/modules, with its modules and the tree to build
 	  external modules against, which the host shares with every guest.
+
+config L4H_MEMHP
+	bool "Memory hotplug from the l4h host"
+	default y
+	depends on MEMORY_HOTREMOVE && MHP_MEMMAP_ON_MEMORY
+	help
+	  Plug and unplug 128 MiB of RAM at a time as the host's target for
+	  this guest changes (l4hctl mem in dom0).
 
 config L4H_RTC
 	bool "l4h real-time clock"

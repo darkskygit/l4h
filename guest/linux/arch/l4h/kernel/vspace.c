@@ -354,6 +354,9 @@ bool l4h_kernel_range_ok(unsigned long addr, unsigned long size)
 		return l4h_ram_mapped(addr - uml_physmem, size);
 	if (addr >= l4h_io_pool_start && end <= l4h_io_pool_end)
 		return true;
+	/* Hotplug blocks that are plugged and mapped. */
+	if (addr >= uml_physmem && l4h_hp_contains(addr - uml_physmem, size))
+		return l4h_ram_mapped(addr - uml_physmem, size);
 	if (addr >= L4H_SPECIAL_BASE && end <= L4H_SPECIAL_BASE + L4H_BOOTINFO_SIZE)
 		return true;
 	for (addr &= PAGE_MASK; addr < end; addr += PAGE_SIZE) {

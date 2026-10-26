@@ -53,8 +53,9 @@ Third-party components, including the submodules in `kernel/seL4` and
   DMA mappings and interrupt remapping (`iommu` and `iommu_intremap`).
 - **Control.** dom0, the first guest, controls the host through
   `/dev/l4hctl` and the `l4hctl` CLI: create, start (with an initramfs
-  and a command line), shutdown and destroy VMs; console access; disks; switches; NICs; CPU caps. Destroying
-  a VM returns all its memory. `l4hctl rtc-set` saves dom0's time to the
+  and a command line), shutdown and destroy VMs; console access; disks; switches; NICs; CPU caps;
+  memory hotplug (`l4hctl mem`: a running VM's memory grows and shrinks
+  128 MiB at a time). Destroying a VM returns all its memory. `l4hctl rtc-set` saves dom0's time to the
   machine's real-time clock.
 - **Memory under QEMU/KVM.** Memory not given to guests is reported
   free through virtio-balloon free page reporting, so QEMU drops it.
@@ -208,6 +209,7 @@ without it, the host reports `unknown`.
 | `tests/run-capperf.sh [caps]` | fork/exec and CPU-bound timings, uncapped and under each cap (use a release seL4) |
 | `tests/run-limits.sh` | the root task refuses what it cannot afford and recovers |
 | `tests/run-balloontest.sh` | free memory reported to QEMU (virtio-balloon) is dropped: QEMU's memory use idle, with a guest and after destroying it |
+| `tests/run-hotplugtest.sh` | memory hotplug: a VM grows from 256 MiB to 2 GiB and shrinks again under `l4hctl mem`, falling short while its data needs the memory; host memory comes back |
 | `tests/run-monitor.sh` | serial monitor (`list`, `restart-dom0`), continued operation with an absent UART |
 | `tests/run-uefitest.sh` | UEFI/GRUB boot image with NVMe and virtio-net, as on GCE |
 | `tests/run-xentest.sh` | two l4h partitions as Xen HVM guests, nested in KVM, each with a passed-through NIC, ping each other (DESIGN.md §10.2) |

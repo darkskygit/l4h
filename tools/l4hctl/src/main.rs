@@ -102,6 +102,10 @@ const USAGE: &str = "usage: l4hctl <command>
   shutdown VM [--reboot]       ask the VM to shut down (or reboot) cleanly
   destroy VM                   stop a VM and free its resources
   sched VM CAP                 cap each vCPU of VM at CAP% of a core (0: none)
+  mem VM [MB] [--wait[=SECS]]  memory of VM (boot/target/plugged/region, MiB);
+                               with MB, plug or unplug 128 MiB hotplug blocks
+                               until it has MB; --wait for the guest to get
+                               there (default 60 s)
   cores VM                     host core of each vCPU of VM
   top                          CPU use of each VM
   nics                         host NICs
@@ -433,6 +437,33 @@ fn run(args: &[String]) -> Result<i32> {
             let vm = parse_num(args.get(1).ok_or(Error("shutdown: missing VM".into()))?)?;
             let how = if args.get(2).map(|s| s.as_str()) == Some("--reboot") { 1 } else { 0 };
             ctl.call(CTL_VM_SHUTDOWN, &[vm, how], &[], &[])?;
+        }
+        "mem" => {
+            let vm = parse_num(args.get(1).ok_or(Error("mem: missing VM".into()))?)?;
+            let (mut size, mut wait) = (None, None);
+            for a in &args[2..] {
+                match a.as_str() {
+                    "--wait" => wait = Some(60),
+                    w if w.starts_with("--wait=") => wait = Some(parse_num(&w[7..])?),
+                    s => size = Some(parse_mib(s)?),
+                }
+            }
+            if let Some(bytes) = size {
+                ctl.set_mem(vm, bytes)?;
+            }
+            let mut m = ctl.mem_info(vm)?;
+            if let Some(secs) = wait {
+                let until = std::time::Instant::now() + Duration::from_secs(secs);
+                while m.plugged != m.target && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(100));
+                    m = ctl.mem_info(vm)?;
+                }
+            }
+            println!("{}/{}/{}/{} MiB", m.boot >> 20, (m.boot + m.target) >> 20, (m.boot + m.plugged) >> 20, (m.boot + m.region) >> 20);
+            if wait.is_some() && m.plugged != m.target {
+                let why = if m.plugged > m.target { "the guest cannot give back more" } else { "the host is short of memory" };
+                return err(format!("mem: {} MiB plugged, target {} MiB: {why}", m.plugged >> 20, m.target >> 20));
+            }
         }
         "destroy" => {
             let vm = parse_num(args.get(1).ok_or(Error("destroy: missing VM".into()))?)?;

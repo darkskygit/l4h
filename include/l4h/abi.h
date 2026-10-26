@@ -29,7 +29,7 @@ typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 4
+#define L4H_ABI_VERSION 5
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -108,6 +108,32 @@ typedef int64_t l4h_s64;
 		  ((gpa) >> 12) & ((1u << L4H_L2_INDEX_BITS) - 1))
 #define L4H_SLOT_BLOCKS         642
 #define L4H_BLOCK_CPTR(b)       L4H_CPTR2(L4H_SLOT_BLOCKS, b)
+
+/* Memory hotplug.  Above the I/O pool, from bootinfo.hp_gpa to the 64 GiB
+ * guest-physical limit, guest RAM comes and goes in hotplug blocks of
+ * 128 MiB (L4H_HP_BLOCKS 2 MiB blocks): hotplug block m is GPA
+ * [hp_gpa + m * L4H_HP_SIZE, +L4H_HP_SIZE), for m < bootinfo.hp_count.
+ *
+ * Root slot L4H_SLOT_HP is a level-1 CNode (radix 9, guard 3) made by the
+ * host.  Its slot m is empty until the guest retypes a level-2 CNode
+ * (radix 6, no guard) there; plugging m (L4H_HC_MEM) puts the copy of the
+ * Untyped of block i of the hotplug block in its slot i, which the guest
+ * names L4H_HP_BLOCK_CPTR(m, i).  Unplugging m revokes them.  Frames of
+ * hotplugged memory are named by L4H_FRAME_CPTR, like the rest of RAM: the
+ * guest makes the level-1 RAM CNodes of the region (root slots
+ * L4H_SLOT_RAM_L1_BASE + n) itself.  See DESIGN.md §17. */
+#define L4H_HP_SHIFT            27
+#define L4H_HP_SIZE             (1ull << L4H_HP_SHIFT)
+#define L4H_HP_BITS             (L4H_HP_SHIFT - L4H_BLOCK_SHIFT)
+#define L4H_HP_BLOCKS           (1u << L4H_HP_BITS)
+#define L4H_HP_L1_BITS          9
+#define L4H_HP_MAX              (1u << L4H_HP_L1_BITS)
+#define L4H_HP_L1_GUARD         (L4H_L2_INDEX_BITS - L4H_HP_L1_BITS - L4H_HP_BITS)
+#define L4H_SLOT_HP             643
+#define L4H_HP_L2_CPTR(m)       L4H_CPTR2(L4H_SLOT_HP, (l4h_u64)(m) << L4H_HP_BITS)
+#define L4H_HP_BLOCK_CPTR(m, i) L4H_CPTR2(L4H_SLOT_HP, ((l4h_u64)(m) << L4H_HP_BITS) | (i))
+/* The end of guest-physical space: RAM, the I/O pool and the region. */
+#define L4H_GPA_END             ((l4h_u64)L4H_MAX_RAM_L1 << 30)
 
 /* A CNode with bootinfo.nr_vspaces pre-assigned (ASID-bearing) VSpace
  * roots that the guest uses for its processes. */
@@ -191,6 +217,7 @@ enum l4h_dev_type {
 	L4H_DEV_CONSOLE = 2,    /* hvc console ring */
 	L4H_DEV_CTL = 3,        /* dom0 control channel (l4hctl) */
 	L4H_DEV_ATTEST = 4,     /* attestation by l4h-trustd, see l4h_attest_page */
+	L4H_DEV_MEM = 5,        /* memory hotplug, see l4h_mem_page */
 };
 
 struct l4h_dev_desc {
@@ -238,7 +265,11 @@ struct l4h_bootinfo {
 	 * by all guests at kmod_va.  kmod_size is 0 if the host has none. */
 	l4h_u64 kmod_va;
 	l4h_u64 kmod_size;
-	l4h_u64 reserved[8];
+	/* The memory hotplug region (L4H_SLOT_HP): hp_count hotplug blocks
+	 * from hp_gpa (128 MiB aligned, above the I/O pool). */
+	l4h_u64 hp_gpa;
+	l4h_u64 hp_count;
+	l4h_u64 reserved[6];
 	struct l4h_dev_desc devices[L4H_MAX_DEVICES];
 	char cmdline[L4H_CMDLINE_SIZE];
 };
@@ -317,13 +348,38 @@ struct l4h_console_page {
 };
 
 /* ------------------------------------------------------------------------
+ * Memory device (L4H_DEV_MEM): the hotplug target and state, written by the
+ * host, which raises the device's event when the target changes.  The guest
+ * plugs and unplugs hotplug blocks with L4H_HC_MEM until `plugged` equals
+ * `target`.
+ */
+struct l4h_mem_page {
+	l4h_u32 generation;     /* bumped after every change */
+	l4h_u32 target;         /* hotplug blocks */
+	l4h_u32 plugged;
+	l4h_u32 reserved0;
+	l4h_u64 plugged_map[L4H_HP_MAX / 64]; /* bit m: hotplug block m is plugged */
+	l4h_u64 reserved[6];
+};
+
+/* L4H_HC_MEM: MR0 = op, MR1 = hotplug block.  Result (MR0): 0, or -EINVAL
+ * (out of range, already plugged or not plugged, no level-2 CNode in its
+ * slot or a slot of it not empty), -ENOSPC (a plug with as many plugged as
+ * the target), -EBUSY (the host is short of memory, or the guest plugs and
+ * unplugs too fast: try again later), -EIO (the host failed). */
+enum l4h_mem_op {
+	L4H_MEM_PLUG = 1,
+	L4H_MEM_UNPLUG = 2,
+};
+
+/* ------------------------------------------------------------------------
  * Control device (L4H_DEV_CTL, dom0 only): a request at offset 0 of the
  * device page and the response at L4H_CTL_RESP_OFF, exchanged with
  * L4H_HC_CTL.  Bulk data (images) is passed in the device's data area
  * (l4h_dev_desc.data_va), which belongs to the host: l4h-root never reads
  * dom0's RAM.  See DESIGN.md §9.1.
  */
-#define L4H_CTL_VERSION         2
+#define L4H_CTL_VERSION         3
 #define L4H_CTL_RESP_OFF        2048
 #define L4H_CTL_DATA_MAX        1984
 #define L4H_CTL_LOAD_MAX        (1u << 20)
@@ -436,6 +492,14 @@ enum l4h_ctl_op {
 	 * frame (it changes with every update).  -EAGAIN if the guest updated
 	 * the image while it was copied. */
 	L4H_CTL_GPU_READ = 27,
+	/* args: vm, target bytes: plug or unplug memory until the VM has this
+	 * much.  The part above its boot RAM is rounded up to whole hotplug
+	 * blocks (L4H_HP_SIZE) and clamped to its region; returns at once, the
+	 * guest plugs and unplugs as it can (DESIGN.md §17). */
+	L4H_CTL_VM_SET_MEM = 28,
+	/* args: vm -> vals: boot bytes, region bytes, target bytes, plugged
+	 * bytes (all host memory: a hotplug block counts L4H_HP_SIZE) */
+	L4H_CTL_VM_MEM_INFO = 29,
 };
 
 #define L4H_GPU_MIN             64
@@ -487,6 +551,7 @@ enum l4h_hypercall {
 	L4H_HC_SET_IRQ_AFFINITY = 5,/* MR0 = device index, MR1 = vCPU */
 	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */
 	L4H_HC_CTL = 7,             /* dom0: execute the request in the control device page */
+	L4H_HC_MEM = 8,             /* MR0 = L4H_MEM_*, MR1 = hotplug block (see l4h_mem_page) */
 };
 #define L4H_HC_CONSOLE_MAX_WORDS 32
 

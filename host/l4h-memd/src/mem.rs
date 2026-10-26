@@ -89,6 +89,16 @@ pub struct List {
 
 impl List {
     pub const EMPTY: List = List { head: NIL, tail: NIL, len: 0 };
+
+    pub fn head(&self) -> u32 {
+        self.head
+    }
+
+    /// The guest list from unit `head` on (NIL: empty), whose units are
+    /// to be taken off with `pop_guest`: its tail and length are not kept.
+    pub fn from_head(head: u32) -> List {
+        List { head, tail: NIL, len: usize::MAX / 2 }
+    }
 }
 
 pub struct Mem {
@@ -260,6 +270,11 @@ impl Mem {
 
     pub fn free_bytes(&self) -> usize {
         (0..ORDERS).map(|k| (self.free[k].len + self.reported[k].len) * bytes(k)).sum::<usize>() + self.reporting_bytes()
+    }
+
+    /// Free memory that can be taken without waiting for a report.
+    pub fn available_bytes(&self) -> usize {
+        (0..ORDERS).map(|k| (self.free[k].len + self.reported[k].len) * bytes(k)).sum()
     }
 
     fn reporting_bytes(&self) -> usize {
