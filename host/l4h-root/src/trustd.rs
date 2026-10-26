@@ -4,7 +4,7 @@
 //! trustd asks root for: raising a device's event when it has answered,
 //! and the hardware accesses of its AML interpreter.
 //!
-//! Only x86 finds a TPM (in ACPI) so far: on aarch64, trustd never starts.
+//! Only x86 finds a TPM (in ACPI) so far; other hosts run flags only.
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
 
@@ -29,6 +29,7 @@ static TRUSTD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l4h-trustd.
 
 const PAGE: usize = 4096;
 pub const TRUSTD_ID: u32 = 0x300;
+pub const FLAGS_ID: u32 = 0x301;
 /// The registry page in the root task.
 const REGISTRY_VA: usize = crate::layout::TRUSTD_REGISTRY.base;
 /// Mapping capabilities trustd's ranges and AML pages can need.
@@ -39,7 +40,9 @@ pub struct Trustd {
     #[allow(dead_code)]
     arena: Arena,
     registry: *mut GuestRecord,
-    next_instance: u64,
+    flags_ep: cap::Endpoint,
+    no_reports: bool,
+    failed: bool,
     /// The request page of each guest id, mapped in trustd.
     pages: [cap::Granule; trust::MAX_RECORDS],
     /// Guests signal it, badged with trust::kick_badge(id).
@@ -179,7 +182,7 @@ fn find_tpm(bootinfo: &sel4::BootInfoPtr, phys: &mut crate::acpi::Phys) -> Optio
     Some(l)
 }
 
-/// Start trustd if the host has a TPM (and root was built with trustd).
+/// Start trustd whenever built in. Without a usable TPM it serves flags.
 pub fn spawn(
     bootinfo: &sel4::BootInfoPtr,
     alloc: &mut Alloc,
@@ -197,12 +200,14 @@ pub fn spawn(
     {
         let mut frames = frames;
         let mut phys = crate::acpi::Phys::new(alloc, devmem, win, &mut frames);
-        let l = find_tpm(bootinfo, &mut phys)?;
+        let Some(l) = find_tpm(bootinfo, &mut phys) else {
+            return flags_only(alloc, win, asids, info, frames);
+        };
         // The pages of each range, which stay in `frames`.
         for &(base, size) in &l.ranges {
             if (0..size / PAGE).any(|p| phys.frame(base + p * PAGE).is_none()) {
                 sel4::debug_println!("l4h-root: TPM at {:#x} is not device memory, no attestation", base);
-                return None;
+                return flags_only(alloc, win, asids, info, frames);
             }
         }
         // The AML's size.  Its pages are carved now, so that copying it
@@ -216,7 +221,7 @@ pub fn spawn(
                     Some(n) => n,
                     None => {
                         sel4::debug_println!("l4h-root: cannot read the ACPI tables for the TPM, no attestation");
-                        return None;
+                        return flags_only(alloc, win, asids, info, frames);
                     }
                 }
             }
@@ -273,16 +278,30 @@ pub fn spawn(
             if crate::acpi::aml_tables(bootinfo, &mut phys, copy) != Some(aml_size) {
                 sel4::debug_println!("l4h-root: cannot copy the ACPI tables for the TPM, no attestation");
                 alloc.reclaim(arena);
-                return None;
+                return flags_only(alloc, win, asids, info, frames);
             }
         }
-        finish(comp, arena, alloc, &mut keep_slot, frames)
+        finish(comp, arena, alloc, &mut keep_slot, info, false, frames)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (bootinfo, alloc, devmem, win, asids, info);
-        None
+        let _ = (bootinfo, devmem);
+        flags_only(alloc, win, asids, info)
     }
+}
+
+/// The same flags service on machines with no usable TPM.
+fn flags_only(
+    alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &HostInfo,
+    #[cfg(target_arch = "x86_64")] frames: crate::acpi::Frames,
+) -> Option<Trustd> {
+    let (comp, arena, keep) = create(&Layout::default().config(0), alloc, win, asids, info, 0)?;
+    let mut next = 0;
+    finish(comp, arena, alloc, &mut || {
+        let slot = keep.absolute_cptr_from_bits_with_depth(next, KEEP_BITS);
+        next += 1;
+        slot
+    }, info, true, #[cfg(target_arch = "x86_64")] frames)
 }
 
 /// Create trustd with configuration `cfg`, and the CNode that keeps its
@@ -295,7 +314,7 @@ fn create(
     info: &HostInfo,
     aml_size: usize,
 ) -> Option<(Component, Arena, cap::CNode)> {
-    let mut arena = alloc.arena((8 << 20) + 2 * aml_size)?;
+    let mut arena = alloc.arena((8 << 20) + 2 * aml_size).expect("memory for trustd and flags service");
     let cfg_bytes = unsafe {
         core::slice::from_raw_parts(cfg as *const TrustdConfig as *const u8, core::mem::size_of::<TrustdConfig>())
     };
@@ -322,12 +341,14 @@ fn create(
 
 /// Map the registry and request pages, give trustd its kick notification,
 /// and start it.
-#[cfg(target_arch = "x86_64")]
 fn finish(
     comp: Component,
     mut arena: Arena,
     alloc: &mut Alloc,
     keep: &mut impl FnMut() -> sel4::AbsoluteCPtr,
+    info: &HostInfo,
+    no_reports: bool,
+    #[cfg(target_arch = "x86_64")]
     frames: crate::acpi::Frames,
 ) -> Option<Trustd> {
     let registry = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
@@ -347,16 +368,65 @@ fn finish(
     });
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
+    for p in 0..trust::FLAGS_SIZE / PAGE {
+        let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
+        comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+        comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_WRITE_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep());
+        map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
+            crate::layout::TRUSTD_FLAGS.base + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
+    }
+    let ep = arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
+    comp.give(trust::SLOT_FLAGS_EP, ep, CapRights::all());
+    let call_rights = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
+    comp.give_badged(trust::SLOT_FLAGS_CALL, ep, call_rights.clone(), trust::FLAGS_TRUSTD);
+    let slot = alloc.slots.alloc();
+    let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
+    abs_of(flags_ep).mint(&abs_of(ep), call_rights, trust::FLAGS_ROOT).expect("root flags endpoint");
+    let bootstrap = component::flags_thread(&comp, alloc, &mut arena, info);
     component::start(&comp);
-    Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord, next_instance: 1, pages, kick, frames })
+    // reply_recv puts the worker back on the endpoint before returning
+    // this reply. Unbind only now: subsequent calls donate their SC.
+    sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..8].fill(0));
+    flags_ep.call(sel4::MessageInfo::new(0, 0, 0, 8));
+    bootstrap.unbind().expect("passive flags server");
+    Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord,
+        flags_ep, no_reports, failed: false, pages, kick,
+        #[cfg(target_arch = "x86_64")] frames })
 }
 
 impl Trustd {
+    pub fn flags(&self, g: &Guest) -> trust::Flags {
+        unsafe { &*(crate::layout::TRUSTD_FLAGS.base as *const trust::FlagsEntry).add(g.id) }
+            .read().for_instance(g.instance)
+    }
+
+    /// Seal check on every op, ACT only for its first taint. `effect`
+    /// is false for an empty read/write: it checks seals without tainting.
+    pub fn act(&self, g: &Guest, caller: usize, bits: u64, effect: bool) -> Result<(), i64> {
+        if g.id == caller { return Ok(()); }
+        self.flags(g).act(bits, effect, || {
+            sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..8].copy_from_slice(
+                &[trust::FLAGS_ACT, g.id as u64, g.instance, bits, 0, 0, 0, 0]));
+            let reply = self.flags_ep.call(sel4::MessageInfo::new(0, 0, 0, 8));
+            if reply.length() != 10 { return Err(crate::ctl::EIO); }
+            let status = mr(0) as i64;
+            if status == 0 { Ok(()) } else { Err(-status) }
+        })
+    }
+
     /// Give guest `g` (being created) its attestation device: its id's
     /// request page, cleared, and a kick capability badged with its id.
     pub fn give(&self, g: &mut Guest, alloc: &mut Alloc, win: &mut Window) {
+        if self.failed { return; }
         let page = self.pages[g.id];
-        win.with_frame(&abs_of(page), |p| unsafe { core::ptr::write_bytes(p, 0, PAGE) });
+        win.with_frame(&abs_of(page), |p| unsafe {
+            // Do not carry any guest-writable state across instances.
+            // If TPM initialization failed, trustd also sets NO_REPORTS
+            // on the new guest's probe request before answering it.
+            core::ptr::write_bytes(p, 0, PAGE);
+            core::ptr::addr_of_mut!((*(p as *mut abi::AttestPage)).state)
+                .write_volatile(if self.no_reports { abi::ATTEST_NO_REPORTS } else { 0 });
+        });
         if g.add_device_with(alloc, crate::guest::DevKind::Attest, page, (self.kick, trust::kick_badge(g.id))).is_some() {
             g.attest = true;
         }
@@ -364,6 +434,7 @@ impl Trustd {
 
     /// Guest `g` starts: its reports describe it from now on.
     pub fn register(&mut self, g: &Guest) {
+        if self.failed { return; }
         let Some(launch) = g.launch else { return };
         let r = GuestRecord {
             instance: 0,
@@ -377,9 +448,8 @@ impl Trustd {
         unsafe {
             p.write_volatile(r);
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            core::ptr::addr_of_mut!((*p).instance).write_volatile(self.next_instance);
+            core::ptr::addr_of_mut!((*p).instance).write_volatile(g.instance);
         }
-        self.next_instance += 1;
     }
 
     /// Guest `id` is destroyed.
@@ -387,10 +457,11 @@ impl Trustd {
         unsafe { core::ptr::addr_of_mut!((*self.registry.wrapping_add(id)).instance).write_volatile(0) };
     }
 
-    /// trustd faulted (the firmware's AML can make it panic): stop it,
+    /// The main thread faulted (the firmware's AML can make it panic): stop it,
     /// mark every guest's page failed and answer what it asked with -EIO,
     /// so that no guest waits for good.  New guests get no attestation.
-    fn fail(self, h: &mut Host) {
+    fn fail(&mut self, h: &mut Host) {
+        self.failed = true;
         let _ = self.comp.tcb.tcb_suspend();
         let kick = abs_of(self.kick);
         let _ = kick.revoke();
@@ -414,11 +485,13 @@ impl Trustd {
     }
 }
 
-/// A fault of trustd (component `id`)?  Then it is gone.
+/// Stop a failed main thread, retaining the independent flags server.
 pub fn fault(h: &mut Host, id: u32) {
+    assert!(id != FLAGS_ID, "l4h-root: flags thread faulted");
     if id == TRUSTD_ID {
-        if let Some(t) = h.trustd.take() {
+        if let Some(mut t) = h.trustd.take() {
             t.fail(h);
+            h.trustd = Some(t);
         }
     }
 }

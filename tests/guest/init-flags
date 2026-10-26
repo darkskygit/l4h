@@ -1,0 +1,15 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+fail() { echo "FLAGSTEST: FAIL: $*"; poweroff -f; }
+if l4hctl attest report >/tmp/report 2>/tmp/err; then fail 'report without TPM'; fi
+grep -q 'no TPM: flags only' /tmp/err || fail 'no TPM diagnostic'
+l4hctl attest flags || fail flags
+l4hctl attest act --seal 150 || fail act
+if l4hctl attest act 150; then fail 'sealed action'; fi
+/bin/flags-test dom0 no-tpm || fail 'flags checks'
+l4hctl vms
+l4hctl attest seal console-in || fail seal
+echo 'FLAGSTEST: PASS'
+poweroff -f

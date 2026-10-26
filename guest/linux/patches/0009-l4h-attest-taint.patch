@@ -1,0 +1,22 @@
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -12,6 +12,9 @@
+ #include <linux/debug_locks.h>
+ #include <linux/sched/debug.h>
+ #include <linux/interrupt.h>
++#ifdef CONFIG_L4H_ATTEST
++#include <asm/attest.h>
++#endif
+ #include <linux/kgdb.h>
+ #include <linux/kmsg_dump.h>
+ #include <linux/kallsyms.h>
+@@ -753,6 +756,9 @@
+ 		pr_warn("Disabling lock debugging due to kernel taint\n");
+ 
+ 	set_bit(flag, &tainted_mask);
++#ifdef CONFIG_L4H_ATTEST
++	l4h_attest_taint(flag);
++#endif
+ 
+ 	if (tainted_mask & panic_on_taint) {
+ 		panic_on_taint = 0;

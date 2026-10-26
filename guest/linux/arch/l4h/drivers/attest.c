@@ -2,7 +2,7 @@
 /*
  * Attestation by the l4h host (l4h-trustd, DESIGN.md §9.2), through the
  * attestation device (L4H_DEV_ATTEST, struct l4h_attest_page) on hosts
- * with a TPM:
+ * (flags work without a TPM):
  *
  * - configfs-tsm reports (/sys/kernel/config/tsm/report, provider "l4h"):
  *   inblob is the report data (up to 64 bytes, zero padded), outblob the
@@ -13,16 +13,23 @@
  * Requests are asynchronous: the caller sleeps until the host's answer
  * raises the device's event, and the vCPU runs other tasks meanwhile.
  */
+#include <linux/atomic.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/kobject.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/panic.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/tsm.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
+#include <asm/attest.h>
 #include <irq_kern.h>
 #include <l4h_sys.h>
 
@@ -31,7 +38,7 @@ struct l4h_attest_ioc {
 	__u32 blob_len;		/* ACTIVATE: credential blob bytes */
 	__u32 secret_len;	/* ACTIVATE: encrypted secret bytes */
 	__u32 out_len;		/* in: room at out; out: the result's length */
-	__u64 data;		/* REPORT: 64 bytes; ACTIVATE: blob, then secret */
+	__u64 data;		/* REPORT: 64 bytes; ACTIVATE: blob + secret; ACT/SEAL: blob_len bytes */
 	__u64 out;
 };
 
@@ -47,10 +54,26 @@ static u32 seq;
 /* A request the host has not answered yet although its caller gave up: the
  * host still owns the page until done says so. */
 static u32 outstanding;
+static atomic_long_t pending = ATOMIC_LONG_INIT(0);
+static bool ready, flags_supported = true;
+static void taint_work(struct work_struct *work);
+static DECLARE_WORK(taint_sender, taint_work);
+static void no_reports(void);
+
+/* add_taint() can run before probe, from an IRQ, or while reporting.
+ * Never wait here. A report takes this pending word under attest_lock. */
+void l4h_attest_taint(unsigned flag)
+{
+	if (flag >= BITS_PER_LONG)
+		return;
+	atomic_long_or(BIT(flag), &pending);
+	if (smp_load_acquire(&ready))
+		schedule_work(&taint_sender);
+}
 
 static bool attest_answered(u32 s)
 {
-	return READ_ONCE(page->done) == s || READ_ONCE(page->state) == L4H_ATTEST_FAILED;
+	return READ_ONCE(page->done) == s || (READ_ONCE(page->state) & L4H_ATTEST_FAILED);
 }
 
 static irqreturn_t attest_interrupt(int irq, void *data)
@@ -64,7 +87,7 @@ static irqreturn_t attest_interrupt(int irq, void *data)
  * credential blob) and collect its result, which may take several
  * replies.  Returns a kvmalloc'ed buffer in *out.
  */
-static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 **out, size_t *out_len)
+static int attest_call_locked(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 **out, size_t *out_len)
 {
 	size_t total = 0, got = 0;
 	u8 *buf = NULL;
@@ -72,12 +95,9 @@ static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 
 
 	if (in_len > L4H_ATTEST_PAGE_DATA)
 		return -EINVAL;
-	if (mutex_lock_killable(&attest_lock))
-		return -EINTR;
 	/* The host would write that answer over our request. */
 	if (outstanding) {
 		if (wait_event_killable(answered, attest_answered(outstanding))) {
-			mutex_unlock(&attest_lock);
 			return -EINTR;
 		}
 		outstanding = 0;
@@ -87,7 +107,7 @@ static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 
 		u32 s = ++seq ?: ++seq, n;
 		long left;
 
-		if (READ_ONCE(page->state) == L4H_ATTEST_FAILED) {
+		if (READ_ONCE(page->state) & L4H_ATTEST_FAILED) {
 			ret = -EIO;
 			break;
 		}
@@ -132,7 +152,6 @@ static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 
 		memcpy(buf + got, page->data, n);
 		got += n;
 	} while (got < total);
-	mutex_unlock(&attest_lock);
 	if (ret) {
 		kvfree(buf);
 		return ret;
@@ -140,6 +159,55 @@ static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 
 	*out = buf;
 	*out_len = total;
 	return 0;
+}
+
+/* attest_lock held. Put failed sends back: losing a taint on interruption
+ * would allow a later report to claim a clean kernel. */
+static int flush_taints(void)
+{
+	unsigned long mask;
+	u8 bits[L4H_FLAG_BITS / 8] = {}, *out = NULL;
+	size_t len;
+	int ret;
+
+	if (!flags_supported)
+		return 0;
+	mask = atomic_long_xchg(&pending, 0);
+	if (!mask)
+		return 0;
+	put_unaligned_le64(mask, bits + L4H_FLAG_GUEST / 8);
+	ret = attest_call_locked(L4H_ATTEST_ACT, bits, sizeof(bits), 0, &out, &len);
+	kvfree(out);
+	if (ret == -ENOSYS) {
+		flags_supported = false;
+		pr_warn_once("l4h-attest: host has no taint/seal operations\n");
+		return 0;
+	}
+	if (ret)
+		atomic_long_or(mask, &pending);
+	return ret;
+}
+
+static void taint_work(struct work_struct *work)
+{
+	mutex_lock(&attest_lock);
+	flush_taints();
+	mutex_unlock(&attest_lock);
+}
+
+static int attest_call(u32 op, const u8 *in, size_t in_len, size_t blob_len, u8 **out, size_t *out_len)
+{
+	int ret;
+
+	if (mutex_lock_killable(&attest_lock))
+		return -EINTR;
+	ret = flush_taints();
+	if (!ret)
+		ret = attest_call_locked(op, in, in_len, blob_len, out, out_len);
+	mutex_unlock(&attest_lock);
+	if (ret == -ENODEV && (READ_ONCE(page->state) & L4H_ATTEST_NO_REPORTS))
+		no_reports();
+	return ret;
 }
 
 static int attest_report(const u8 *data, size_t len, u8 **out, size_t *out_len)
@@ -196,6 +264,51 @@ static const struct tsm_report_ops l4h_tsm_ops = {
 };
 #endif
 
+/* Unregister outside attest_lock and the configfs callback: the latter
+ * holds tsm's read lock. Registration is settled during probe. */
+#if IS_ENABLED(CONFIG_TSM_REPORTS)
+static bool tsm_registered;
+#endif
+static void unregister_tsm(struct work_struct *work)
+{
+#if IS_ENABLED(CONFIG_TSM_REPORTS)
+	if (tsm_registered) {
+		tsm_report_unregister(&l4h_tsm_ops);
+		tsm_registered = false;
+	}
+#endif
+}
+static DECLARE_WORK(tsm_remover, unregister_tsm);
+static void no_reports(void)
+{
+	schedule_work(&tsm_remover);
+}
+
+static ssize_t flags_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	u8 bits[L4H_FLAG_BITS / 8] = {}, *out;
+	size_t len;
+	unsigned int i, at = 0, offset = attr->attr.name[0] == 's' ? sizeof(bits) : 0;
+	int ret = attest_call(L4H_ATTEST_ACT, bits, sizeof(bits), 0, &out, &len);
+
+	if (ret)
+		return ret;
+	if (len != sizeof(struct l4h_attest_flags)) {
+		kvfree(out);
+		return -EIO;
+	}
+	for (i = 0; i < L4H_FLAG_BITS; i++)
+		if (out[offset + i / 8] & BIT(i % 8))
+			at += sysfs_emit_at(buf, at, "%s%u", at ? "," : "", i);
+	at += sysfs_emit_at(buf, at, "\n");
+	kvfree(out);
+	return at;
+}
+static struct kobj_attribute taint_attr = __ATTR(taint, 0444, flags_show, NULL);
+static struct kobj_attribute seal_attr = __ATTR(seal, 0444, flags_show, NULL);
+static struct attribute *flags_attrs[] = { &taint_attr.attr, &seal_attr.attr, NULL };
+static const struct attribute_group flags_group = { .name = "attest", .attrs = flags_attrs };
+
 static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct l4h_attest_ioc c;
@@ -216,6 +329,16 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (in_len > L4H_ATTEST_PAGE_DATA)
 			return -EINVAL;
 		break;
+	case L4H_ATTEST_ACT:
+		in_len = c.blob_len;
+		if (c.secret_len || (in_len != L4H_FLAG_BITS / 8 && in_len != sizeof(struct l4h_attest_act)))
+			return -EINVAL;
+		break;
+	case L4H_ATTEST_SEAL:
+		in_len = c.blob_len;
+		if (c.secret_len || in_len != L4H_FLAG_BITS / 8)
+			return -EINVAL;
+		break;
 	case L4H_ATTEST_EVIDENCE:
 		in_len = 0;
 		break;
@@ -227,12 +350,17 @@ static long attest_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (IS_ERR(in))
 			return PTR_ERR(in);
 	}
+	/* Kernel events can only be recorded by the measured kernel. */
+	if (c.op == L4H_ATTEST_ACT && memchr_inv(in, 0, L4H_FLAG_USER / 8)) {
+		kfree(in);
+		return -EPERM;
+	}
 	if (c.op == L4H_ATTEST_REPORT)
 		ret = attest_report(in, in_len, &out, &len);
 	else if (c.op == L4H_ATTEST_EVIDENCE)
 		ret = attest_evidence(&out, &len);
 	else
-		ret = attest_call(L4H_ATTEST_ACTIVATE, in, in_len, c.blob_len, &out, &len);
+		ret = attest_call(c.op, in, in_len, c.blob_len, &out, &len);
 	kfree(in);
 	if (ret)
 		return ret;
@@ -264,6 +392,9 @@ static int __init l4h_attest_init(void)
 	const struct l4h_bootinfo *bi = l4h_bootinfo;
 	unsigned int i;
 	int irq, ret;
+	struct kobject *kobj;
+	u8 bits[L4H_FLAG_BITS / 8] = {}, *out = NULL;
+	size_t len;
 
 	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++) {
 		if (bi->devices[i].type == L4H_DEV_ATTEST)
@@ -280,15 +411,33 @@ static int __init l4h_attest_init(void)
 	if (ret)
 		return ret;
 	seq = READ_ONCE(page->seq);
+	/* Include taints from before the hook/driver was ready. The empty ACT
+	 * also waits for TPM initialization, so NO_REPORTS is known at probe. */
+	atomic_long_or(get_taint(), &pending);
+	smp_store_release(&ready, true);
+	ret = attest_call(L4H_ATTEST_ACT, bits, sizeof(bits), 0, &out, &len);
+	kvfree(out);
+	if (ret == -ENOSYS) {
+		flags_supported = false;
+		pr_warn_once("l4h-attest: host has no taint/seal operations\n");
+	}
 	ret = misc_register(&attest_dev);
 	if (ret)
 		return ret;
+	kobj = kobject_create_and_add("l4h", kernel_kobj);
+	if (kobj && sysfs_create_group(kobj, &flags_group))
+		kobject_put(kobj);
 #if IS_ENABLED(CONFIG_TSM_REPORTS)
-	ret = tsm_report_register(&l4h_tsm_ops, NULL);
-	if (ret)
-		pr_warn("l4h-attest: no configfs-tsm reports: %d\n", ret);
+	if (!(READ_ONCE(page->state) & (L4H_ATTEST_NO_REPORTS | L4H_ATTEST_FAILED))) {
+		ret = tsm_report_register(&l4h_tsm_ops, NULL);
+		if (ret)
+			pr_warn("l4h-attest: no configfs-tsm reports: %d\n", ret);
+		else
+			tsm_registered = true;
+	}
 #endif
-	pr_info("l4h-attest: host attestation available\n");
+	pr_info("l4h-attest: %s\n", READ_ONCE(page->state) & L4H_ATTEST_NO_REPORTS ?
+		"no TPM: flags only" : "host attestation available");
 	return 0;
 }
 device_initcall(l4h_attest_init);

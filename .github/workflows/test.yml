@@ -60,6 +60,8 @@ jobs:
         run: tests/run-versiontest.sh
       - name: Host unit tests (allocator, I/O pool, display)
         run: tests/run-alloctest.sh
+      - name: Taint/seal service and verifier policy
+        run: tests/run-trusttest.sh
       - name: Build seL4
         run: tools/build-kernel.sh
       - name: CPU topology and migration policy

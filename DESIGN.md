@@ -94,7 +94,7 @@ gVNIC after Linux `gve`, ENA after Linux `ena` and the X550 after Linux
 `ixgbe`.
 
 Trust: the seL4 kernel, `l4h-root`, `l4h-memd`, `l4h-blkd`, `l4h-netd`
-and, with a TPM, `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
+and `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
 read other guests' memory. Each `l4h-vmm` is trusted only by its own
 guest: it maps that guest's I/O pool and host-owned device, event and
 queue pages, and never its RAM (§15), so a compromised VMM can harm only
@@ -891,7 +891,7 @@ The guest kernel makes plain seL4 invocations on capabilities it holds:
 - Signal;
 - Call to its VMM endpoint for device configuration, power-off and reboot;
 - Signal its devices' kick notifications, the attestation device's
-  included, which trustd serves on hosts with a TPM (§9.2).
+  included, which trustd serves even without a TPM (§9.2).
 
 **Direct seL4 invocations rely on capability checks.** The CSpace that
 `l4h-root` hands the guest contains:
@@ -1859,7 +1859,7 @@ the host keeps that dynamic plumbing simple.
 | `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
 | `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC, ENA and X550 uplink drivers. |
-| `l4h-trustd` | 0 or 1 | With a TPM: has the TPM quote its signing key, and signs guests' reports with it (§9.2). |
+| `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§9.2). |
 | `l4h-memd` | 1 | Owns the free memory and every guest's RAM blocks; gives root memory for host objects; reports free memory to the hypervisor (§16). |
 
 **No dynamic allocation.** Host components are built so that nothing a
@@ -2134,8 +2134,9 @@ The chain has four links.
    - Root reads the image back from guest RAM before the guest starts.
      `vm_start` fails if dom0 loaded anything outside the initramfs.
    - Root writes {instance, RAM, vCPUs, dom0, digest} into a registry page
-     that trustd maps read-only. Root never calls trustd, whose TPM commands
-     can take seconds.
+     that trustd maps read-only. Root never waits for trustd's main
+     thread, whose TPM commands can take seconds; its passive flags
+     thread answers root independently (below).
    - Each guest gets an attestation device (`L4H_DEV_ATTEST`). Requests are
      asynchronous, so a vCPU never waits for trustd, which answers one
      request at a time and can take seconds for ActivateCredential:
@@ -2152,15 +2153,18 @@ The chain has four links.
      answer whose guest's instance changed while it worked.
    - `L4H_ATTEST_REPORT`, with 64 bytes of the guest's data, returns a
      COSE_Sign1 (ES256) signed by K. It carries a CBOR map: `v`, `ram`,
-     `data`, `dom0`, `host` (SHA-256 of K), `guest`, `vcpus`, `launch` and
-     `instance` (unique per guest started since boot).
+     `data`, `dom0`, `host` (SHA-256 of K), `seal`, `guest`, `taint`, `vcpus`, `launch` and
+     `instance` (unique per guest created since boot). The two bitmaps
+     are 32-byte strings, bit n in bit n % 8 of byte n / 8. The map stays
+     `v: 1`, in deterministic CBOR key order.
    - `L4H_ATTEST_EVIDENCE` returns the host evidence, a CBOR map: K as a
      COSE_Key, the AK's `TPMT_PUBLIC`, the quote (`TPMS_ATTEST`) and its
      signature, the quoted PCR values, and the EK certificate if the TPM
      has one in NV.
    - Results longer than the page come in pieces: each request gives the
-     offset its answer starts at. A report is deterministic, so its pieces
-     fit together.
+     offset its answer starts at. Evidence is fixed at startup. A report,
+     whose flags may change between requests, is at most 512 bytes and
+     always fits in one answer.
    - Linux exposes both as configfs-tsm reports (provider `l4h`: `inblob`,
      `outblob`, and the evidence as `auxblob`) and through `/dev/l4h-attest`
      (`l4hctl attest`).
@@ -2189,7 +2193,111 @@ The chain has four links.
    others wait. Each guest instance may therefore make 5 at once, then
    one a second (GCRA, one timestamp per guest id, reset when a new guest
    takes the id). Beyond that trustd answers `-EAGAIN` without using the
-   TPM. Reports and evidence are not limited: they cost no TPM time.
+   TPM. Reports, evidence, ACT and SEAL are not limited: they cost no TPM time.
+
+**Taint and seal.** Each guest instance has two set-only 256-bit
+bitmaps. Taint bit b records that action b happened; seal bit b prevents
+it from happening. `ACT(bits)` atomically refuses with `-EPERM` if any
+requested bit is sealed, otherwise taints all of them. `SEAL(bits)` sets
+seals. Neither dom0 nor the guest can clear either bitmap. A verifier's
+check `taint & mask == 0 && seal & mask == mask` covers the past and the
+future; checking taint alone leaves a session key exposed after its report.
+
+| Bits | Who acts | Who seals | Meaning and trust |
+|------|----------|-----------|-------------------|
+| 0–31 | Host actor (root today) | Guest userspace | Host TCB enforces the refusal; 0 is `CONSOLE_IN`, 1 is `CONSOLE_OUT`, 2–31 reserved |
+| 32–63 | Reserved for host actors | Nobody yet | Reserved |
+| 64–127 | Guest kernel | Nobody | Bit 64 + Linux's taint flag; trusted as far as the measured kernel |
+| 128–255 | Guest userspace | Guest userspace | Workload-defined actions; the workload must honour refusal |
+
+`CONSOLE_WRITE` takes `CONSOLE_IN` before injecting bytes, including
+input queued before start. `CONSOLE_READ` and `GPU_READ` take
+`CONSOLE_OUT` before disclosing text or pixels. Empty operations do not
+taint; a write that finds its ring full conservatively does. Every call
+checks seals, including empty calls. An image copied into dom0's data
+area taints even if the image changes and the read returns `-EAGAIN`.
+dom0's own console reads/writes are exempt. The serial monitor never
+injects guest input. Debug builds also copy guest output to the host's
+physical serial port; that trusted debug output is not a dom0 control op.
+
+**Rule for new control ops:** reading or changing a running guest's
+state outside the devices attached before start needs an action bit,
+recorded before the effect and refused after sealing. Register access,
+memory dumps, snapshots and migration must follow this rule. An op
+without a bit remains available on a sealed guest, so adding one is an
+attestation-visible decision. Scheduling, shutdown, destruction and
+cooperative memory hotplug remain dom0's availability decisions; host
+metadata queries do not disclose guest state. Disk/network choices are
+still outside the launch measurement.
+
+A passive thread in trustd is the sole writer of an 8 KiB flags area:
+64 entries, each 128 bytes, with a seqlock, instance and the two bitmaps.
+Root and the main thread use read-only mappings; only the flags thread
+uses the writable alias in trustd's address space. Readers retry an odd
+or changed sequence counter. Root assigns monotonically increasing
+instances at `VM_CREATE`, stores them in `Guest`, and publishes the same
+instance in the registry at start. An entry for another instance reads as
+empty. A higher-instance request replaces an entry; an older request gets
+`-ESRCH`. Destruction does not clear flags.
+
+The flags endpoint has badged callers: `FLAGS_ROOT` can ACT on defined
+host bits, and `FLAGS_TRUSTD` can ACT on guest bits and SEAL defined host
+or userspace bits. Kernel bits cannot be sealed. The service validates
+all arguments before changing any entry. Its requests are MR0 op, MR1
+id, MR2 instance, MR3–6 bitmap and MR7 options; replies are MR0 status,
+MR1 instance, MR2–5 taint, MR6–9 seal. At root's priority, it runs on the
+caller's donated MCS scheduling context, with no heap, TPM, AML or calls
+back to root. A temporary startup SC is removed after its initial
+reply/receive handshake. A fault in this thread is a host bug, like a
+fault in root.
+
+An actor first checks the seal in a consistent entry. If the taint is
+already set, no IPC is needed; otherwise ACT must succeed before the
+operation. This costs one IPC per action kind per instance, including
+continuous console polling. ACT and SEAL serialize in the flags thread.
+An operation that passed its check can land after sealing, but its taint
+was set before that seal. Thus a report or SEAL answer showing a clean
+sealed bit guarantees that action has never happened and never will.
+It does not promise that an already-tainted action is no longer in flight.
+
+Guest requests use the existing attestation page/ioctl: ACT (4) takes a
+32-byte bitmap with an optional u32 options word, SEAL (5) a 32-byte
+bitmap, and each returns 32 bytes of taint followed by 32 bytes of seal.
+An empty ACT reads the flags. `L4H_ACT_SEAL` on userspace bits taints and
+seals atomically, giving at-most-once actions even between racing
+processes. Failed multi-bit ACTs change nothing. Invalid ranges or
+options get `-EINVAL`; an older host lacking these ops gives `-ENOSYS`.
+The Linux driver refuses userspace ACTs below bit 128 with `-EPERM`.
+Its `add_taint` hook accumulates kernel bits atomically, sends them from
+workqueue context, and flushes them under the request lock before any
+report. Probe includes existing kernel taints. Failed sends are retained
+for retry. The kernel never seals on its own.
+
+`l4hctl attest flags`, `seal console-in|console-out|BIT...`, and
+`act [--seal] BIT...` expose the gates; refused actions exit 1. Sysfs
+`/sys/kernel/l4h/attest/{taint,seal}` prints bit lists. To seal early, a
+measured initramfs calls `l4hctl attest seal console-in` from init; any
+input queued before it is still recorded. dom0's `VM_TRUST` (30) reports
+only bits 0–63. `l4hctl list` / `vms` shows seals; console output stays
+usable after input is sealed.
+
+The verifier prints host names and Linux taint letters and accepts
+`--deny-taint` / `--require-seal` as comma-separated names, numbers and
+ranges. By default it denies `console-in`; `--deny-taint ''` opts out.
+No guest bits are denied by default. An older report with no seal cannot
+satisfy a required seal. Bitmaps may grow: at least 32 bytes are required,
+and bits beyond their length count as clear.
+
+**Without a TPM.** trustd always starts when built in, on both
+architectures. `TPM_NONE`, an unsupported TPM, or TPM initialization
+failure leaves a flags-only service: ACT, SEAL and VM_TRUST work, while
+REPORT, EVIDENCE and ACTIVATE return `-ENODEV`. Root sets
+`L4H_ATTEST_NO_REPORTS` before boot when no TPM was found; trustd sets it
+if initialization fails. Linux reads it at probe and on `-ENODEV`, keeps
+`/dev/l4h-attest` and only registers configfs-tsm when reports work.
+`l4hctl attest report` says `no TPM: flags only`. Local seals still work,
+but without a signing key they have no remote proof. A later TPM command
+failure returns `-EIO`.
 
 **TPM interfaces.** These follow Linux's `tpm_crb` and `tpm_tis`:
 
@@ -2212,10 +2320,11 @@ The chain has four links.
     the PCI functions the host drives. Reads of anything refused return
     all ones.
   - The interpreter runs in trustd, not root, because it still panics on
-    some AML. If trustd faults, root suspends it and revokes the guests'
+    some AML. If the main thread faults, root suspends only it and revokes the guests'
     kick capabilities. It marks every attestation page failed and answers
     the request in it with -EIO, so no guest waits for its timeout. No new
-    guest gets attestation.
+    guest gets attestation. The flags thread and its arena stay alive:
+    existing seals remain enforced, and actors keep recording taints.
   - The crate is pinned to an upstream commit past 6.1.1, whose buffer
     comparison, which every `_DSM` needs for its UUID check, panics.
 - **CRB with Pluton**, start method 13: the start and reply doorbells
@@ -2248,12 +2357,16 @@ this does not cover:
   behind it (their vCPUs do not). The rate limit bounds what each guest
   asks, not the number of guests: with every guest at its limit, a
   request can wait about one activation per guest.
-- **aarch64.** It has no TPM path yet.
+- **aarch64.** It has no TPM path yet; local flags and seals work.
 - **CRB buffer sizes.** trustd uses the buffer sizes from the CRB
   registers. Linux also clips them to the device's `_CRS` because some
   firmware reports larger buffers, and trustd does not do that.
 
-`tests/run-attesttest.sh` boots under OVMF with swtpm three times: CRB,
+`tests/run-trusttest.sh` checks badge/range validation, atomic gates,
+instance reuse, concurrent snapshots and signed verifier policy.
+`tests/run-ctltest.sh` also checks flags without a TPM, and
+`tests/run-attesttest.sh` checks signed flags, console/display seals,
+kernel taints, racing userspace gates and pre-start input. It boots under OVMF with swtpm three times: CRB,
 then FIFO, then CRB with the ACPI start method, and checks the whole
 chain each time, the credential included. For the third boot, it has GRUB
 replace QEMU's TPM2 table with one for start method 2, and add an SSDT
@@ -2267,6 +2380,10 @@ a locality, so a command only runs if trustd ran the `_DSM`.
 ---
 
 ## 10. Boot and deployment
+
+Every host image includes trustd, including on aarch64 and machines
+without a TPM: its passive flags server enforces guest seals locally.
+The TPM enables signing; it does not decide whether seals work (§9.2).
 
 - **Firmware.** UEFI → GRUB (EFI) → multiboot2. QEMU uses OVMF for this
   path, or plain `-kernel` multiboot for development. `tools/mkefi.sh`

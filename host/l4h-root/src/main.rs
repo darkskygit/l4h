@@ -223,6 +223,7 @@ pub struct Host {
     /// restarts.
     pub dom0_initrd: &'static [u8],
     pub trustd: Option<trustd::Trustd>,
+    next_instance: u64,
     pub memd: memd::Memd,
     pub reset: reset::Reset,
     pub rtc: rtc::Rtc,
@@ -264,7 +265,9 @@ impl Host {
         let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
         self.alloc.slots.track(id);
         let asids = self.asids.in_use;
-        let mut g = guest::create(id, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel);
+        let instance = self.next_instance;
+        self.next_instance = instance.checked_add(1).expect("guest instance exhausted");
+        let mut g = guest::create(id, instance, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel);
         if let (Ok(g), Some(t)) = (&mut g, &self.trustd) {
             t.give(g, &mut self.alloc, &mut self.wins.a);
         }
@@ -633,6 +636,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         kmods,
         dom0_initrd,
         trustd,
+        next_instance: 1,
         memd,
         reset,
         rtc,

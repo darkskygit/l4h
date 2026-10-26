@@ -278,6 +278,7 @@ pub const CTL_GPU_ATTACH: u32 = 26;
 pub const CTL_GPU_READ: u32 = 27;
 pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
+pub const CTL_VM_TRUST: u32 = 30;
 /// CTL_GPU_ATTACH: scanout sizes, and the I/O pool a VM with a GPU needs
 /// (in images of its scanout).
 pub const GPU_MIN: u32 = 64;
@@ -332,8 +333,30 @@ pub const HC_CONSOLE_MAX_WORDS: usize = 32;
 pub const ATTEST_REPORT: u32 = 1;
 pub const ATTEST_EVIDENCE: u32 = 2;
 pub const ATTEST_ACTIVATE: u32 = 3;
+pub const ATTEST_ACT: u32 = 4;
+pub const ATTEST_SEAL: u32 = 5;
+pub const FLAG_BITS: usize = 256;
+pub const FLAG_HOST: usize = 0;
+pub const FLAG_GUEST: usize = 64;
+pub const FLAG_USER: usize = 128;
+pub const FLAG_CONSOLE_IN: u64 = 1 << 0;
+pub const FLAG_CONSOLE_OUT: u64 = 1 << 1;
+pub const FLAGS_HOST_DEFINED: u64 = 3;
+pub const ACT_SEAL: u32 = 1;
+#[repr(C)]
+pub struct AttestAct {
+    pub bits: [u8; FLAG_BITS / 8],
+    pub flags: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AttestFlags {
+    pub taint: [u8; FLAG_BITS / 8],
+    pub seal: [u8; FLAG_BITS / 8],
+}
 pub const ATTEST_DATA_SIZE: usize = 64;
 pub const ATTEST_FAILED: u32 = 1;
+pub const ATTEST_NO_REPORTS: u32 = 2;
 pub const ATTEST_PAGE_DATA: usize = 4096 - 64;
 
 #[repr(C)]
@@ -358,6 +381,8 @@ pub const POWER_CRASH: u64 = 2;
 
 const _: () = assert!(core::mem::size_of::<EventPage>() == 4096);
 const _: () = assert!(core::mem::size_of::<AttestPage>() == 4096);
+const _: () = assert!(core::mem::size_of::<AttestAct>() == 36);
+const _: () = assert!(core::mem::size_of::<AttestFlags>() == 64);
 const _: () = assert!(core::mem::size_of::<DevDesc>() == 48);
 const _: () = assert!(
     core::mem::size_of::<BootInfo>()

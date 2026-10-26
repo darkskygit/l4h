@@ -93,6 +93,8 @@ regions! {
     MODULES = 0x7300_0000_0000, 64 * GIB;
     /// trustd's guest registry (trustd.rs).
     TRUSTD_REGISTRY = 0x7500_0000_0000, PAGE;
+    /// trustd flags, read-only in root.
+    TRUSTD_FLAGS = 0x7500_0001_0000, l4h_host::trust::FLAGS_SIZE;
     /// memd's status page (memd.rs).
     MEMD_STATUS = 0x7700_0000_0000, PAGE;
     /// IOMMU registers: 16 KiB per AMD-Vi unit, 64 KiB per VT-d unit.

@@ -10,6 +10,7 @@ mkdir -p "$out/ctlroot"
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$l4h_linux_out/vmlinux.stripped"
 "$root/tools/build-l4hctl.sh"
+"$root/tests/build-flagstest.sh"
 export L4H_VERSION=$("$root/tools/version.sh")
 printf '%s\n' "$L4H_VERSION" > "$out/host-version"
 "$root/tools/mkinitramfs.sh" "$out/vm.cpio.gz" "$root/tests/guest/init-vm" >/dev/null
@@ -25,7 +26,8 @@ for i in 1 2; do head -c 32M /dev/zero | tr '\000' '\245' > "$out/dma$i.img"; do
 slow=throttling.bps-read=2097152
 # mkinitramfs copies extra files into /bin; move the payload to / in init.
 "$root/tools/mkinitramfs.sh" "$out/ctltest.cpio.gz" "$root/tests/guest/init-ctltest" \
-    "$l4h_ctl" "$out/ctlroot/vm.cpio.gz" "$out/host-version" >/dev/null
+    "$l4h_ctl" "$out/ctlroot/vm.cpio.gz" "$out/host-version" \
+    "$out/flags-test" "$out/flagsvm.cpio.gz" >/dev/null
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
 L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0,disable-legacy=on \
     -drive file=$out/dma1.img,if=none,id=d1,format=raw,$slow -device virtio-blk-pci,drive=d1,disable-legacy=on \
@@ -33,6 +35,10 @@ L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-
     "$root/tools/run-dom0.sh" "$out/ctltest.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" ${CTLTEST_TIMEOUT:-$((600 * l4h_test_slow))} \
     | grep -E "CTLTEST|l4hctl|GUEST|vm [0-9]|disk [0-9]|^ *[0-9]+ |memory|l4h-root: guest|panic" || true
 grep -q "CTLTEST: PASS" "$root/build/qemu.log"
+grep -q "FLAGS: PASS no TPM" "$root/build/qemu.log"
+grep -q "FLAGVM: PASS no TPM" "$root/build/qemu.log"
+grep -q "l4h-attest: no TPM: flags only" "$root/build/qemu.log"
+! grep -q "FLAGVM: FAIL" "$root/build/qemu.log"
 # l4hctl iommu: on and remapping with either emulated IOMMU, else none.
 if [[ "${L4H_QEMU_IOMMU:-}" = amd || "${L4H_QEMU_IOMMU:-}" = intel ]]; then
     grep -aq "CTLTEST: iommu state: *on" "$root/build/qemu.log" \

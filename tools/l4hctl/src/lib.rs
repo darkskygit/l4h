@@ -45,6 +45,7 @@ pub const CTL_GPU_ATTACH: u32 = 26;
 pub const CTL_GPU_READ: u32 = 27;
 pub const CTL_VM_SET_MEM: u32 = 28;
 pub const CTL_VM_MEM_INFO: u32 = 29;
+pub const CTL_VM_TRUST: u32 = 30;
 pub const GPU_POOL_IMAGES: u64 = 4;
 pub const IOMMU_NONE: u64 = 0;
 pub const IOMMU_OFF: u64 = 1;
@@ -172,6 +173,10 @@ impl Ctl {
     fn call_buf(&self, op: u32, args: &[u64], data: &[u8], buf: u64, len: usize) -> Result<Box<Resp>> {
         let resp = self.raw_call(op, args, data, buf, len)?;
         if resp.status < 0 {
+            if resp.status == -1 && matches!(op, CTL_CONSOLE_READ | CTL_CONSOLE_WRITE | CTL_GPU_READ) {
+                let kind = if op == CTL_CONSOLE_WRITE { "input" } else { "output" };
+                return err(format!("{kind} sealed by the guest"));
+            }
             return err(format!("request {op} failed: {}", errno_name(-resp.status)));
         }
         Ok(resp)
@@ -587,6 +592,12 @@ impl Ctl {
         Ok((r.vals[0], r.vals[1]))
     }
 
+    /// Host taint and seal bits (0-63) of this VM instance.
+    pub fn vm_trust(&self, vm: u64) -> Result<(u64, u64)> {
+        let r = self.call(CTL_VM_TRUST, &[vm], &[], &[])?;
+        Ok((r.vals[0], r.vals[1]))
+    }
+
     /// Console output from offset `off`: (next offset, bytes, bytes lost).
     pub fn console_read(&self, vm: u64, off: u64) -> Result<(u64, Vec<u8>, u64)> {
         let r = self.call(CTL_CONSOLE_READ, &[vm, off], &[], &[])?;
@@ -681,13 +692,16 @@ impl Ctl {
 }
 
 /// Attestation by the host (DESIGN.md §9.2) on /dev/l4h-attest, in any
-/// guest of a host with a TPM.
+/// guest. ACT/SEAL work without a TPM.
 pub mod attest {
     use super::*;
 
     const REPORT: u32 = 1;
     const EVIDENCE: u32 = 2;
     const ACTIVATE: u32 = 3;
+    const ACT: u32 = 4;
+    const SEAL: u32 = 5;
+    pub const FLAG_BITS: usize = 256;
     pub const DATA_SIZE: usize = 64;
 
     #[repr(C)]
@@ -708,7 +722,7 @@ pub mod attest {
             .read(true)
             .write(true)
             .open("/dev/l4h-attest")
-            .map_err(|e| Error(format!("/dev/l4h-attest: {e} (does the host have a TPM?)")))?;
+            .map_err(|e| Error(format!("/dev/l4h-attest: {e} (does the host provide attestation/flags?)")))?;
         let mut out = vec![0u8; 64 << 10];
         let mut c = Ioc {
             op,
@@ -719,10 +733,71 @@ pub mod attest {
             out: out.as_mut_ptr() as u64,
         };
         if unsafe { ioctl(dev.as_raw_fd(), IOC, &mut c as *mut Ioc) } < 0 {
-            return err(format!("attestation request {op} failed: {}", io::Error::last_os_error()));
+            let e = io::Error::last_os_error();
+            return err(match e.raw_os_error() {
+                Some(19) => "no TPM: flags only".into(),
+                Some(38) => "host has no taint/seal operations".into(),
+                _ => format!("attestation request {op} failed: {e}"),
+            });
         }
         out.truncate(c.out_len as usize);
         Ok(out)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Flags {
+        pub taint: [u8; 32],
+        pub seal: [u8; 32],
+    }
+
+    fn flags_call(op: u32, data: &[u8]) -> Result<Flags> {
+        let r = call(op, data, data.len())?;
+        if r.len() != 64 { return err("bad flags response length"); }
+        Ok(Flags { taint: r[..32].try_into().unwrap(), seal: r[32..].try_into().unwrap() })
+    }
+
+    pub fn flags() -> Result<Flags> { flags_call(ACT, &[0; 32]) }
+
+    /// Record all actions, or fail without taking any. With `seal`, each
+    /// action can be taken at most once. Do not act if this call fails.
+    pub fn act(bits: &[u8; 32], seal: bool) -> Result<Flags> {
+        let mut data = [0; 36];
+        data[..32].copy_from_slice(bits);
+        data[32..].copy_from_slice(&(seal as u32).to_le_bytes());
+        flags_call(ACT, &data)
+    }
+
+    pub fn seal(bits: &[u8; 32]) -> Result<Flags> { flags_call(SEAL, bits) }
+
+    /// Host names and numeric bit numbers. The driver enforces which
+    /// ranges userspace may act on and seal.
+    pub fn bitmap(spec: &[&str]) -> Result<[u8; 32]> {
+        let mut bits = [0; 32];
+        for s in spec {
+            let bit = match *s {
+                "console-in" => 0,
+                "console-out" => 1,
+                _ => s.parse::<usize>().map_err(|_| Error(format!("unknown flag: {s}")))?,
+            };
+            if bit >= FLAG_BITS { return err(format!("flag out of range: {s}")); }
+            bits[bit / 8] |= 1 << (bit % 8);
+        }
+        Ok(bits)
+    }
+
+    pub fn format_bits(bits: &[u8]) -> String {
+        const TAINT: &[u8] = b"PFSRMBUDAWCIOELKXTNJ";
+        let mut out = Vec::new();
+        for i in 0..bits.len() * 8 {
+            if bits[i / 8] & (1 << (i % 8)) == 0 { continue; }
+            out.push(match i {
+                0 => "0(console-in)".into(),
+                1 => "1(console-out)".into(),
+                i if (64..64 + TAINT.len()).contains(&i) => format!("{i}({})", TAINT[i - 64] as char),
+                _ => i.to_string(),
+            });
+        }
+        out.join(",")
     }
 
     /// A report (COSE_Sign1) on this guest with `data` (a verifier's nonce,

@@ -244,6 +244,7 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             let off = a[1].min(head);
             let start = off.max(head.saturating_sub(host::CONSOLE_RING_DATA as u64));
             let n = (head - start).min(abi::CTL_DATA_MAX as u64) as usize;
+            if let Some(t) = &h.trustd { t.act(g, caller, abi::FLAG_CONSOLE_OUT, n != 0)?; }
             for i in 0..n {
                 let idx = (start as usize + i) % host::CONSOLE_RING_DATA;
                 resp.data[i] = unsafe { addr_of!((*ring).data[idx]).read_volatile() };
@@ -262,12 +263,17 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
             // Into dom0's control data area, which belongs to the host.
             let to = h.guest(caller).and_then(|d0| d0.ctl_data()).ok_or(EINVAL)? as *mut u8;
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
-            resp.vals = crate::gpu::read(g, a[1], to)?;
+            if let Some(t) = &h.trustd { t.act(g, caller, abi::FLAG_CONSOLE_OUT, false)?; }
+            resp.vals = crate::gpu::read(g, a[1], to, |effect| {
+                if let Some(t) = &h.trustd { t.act(g, caller, abi::FLAG_CONSOLE_OUT, effect)?; }
+                Ok(())
+            })?;
             Ok(())
         }
         abi::CTL_CONSOLE_WRITE => {
             let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
             let len = (a[1] as usize).min(abi::CTL_DATA_MAX);
+            if let Some(t) = &h.trustd { t.act(g, caller, abi::FLAG_CONSOLE_IN, len != 0)?; }
             let p = g.console_page();
             unsafe {
                 let mut head = addr_of!((*p).in_head).read_volatile();
@@ -284,6 +290,14 @@ fn execute(h: &mut Host, caller: usize, req: &abi::CtlReq, resp: &mut abi::CtlRe
                 addr_of_mut!((*p).in_head).write_volatile(head);
                 resp.vals[0] = n as u64;
             }
+            Ok(())
+        }
+        abi::CTL_VM_TRUST => {
+            let g = h.guest(vm_arg(a[0])?).ok_or(ENOENT)?;
+            let t = h.trustd.as_ref().ok_or(ENOSYS)?;
+            let flags = t.flags(g);
+            resp.vals[0] = flags.taint[0];
+            resp.vals[1] = flags.seal[0];
             Ok(())
         }
         abi::CTL_SWITCH_CREATE => {

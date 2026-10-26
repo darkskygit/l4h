@@ -43,6 +43,9 @@ fn cmd_create(ctl: &Ctl, o: &CreateOpts) -> Result<u64> {
 }
 
 fn cmd_console(ctl: &Ctl, vm: u64, follow: bool, until: Option<&str>, timeout: Option<Duration>) -> Result<bool> {
+    if ctl.vm_trust(vm).is_ok_and(|(_, seal)| seal & 1 != 0) {
+        eprintln!("input sealed by the guest");
+    }
     let start = Instant::now();
     let mut off = 0u64;
     let mut seen = Vec::new();
@@ -90,7 +93,7 @@ const USAGE: &str = "usage: l4hctl <command>
   disks                        host disks, owners, capacities and attachments
   disk-zero DISK START SECTORS zero an unattached region
   disk-write DISK START FILE   seed an unattached region, then flush
-  list                         VMs
+  list (or vms)                VMs and their host seals
   create NAME [--initrd F] [--mem MB] [--vcpus N]
          [--cmdline S] [--disk I[,ro][,start=SECTOR][,sectors=N]]...
                                create and start a VM, which runs the
@@ -118,7 +121,11 @@ const USAGE: &str = "usage: l4hctl <command>
   send VM [--wait PAT [--timeout SECS]] TEXT
                                type TEXT (plus newline) on the VM's console;
                                with --wait, print the time until PAT appears
-In any guest of a host with a TPM:
+In any guest (flags work without a TPM):
+  attest flags                show taint and seal bit lists
+  attest seal FLAG...         seal console-in, console-out or bits 128-255
+  attest act [--seal] BIT...   act on bits 128-255; --seal takes them once;
+                               a refusal exits with status 1
   attest report [HEX] [-o F]   report on this guest with HEX (up to 64
                                bytes) as its data; hex, or binary to F
   attest evidence [-o F]       the host evidence; hex, or binary to F
@@ -146,6 +153,23 @@ fn cmd_attest(args: &[String]) -> Result<i32> {
         } else {
             pos.push(a.as_str());
         }
+    }
+    let action = args.first().map(String::as_str);
+    if matches!(action, Some("flags" | "seal" | "act")) {
+        if out.is_some() { return err("flags commands print bit lists; -o is for reports and evidence"); }
+        let f = match action {
+            Some("flags") if pos.is_empty() => attest::flags()?,
+            Some("seal") if !pos.is_empty() => attest::seal(&attest::bitmap(&pos)?)?,
+            Some("act") => {
+                let seal = pos.first() == Some(&"--seal");
+                let bits = if seal { &pos[1..] } else { &pos[..] };
+                if bits.is_empty() { return err("act: missing bits"); }
+                attest::act(&attest::bitmap(bits)?, seal)?
+            }
+            _ => return err("attest flags | seal FLAG... | act [--seal] BIT..."),
+        };
+        println!("taint={} seal={}", attest::format_bits(&f.taint), attest::format_bits(&f.seal));
+        return Ok(0);
     }
     let result = match (args.first().map(|s| s.as_str()), pos.as_slice()) {
         (Some("report"), []) => attest::report(&[])?,
@@ -251,8 +275,8 @@ fn run(args: &[String]) -> Result<i32> {
             }
             ctl.disk_flush(disk)?;
         }
-        "list" => {
-            println!("{:>3} {:<16} {:>5} {:>8} {}", "ID", "NAME", "VCPUS", "MEM", "STATE");
+        "list" | "vms" => {
+            println!("{:>3} {:<16} {:>5} {:>8} {}", "ID", "NAME", "VCPUS", "MEM", "STATE / SEAL");
             let mut first = 0u64;
             loop {
                 let r = ctl.call(CTL_VM_LIST, &[first], &[], &[])?;
@@ -271,13 +295,15 @@ fn run(args: &[String]) -> Result<i32> {
                         3 => "stopped",
                         _ => "?",
                     };
+                    let seal = ctl.vm_trust(vm.id as u64).map(|(_, seal)| seal).unwrap_or(0);
+                    let seal = if seal != 0 { format!(" seal={}", attest::format_bits(&seal.to_le_bytes())) } else { String::new() };
                     println!(
-                        "{:>3} {:<16} {:>5} {:>7}M {}",
+                        "{:>3} {:<16} {:>5} {:>7}M {}{}",
                         vm.id,
                         String::from_utf8_lossy(&vm.name[..name_len]),
                         vm.vcpus,
                         vm.ram >> 20,
-                        state
+                        state, seal
                     );
                     first = vm.id as u64 + 1;
                 }

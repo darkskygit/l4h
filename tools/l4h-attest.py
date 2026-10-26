@@ -33,6 +33,7 @@
       reports carry as "launch".
   l4h-attest.py verify REPORT EVIDENCE [--data HEX] [--launch HEX]
                 [--pcr N=HEX]... [--ak-name HEX] [--ek-ca PEM]
+                [--deny-taint SPEC] [--require-seal SPEC]
       Check a report (l4hctl attest report -o) against the host evidence
       (l4hctl attest evidence -o), and print what they claim as JSON.
       Without --ak-name the attestation key is not known to be a TPM's.
@@ -339,7 +340,62 @@ def check_evidence(ev, pins, ak_name, ek_ca):
     return key, host
 
 
-def check_report(rep, key, data, launch):
+HOST_FLAGS = {"console-in": 0, "console-out": 1}
+LINUX_TAINT = "PFSRMBUDAWCIOELKXTNJ"
+
+
+def flag_spec(spec):
+    """Comma-separated host names, numbers and inclusive bit ranges."""
+    bits = set()
+    if not spec.strip():
+        return bits
+    for part in spec.split(","):
+        part = part.strip()
+        if part in HOST_FLAGS:
+            bits.add(HOST_FLAGS[part])
+            continue
+        try:
+            bounds = [int(n) for n in part.split("-")]
+            if len(bounds) not in (1, 2) or min(bounds) < 0 or bounds[0] > bounds[-1]:
+                raise ValueError()
+            bits.update(range(bounds[0], bounds[-1] + 1))
+        except ValueError:
+            raise Fail("invalid flag specification: %s" % part)
+    return bits
+
+
+def flag_name(bit):
+    if bit < 2:
+        return ("console-in", "console-out")[bit]
+    if 64 <= bit < 64 + len(LINUX_TAINT):
+        return LINUX_TAINT[bit - 64]
+    return None
+
+
+def flag_list(bits):
+    return [str(b) + ("(%s)" % flag_name(b) if flag_name(b) else "") for b in sorted(bits)]
+
+
+def check_flags(claims, deny_taint, require_seal):
+    def bitmap(key):
+        if key not in claims:
+            return set()  # old hosts; cannot satisfy a required seal
+        b = claims[key]
+        if not isinstance(b, bytes) or len(b) < 32:
+            raise Fail("%s must be a byte string of at least 32 bytes" % key)
+        return {i for i in range(len(b) * 8) if b[i // 8] & (1 << (i % 8))}
+
+    taint, seal = bitmap("taint"), bitmap("seal")
+    denied = taint & flag_spec(deny_taint)
+    missing = flag_spec(require_seal) - seal
+    if denied:
+        raise Fail("denied taint: %s" % ",".join(flag_list(denied)))
+    if missing:
+        raise Fail("required seal missing: %s" % ",".join(flag_list(missing)))
+    return {"taint_bits": flag_list(taint), "seal_bits": flag_list(seal)}
+
+
+def check_report(rep, key, data, launch, deny_taint="console-in", require_seal=""):
     if not (isinstance(rep, tuple) and rep[:2] == ("tag", 18)) or len(rep[2]) != 4:
         raise Fail("report is not a COSE_Sign1")
     protected, _unprotected, payload, sig = rep[2]
@@ -361,7 +417,8 @@ def check_report(rep, key, data, launch):
         raise Fail("report data is not the expected nonce")
     if launch is not None and c["launch"] != launch:
         raise Fail("launch digest %s is not the expected one" % c["launch"].hex())
-    return {k: (v.hex() if isinstance(v, bytes) else v) for k, v in c.items()}
+    flags = check_flags(c, deny_taint, require_seal)
+    return {**{k: (v.hex() if isinstance(v, bytes) else v) for k, v in c.items()}, **flags}
 
 
 # ---- make-credential
@@ -419,6 +476,8 @@ def main():
     v.add_argument("--launch", help="expected launch digest (hex)")
     v.add_argument("--pcr", action="append", default=[], help="N=HEX: expected sha256 PCR value")
     v.add_argument("--ak-name", help="the enrolled attestation key's name (hex)")
+    v.add_argument("--deny-taint", default="console-in", help="deny host names, bit numbers or ranges (default: console-in; '' disables)")
+    v.add_argument("--require-seal", default="", help="require sealed host names, bit numbers or ranges")
     v.add_argument("--ek-ca", help="CA certificate (PEM) that issued the EK certificate")
     c = sub.add_parser("make-credential")
     c.add_argument("evidence")
@@ -440,7 +499,7 @@ def main():
             key, host = check_evidence(ev, pins, ak_name, a.ek_ca)
             data = bytes.fromhex(a.data) if a.data is not None else None
             launch = bytes.fromhex(a.launch) if a.launch else None
-            guest = check_report(cbor_decode(open(a.report, "rb").read()), key, data, launch)
+            guest = check_report(cbor_decode(open(a.report, "rb").read()), key, data, launch, a.deny_taint, a.require_seal)
             print(json.dumps({"host": host, "guest": guest}, indent=2))
             if ak_name is None:
                 print("l4h-attest: warning: attestation key not pinned (--ak-name)", file=sys.stderr)

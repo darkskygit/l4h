@@ -97,7 +97,7 @@ pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Resu
 /// CTL_GPU_READ: copy the image of guest `g` from byte `offset` into `to`
 /// (dom0's control data area, CTL_LOAD_MAX bytes).  The size is l4h-root's
 /// own, not what l4h-vmm may have written in the header.
-pub fn read(g: &Guest, offset: u64, to: *mut u8) -> Result<[u64; 6], i64> {
+pub fn read(g: &Guest, offset: u64, to: *mut u8, before_copy: impl FnOnce(bool) -> Result<(), i64>) -> Result<[u64; 6], i64> {
     let (width, height) = g.gpu.ok_or(EINVAL)?;
     let base = root_display_va(g.id);
     let hdr = unsafe { &*(base as *const DisplayHeader) };
@@ -109,6 +109,9 @@ pub fn read(g: &Guest, offset: u64, to: *mut u8) -> Result<[u64; 6], i64> {
     let total = image_bytes(width, height) as u64;
     let off = offset.min(total);
     let n = (total - off).min(abi::CTL_LOAD_MAX) as usize;
+    // Once copied into dom0's data area the pixels are disclosed, even
+    // if the frame changes and we ultimately return EAGAIN.
+    before_copy(n != 0)?;
     // l4h-vmm may be writing meanwhile: the frame counter tells.
     unsafe { host::gpu::copy_volatile((base + IMAGE_OFFSET + off as usize) as *const u8, to, n) };
     fence(Ordering::Acquire);

@@ -3,3 +3,6 @@ name = "l4h-host"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+
+[dependencies]
+l4h-abi.workspace = true
