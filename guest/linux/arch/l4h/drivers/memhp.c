@@ -6,7 +6,7 @@
  * we have that many.  A plugged block brings its own metadata:
  *
  *   block 0       its memmap (memmap_on_memory)
- *   blocks 1-62   RAM, onlined to ZONE_MOVABLE up to three times boot RAM
+ *   blocks 1-62   RAM, onlined to ZONE_MOVABLE
  *   block 63      the seL4 objects that map blocks 0-62 (l4h_hp_map()),
  *                 kept PageOffline: never in the page allocator
  *
@@ -33,8 +33,6 @@
 /* Retry after the host was busy, or Linux could not offline enough. */
 #define RETRY_BUSY	HZ
 #define RETRY_STUCK	(10 * HZ)
-/* ZONE_MOVABLE memory, at most, in times boot RAM (as auto-movable). */
-#define MOVABLE_RATIO	3
 /* Available memory an unplug leaves, at least (can_spare_block()). */
 #define HEADROOM_MIN	(64ul << 20)
 #define HEADROOM_SHIFT	4
@@ -42,7 +40,6 @@
 static_assert(L4H_HP_SHIFT == SECTION_SIZE_BITS);
 
 static struct l4h_mem_page *page;
-static u64 boot_bytes;
 static u64 region_gpa;
 static unsigned int region_count;
 /* Hotplug blocks in Linux, and those out of Linux and unmapped that the
@@ -109,35 +106,26 @@ static struct notifier_block memhp_nb = {
 	.notifier_call = memhp_notify,
 };
 
-/* Did hotplug block m go to ZONE_MOVABLE?  (Its block 0 is its memmap.) */
-static bool is_movable(unsigned int m)
-{
-	struct page *p = pfn_to_page(PFN_DOWN(block_gpa(m) + L4H_BLOCK_SIZE));
-
-	return page_zonenum(p) == ZONE_MOVABLE;
-}
-
 static int online_block(struct memory_block *mem, void *arg)
 {
-	mem->online_type = *(int *)arg;
+	mem->online_type = MMOP_ONLINE_MOVABLE;
 	return device_online(&mem->dev);
 }
 
 /*
- * Online hotplug block m: to ZONE_MOVABLE, which can always be offlined
- * again, while that stays within MOVABLE_RATIO times boot RAM, else to the
- * kernel zone, for the kernel memory a bigger VM's processes need.
+ * Online hotplug block m, always to ZONE_MOVABLE, which can always be
+ * offlined again.  A block in a kernel zone collects unmovable kernel pages
+ * and may never go back.  The kernel memory a bigger VM needs most, its
+ * processes' seL4 page tables and slots, comes from boot RAM in any case
+ * (hotplug blocks are never object blocks, kernel/caps.c); what remains,
+ * Linux's own page tables and slabs, is small next to the memory it serves.
  */
 static int online(unsigned int m)
 {
-	unsigned int i, movable = 1;
-	int type, ret;
+	int ret;
 
-	for_each_set_bit(i, added, region_count)
-		movable += is_movable(i);
-	type = (u64)movable * L4H_HP_SIZE <= MOVABLE_RATIO * boot_bytes ? MMOP_ONLINE_MOVABLE : MMOP_ONLINE_KERNEL;
 	lock_device_hotplug();
-	ret = walk_memory_blocks(block_gpa(m), L4H_HP_SIZE, &type, online_block);
+	ret = walk_memory_blocks(block_gpa(m), L4H_HP_SIZE, NULL, online_block);
 	unlock_device_hotplug();
 	return ret;
 }
@@ -239,20 +227,22 @@ static void memhp_work_fn(struct work_struct *w)
 		n++;
 	}
 	while (n > target) {
-		bool done = false;
-		int pass;
+		int ret = -ENOENT;
 
-		/* ZONE_MOVABLE first, whose pages can always move, highest
-		 * first; then the others. */
-		for (pass = 0; pass < 2 && !done; pass++) {
-			for (m = region_count; m-- > 0 && !done;) {
-				if (test_bit(m, added) && is_movable(m) == !pass && !unplug(m))
-					done = true;
-			}
-		}
-		if (!done) {
-			pr_info_ratelimited("l4h-memhp: %u blocks plugged, target %u: cannot offline more\n",
+		if (!can_spare_block()) {
+			pr_info_ratelimited("l4h-memhp: %u blocks plugged, target %u: too little memory available to give one back\n",
 					    n, target);
+			delay = RETRY_STUCK;
+			goto out;
+		}
+		/* Highest first; another if one has pages that will not move. */
+		for (m = region_count; m-- > 0 && ret;) {
+			if (test_bit(m, added))
+				ret = unplug(m);
+		}
+		if (ret) {
+			pr_info_ratelimited("l4h-memhp: %u blocks plugged, target %u: cannot offline more: %d\n",
+					    n, target, ret);
 			delay = RETRY_STUCK;
 			goto out;
 		}
@@ -285,8 +275,6 @@ static int __init l4h_memhp_init(void)
 	page = (struct l4h_mem_page *)bi->devices[i].page_va;
 	region_gpa = bi->hp_gpa;
 	region_count = min_t(u64, bi->hp_count, L4H_HP_MAX);
-	/* Before any plug: the memory the kernel booted with. */
-	boot_bytes = (u64)totalram_pages() << PAGE_SHIFT;
 	if (!mhp_supports_memmap_on_memory())
 		pr_warn("l4h-memhp: no memmap_on_memory: plugged memory takes its memmap from boot RAM\n");
 	ret = set_online_page_callback(memhp_online_page);

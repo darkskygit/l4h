@@ -1,0 +1,38 @@
+#!/bin/sh
+# Guest of tests/guest/init-hotplugstress: keep memory busy while dom0
+# resizes it (hpstress, selftest's smp_mm_stress, tmpfs files checked),
+# and answer "status" on the console; "quiet" stops all but hpstress's
+# long-lived region, which is still checked.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /tmp/t && mount -t tmpfs -o size=2g tmp /tmp/t
+/bin/hpstress &
+hp=$!
+( trap 'exit 0' USR2; while :; do
+    /bin/selftest smp_mm_stress > /tmp/st.log 2>&1 || { echo "HPVM: SELFTEST FAIL"; cat /tmp/st.log; }
+done ) &
+st=$!
+( trap 'exit 0' USR2; n=0; while :; do
+    n=$((n + 1))
+    yes "l4h-hpstress-$n" | head -c $((32 << 20)) > /tmp/t/f
+    want=$(yes "l4h-hpstress-$n" | head -c $((32 << 20)) | md5sum)
+    sleep 1
+    [ "$(md5sum < /tmp/t/f)" = "$want" ] || echo "HPVM: TMPFS CORRUPT round $n"
+    rm -f /tmp/t/f
+done ) &
+fs=$!
+echo "HPVM: ready"
+while read -r cmd; do
+    case "$cmd" in
+    quiet)
+        kill -USR2 $hp $st $fs
+        echo "HPVM: quiet" ;;
+    status)
+        kill -USR1 $hp
+        sleep 0.2
+        kill -0 $hp 2>/dev/null || echo "HPVM: HPSTRESS DIED"
+        bad=$(dmesg | grep -cE 'BUG:|Oops|WARNING:|Kernel panic|deadlocked')
+        echo "HPVM: status total $(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo) >> 10 )) kernel-bad $bad" ;;
+    esac
+done

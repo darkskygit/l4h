@@ -1,0 +1,73 @@
+#!/bin/sh
+# dom0 init for tests/run-hotplugstress.sh: three VMs under memory load,
+# each resized to a random target every few seconds, more in all than the
+# host has; now and then one is destroyed in the middle of a resize and
+# created again.  Then all shrink back, report, and are destroyed: no
+# data may be lost, no guest may complain, and host memory must come back.
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "HOTPLUGSTRESS: FAIL: $*"; poweroff -f; }
+arg() { sed -n "s/.* $1=\([0-9]*\).*/\1/p" /proc/cmdline; }
+rounds=$(arg HS_ROUNDS)
+rand() { echo $(( $(od -An -N2 -tu2 /dev/urandom) % $1 )); }
+free_mib() { l4hctl info | sed -n 's/^memory: *\([0-9]*\) MiB free.*/\1/p'; }
+create() {
+    id=$(l4hctl create "hs$1" --initrd /bin/hpstressvm.cpio.gz --mem 256 --vcpus 2) || fail "create hs$1"
+    l4hctl console "$id" --until "HPVM: ready" --timeout 120 >/dev/null || fail "hs$1 did not boot"
+    echo "$id"
+}
+
+free0=$(free_mib)
+vms="$(create 0) $(create 1) $(create 2)"
+echo "HOTPLUGSTRESS: VMs $vms, host free $free0 MiB, $rounds rounds"
+r=0
+while [ $r -lt "$rounds" ]; do
+    r=$((r + 1))
+    for id in $vms; do
+        # 256 to 1536 MiB: up to 4.5 GiB in all, on a host with less.
+        l4hctl mem "$id" $((256 + 128 * $(rand 11))) >/dev/null || fail "round $r: mem $id"
+    done
+    if [ $((r % 15)) = 0 ]; then
+        # Destroy one while it plugs or unplugs, and replace it.
+        set -- $vms
+        victim=$(eval echo \${$(( $(rand 3) + 1 ))})
+        l4hctl mem "$victim" 1536 >/dev/null
+        sleep 0.$(rand 10)
+        l4hctl destroy "$victim" || fail "round $r: destroy $victim"
+        new=$(create "r$r")
+        vms=$(for id in $vms; do [ "$id" = "$victim" ] && echo "$new" || echo "$id"; done | tr '\n' ' ')
+        echo "HOTPLUGSTRESS: round $r: destroyed $victim mid-resize, created $new"
+    fi
+    sleep $((1 + $(rand 3)))
+    [ $((r % 10)) = 0 ] && echo "HOTPLUGSTRESS: round $r: host free $(free_mib) MiB; $(for id in $vms; do l4hctl mem "$id"; done | tr '\n' ' ')"
+done
+
+# Back to boot RAM.  The workloads take a share of what is available,
+# which can keep a guest from having room to give a block back: stop
+# them first, all but hpstress's long-lived region.
+for id in $vms; do
+    l4hctl send "$id" --wait "HPVM: quiet" --timeout 30 quiet >/dev/null || fail "VM $id does not quiet down"
+    l4hctl mem "$id" 256 >/dev/null
+done
+for id in $vms; do
+    l4hctl mem "$id" --wait=180 > /tmp/mem || fail "VM $id stayed at $(cat /tmp/mem) (boot/target/plugged/region)"
+done
+for id in $vms; do
+    l4hctl send "$id" --wait "HPVM: status" --timeout 30 status >/dev/null || fail "VM $id does not answer"
+    l4hctl console "$id" > /tmp/con
+    grep "HPSTRESS: rounds" /tmp/con | tail -1
+    grep "HPVM: status" /tmp/con | tail -1
+    # (Its start has left the console ring by now: its counts show it runs.)
+    grep -q "HPSTRESS: rounds" /tmp/con || fail "VM $id: hpstress does not answer"
+    ! grep -qE "CORRUPT|SELFTEST FAIL|HPSTRESS DIED" /tmp/con || { grep -E "CORRUPT|FAIL|DIED" /tmp/con | head; fail "VM $id lost data"; }
+    grep "HPVM: status" /tmp/con | tail -1 | grep -q "kernel-bad 0" || fail "VM $id: kernel BUG or WARNING"
+    grep "HPSTRESS: rounds" /tmp/con | tail -1 | grep -q "bad 0 " || fail "VM $id: hpstress found bad data"
+done
+for id in $vms; do l4hctl destroy "$id" || fail "destroy $id"; done
+free1=$(free_mib)
+echo "HOTPLUGSTRESS: destroyed all: host free $free1 MiB (was $free0)"
+[ $((free0 - free1)) -le 16 ] || fail "$((free0 - free1)) MiB not returned"
+echo "HOTPLUGSTRESS: PASS"
+poweroff -f
