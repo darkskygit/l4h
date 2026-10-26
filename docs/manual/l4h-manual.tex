@@ -545,10 +545,20 @@ be installed. The checks cover:
         \file{/lib/modules} and init on root; no active AppArmor profiles
         or DKMS modules. An active SELinux mode is carried into dom0's
         command line;
-  \item exactly one physical Ethernet interface, driven by virtio-net,
+  \item one or two physical Ethernet interfaces, driven by virtio-net,
         gVNIC, ENA or Intel X550. Automatic migration rejects bonds,
-        bridges, VLAN interfaces, changed MACs and multiple NICs.
+        bridges, VLAN interfaces, changed or duplicate MACs, and more
+        than two NICs. Dom0's 16 device slots leave room for at most
+        15 disks with one NIC, or 14 disks with two.
 \end{itemize}
+
+Each physical NIC is assigned to its own switch in ascending PCI address
+order: \texttt{uplink\_nic} selects switch 0's uplink and, with two NICs,
+\texttt{uplink2\_nic} selects switch 1's. Dom0 gets one vNIC on each
+switch, retaining that uplink's MAC address. The initramfs matches these
+MACs to restore the original Linux interface names, including when the
+names need to be exchanged. The existing distribution configuration
+supplies addresses, routes and DNS on both networks.
 
 The installer chooses the generic application when PCID and x2APIC are
 available, otherwise xapic-nopcid. \texttt{--variant NAME} overrides this
@@ -571,7 +581,7 @@ files. Keep it if the installer reports incomplete rollback.
 The default is a one-time \texttt{BootNext} selection. Reboot when ready:
 the initramfs locates root by filesystem UUID despite changed disk names,
 mounts the matching module tree read-only over \file{/lib/modules},
-preserves the uplink's name and MAC, and starts the existing init.
+preserves each uplink's name and MAC, and starts the existing init.
 The distribution's fstab and network configuration are retained. After
 testing, stop workloads, run \cmd{sync}, then \cmd{l4hctl host-reboot}
 as root to return to native Linux, and rerun with \texttt{--make-default}

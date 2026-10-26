@@ -116,8 +116,13 @@ No source build or hardware virtualization extensions are needed.
 Preflight checks CPU features, Meltdown status, Secure Boot, EFI variables,
 the ESP, storage, network and userspace. Automatic migration currently
 supports headless systemd installations with a plain ext4/XFS root,
-NVMe namespace 1 or supported virtio disks, and one physical virtio-net,
-gVNIC, ENA or Intel X550 uplink. Other layouts need a custom deployment:
+NVMe namespace 1 or supported virtio disks, and one or two physical
+virtio-net, gVNIC, ENA or Intel X550 NICs. Each NIC becomes the uplink of its
+own L4H switch (switch 0, then switch 1, in PCI address order). Dom0 gets
+one interface on each switch with the original name and MAC, so existing
+address, route and DNS settings can apply. Profiles tied to a PCI path or
+native driver may need adaptation. Bonds, bridges and VLAN interfaces
+require a custom deployment, as do other unsupported layouts:
 in particular LVM, encrypted volumes, RAID, Btrfs, separate `/usr`,
 SATA/USB storage, active AppArmor profiles and DKMS modules are rejected.
 Secure Boot must be disabled. Firmware and application compatibility still
@@ -238,7 +243,7 @@ without it, the host reports `unknown`.
 | Test | What it checks |
 |------|----------------|
 | `python3 tests/test_installer.py` | installer preflight, verified downloads, EFI changes, updates and rollback without touching the host |
-| `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory]` | in a disposable UEFI/KVM VM, install from native Debian, boot its existing userspace under L4H, then return to native Linux; uses prebuilt release artifacts and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user) |
+| `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

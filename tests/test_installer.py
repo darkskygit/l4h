@@ -41,13 +41,12 @@ class Machine:
         for path in ("/lib/modules", "/dev", "/proc", "/sys", "/run", "/usr", "/etc", "/boot/efi"):
             self.path(path).mkdir(parents=True, exist_ok=True)
         self.pci("00:04.0", 0x1AF4, 0x1042, 0x010000)
-        self.pci("00:05.0", 0x1AF4, 0x1041, 0x020000)
+        self.links = [dict(ifname="lo", link_type="loopback")]
+        self.nic("ens3", "00:05.0", "52:54:00:12:34:56")
         disk = self.path("/sys/devices/pci0000:00/0000:00:04.0/virtio0/block/vda")
         disk.mkdir(parents=True)
         self.link("/sys/class/block/vda", disk)
         self.write("/sys/class/block/vda1/partition", "1")
-        self.link("/sys/class/net/ens3/device", self.path("/sys/devices/pci0000:00/0000:00:05.0"))
-        self.write("/sys/class/net/ens3/addr_assign_type", "0")
         self.blocks = [
             dict(name="/dev/vda", type="disk", pkname=None, pttype="gpt", **{"maj:min": "252:0"}),
             dict(name="/dev/vda1", type="part", pkname="/dev/vda", fstype="vfat", uuid="ABCD-1234",
@@ -59,7 +58,6 @@ class Machine:
                        dict(source="/dev/vda1", target="/boot/efi", fstype="vfat", options="rw,relatime", **{"maj:min": "252:1"})]
         self.fstab = [dict(source="UUID=1234-abcd", target="/", fstype="ext4", options="defaults"),
                       dict(source="UUID=ABCD-1234", target="/boot/efi", fstype="vfat", options="defaults")]
-        self.links = [dict(ifname="lo", link_type="loopback"), dict(ifname="ens3", link_type="ether")]
 
     def path(self, path):
         return self.root / str(path).lstrip("/")
@@ -85,6 +83,13 @@ class Machine:
         config[0x50:0x54] = bytes([9 if modern else 1, 0, 16, 1])
         self.write(base + "/config", config)
         self.write(base + "/resource", "0x1000 0x5fff 0x200\n" * 6)
+
+    def nic(self, name, bdf, mac):
+        self.pci(bdf, 0x1AF4, 0x1041, 0x020000)
+        self.link("/sys/class/net/" + name + "/device", self.path("/sys/devices/pci0000:00/0000:" + bdf))
+        self.write("/sys/class/net/" + name + "/addr_assign_type", "0")
+        self.write("/sys/class/net/" + name + "/address", mac)
+        self.links.append(dict(ifname=name, link_type="ether"))
 
     def command(self, *args):
         self.calls.append(args)
@@ -167,8 +172,13 @@ class InstallerTests(unittest.TestCase):
     def test_supported_machine_and_read_only_preflight(self):
         before = sorted(str(p) for p in self.root.rglob("*"))
         plan = self.check()
-        self.assertEqual((plan["variant"], plan["root_uuid"], plan["ifname"]), ("generic", "1234-abcd", "ens3"))
-        self.assertIn("root=UUID=1234-abcd", installer.configuration(plan))
+        self.assertEqual((plan["variant"], plan["root_uuid"]), ("generic", "1234-abcd"))
+        self.assertEqual(plan["uplinks"], [dict(ifname="ens3", bdf="00:05.0", mac="52:54:00:12:34:56")])
+        config = installer.configuration(plan)
+        self.assertIn("root=UUID=1234-abcd", config)
+        self.assertIn("l4h.net=52:54:00:12:34:56,ens3", config)
+        self.assertIn("dom0_disks=15\ndom0_nics=1\n", config)
+        self.assertNotIn("uplink2_nic", config)
         self.assertEqual(before, sorted(str(p) for p in self.root.rglob("*")))
 
     def test_secure_boot(self):
@@ -243,8 +253,68 @@ class InstallerTests(unittest.TestCase):
     def test_unsupported_network_and_bridge(self):
         self.machine.pci("00:05.0", 0x8086, 0x100E, 0x020000)
         self.rejected("supported uplinks")
-        self.machine.links.append(dict(ifname="br0", link_type="ether"))
-        self.rejected("exactly one")
+        self.machine.pci("00:05.0", 0x1AF4, 0x1041, 0x020000)
+        self.machine.links.append(dict(ifname="br0", link_type="ether", linkinfo=dict(info_kind="bridge")))
+        self.rejected("plain Ethernet uplink")
+
+    def test_two_uplinks_have_separate_switches_and_stable_mac_mappings(self):
+        self.machine.nic("ens2", "00:03.0", "52:54:00:12:34:57")
+        plan = self.check()
+        self.assertEqual(plan["uplinks"], [dict(ifname="ens2", bdf="00:03.0", mac="52:54:00:12:34:57"),
+                                           dict(ifname="ens3", bdf="00:05.0", mac="52:54:00:12:34:56")])
+        config = installer.configuration(plan)
+        self.assertIn("uplink_nic=00:03.0\nuplink2_nic=00:05.0\n", config)
+        # Two vNICs on switch 0 would connect both networks to the same switch.
+        self.assertIn("dom0_disks=14\ndom0_nics=1\n", config)
+        self.assertIn("l4h.net=52:54:00:12:34:57,ens2 l4h.net=52:54:00:12:34:56,ens3", config)
+        self.machine.links.reverse()
+        self.assertEqual(self.check(), plan)
+        self.commit(plan)
+        self.assertEqual(self.machine.path("/boot/efi/l4h/l4h.conf").read_text(), config)
+
+    def test_zero_and_three_nics_rejected(self):
+        self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:57")
+        self.machine.nic("ens5", "00:07.0", "52:54:00:12:34:58")
+        self.rejected("one or two physical NICs")
+        self.machine.links = self.machine.links[:1]
+        self.rejected("one or two physical NICs")
+
+    def test_second_nic_must_be_supported_unbridged_and_have_permanent_mac(self):
+        self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:57")
+        self.machine.pci("00:06.0", 0x8086, 0x100E, 0x020000)
+        self.rejected("ens4: supported uplinks")
+        self.machine.pci("00:06.0", 0x1AF4, 0x1041, 0x020000)
+        self.machine.links[-1]["master"] = "br0"
+        self.rejected("ens4: need a plain Ethernet")
+        del self.machine.links[-1]["master"]
+        self.machine.write("/sys/class/net/ens4/addr_assign_type", "3")
+        self.rejected("ens4: uplink MAC has been changed")
+
+    def test_duplicate_uplink_mac_and_pci_rejected(self):
+        self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:56")
+        self.rejected("distinct MAC addresses and PCI devices")
+        self.machine.write("/sys/class/net/ens4/address", "52:54:00:12:34:57")
+        self.machine.path("/sys/class/net/ens4/device").unlink()
+        self.machine.link("/sys/class/net/ens4/device", self.machine.path("/sys/devices/pci0000:00/0000:00:05.0"))
+        self.rejected("distinct MAC addresses and PCI devices")
+
+    def test_invalid_uplink_mac_rejected(self):
+        for mac in ("invalid", "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff", "53:54:00:12:34:56"):
+            with self.subTest(mac=mac):
+                self.machine.write("/sys/class/net/ens3/address", mac)
+                self.rejected("invalid Ethernet MAC")
+
+    def test_disk_capacity_reserves_one_slot_per_uplink(self):
+        disk = self.machine.blocks[0]
+        self.machine.blocks.extend(dict(disk, name="/dev/disk{}".format(i)) for i in range(13))
+        self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:57")
+        self.check()  # 14 disks and two vNICs fit.
+        self.machine.blocks.append(dict(disk, name="/dev/extra"))
+        self.rejected("at most 14 disks with 2 uplink")
+        self.machine.links.pop()
+        self.check()  # 15 disks and one vNIC fit.
+        self.machine.blocks.append(dict(disk, name="/dev/extra2"))
+        self.rejected("at most 15 disks with 1 uplink")
 
     def test_existing_bootnext(self):
         self.machine.boot["next"] = "0002"

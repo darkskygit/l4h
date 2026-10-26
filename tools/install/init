@@ -14,14 +14,14 @@ mount -t sysfs sysfs /sys || fail 'cannot mount sysfs'
 mount -t devtmpfs devtmpfs /dev || fail 'cannot mount devtmpfs'
 mkdir -p /newroot /run
 mount -t tmpfs -o mode=0755 tmpfs /run || fail 'cannot mount run'
-root='' rootfstype='' ifname=''
+root='' rootfstype='' networks=''
 # The kernel command line is a list of whitespace-separated words.
 # shellcheck disable=SC2013
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
         root=UUID=*) root=${arg#root=} ;;
         rootfstype=*) rootfstype=${arg#rootfstype=} ;;
-        l4h.ifname=*) ifname=${arg#l4h.ifname=} ;;
+        l4h.net=*) networks="$networks ${arg#l4h.net=}" ;;
     esac
 done
 case "$rootfstype" in ext4|xfs) ;; *) fail 'unsupported root filesystem' ;; esac
@@ -37,19 +37,55 @@ done
 # Expose only the running kernel's modules over the existing module tree.
 # /lib may be a symlink to /usr/lib; the installer checks that /usr is on root.
 mount -t erofs -o ro /dev/l4hkmod /newroot/lib/modules || fail 'cannot mount kernel modules'
-case "$ifname" in
-    ''|*[!a-zA-Z0-9_-]*) fail 'invalid uplink interface name' ;;
-esac
-[ "$ifname" = eth0 ] || ip link set eth0 name "$ifname" || fail 'cannot preserve interface name'
-# Preserve that name through systemd-udevd, without modifying native Linux.
-mkdir -p /run/systemd/network
-cat > /run/systemd/network/00-l4h-uplink.link <<LINK
+# Match each dom0 vNIC by the physical uplink's MAC, not enumeration order.
+# Move all of them to unused temporary names first, so eth0/eth1 swaps work.
+[ -n "$networks" ] || fail 'missing uplink interface mappings'
+name_in_use() {
+    [ -e "/sys/class/net/$1" ] && return 0
+    for candidate in $networks; do
+        [ "${candidate#*,}" = "$1" ] && return 0
+    done
+    return 1
+}
+renames='' index=0 count=0
+for mapping in $networks; do
+    count=$((count + 1))
+    [ "$count" -le 2 ] || fail 'too many uplink interface mappings'
+    mac=${mapping%,*} ifname=${mapping#*,}
+    case "$ifname" in
+        ''|lo|*[!a-zA-Z0-9_-]*) fail 'invalid uplink interface name' ;;
+    esac
+    [ "${#ifname}" -le 15 ] || fail 'uplink interface name too long'
+    printf '%s\n' "$mac" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || fail 'invalid uplink MAC'
+    device=''
+    for net in /sys/class/net/*; do
+        [ "$(cat "$net/address")" = "$mac" ] || continue
+        [ -z "$device" ] || fail "ambiguous uplink MAC $mac"
+        device=${net##*/}
+    done
+    [ -n "$device" ] || fail "missing dom0 NIC for uplink MAC $mac"
+    temporary=l4h-tmp$index
+    while name_in_use "$temporary"; do
+        index=$((index + 1))
+        temporary=l4h-tmp$index
+    done
+    ip link set "$device" name "$temporary" || fail 'cannot stage interface rename'
+    renames="$renames $temporary,$mapping"
+done
+# Preserve the names through systemd-udevd, without modifying native Linux.
+mkdir -p /run/systemd/network || fail 'cannot create network configuration directory'
+for rename in $renames; do
+    temporary=${rename%%,*} mapping=${rename#*,}
+    mac=${mapping%,*} ifname=${mapping#*,}
+    ip link set "$temporary" name "$ifname" || fail "cannot preserve interface name $ifname"
+    cat > "/run/systemd/network/00-l4h-$temporary.link" <<LINK || fail 'cannot preserve network configuration'
 [Match]
-MACAddress=$(cat "/sys/class/net/$ifname/address")
+MACAddress=$mac
 [Link]
 NamePolicy=
 Name=$ifname
 LINK
+done
 for fs in dev proc sys run; do
     mount --move "/$fs" "/newroot/$fs" || fail "cannot move $fs"
 done
