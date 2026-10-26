@@ -180,7 +180,7 @@ own count; swiotlb_search_area() skips areas a pool does not have.
 +	 * whose lock its allocation does not hold.
 +	 */
 +	nareas = min_t(unsigned long, nareas, 1UL << __ffs(nslabs / IO_TLB_SEGSIZE));
-+	pool->slots = kcalloc(nslabs, sizeof(*pool->slots), GFP_KERNEL);
++	pool->slots = kvcalloc(nslabs, sizeof(*pool->slots), GFP_KERNEL);
 +	pool->areas = kcalloc(nareas, sizeof(*pool->areas), GFP_KERNEL);
 +	if (!pool->slots || !pool->areas)
 +		goto fail;
@@ -210,7 +210,7 @@ own count; swiotlb_search_area() skips areas a pool does not have.
 +	goto out;
 +fail:
 +	if (mem) {
-+		kfree(mem->defpool.slots);
++		kvfree(mem->defpool.slots);
 +		kfree(mem->defpool.areas);
 +	}
 +	kfree(mem);
