@@ -15,6 +15,7 @@ rm -rf "$out/run" && mkdir -p "$out/run"
     || { grep -E "error|undefined" "$root/build/linux-build.log"; exit 1; }
 "$l4h_objcopy" --strip-debug "$l4h_linux_out/vmlinux" "$out/run/vmlinux"
 "$root/tools/build-l4hctl.sh"
+"$root/tests/build-flagstest.sh"
 "$root/tools/build-host.sh"
 "$root/tools/mkinitramfs.sh" "$out/run/vm.cpio.gz" "$root/tests/guest/init-attestvm" "$l4h_ctl" >/dev/null
 nonce=$(head -c 64 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -55,13 +56,13 @@ boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
 # else: prints from other cores (the serial copy of a guest's console,
 # "[vm1] ...") can interleave with a line, character by character.
 field() {  # field <log> <what> <out file>
-    grep -a "^$2 [0-9a-f]*"$'\r'"*$" "$1" | head -1 | tr -d '\r' | sed "s/^$2 //" \
+    sed -E 's/^\[vm[0-9]+\] //' "$1" | grep -a "^$2 [0-9a-f]*"$'\r'"*$" | head -1 | tr -d '\r' | sed "s/^$2 //" \
         | python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip()))" > "$3"
     [ -s "$3" ] || { echo "no $2 in $1"; exit 1; }
 }
 fail() { echo "ATTESTTEST: FAIL: $*"; exit 1; }
 
-boot boot1 tpm-crb
+boot boot1 tpm-crb "$root/build/guest/flags-test" "$root/build/guest/flagsvm.cpio.gz"
 log=$out/boot1.log
 field "$log" "ATTEST: dom0 report" "$out/run/dom0.report"
 field "$log" "ATTEST: evidence" "$out/run/evidence1"
@@ -91,6 +92,39 @@ printf '\x00' | dd of="$out/run/bad.report" bs=1 seek=40 conv=notrunc status=non
     || fail "wrong launch digest accepted"
 ak=$(json "$out/run/dom0.json" 'd["host"]["ak_name"]')
 echo "ATTESTTEST: reports verify; AK $ak"
+
+grep -aq "FLAGS: PASS" "$log" || fail "dom0 flags checks"
+grep -aq "FLAGVM: PASS" "$log" || fail "guest flags checks"
+! grep -aq "FLAGS: FAIL\|FLAGVM: FAIL" "$log" || fail "flags guest failed"
+for phase in clean injected gates fresh queued; do
+    field "$log" "FLAGVM: $phase report" "$out/run/$phase.report"
+done
+python3 "$attest" verify "$out/run/clean.report" "$out/run/evidence1" --data "$nonce" \
+    --require-seal console-out > "$out/run/clean.json" || fail "clean sealed report"
+! python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" >/dev/null 2>&1 || fail "injected input accepted"
+python3 "$attest" verify "$out/run/injected.report" "$out/run/evidence1" --deny-taint '' > "$out/run/injected.json" || fail "allow input"
+python3 "$attest" verify "$out/run/gates.report" "$out/run/evidence1" --deny-taint 130,131 \
+    --require-seal console-in,console-out,130,140-141 > "$out/run/gates.json" || fail "guest gates"
+python3 "$attest" verify "$out/run/fresh.report" "$out/run/evidence1" > "$out/run/fresh.json" || fail "new instance"
+python3 "$attest" verify "$out/run/queued.report" "$out/run/evidence1" --deny-taint '' > "$out/run/queued.json" || fail "pre-start input"
+python3 - "$out/run" <<'CHECK'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+def guest(phase):
+    return json.loads((p / (phase + '.json')).read_text())['guest']
+clean, injected, gates, fresh, queued = map(guest, ['clean', 'injected', 'gates', 'fresh', 'queued'])
+assert int.from_bytes(bytes.fromhex(clean['taint']), 'little') == 0
+assert int.from_bytes(bytes.fromhex(clean['seal']), 'little') == 2
+assert injected['taint_bits'] == ['0(console-in)']
+assert gates['taint_bits'] == ['0(console-in)', '65(F)', '140', '141', '200']
+assert fresh['taint_bits'] == fresh['seal_bits'] == []
+assert queued['taint_bits'] == ['0(console-in)']
+assert clean['guest'] == fresh['guest'] == queued['guest']
+assert clean['instance'] < fresh['instance'] < queued['instance']
+CHECK
+echo "ATTESTTEST: taint, seals, at-most-once gates and reused instances verify"
+
 
 secret=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 python3 "$attest" make-credential "$out/run/evidence1" "$secret" -o "$out/run/cred" || fail "make-credential"

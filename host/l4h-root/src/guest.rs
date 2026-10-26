@@ -225,6 +225,8 @@ pub enum State {
 
 pub struct Guest {
     pub id: usize,
+    /// Unique since host boot, assigned before any console input.
+    pub instance: u64,
     pub name: ArrayString<{ abi::CTL_NAME_MAX }>,
     pub arena: Arena,
     pub cnode: cap::CNode,
@@ -866,6 +868,7 @@ impl Guest {
 /// guest, if there is one, for the caller to destroy.
 pub fn create(
     id: usize,
+    instance: u64,
     cfg: &GuestConfig,
     alloc: &mut Alloc,
     asids: &mut AsidPools,
@@ -954,6 +957,7 @@ pub fn create(
 
     let mut g = Guest {
         id,
+        instance,
         name: ArrayString::from_str_truncate(cfg.name),
         arena,
         cnode: root_cap::<cap_type::CNode>(cnode_slot),

@@ -30,9 +30,11 @@ if mkdir $r 2>/dev/null; then
 fi
 if [ -f /bin/cred ]; then
     echo "ATTEST: secret $(l4hctl attest activate /bin/cred)"
-    # The rate limit: the rest of the burst, refused, then one more after
-    # a pause.
-    n=1
+    # The first activation creates the EK and may take over a second,
+    # refilling its allowance. Start the burst test with the EK cached
+    # and a full allowance, then check refusal and recovery.
+    sleep 2
+    n=0
     while [ $n -lt 20 ] && l4hctl attest activate /bin/cred >/dev/null 2>/tmp/err; do
         n=$((n + 1))
     done
@@ -48,6 +50,9 @@ if [ -f /bin/vm.cpio.gz ]; then
         l4hctl console "$id" --until "ATTESTVM: done" --timeout 60 > /tmp/vm.out
     sleep 1
     grep ATTESTVM /tmp/vm.out
+fi
+if [ -x /bin/flags-test ]; then
+    /bin/flags-test dom0 || echo "FLAGS: FAIL"
 fi
 echo "ATTEST: done"
 poweroff -f

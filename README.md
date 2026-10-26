@@ -74,7 +74,9 @@ Third-party components, including the submodules in `kernel/seL4` and
   then dom0's files). It signs CBOR (COSE) reports on each guest with that
   key, giving the guest's launch digest and the guest's own nonce. Guests
   get them through configfs-tsm or `l4hctl attest`; `tools/l4h-attest.py`
-  verifies them.
+  verifies them. Per-instance taint and seal flags record console access
+  and let guests lock it out; local seals and workload gates also work
+  on hosts without a TPM.
 - **aarch64.** seL4 and the host components run on QEMU `virt` at EL1. Native AArch64 Linux guests support SMP, signals, TLS,
   kernel modules, PCI virtio-blk/net and NVMe; virtualization is disabled.
 
@@ -183,6 +185,8 @@ without it, the host reports `unknown`.
 | Test | What it checks |
 |------|----------------|
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
+| `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
+| `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim and fixed-container panic safety |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |

@@ -101,6 +101,15 @@ static KEEPER_TLS: sel4_initialize_tls::StaticTlsAllocation<4096, KeeperTlsAlign
 /// host::KEEPER_STACK_TOP, which l4h-root maps), TLS and IPC buffer: it
 /// shares nothing with this thread.
 fn start_keeper() {
+    unsafe { start_secondary(host::SLOT_KEEPER, host::KEEPER_STACK_TOP, keeper) };
+}
+
+/// Start the component's one secondary thread on its own TLS and stack.
+///
+/// # Safety
+/// Call only once, with a suspended TCB and a mapped stack. The entry
+/// must install that thread's IPC buffer before making any seL4 call.
+pub unsafe fn start_secondary(slot: u64, top: usize, entry: extern "C" fn() -> !) {
     let phdr = sel4_phdrs::locate_phdrs()
         .ok()
         .and_then(|p| p.find_by_type(sel4_phdrs::PT_TLS))
@@ -114,10 +123,9 @@ fn start_keeper() {
     .check()
     .expect("keeper: bad TLS image");
     let tp = unsafe { image.initialize_inexact_reservation_region(&KEEPER_TLS.region()) }.expect("keeper TLS space");
-    let k = cap::<sel4::cap_type::Tcb>(host::SLOT_KEEPER);
-    let top = host::KEEPER_STACK_TOP;
+    let k = cap::<sel4::cap_type::Tcb>(slot);
     let mut regs = sel4::UserContext::default();
-    *regs.pc_mut() = keeper as *const () as u64;
+    *regs.pc_mut() = entry as *const () as u64;
     // As if called: x86-64 expects a return address pushed.
     *regs.sp_mut() = (if cfg!(target_arch = "x86_64") { top - 8 } else { top }) as u64;
     k.tcb_write_all_registers(false, &mut regs).expect("keeper registers");

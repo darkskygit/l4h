@@ -506,6 +506,8 @@ enum l4h_ctl_op {
 	/* args: vm -> vals: boot bytes, region bytes, target bytes, plugged
 	 * bytes (all host memory: a hotplug block counts L4H_HP_SIZE) */
 	L4H_CTL_VM_MEM_INFO = 29,
+	/* vm -> taint bits 0-63, seal bits 0-63 (host actions only) */
+	L4H_CTL_VM_TRUST = 30,
 };
 
 #define L4H_GPU_MIN             64
@@ -562,7 +564,7 @@ enum l4h_hypercall {
 #define L4H_HC_CONSOLE_MAX_WORDS 32
 
 /* ------------------------------------------------------------------------
- * Attestation device (L4H_DEV_ATTEST, on hosts with a TPM): requests to
+ * Attestation/flags device (L4H_DEV_ATTEST, flags work without a TPM): requests to
  * l4h-trustd in the device page.  The host proves what it booted with a
  * TPM quote over its signing key, and signs reports about the guest with
  * that key (DESIGN.md §9.2).  Requests are asynchronous:
@@ -599,9 +601,35 @@ enum l4h_attest_op {
 	L4H_ATTEST_REPORT = 1,
 	L4H_ATTEST_EVIDENCE = 2,
 	L4H_ATTEST_ACTIVATE = 3,
+	/* data: l4h_attest_act (or 32 bytes, flags=0). All or nothing;
+	 * -EPERM if any bit is sealed. Returns l4h_attest_flags. */
+	L4H_ATTEST_ACT = 4,
+	/* data: 32-byte bitmap, defined host bits or userspace bits only.
+	 * Returns l4h_attest_flags. */
+	L4H_ATTEST_SEAL = 5,
 };
+#define L4H_FLAG_BITS           256
+#define L4H_FLAG_HOST           0   /* 0-31 host; 32-63 reserved for host */
+#define L4H_FLAG_GUEST          64  /* 64 + Linux TAINT_*; not sealable */
+#define L4H_FLAG_USER           128 /* 128-255: workload-defined gates */
+#define L4H_FLAG_CONSOLE_IN     (1u << 0)
+#define L4H_FLAG_CONSOLE_OUT    (1u << 1) /* text console and GPU_READ */
+#define L4H_FLAGS_HOST_DEFINED  0x3u
+#define L4H_ACT_SEAL            (1u << 0) /* userspace bits: at most once */
+
+/* Bit n is bit n % 8 of byte n / 8. Empty ACT reads both bitmaps. */
+struct l4h_attest_act {
+	l4h_u8 bits[L4H_FLAG_BITS / 8];
+	l4h_u32 flags;
+};
+struct l4h_attest_flags {
+	l4h_u8 taint[L4H_FLAG_BITS / 8];
+	l4h_u8 seal[L4H_FLAG_BITS / 8];
+};
+
 #define L4H_ATTEST_DATA_SIZE    64
 #define L4H_ATTEST_FAILED       1
+#define L4H_ATTEST_NO_REPORTS   2 /* no TPM: ACT/SEAL work, reports -ENODEV */
 #define L4H_ATTEST_PAGE_DATA    (4096 - 64)
 
 struct l4h_attest_page {
@@ -614,7 +642,7 @@ struct l4h_attest_page {
 	l4h_s32 status;
 	l4h_u32 total;          /* the whole result's length */
 	l4h_u32 out_len;        /* bytes of data in the reply, from offset */
-	l4h_u32 state;          /* host: L4H_ATTEST_FAILED, or 0 */
+	l4h_u32 state;          /* host: L4H_ATTEST_FAILED / NO_REPORTS bits */
 	l4h_u32 reserved[6];
 	l4h_u8 data[L4H_ATTEST_PAGE_DATA];
 };

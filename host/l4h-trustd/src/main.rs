@@ -28,6 +28,7 @@ extern crate alloc;
 
 mod aml;
 mod cbor;
+mod flags;
 mod time;
 mod tpm;
 mod tpm2;
@@ -52,6 +53,7 @@ const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
 const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
+const ENODEV: i64 = 19;
 
 /// ActivateCredential per guest: up to ACTIVATE_BURST at once, then one
 /// every ACTIVATE_INTERVAL_MS (about 80 ms of TPM time each, on a discrete
@@ -82,6 +84,8 @@ const PAYLOAD_MAX: usize = 1
     + (5 + 2 + abi::ATTEST_DATA_SIZE)
     + (5 + 1)
     + (5 + 2 + 32)
+    + (5 + 2 + 32)
+    + (6 + 2 + 32)
     + (6 + 9)
     + (6 + 9)
     + (7 + 2 + 32)
@@ -208,13 +212,16 @@ impl State {
     fn report(&self, id: usize, r: &GuestRecord, data: &[u8; abi::ATTEST_DATA_SIZE], out: &mut [u8]) -> Result<usize, Overflow> {
         let mut payload = [0u8; REPORT_MAX];
         let mut c = Enc::new(&mut payload);
-        c.map(9);
+        let flags = flags::read(id, r.instance).bytes();
+        c.map(11);
         c.text("v").uint(1);
         c.text("ram").uint(r.ram);
         c.text("data").bytes(data);
         c.text("dom0").bool(r.flags & trust::RECORD_DOM0 != 0);
         c.text("host").bytes(&self.key_id);
+        c.text("seal").bytes(&flags.seal);
         c.text("guest").uint(id as u64);
+        c.text("taint").bytes(&flags.taint);
         c.text("vcpus").uint(r.vcpus as u64);
         c.text("launch").bytes(&r.launch);
         c.text("instance").uint(r.instance);
@@ -296,7 +303,18 @@ fn execute<'a>(
         *b = unsafe { addr_of!((*p).data[i]).read_volatile() };
     }
     let data = &*data;
-    let Some(s) = state else { return Err(EIO) };
+    if matches!(op, abi::ATTEST_ACT | abi::ATTEST_SEAL) {
+        if in_len != 32 && !(op == abi::ATTEST_ACT && in_len == 36) { return Err(EINVAL); }
+        let bits = core::array::from_fn(|i| u64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap()));
+        let options = if in_len == 36 { u32::from_le_bytes(data[32..36].try_into().unwrap()) as u64 } else { 0 };
+        let op = if op == abi::ATTEST_ACT { trust::FLAGS_ACT } else { trust::FLAGS_SEAL };
+        let flags = flags::call(op, id, r.instance, bits, options)?.bytes();
+        out[..32].copy_from_slice(&flags.taint);
+        out[32..64].copy_from_slice(&flags.seal);
+        return Ok(&out[..64]);
+    }
+    if !matches!(op, abi::ATTEST_REPORT | abi::ATTEST_EVIDENCE | abi::ATTEST_ACTIVATE) { return Err(ENOSYS); }
+    let Some(s) = state else { return Err(ENODEV) };
     match op {
         abi::ATTEST_REPORT => {
             let mut d = [0u8; abi::ATTEST_DATA_SIZE];
@@ -312,7 +330,7 @@ fn execute<'a>(
         abi::ATTEST_ACTIVATE => {
             let n = s.activate(&data[..blob_len], &data[blob_len..], out).map_err(|e| {
                 info!("l4h-trustd: guest {}: ActivateCredential failed: {}", id, e);
-                EINVAL
+                EIO
             })?;
             Ok(&out[..n])
         }
@@ -347,15 +365,26 @@ fn answer(id: usize, seq: u32, result: Result<&[u8], i64>) {
 }
 
 fn main(info: &'static Info) -> ! {
+    flags::start();
     let cfg: &TrustdConfig = unsafe { info.config() };
     let hz = info.header().tsc_hz;
-    let mut state = match init(cfg, hz) {
-        Ok(s) => Some(s),
-        Err((what, e)) => {
-            sel4::debug_println!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
-            None
+    let mut state = if cfg.iface == trust::TPM_NONE {
+        None
+    } else {
+        match init(cfg, hz) {
+            Ok(s) => Some(s),
+            Err((what, e)) => {
+                sel4::debug_println!("l4h-trustd: TPM unusable, no attestation: {}: {}", what, e);
+                None
+            }
         }
     };
+    if state.is_none() {
+        for id in 0..trust::MAX_RECORDS {
+            unsafe { addr_of_mut!((*page(id)).state).write_volatile(abi::ATTEST_NO_REPORTS) };
+        }
+        info!("l4h-trustd: no TPM: flags only");
+    }
     // Guests kick while we set up the TPM too: their bits wait in the
     // notification.
     let kick = cap::<cap_type::Notification>(trust::SLOT_KICK);
@@ -367,6 +396,9 @@ fn main(info: &'static Info) -> ! {
             let id = kicked.trailing_zeros() as usize;
             kicked &= kicked - 1;
             let Some(r) = record(id) else { continue };
+            if state.is_none() {
+                unsafe { addr_of_mut!((*page(id)).state).write_volatile(abi::ATTEST_NO_REPORTS) };
+            }
             let seq = unsafe { addr_of!((*page(id)).seq).read_volatile() };
             fence(Ordering::Acquire);
             let last = &mut answered[id];
