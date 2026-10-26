@@ -44,8 +44,13 @@ static inline long kemu_syscall_enter(struct pt_regs *regs)
 	 * Exit tracing belongs in the entry caller, after kemu_svc() has
 	 * written the result to the emulated state (including ptrace stops).
 	 */
-	return syscall_trace_enter(regs) || secure_computing() ?
-		-1 : kemu_reg(regs, orig_ax);
+	if (syscall_trace_enter(regs)) {
+		/* Ptrace edits to AArch64 x0 update the argument view. Preserve
+		 * that value as the result when SYSEMU skips the syscall. */
+		kemu_reg(regs, ax) = kemu_reg(regs, di);
+		return -1;
+	}
+	return secure_computing() ? -1 : kemu_reg(regs, orig_ax);
 }
 
 static inline void kemu_set_gs(unsigned long base)
