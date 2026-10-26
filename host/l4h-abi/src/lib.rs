@@ -225,6 +225,7 @@ pub struct MemPage {
 pub const MEM_PLUG: u64 = 1;
 pub const MEM_UNPLUG: u64 = 2;
 
+/// Bump only for incompatible changes to existing ops (see abi.h).
 pub const CTL_VERSION: u32 = 3;
 pub const CTL_RESP_OFF: usize = 2048;
 pub const CTL_DATA_MAX: usize = 1984;

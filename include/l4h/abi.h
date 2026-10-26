@@ -378,6 +378,12 @@ enum l4h_mem_op {
  * L4H_HC_CTL.  Bulk data (images) is passed in the device's data area
  * (l4h_dev_desc.data_va), which belongs to the host: l4h-root never reads
  * dom0's RAM.  See DESIGN.md §9.1.
+ *
+ * l4h-root refuses every request whose version is not its own, so a bump
+ * makes l4hctl of one release unable to talk to the host of another, in
+ * both directions (3 did, for two new ops only).  Bump it only when an
+ * existing request or response changes meaning or layout.  A new op needs
+ * none: a host that does not know it answers -ENOSYS.
  */
 #define L4H_CTL_VERSION         3
 #define L4H_CTL_RESP_OFF        2048
