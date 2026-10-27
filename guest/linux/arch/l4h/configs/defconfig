@@ -29,12 +29,14 @@ CONFIG_TCP_CONG_BBR=y
 CONFIG_NET_SCHED=y
 CONFIG_NET_SCH_FQ=y
 CONFIG_NET_SCH_CAKE=y
-# BPF programs on tc (the clsact qdisc, cls_bpf, act_bpf) and XDP, with
-# AF_XDP sockets.
+# BPF programs on tc (clsact, BPF/flower classifiers, BPF/checksum actions)
+# and XDP, with AF_XDP sockets.
 CONFIG_NET_CLS_ACT=y
 CONFIG_NET_SCH_INGRESS=y
 CONFIG_NET_CLS_BPF=y
+CONFIG_NET_CLS_FLOWER=y
 CONFIG_NET_ACT_BPF=y
+CONFIG_NET_ACT_CSUM=y
 CONFIG_XDP_SOCKETS=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
