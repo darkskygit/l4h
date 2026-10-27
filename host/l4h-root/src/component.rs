@@ -1,9 +1,10 @@
-//! Spawning host components (l4h-vmm, blkd, netd, trustd, memd) as separate seL4
-//! processes with the layout defined in `l4h-host`.
+//! Spawning host components as separate seL4 processes with the layout
+//! defined in `l4h-host`: root spawns blkd, netd, trustd, memd and vmmgr,
+//! and vmmgr (which includes this file) spawns guests' l4h-vmm.
 
 use core::ptr;
 
-use sel4::init_thread::slot;
+use crate::slot;
 use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_host as host;
@@ -32,7 +33,8 @@ pub fn abs_of(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
     abs(c)
 }
 
-fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
+/// The capability in slot `s` of our own CNode.
+pub fn root_cap<T: sel4::CapType>(s: Slot) -> sel4::Cap<T> {
     sel4::init_thread::Slot::<T>::from_index(s).cap()
 }
 
@@ -236,7 +238,7 @@ pub fn create(
     }
 
     // ---- Stacks: fresh frames, with nothing mapped below them.
-    let mut stacks = [(host::STACK_TOP, host::STACK_SIZE), (0, 0)];
+    let mut stacks = [(host::STACK_TOP, host::stack_size(args.kind)), (0, 0)];
     if keeper.is_some() {
         stacks[1] = (host::KEEPER_STACK_TOP, host::KEEPER_STACK_SIZE);
     }
@@ -272,7 +274,7 @@ pub fn create(
         .expect("component SC");
     let fault_slot = alloc.slots.alloc();
     abs(root_cap::<cap_type::Null>(fault_slot))
-        .mint(&abs(host_info.hyp_ep), CapRights::all(), component_badge(args.id) | crate::guest::HYP_BADGE_FAULT)
+        .mint(&abs(host_info.hyp_ep), CapRights::all(), component_badge(args.id) | crate::HYP_BADGE_FAULT)
         .expect("component fault ep");
     let root_fault = root_cap::<cap_type::Endpoint>(fault_slot);
     // The keeper is left suspended: the main thread starts it, on its own
@@ -302,37 +304,4 @@ pub fn create(
 
 pub fn start(c: &Component) {
     c.tcb.tcb_resume().expect("start component");
-}
-
-/// trustd's passive flags server. Its temporary SC is unbound after the
-/// initial reply_recv handshake; thereafter only callers supply budget.
-pub fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &HostInfo) -> cap::SchedContext {
-    use host::trust;
-    let mut ctx = ObjCtx::arena(alloc, arena);
-    let tcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
-    let sc = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
-        size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
-    });
-    let ipc = ctx.cap::<cap_type::Granule>(FRAME_BP);
-    let reply = ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply);
-    map_frame(&mut ctx, c.vspace, ipc, trust::FLAGS_IPCBUF_VA, CapRights::read_write(), VmAttributes::DEFAULT);
-    for va in (trust::FLAGS_STACK_TOP - trust::FLAGS_STACK_SIZE..trust::FLAGS_STACK_TOP).step_by(PAGE) {
-        let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
-        map_frame(&mut ctx, c.vspace, f, va, CapRights::read_write(), VmAttributes::DEFAULT);
-    }
-    let fault_slot = ctx.alloc.slots.alloc();
-    abs(root_cap::<cap_type::Null>(fault_slot))
-        .mint(&abs(info.hyp_ep), CapRights::all(), component_badge(crate::trustd::FLAGS_ID) | crate::guest::HYP_BADGE_FAULT)
-        .expect("flags fault ep");
-    tcb.tcb_configure(c.cnode, CNodeCapData::new(0, 64 - c.cnode_bits), c.vspace, trust::FLAGS_IPCBUF_VA as u64, ipc)
-        .expect("flags TCB configure");
-    info.sched_control(info.cores - 1).sched_control_configure_flags(sc, info.timeslice_us, info.timeslice_us, 0, 0, 0)
-        .expect("flags bootstrap SC");
-    // Root is the initial task, at the maximum priority.
-    let prio = 255;
-    tcb.tcb_set_sched_params(slot::TCB.cap(), prio, prio, sc, root_cap::<cap_type::Endpoint>(fault_slot))
-        .expect("flags sched params");
-    c.give(trust::SLOT_FLAGS_TCB, tcb, CapRights::all());
-    c.give(trust::SLOT_FLAGS_REPLY, reply, CapRights::all());
-    sc
 }

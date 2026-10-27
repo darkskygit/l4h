@@ -95,8 +95,9 @@ docs/manual/         user manual (LaTeX; make -C docs/manual renders the PDF)
 include/l4h/abi.h    guest <-> host ABI (single source of truth)
 kernel/              seL4 submodule, l4h patches (kernel/patches), configs
 guest/linux/         arch/l4h for Linux 6.18 and patches outside arch/
-host/                Rust workspace: l4h-root (root task), l4h-vmm (per guest),
-                     l4h-blkd (disks), l4h-netd (switches, NICs), shared crates
+host/                Rust workspace: l4h-root (root task), l4h-vmmgr (guests),
+                     l4h-vmm (per guest), l4h-blkd (disks), l4h-netd
+                     (switches, NICs), shared crates
 tools/               build and run scripts, l4hctl (dom0 CLI)
 tests/               integration tests (QEMU) and fuzzing
 third_party/         rust-sel4, sDDF, kemu submodules; patches/ for rust-sel4

@@ -1,7 +1,8 @@
-//! Scratch mappings in the root task's own VSpace used to read and write
-//! frames that belong to guests.
+//! Scratch mappings in the task's own VSpace (root's, or vmmgr's, which
+//! includes this file) used to read and write frames that belong to guests
+//! and components.
 
-use sel4::init_thread::slot;
+use crate::slot;
 use sel4::{CapRights, VmAttributes, cap_type};
 
 use crate::layout;

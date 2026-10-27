@@ -17,5 +17,5 @@ mkdir -p "$out"
     "$l4h_ctl" "$out/densvm.cpio.gz" >/dev/null
 L4H_MEM=${L4H_MEM:-16G} L4H_DOM0_MEM_MB=256 \
     "$root/tools/run-dom0.sh" "$out/density.cpio.gz" "console=hvc0 DENS_N=$n DENS_MEM=$mem ${DENS_EXTRA:-}" ${DENSITY_TIMEOUT:-900} \
-    | grep -E "DENSITY|memory|panic|l4h-root: (comp|.*fault)" || true
+    | grep -E "DENSITY|memory|panic|l4h-(root|vmmgr): (comp|.*fault)" || true
 grep -q "DENSITY: PASS" "$root/build/qemu.log"

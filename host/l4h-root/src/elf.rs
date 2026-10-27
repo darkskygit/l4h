@@ -74,6 +74,7 @@ impl<'a> Elf<'a> {
     }
 
     /// Lowest and highest (exclusive) virtual address of loadable segments.
+    #[allow(dead_code)] // vmmgr's kimage.rs
     pub fn bounds(&self) -> (u64, u64) {
         let mut lo = u64::MAX;
         let mut hi = 0;

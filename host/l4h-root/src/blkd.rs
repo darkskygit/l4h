@@ -13,11 +13,10 @@ use l4h_host::{self as host, blk};
 
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
-use crate::guest::Guest;
 use crate::iommu::{Iommu, Domain};
 use crate::mem::{Alloc, Arena, Dest, Slot};
 use crate::pci::{self, Pci};
-use crate::vmm;
+use crate::vmmgr::RootGuest;
 use crate::vspace::FRAME_BP;
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
@@ -364,13 +363,15 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 }
 
 /// Attach a checked window of host disk `disk` to one client of its
-/// running shared controller.
+/// running shared controller, for its device `dev_index`.  Returns the
+/// client, the channel frames (the client's) and a kick capability (in a
+/// slot of its own) for the client's l4h-vmm.
 #[allow(clippy::too_many_arguments)]
-pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index: usize,
-    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, vmm::Backend) {
+pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest, dev_index: usize,
+    window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
     let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
     let driver = ctrl.driver.as_mut().expect("started blkd");
-    let chan: l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES }> = (0..blk::CHANNEL_PAGES)
+    let chan: Channel = (0..blk::CHANNEL_PAGES)
         .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
     let keep = client.arena.object_cap::<cap_type::CNode>(alloc, sel4::ObjectBlueprint::CNode { size_bits: 10 });
     // Initial values are delivered via the service call, not guest-chosen IDs.
@@ -388,14 +389,16 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut Guest, dev_index:
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);
     ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, pool });
-    (i, vmm::Backend::Blk { chan, kick })
+    (i, chan, kick)
 }
+
+/// The frames of a client's channel.
+pub type Channel = l4h_host::fixed::ArrayVec<cap::Granule, { blk::CHANNEL_PAGES }>;
 
 /// Publish root-owned client configuration, then activate the channel.
 /// EIO if blkd has failed (the controller is then quarantined).
-pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &Guest, backend: &vmm::Backend, win: &mut Window,
+pub fn activate(ctrl: &mut Controller, unit: u64, i: usize, client: &RootGuest, chan: &Channel, win: &mut Window,
     pci: &Pci) -> Result<(), i64> {
-    let vmm::Backend::Blk { chan, .. } = backend else { unreachable!() };
     let a = ctrl.clients[i].as_ref().unwrap();
     let read_only = a.read_only;
     win.with_frame(&abs_of(chan[0]), |p| unsafe {

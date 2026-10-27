@@ -18,5 +18,5 @@ mkdir -p "$out"
     "$l4h_ctl" "$out/capvm.cpio.gz" >/dev/null
 "$root/tools/run-dom0.sh" "$out/captest.cpio.gz" \
     "console=hvc0 captest_cap=${1:-25} captest_rounds=${2:-2}" ${CAPTEST_TIMEOUT:-900} \
-    | grep -E "CAPTEST|l4h-root: guest|panic" || true
+    | grep -E "CAPTEST|l4h-vmmgr: guest|panic" || true
 grep -q "CAPTEST: PASS" "$root/build/qemu.log"

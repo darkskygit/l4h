@@ -391,6 +391,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "l4h-vmmgr"
+version = "0.1.0"
+dependencies = [
+ "l4h-abi",
+ "l4h-host",
+ "l4h-rt",
+ "sel4",
+ "sha2",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

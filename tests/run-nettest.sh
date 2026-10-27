@@ -22,7 +22,7 @@ mode=disable-legacy=on
 [ "${NETTEST_LEGACY:-0}" = 1 ] && mode=disable-modern=on
 L4H_QEMU_ARGS="-netdev user,id=n0 -device virtio-net-pci,netdev=n0,$mode" \
     "$root/tools/run-dom0.sh" "$out/nettest.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" ${NETTEST_TIMEOUT:-$((300 * l4h_test_slow))} \
-    | grep -E "NETTEST|NETVM|netd|nic|switch|^ +[0-9]+ |panic|l4h-root: (guest|comp)" || true
+    | grep -E "NETTEST|NETVM|netd|nic|switch|^ +[0-9]+ |panic|l4h-(root|vmmgr): (guest|comp)" || true
 grep -q "NETTEST: PASS" "$root/build/qemu.log"
 if [ "${NETTEST_LEGACY:-0}" = 1 ]; then
     grep -q "virtio-net legacy" "$root/build/qemu.log"

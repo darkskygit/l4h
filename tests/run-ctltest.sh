@@ -33,7 +33,7 @@ L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-
     -drive file=$out/dma1.img,if=none,id=d1,format=raw,$slow -device virtio-blk-pci,drive=d1,disable-legacy=on \
     -drive file=$out/dma2.img,if=none,id=d2,format=raw,$slow -device nvme,drive=d2,serial=l4hdma" \
     "$root/tools/run-dom0.sh" "$out/ctltest.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" ${CTLTEST_TIMEOUT:-$((600 * l4h_test_slow))} \
-    | grep -E "CTLTEST|l4hctl|GUEST|vm [0-9]|disk [0-9]|^ *[0-9]+ |memory|l4h-root: guest|panic" || true
+    | grep -E "CTLTEST|l4hctl|GUEST|vm [0-9]|disk [0-9]|^ *[0-9]+ |memory|l4h-vmmgr: guest|panic" || true
 grep -q "CTLTEST: PASS" "$root/build/qemu.log"
 grep -q "FLAGS: PASS no TPM" "$root/build/qemu.log"
 grep -q "FLAGVM: PASS no TPM" "$root/build/qemu.log"

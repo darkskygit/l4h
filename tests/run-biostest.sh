@@ -27,7 +27,7 @@ log=$root/build/qemu-bios.log
 timeout "${BIOSTEST_TIMEOUT:-120}" "$root/tools/run-bios.sh" "$root/build/l4h-bios.raw" </dev/null >"$log" 2>&1 &
 qemu=$!
 while kill -0 "$qemu" 2>/dev/null; do
-    grep -aq "IMAGETEST: done\|l4h-root: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
+    grep -aq "IMAGETEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true

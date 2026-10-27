@@ -12,14 +12,9 @@ mod mem;
 
 pub const MAX_GUESTS: usize = 64;
 pub const RETYPE_FAN_OUT: usize = 16384;
-pub mod guest {
-    pub const MAX_GUEST_DEVICES: usize = 16;
-}
-
-#[macro_export]
-macro_rules! sel4_cfg_usize {
-    (ROOT_CNODE_SIZE_BITS) => { 19usize };
-}
+pub const MAX_GUEST_DEVICES: usize = 16;
+pub const CNODE_SLOTS: usize = 1 << 19;
+pub use init_thread::slot;
 
 #[macro_export]
 macro_rules! debug_println {

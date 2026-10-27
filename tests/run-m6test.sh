@@ -13,5 +13,5 @@ mkdir -p "$out"
 "$root/tools/mkinitramfs.sh" "$out/m6test.cpio.gz" "$root/tests/guest/init-m6test" \
     "$l4h_ctl" "$out/densvm.cpio.gz" >/dev/null
 "$root/tools/run-dom0.sh" "$out/m6test.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" ${M6TEST_TIMEOUT:-$((300 * l4h_test_slow))} \
-    | grep -E "M6TEST|restarting|l4h-root: guest|panic" || true
+    | grep -E "M6TEST|restarting|l4h-vmmgr: guest|panic" || true
 grep -q "M6TEST: PASS" "$root/build/qemu.log"

@@ -1,9 +1,9 @@
 // Run with tests/run-schedtest.sh; no seL4 toolchain or QEMU needed.
 extern crate alloc;
 
-#[path = "../host/l4h-root/src/sched/policy.rs"]
+#[path = "../host/l4h-vmmgr/src/sched/policy.rs"]
 mod policy;
-#[path = "../host/l4h-root/src/sched/topology.rs"]
+#[path = "../host/l4h-root/src/topology.rs"]
 mod topology;
 
 use policy::{Migration, Sample, choose};

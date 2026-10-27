@@ -38,6 +38,17 @@ impl Topology {
         t
     }
 
+    /// The topology as (CPUs, each CPU's physical core, the placement
+    /// order), as root passes it to vmmgr.
+    pub fn raw(&self) -> (usize, [u8; MAX_CPUS], [u8; MAX_CPUS]) {
+        (self.cpus, self.physical, self.order)
+    }
+
+    pub fn from_raw(cpus: usize, physical: [u8; MAX_CPUS], order: [u8; MAX_CPUS]) -> Self {
+        assert!(cpus <= MAX_CPUS && physical.iter().chain(&order).all(|&c| (c as usize) < cpus.max(1)));
+        Self { cpus, physical, order }
+    }
+
     /// Each CPU's physical core (its first seL4 CPU).
     pub fn physical(&self) -> &[u8] {
         &self.physical[..self.cpus]

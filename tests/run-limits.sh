@@ -14,5 +14,5 @@ mkdir -p "$out"
 "$root/tools/mkinitramfs.sh" "$out/limits.cpio.gz" "$root/tests/guest/init-limits" \
     "$l4h_ctl" "$out/vm.cpio.gz" >/dev/null
 L4H_MEM=${L4H_MEM:-6G} "$root/tools/run-dom0.sh" "$out/limits.cpio.gz" "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow" "${LIMITSTEST_TIMEOUT:-$((900 * l4h_test_slow))}" \
-    | grep -aE "LIMITS|memory:|panicked|l4h-root: comp" || true
+    | grep -aE "LIMITS|memory:|panicked|l4h-(root|vmmgr): comp" || true
 grep -aq "LIMITS: PASS" "$root/build/qemu.log"

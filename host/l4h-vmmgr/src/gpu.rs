@@ -1,6 +1,6 @@
 //! A guest's virtio-gpu (DESIGN.md §8.6).  l4h-vmm serves the device; here
 //! is the host memory it needs: the display area, which l4h-vmm writes and
-//! l4h-root maps too, to copy the image out for dom0 (CTL_GPU_READ), and
+//! vmmgr maps too, to copy the image out for dom0 (CTL_GPU_READ), and
 //! l4h-vmm's tables of the guest's resources.  The guest's buffers stay in
 //! its I/O pool.
 
@@ -24,8 +24,8 @@ const PAGE: usize = 4096;
 const _: () = assert!(display_pages(abi::GPU_MAX_WIDTH, abi::GPU_MAX_HEIGHT) * PAGE <= layout::DISPLAY_STRIDE);
 const _: () = assert!(display_pages(abi::GPU_MAX_WIDTH, abi::GPU_MAX_HEIGHT) <= host::gpu::DISPLAY_MAX_PAGES);
 
-/// Where l4h-root maps guest `id`'s display area (layout::DISPLAY).
-pub fn root_display_va(id: usize) -> usize {
+/// Where vmmgr maps guest `id`'s display area (layout::DISPLAY).
+pub fn self_display_va(id: usize) -> usize {
     assert!(id < crate::MAX_GUESTS);
     layout::DISPLAY.base + id * layout::DISPLAY_STRIDE
 }
@@ -60,7 +60,7 @@ pub fn table_bytes(pages: usize) -> usize {
 }
 
 /// The frames of a GPU with one scanout of `width` x `height`, its display
-/// area mapped in l4h-root.  ENOMEM if the host has too little memory;
+/// area mapped in vmmgr.  ENOMEM if the host has too little memory;
 /// what was allocated by then stays in the guest's arena until destroy.
 pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Result<Backend, i64> {
     let (n, radix) = frames(width, height);
@@ -81,9 +81,9 @@ pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Resu
         i += k;
     }
     let pages = display_pages(width, height);
-    let va = root_display_va(g.id);
+    let va = self_display_va(g.id);
     for p in 0..pages {
-        g.map_abs_in_root(alloc, &frames.absolute_cptr_from_bits_with_depth(p as u64, radix), va + p * PAGE);
+        g.map_abs_in_self(alloc, &frames.absolute_cptr_from_bits_with_depth(p as u64, radix), va + p * PAGE);
     }
     let hdr = va as *mut DisplayHeader;
     unsafe {
@@ -95,11 +95,11 @@ pub fn attach(g: &mut Guest, alloc: &mut Alloc, width: u32, height: u32) -> Resu
 }
 
 /// CTL_GPU_READ: copy the image of guest `g` from byte `offset` into `to`
-/// (dom0's control data area, CTL_LOAD_MAX bytes).  The size is l4h-root's
+/// (dom0's control data area, CTL_LOAD_MAX bytes).  The size is vmmgr's
 /// own, not what l4h-vmm may have written in the header.
 pub fn read(g: &Guest, offset: u64, to: *mut u8, before_copy: impl FnOnce(bool) -> Result<(), i64>) -> Result<[u64; 6], i64> {
     let (width, height) = g.gpu.ok_or(EINVAL)?;
-    let base = root_display_va(g.id);
+    let base = self_display_va(g.id);
     let hdr = unsafe { &*(base as *const DisplayHeader) };
     let frame = hdr.frame.load(Ordering::Acquire);
     if frame & 1 != 0 {

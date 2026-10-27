@@ -13,7 +13,6 @@ use sel4::{CapRights, VmAttributes};
 use crate::Host;
 use crate::devmem::DevMem;
 use crate::font;
-use crate::guest::State;
 use crate::mem::{Alloc, ObjCtx};
 use crate::vspace::map_frame;
 
@@ -240,8 +239,9 @@ impl Dashboard {
         let col = self.cols.saturating_sub(width.0 + 1);
         let _ = right(&mut self.at(0, col, BAR_FG, BAR_BG));
 
-        let guests = h.guests.iter().flatten().count();
-        let running = h.guests.iter().flatten().filter(|g| g.state == State::Running).count();
+        let status = |id| h.vmmgr.as_ref().and_then(|v| v.guest(id));
+        let guests = (0..crate::MAX_GUESTS).filter_map(status).count();
+        let running = (0..crate::MAX_GUESTS).filter_map(status).filter(|g| g.state as u32 == l4h_abi::VM_RUNNING + 1).count();
         let total = h.total_bytes >> 20;
         let free = h.alloc.free_bytes() >> 20;
         let mut r = 2;
@@ -265,30 +265,31 @@ impl Dashboard {
             "ID", "NAME", "STATE", "VCPUS", "MEMORY", "CPU%", "CAP%", "CORES"
         );
         r += 1;
-        for (n, g) in h.guests.iter().flatten().enumerate() {
+        for (n, (id, g)) in (0..crate::MAX_GUESTS).filter_map(|id| Some((id, status(id)?))).enumerate() {
             if r + 8 >= self.rows {
                 let _ = write!(self.at(r, 3, DIM, BG), "... and {} more", guests - n);
                 r += 1;
                 break;
             }
-            let (state, color) = match g.state {
-                State::Running => ("running", GREEN),
-                State::Stopped => ("stopped", RED),
-                State::Created => ("created", YELLOW),
+            let (state, color) = match g.state.wrapping_sub(1) as u32 {
+                l4h_abi::VM_RUNNING => ("running", GREEN),
+                l4h_abi::VM_STOPPED => ("stopped", RED),
+                _ => ("created", YELLOW),
             };
-            let cpu: u64 = g.vcpus.iter().map(|v| v.usage as u64).sum();
+            let cpu = g.cpu as u64;
             let mut w = self.at(r, 3, FG, BG);
-            let _ = write!(w, "{:>3}  {:<16} ", g.id, first_chars(&g.name, 16));
+            let _ = write!(w, "{:>3}  {:<16} ", id, first_chars(crate::monitor::name(&g), 16));
             w.fg = color;
             let _ = write!(w, "{:<8}", state);
             w.fg = FG;
-            let _ = write!(w, " {:>5} {:>6}M {:>5}.{} ", g.vcpus.len(), g.owned_ram() >> 20, cpu / 10, cpu % 10);
-            let _ = if g.cpu_cap_pct == 0 { write!(w, "{:>5}  ", "-") } else { write!(w, "{:>5}  ", g.cpu_cap_pct) };
-            for (i, v) in g.vcpus.iter().take(8).enumerate() {
-                let _ = write!(w, "{}{}", if i == 0 { "" } else { "," }, v.core);
+            let _ = write!(w, " {:>5} {:>6}M {:>5}.{} ", g.vcpus, g.ram_mb, cpu / 10, cpu % 10);
+            let _ = if g.cap_pct == 0 { write!(w, "{:>5}  ", "-") } else { write!(w, "{:>5}  ", g.cap_pct) };
+            let shown = (g.vcpus as usize).min(l4h_host::vmmgr::STATUS_CORES);
+            for (i, c) in g.cores[..shown].iter().enumerate() {
+                let _ = write!(w, "{}{}", if i == 0 { "" } else { "," }, c);
             }
-            let more = if g.vcpus.len() > 8 { " ..." } else { "" };
-            let _ = write!(w, "{}{}", more, if g.dom0 { "   dom0" } else { "" });
+            let more = if g.vcpus as usize > shown { " ..." } else { "" };
+            let _ = write!(w, "{}{}", more, if g.dom0 != 0 { "   dom0" } else { "" });
             r += 1;
         }
         r += 1;

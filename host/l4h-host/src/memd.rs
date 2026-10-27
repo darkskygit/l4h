@@ -1,12 +1,12 @@
 //! l4h-memd, the owner of the host's free memory and of every guest's RAM
-//! (DESIGN.md §16): its CSpace, the calls l4h-root makes to it, and the
-//! status page it keeps for l4h-root.
+//! (DESIGN.md §16): its CSpace, the calls l4h-root and l4h-vmmgr make to
+//! it, and the status page it keeps for them.
 //!
 //! memd's CSpace is one CNode of 2^cnode_bits slots (MemdConfig), with a
 //! slot for every block it can hold (`block_slots`).  l4h-root holds a
-//! capability to it, and passes Untypeds and CNodes by moving them into
-//! the exchange slots and the guest slots below; memd never calls
-//! l4h-root.
+//! capability to it, and passes Untypeds by moving them into the exchange
+//! slots below.  vmmgr passes them through its mailbox (SLOT_MAILBOX).
+//! memd never calls either.
 //!
 //! memd allocates nothing: what it knows of memory is a table with an
 //! entry per 2 MiB of physical address space (TABLE_VA), which l4h-root
@@ -16,14 +16,14 @@
 /// l4h-root puts here before MEMD_BALLOON.
 pub const SLOT_BALLOON_IOPORT: u64 = crate::SLOT_FIRST_FREE;
 /// Slot of guest g's block CNode (L4H_SLOT_BLOCKS of the guest), which
-/// l4h-root puts there before MEMD_GUEST_CREATE and memd deletes at
+/// memd takes from vmmgr's mailbox at MEMD_GUEST_CREATE and deletes at
 /// MEMD_GUEST_DESTROY.
 pub const SLOT_GUEST_BCN: u64 = 32;
 const _: () = assert!(SLOT_BALLOON_IOPORT < SLOT_GUEST_BCN);
 pub const MAX_GUESTS: usize = 64;
 /// Slot of guest g's hotplug CNode (L4H_SLOT_HP of the guest, without its
-/// guard), SLOT_GUEST_HCN + g, which l4h-root puts there before
-/// MEMD_GUEST_CREATE and memd deletes at MEMD_GUEST_DESTROY.
+/// guard), SLOT_GUEST_HCN + g, which memd takes from vmmgr's mailbox at
+/// MEMD_GUEST_CREATE and deletes at MEMD_GUEST_DESTROY.
 pub const SLOT_GUEST_HCN: u64 = SLOT_GUEST_BCN + MAX_GUESTS as u64;
 /// Exchange slots: Untypeds passed by MEMD_ALLOC, MEMD_FREE and
 /// MEMD_GUEST_COPY, slot SLOT_XCHG + i for the i-th.  A call passes at
@@ -35,27 +35,35 @@ pub const SLOT_DYN_BASE: u64 = 256;
 const _: () = assert!(SLOT_GUEST_HCN as usize + MAX_GUESTS <= SLOT_XCHG as usize);
 const _: () = assert!(SLOT_XCHG as usize + XCHG_SLOTS <= SLOT_DYN_BASE as usize);
 
-/// Labels of l4h-root's calls on memd's service endpoint.  The reply's
-/// MR0 is 0 or an errno (ENOMEM, EINVAL).  l4h-root calls with an
-/// unbadged capability; a guest's l4h-vmm with one badged
-/// `BADGE_VMM | guest`, which may make the MEMD_HP_* calls only.
+/// Labels of calls on memd's service endpoint.  The reply's MR0 is 0 or
+/// an errno (ENOMEM, EINVAL).  l4h-root calls with an unbadged capability,
+/// for its own memory (MEMD_ALLOC, MEMD_FREE, MEMD_BALLOON); l4h-vmmgr
+/// with one badged BADGE_VMMGR, for its own memory and guests' RAM (all
+/// but MEMD_BALLOON), passing capabilities in its mailbox; a guest's
+/// l4h-vmm with one badged `BADGE_VMM | guest`, which may make the
+/// MEMD_HP_* calls only.
+///
+/// vmmgr is less trusted than memd, so memd keeps the original of every
+/// block it grants vmmgr and gives it a copy: MEMD_FREE then revokes the
+/// original, whatever vmmgr put in the mailbox.
 ///
 /// MR0 = size bits (BLOCK_BITS..=MAX_BITS), MR1 = count (<= XCHG_SLOTS): `count` Untypeds of
 /// 2^bits bytes without children, in the exchange slots; MR1.. of the
 /// reply = their physical addresses.
 pub const MEMD_ALLOC: u64 = 1;
 /// MR0 = count (<= XCHG_SLOTS), MR1.. = (physical address, size bits) of
-/// each: Untypeds without children that l4h-root put in the exchange
+/// each: Untypeds without children that the caller put in its exchange
 /// slots, returned to the free memory.  Each is a block memd gave, or one
 /// of at least 2^BLOCK_BITS bytes in the units of the table.
 pub const MEMD_FREE: u64 = 2;
 /// MR0 = guest, MR1 = blocks, MR2 = radix of its block CNode, MR3 =
-/// hotplug blocks in its region (at most abi::HP_MAX): take the guest's
-/// RAM, `blocks` 2 MiB blocks.  Nothing is given yet, and its hotplug
+/// hotplug blocks in its region (at most abi::HP_MAX), its block and
+/// hotplug CNodes in the mailbox: take the guest's RAM, `blocks` 2 MiB
+/// blocks.  Nothing is given yet, and its hotplug
 /// target is 0.
 pub const MEMD_GUEST_CREATE: u64 = 3;
 /// MR0 = guest, MR1 = block: a copy of the block's Untyped in exchange
-/// slot 0, for l4h-root to fill with frames (a boot block); reply MR1 =
+/// slot 0, for vmmgr to fill with frames (a boot block); reply MR1 =
 /// its physical address.  Once per block, before MEMD_GUEST_GIVE.
 pub const MEMD_GUEST_COPY: u64 = 4;
 /// MR0 = guest, MR1 = first block, MR2 = skip: copies of the Untypeds of
@@ -63,7 +71,7 @@ pub const MEMD_GUEST_COPY: u64 = 4;
 /// b + skip (the guest's blocks of the shared kernel image have none).
 pub const MEMD_GUEST_GIVE: u64 = 5;
 /// MR0 = guest: revoke every block of its RAM, which deletes all that was
-/// made of them (its frames and objects, l4h-root's frames of its boot
+/// made of them (its frames and objects, vmmgr's frames of its boot
 /// blocks), and free them.  A guest memd does not know is no error.
 pub const MEMD_GUEST_DESTROY: u64 = 6;
 /// MR0..MR5 = the free page reporting device (BalloonConfig), which
@@ -87,6 +95,18 @@ pub const MEMD_HP_STATE: u64 = 18;
 /// Badge bit of a VMM's capability to memd's service endpoint; the low 16
 /// bits are its guest.
 pub const BADGE_VMM: u64 = 1 << 62;
+/// l4h-vmmgr's badge.
+pub const BADGE_VMMGR: u64 = 1 << 61;
+
+/// Slot of the mailbox CNode memd shares with vmmgr: vmmgr's exchange
+/// slots (MAILBOX_XCHG + i, as SLOT_XCHG + i is root's) and the guest
+/// CNodes of MEMD_GUEST_CREATE.
+pub const SLOT_MAILBOX: u64 = 16;
+pub const MAILBOX_RADIX: usize = 6;
+pub const MAILBOX_XCHG: u64 = 0;
+pub const MAILBOX_BCN: u64 = XCHG_SLOTS as u64;
+pub const MAILBOX_HCN: u64 = MAILBOX_BCN + 1;
+const _: () = assert!(MAILBOX_HCN < 1 << MAILBOX_RADIX && SLOT_MAILBOX < SLOT_GUEST_BCN);
 /// Hotplug blocks of a region, at most, and the words of its bitmap.
 pub const HP_MAX: usize = 512;
 pub const HP_MAP_WORDS: usize = HP_MAX / 64;

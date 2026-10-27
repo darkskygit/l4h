@@ -1,14 +1,12 @@
 //! l4h-memd (DESIGN.md §16), the owner of the host's free memory and of
 //! every guest's RAM: spawning it and handing it the free memory, the free
-//! page reporting device it drives, and the calls l4h-root makes to it.
+//! page reporting device it drives, the calls l4h-root makes to it, and
+//! vmmgr's capabilities to it.
 //!
 //! memd runs before any guest.  The root task's own objects come from
-//! grants of memd's (mem.rs).  A guest's RAM is taken by memd at create;
-//! l4h-root gets copies of the blocks it fills with frames for the image
-//! (the boot blocks), memd gives the guest copies of the others at boot,
-//! and revokes all of them at destroy.  Memory a guest plugs while it runs
-//! (DESIGN.md §17) is between its l4h-vmm and memd: l4h-root only sets
-//! the target.
+//! grants of memd's (mem.rs).  Guests' RAM is between vmmgr and memd
+//! (l4h-vmmgr's memd.rs), and memory a guest plugs while it runs (DESIGN.md
+//! §17) between its l4h-vmm and memd.
 
 use l4h_abi as abi;
 use l4h_host as host;
@@ -114,56 +112,20 @@ fn link(alloc: &Alloc) -> MemdLink {
     alloc.memd.expect("memd is not running")
 }
 
-/// Take the RAM of guest `g`: `blocks` 2 MiB blocks.  `block_cn` is its
-/// block CNode, of radix `radix`, into which memd gives the guest its
-/// blocks at boot; `hp_cn` its hotplug CNode, for `hp_count` hotplug
-/// blocks.
-pub fn guest_create(alloc: &Alloc, g: usize, blocks: usize, block_cn: cap::CNode, radix: usize, hp_cn: cap::CNode, hp_count: usize) -> bool {
+/// Give vmmgr its capabilities to memd: its endpoint (badged BADGE_VMMGR),
+/// the mailbox it shares with memd, and an endpoint for each guest's
+/// l4h-vmm (badged BADGE_VMM | guest), which vmmgr cannot mint.
+pub fn give_vmmgr(alloc: &mut Alloc, arena: &mut Arena, vmmgr: &Component) {
+    use l4h_host::vmmgr as proto;
     let m = link(alloc);
-    m.slot(memd::SLOT_GUEST_BCN + g as u64).copy(&abs_of(block_cn), CapRights::all()).expect("memd: give block CNode");
-    m.slot(memd::SLOT_GUEST_HCN + g as u64).copy(&abs_of(hp_cn), CapRights::all()).expect("memd: give hotplug CNode");
-    m.call(memd::MEMD_GUEST_CREATE, &[g as u64, blocks as u64, radix as u64, hp_count as u64]) == 0
-}
-
-/// Set the hotplug target of guest `g`, in hotplug blocks.
-pub fn set_target(alloc: &Alloc, g: usize, target: usize) -> bool {
-    link(alloc).call(memd::MEMD_SET_TARGET, &[g as u64, target as u64]) == 0
-}
-
-/// Hotplug target and plugged hotplug blocks of guest `g`.
-pub fn hotplug(g: usize) -> memd::GuestHp {
-    let st = STATUS_VA as *const Status;
-    unsafe { core::ptr::addr_of!((*st).hp[g]).read_volatile() }
-}
-
-/// Mint the capability guest `g`'s l4h-vmm calls memd with into `dst`.
-pub fn mint_vmm_ep(alloc: &Alloc, g: usize, dst: &sel4::AbsoluteCPtr) {
-    let m = link(alloc);
-    dst.mint(&abs_of(m.ep), sel4::CapRightsBuilder::none().write(true).grant_reply(true).build(), memd::BADGE_VMM | g as u64)
-        .expect("memd: VMM endpoint");
-}
-
-/// A copy of block `b` of guest `g`, into root slot `slot`: its physical
-/// address.
-pub fn guest_copy(alloc: &Alloc, g: usize, b: usize, slot: Slot) -> usize {
-    let m = link(alloc);
-    assert_eq!(m.call(memd::MEMD_GUEST_COPY, &[g as u64, b as u64]), 0, "memd: copy of a guest block");
-    let paddr = mr(1) as usize;
-    abs_of(root_cap::<cap_type::Null>(slot)).move_(&m.xchg(0)).expect("memd: take block copy");
-    paddr
-}
-
-/// Give guest `g` its blocks from `first` on, block b at index b + `skip`
-/// of its block CNode (past its shared blocks, guest.rs).
-pub fn guest_give(alloc: &Alloc, g: usize, first: usize, skip: usize) -> bool {
-    link(alloc).call(memd::MEMD_GUEST_GIVE, &[g as u64, first as u64, skip as u64]) == 0
-}
-
-/// Revoke and free all the RAM of guest `g`.
-pub fn guest_destroy(alloc: &Alloc, g: usize) {
-    if let Some(m) = alloc.memd {
-        m.call(memd::MEMD_GUEST_DESTROY, &[g as u64]);
+    let call = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
+    vmmgr.give_badged(proto::SLOT_MEMD_EP, m.ep, call.clone(), memd::BADGE_VMMGR);
+    for g in 0..memd::MAX_GUESTS {
+        vmmgr.give_badged(proto::SLOT_VMM_MEMD_EP + g as u64, m.ep, call.clone(), memd::BADGE_VMM | g as u64);
     }
+    let mailbox = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: memd::MAILBOX_RADIX });
+    vmmgr.give(proto::SLOT_MEMD_MAILBOX, mailbox, CapRights::all());
+    m.slot(memd::SLOT_MAILBOX).copy(&abs_of(mailbox), CapRights::all()).expect("memd: vmmgr mailbox");
 }
 
 /// memd, as l4h-root keeps it.
@@ -173,9 +135,18 @@ pub struct Memd {
     keep: cap::CNode,
     keep_bits: usize,
     keep_next: u64,
+    /// The status page memd writes.
+    status: cap::Granule,
 }
 
 impl Memd {
+    /// Map memd's status page into vmmgr, read-only, keeping the mapping
+    /// capability in `keep`.
+    pub fn map_status(&self, vmmgr: &Component, alloc: &mut Alloc, arena: &mut Arena, keep: sel4::AbsoluteCPtr) {
+        let va = l4h_host::vmmgr::MEMD_STATUS_VA;
+        vmmgr.map_copy(alloc, arena, &abs_of(self.status), va, CapRights::read_only(), VmAttributes::DEFAULT, keep);
+    }
+
     fn keep_left(&self) -> usize {
         (1 << self.keep_bits) - self.keep_next as usize
     }
@@ -301,7 +272,8 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
     // BARs and DMA.
     let keep_bits = (table_pages + KEEP_OTHERS).next_power_of_two().trailing_zeros() as usize;
     let keep = arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: keep_bits });
-    let mut m = Memd { comp, arena, keep, keep_bits, keep_next: 0 };
+    let status = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
+    let mut m = Memd { comp, arena, keep, keep_bits, keep_next: 0, status };
 
     // The table, zeroed as seL4 makes new frames.
     for p in 0..table_pages {
@@ -314,7 +286,6 @@ pub fn spawn(alloc: &mut Alloc, win: &mut Window, asids: &mut AsidPools, info: &
     }
 
     // The status page: memd writes it, l4h-root reads it.
-    let status = alloc.object_cap::<cap_type::Granule>(FRAME_BP);
     alloc.global(|alloc| {
         let copy = alloc.slots.alloc();
         abs_of(root_cap::<cap_type::Null>(copy)).copy(&abs_of(status), CapRights::all()).expect("status copy");
