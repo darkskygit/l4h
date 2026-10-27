@@ -2,7 +2,7 @@
 //! the serial_port and serial_irq settings, e.g. COM2 for Supermicro
 //! serial-over-LAN),
 //! for when dom0 is not usable (DESIGN.md §9.1): list, destroy,
-//! restart-dom0.  The kernel keeps printing to the same port; we only take
+//! restart-dom0 (which vmmgr runs), and reboot.  The kernel keeps printing to the same port; we only take
 //! its receive side.
 
 use sel4::cap_type;
@@ -180,6 +180,29 @@ pub fn name(g: &l4h_host::vmmgr::GuestStatus) -> &str {
 fn run(h: &mut Host, line: &str) {
     let mut words = line.split_whitespace();
     let cmd = words.next().unwrap_or("");
+    // Root's own, which work whatever state vmmgr is in.
+    match cmd {
+        "help" => {
+            sel4::debug_println!("monitor: help | list | info | destroy <vm> | restart-dom0 | reboot");
+            return;
+        }
+        "info" => {
+            sel4::debug_println!(
+                "monitor: {} cores, {} MiB free of {} MiB ({} MiB reported to the hypervisor), {} disk(s), {} NIC(s)",
+                h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.alloc.reported_bytes() >> 20,
+                h.disks.len(), h.netd.nics.len()
+            );
+            return;
+        }
+        // Every guest stops without notice: the way out when vmmgr, or
+        // dom0, no longer answers.
+        "reboot" => {
+            let e = crate::reset::reboot(h, "monitor");
+            sel4::debug_println!("monitor: reboot failed: error {}", e);
+            return;
+        }
+        _ => {}
+    }
     let Some(v) = &h.vmmgr else {
         sel4::debug_println!("monitor: vmmgr is not running");
         return;
@@ -187,7 +210,6 @@ fn run(h: &mut Host, line: &str) {
     // Guests are vmmgr's: it runs what changes them.
     let send = |cmd, arg| if !v.monitor(cmd, arg) { sel4::debug_println!("monitor: vmmgr is busy, try again") };
     match cmd {
-        "help" => sel4::debug_println!("monitor: help | list | info | destroy <vm> | restart-dom0"),
         "list" => {
             for id in 0..crate::MAX_GUESTS {
                 let Some(g) = v.guest(id) else { continue };
@@ -198,11 +220,6 @@ fn run(h: &mut Host, line: &str) {
                 );
             }
         }
-        "info" => sel4::debug_println!(
-            "monitor: {} cores, {} MiB free of {} MiB ({} MiB reported to the hypervisor), {} disk(s), {} NIC(s)",
-            h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.alloc.reported_bytes() >> 20,
-            h.disks.len(), h.netd.nics.len()
-        ),
         "destroy" => match words.next().and_then(|w| w.parse::<u32>().ok()) {
             Some(id) if v.guest(id as usize).is_some_and(|g| g.dom0 == 0) => send(l4h_host::vmmgr::MONITOR_DESTROY, id),
             _ => sel4::debug_println!("monitor: destroy <vm> (not dom0; use restart-dom0)"),

@@ -376,7 +376,7 @@ enum l4h_mem_op {
  * Control device (L4H_DEV_CTL, dom0 only): a request at offset 0 of the
  * device page and the response at L4H_CTL_RESP_OFF, exchanged with
  * L4H_HC_CTL.  Bulk data (images) is passed in the device's data area
- * (l4h_dev_desc.data_va), which belongs to the host: l4h-root never reads
+ * (l4h_dev_desc.data_va), which belongs to the host: the host never reads
  * dom0's RAM.  See DESIGN.md §9.1.
  *
  * l4h-root refuses every request whose version is not its own, so a bump

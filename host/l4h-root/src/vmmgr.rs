@@ -323,8 +323,12 @@ fn map_in_root(h: &mut Host, f: cap::Granule, va: usize, rights: CapRights) {
     });
 }
 
+/// Exchange slot `i` of vmmgr's, emptied for root to put a capability in:
+/// whatever vmmgr left there must not make root fail.
 fn xchg(h: &Host, i: usize) -> sel4::AbsoluteCPtr {
-    h.vmmgr.as_ref().expect("vmmgr").comp.slot(proto::SLOT_XCHG + i as u64)
+    let s = h.vmmgr.as_ref().expect("vmmgr").comp.slot(proto::SLOT_XCHG + i as u64);
+    let _ = s.delete();
+    s
 }
 
 /// A call from vmmgr (label `label`): its reply's length.
@@ -390,11 +394,10 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     }
     h.alloc.slots.track(id);
     let r = (|| {
-        // Its notification first: nothing is made if vmmgr gave none.
-        let ntfn_slot = h.alloc.slots.alloc();
-        let vmm_ntfn = root_cap::<cap_type::Notification>(ntfn_slot);
-        abs_of(vmm_ntfn).move_(&xchg(h, 0)).map_err(|_| ctl::EINVAL)?;
         let mut arena = h.alloc.arena(32 << radix).ok_or(ctl::ENOMEM)?;
+        // Its VMM's notification, which backends signal: root's, so that
+        // it is a notification whatever vmmgr does.
+        let vmm_ntfn = arena.object_cap::<cap_type::Notification>(&mut h.alloc, ObjectBlueprint::Notification);
         // One physically contiguous Untyped retyped into frames, kept in
         // a CNode.
         let pool_slot = h.alloc.slots.alloc();
@@ -407,6 +410,7 @@ fn guest_new(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         let frames = arena.object_cap::<cap_type::CNode>(&mut h.alloc, ObjectBlueprint::CNode { size_bits: radix });
         region.retype(&FRAME_BP, size / PAGE, Dest { cnode: abs_of(frames), offset: 0 }).expect("I/O pool frames");
         xchg(h, 0).copy(&abs_of(frames), CapRights::all()).expect("vmmgr pool frames");
+        xchg(h, 3).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr VMM notification");
         let (page, kick) = (xchg(h, 1), xchg(h, 2));
         let attest = match &h.trustd {
             Some(t) => t.give(id, &mut h.wins.a, &page, &kick),

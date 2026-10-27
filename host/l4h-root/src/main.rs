@@ -68,7 +68,7 @@ pub const CNODE_SLOTS: usize = 1 << sel4::sel4_cfg_usize!(ROOT_CNODE_SIZE_BITS);
 pub const RETYPE_FAN_OUT: usize = 16384;
 pub const MAX_GUESTS: usize = 64;
 /// Badge bit of a component's fault on the root endpoint.
-pub const HYP_BADGE_FAULT: u64 = 1 << 24;
+pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
 /// What root made for vmmgr's guests, by id.
 static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
 /// Memory and root CNode slots kept back from guest requests.
@@ -670,10 +670,6 @@ fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<
     if badge & HYP_BADGE_FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         sel4::debug_println!("l4h-root: component {:#x} fault: {:x?}", id, fault);
-        if id == l4h_host::vmmgr::VMMGR_ID {
-            // Guests keep running, but nothing can change them any more.
-            sel4::debug_println!("l4h-root: vmmgr failed: guests can no longer be created, changed or destroyed");
-        }
         trustd::fault(h, id);
         return None;
     }

@@ -36,13 +36,13 @@ pub const STACK_TOP: usize = 0x1100_0000;
 pub const STACK_SIZE: usize = 256 * 1024;
 pub const KEEPER_STACK_TOP: usize = 0x1080_0000;
 pub const KEEPER_STACK_SIZE: usize = 16 * 1024;
-/// vmmgr's main stack, larger (it builds guests as root did, with root's
-/// stack): it has no keeper.
+/// vmmgr's main stack, larger: it builds guests as root did, with root's
+/// stack.
 pub const VMMGR_STACK_SIZE: usize = 1 << 20;
 // Unmapped pages below each stack.
 const _: () = assert!(KEEPER_IPCBUF_VA + 0x1000 < KEEPER_STACK_TOP - KEEPER_STACK_SIZE);
 const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - STACK_SIZE);
-const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - VMMGR_STACK_SIZE && !has_keeper(KIND_VMMGR));
+const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - VMMGR_STACK_SIZE);
 
 /// The size of the main stack of a component of `kind`.
 pub const fn stack_size(kind: u32) -> usize {
@@ -95,12 +95,17 @@ pub const KIND_TRUSTD: u32 = 4;
 pub const KIND_MEMD: u32 = 5;
 pub const KIND_VMMGR: u32 = 6;
 
-/// The kinds l4h-root calls synchronously (blkd, netd, memd): root could
-/// not wait for their faults to be reported, so a keeper thread answers
-/// for a failed one.
+/// The kinds called synchronously: root calls blkd, netd and memd, guests'
+/// VMMs call vmmgr.  A caller could not wait for their faults to be
+/// reported, so a keeper thread answers for a failed one.
 pub const fn has_keeper(kind: u32) -> bool {
-    matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD)
+    matches!(kind, KIND_BLKD | KIND_NETD | KIND_MEMD | KIND_VMMGR)
 }
+
+/// Badge bit of a fault message on a parent's endpoint (a component's on
+/// root's, a guest kernel's or a VMM's on vmmgr's).  A failed parent's
+/// keeper leaves faults unanswered: the thread would only fault again.
+pub const BADGE_FAULT: u64 = 1 << 24;
 
 /// Driver address-space layout: the device structures, then DMA memory.
 pub const fn blkd_chan_va() -> usize {

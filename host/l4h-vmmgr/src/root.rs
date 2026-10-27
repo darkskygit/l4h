@@ -3,7 +3,7 @@
 //! capabilities in our exchange slots, which we move to slots of our own.
 //! And trustd's flags, which vmmgr acts on for the console.
 
-use sel4::{CapRights, cap, cap_type};
+use sel4::{cap, cap_type};
 
 use l4h_abi as abi;
 use l4h_host as host;
@@ -50,23 +50,21 @@ pub struct NewGuest {
     pub instance: u64,
     /// The CNode of its I/O pool's frames.
     pub pool_frames: cap::CNode,
+    /// Its l4h-vmm's notification, which root's backends signal.
+    pub vmm_ntfn: cap::Notification,
     /// Its attestation device: page and kick capability (badged).
     pub attest: Option<(cap::Granule, cap::Notification)>,
 }
 
 /// Guest `id` is being created, with an I/O pool of `pool` bytes at
-/// `pool_gpa`; its VMM will be signalled through `vmm_ntfn`.
-pub fn guest_new(alloc: &mut Alloc, id: usize, pool: usize, pool_gpa: usize, dom0: bool, vmm_ntfn: cap::Notification) -> Result<NewGuest, i64> {
-    xchg(0).copy(&abs_of(vmm_ntfn), CapRights::all()).expect("vmmgr: give VMM notification");
-    if let Err(e) = call(VMMGR_GUEST_NEW, &[id as u64, pool as u64, pool_gpa as u64, dom0 as u64]) {
-        // Root may not have taken it.
-        let _ = xchg(0).delete();
-        return Err(e);
-    }
+/// `pool_gpa`.
+pub fn guest_new(alloc: &mut Alloc, id: usize, pool: usize, pool_gpa: usize, dom0: bool) -> Result<NewGuest, i64> {
+    call(VMMGR_GUEST_NEW, &[id as u64, pool as u64, pool_gpa as u64, dom0 as u64])?;
     let (instance, attest) = (mr(1), mr(2) != 0);
     let pool_frames = take(alloc, 0);
+    let vmm_ntfn = take(alloc, 3);
     let attest = attest.then(|| (take(alloc, 1), take(alloc, 2)));
-    Ok(NewGuest { instance, pool_frames, attest })
+    Ok(NewGuest { instance, pool_frames, vmm_ntfn, attest })
 }
 
 /// Guest `id` is gone from here: root drains its disks and takes back what

@@ -1443,8 +1443,10 @@ bootconfig and a display stay off.
   `l4h-root` draws a read-only status screen every second: host, VMs (from
   vmmgr's status page, §9.3), disks, switches. Changed character cells only; 8x8 public-domain font.
 - **Serial monitor.** `l4h-root` reads COM1 (I/O ports and IOAPIC IRQ 4)
-  and runs `help`, `list`, `info`, `destroy <vm>` and `restart-dom0`, the
-  last two by vmmgr, which root asks through the events page (§9.3). The
+  and runs `help`, `list`, `info`, `destroy <vm>`, `restart-dom0` and
+  `reboot`. vmmgr runs `destroy` and `restart-dom0`, which root asks
+  through the events page (§9.3); `reboot` resets the host as
+  `host_reboot` does, the way out when neither dom0 nor vmmgr answers. The
   kernel keeps using the port for output (`tests/run-monitor.sh`). An
   absent UART (line status reads as `0xff`) disables the monitor. Input
   uses interrupts, including a remapped I/O APIC entry under Intel VT-d.
@@ -2215,7 +2217,7 @@ external orchestration can run in dom0.
   with `vm_list` and `switch_info`. The authoritative state lives in
   vmmgr (guests) and root (disks, switches).
 - Debugging fallback: a minimal serial monitor in `l4h-root` (`list`,
-  `destroy`, `restart-dom0`) stays available on COM1, which is the GCE serial
+  `destroy`, `restart-dom0`, `reboot`) stays available on COM1, which is the GCE serial
   console.
 
 ### 9.2 Attestation
@@ -2541,7 +2543,11 @@ dom0 sends reaches root; only vmmgr and trustd call it.
   and six arguments. vmmgr parses dom0's request and passes these on;
   their data comes back in a result page. Capabilities cross in vmmgr's
   exchange slots, which root reaches through the CNode of vmmgr's it
-  holds. Root never calls vmmgr, so calls cannot deadlock; it signals
+  holds. Root empties a slot before it puts a capability in it, so a slot
+  vmmgr left full cannot make root fail, and takes no capability from
+  vmmgr: even the notification blkd and netd signal for a guest's VMM is
+  root's, made at `GUEST_NEW`, so it cannot be an endpoint that would
+  block them. Root never calls vmmgr, so calls cannot deadlock; it signals
   vmmgr's notification instead, with news in an events page: trustd
   answered a guest (vmmgr raises its attestation device's event), or the
   serial monitor's `destroy` or `restart-dom0`. vmmgr publishes its guests
@@ -2557,7 +2563,8 @@ dom0 sends reaches root; only vmmgr and trustd call it.
   the two share a small mailbox CNode instead, and memd keeps the
   original of every block it grants vmmgr, giving a copy. Freeing a grant
   revokes the original, so a mislabelled capability in the mailbox cannot
-  confuse memd's table. Root mints the endpoints of guests' VMMs to memd
+  confuse memd's table, and memd empties a mailbox slot before it writes
+  one. Root mints the endpoints of guests' VMMs to memd
   (badged per guest), since vmmgr's own badged one cannot be minted again.
 - **Boot modules.** Root maps the guest kernel, its module tree and dom0's
   initramfs read-only into vmmgr, with a CNode of their frames: guests
@@ -2573,8 +2580,18 @@ dom0 sends reaches root; only vmmgr and trustd call it.
   to keep: it reads the VMM-written console rings and display areas, and
   acts on trustd's flags with root's former capability. A bug in vmmgr
   reaches guests' memory but not the hardware, the IOMMU, the TPM's ports
-  or root. If vmmgr faults, root reports it and guests keep running, but
-  nothing can create, change or destroy them.
+  or root.
+- **If vmmgr fails**, guests keep running: their vCPUs, disks, networks
+  and memory hotplug need nothing of vmmgr. Like blkd, netd and memd it has
+  a keeper thread (l4h_rt), which reports the fault and answers every
+  later call with a failure, the call vmmgr was serving first (its reply
+  object is in `SLOT_REPLY`). So a VMM's call returns instead of blocking
+  it: dom0's control requests fail with EIO (its driver marks the
+  response unanswered before each one), and a guest's power request
+  returns. Faults of guest kernels and VMMs stay unanswered; those vCPUs
+  stop. Nothing can create, change or destroy guests any more, attestation
+  answers no longer reach guests, and the balancer stops. The serial
+  monitor's `reboot` resets the host.
 - **Scheduling.** vmmgr runs on core 0 at `PRIO_KERNEL + 2`, above every
   guest and VMM, with a full budget, and has its own deadline timer for the
   balancer. Its main stack is 1 MiB.
