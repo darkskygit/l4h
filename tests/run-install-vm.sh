@@ -5,6 +5,7 @@
 # INSTALL_VM_FIRMWARE=bios boots the VM as a DigitalOcean droplet instead:
 # SeaBIOS on i440fx, a virtio-blk boot disk and transitional virtio-net, so
 # the installer takes its BIOS GRUB path.
+# INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1 exercises small-VM defaults.
 # Requires prebuilt release artifacts, sudo, QEMU/KVM, OVMF and util-linux.
 # The input image is never modified. Only the new test image is mounted.
 set -euo pipefail
@@ -102,7 +103,7 @@ if [[ $nics == 2 ]]; then
 fi
 echo "Running KVM ($firmware) as $qemu_user with $nics NIC(s); serial log: $work/serial.log"
 timeout "${INSTALL_VM_TIMEOUT:-600}" sudo -u "$qemu_user" qemu-system-x86_64 \
-    -enable-kvm -cpu host,-vmx -m 6G -smp 2 "${machine[@]}" \
+    -enable-kvm -cpu host,-vmx -m "${INSTALL_VM_MEMORY:-6G}" -smp "${INSTALL_VM_CPUS:-2}" "${machine[@]}" \
     "${network[@]}" \
     -display none -serial "file:$work/serial.log" -monitor none &
 qemu=$!

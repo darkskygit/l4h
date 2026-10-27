@@ -134,6 +134,13 @@ SATA/USB storage, active AppArmor profiles and DKMS modules are rejected.
 Secure Boot must be disabled. Firmware and application compatibility still
 need a boot test.
 
+The installer requires at least **768 MiB usable RAM** (normally 1 GiB
+installed). Dom0 gets half the usable RAM by default, with a minimum of
+512 MiB and a maximum of 8192 MiB. `--memory MiB` overrides this allocation,
+up to 61440 MiB, while preserving at least 256 MiB for L4H. Swap does not
+count toward this physical RAM budget. Allocate more RAM for workloads
+that need it, including additional guests.
+
 Some cloud VMs omit the `constant_tsc` CPU flag. For experimental installs,
 pass `--assume-stable-tsc` to both `--check` and the installation command to
 waive that requirement. This assumes a stable TSC without verifying it;
@@ -267,7 +274,7 @@ without it, the host reports `unknown`.
 | Test | What it checks |
 |------|----------------|
 | `python3 tests/test_installer.py` | installer preflight, verified downloads, EFI changes, updates and rollback without touching the host |
-| `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names |
+| `tests/run-install-vm.sh debian-13-nocloud-amd64.qcow2 [release-directory] [1\|2]` | in a disposable UEFI/KVM VM, install from native Debian with one or two uplinks, verify each switch and network, then return to native Linux; uses prebuilt releases and `sudo -u "$L4H_QEMU_USER"` (defaults to the invoking user); `INSTALL_VM_SWAP_NAMES=1` with two NICs also tests exchanging eth0/eth1 names; `INSTALL_VM_FIRMWARE=bios INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1` tests small-VM defaults through BIOS GRUB |
 | `tests/run-versiontest.sh` | host version metadata: release tags, development builds, overrides and worktrees |
 | `tests/run-flagstest.sh` | focused flags-only boot: console/display seals, kernel taints, userspace gates and instance reuse, on either architecture |
 | `tests/run-trusttest.sh` | taint/seal permissions, atomic gates, instances, seqlock snapshots and verifier policy |

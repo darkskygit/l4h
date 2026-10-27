@@ -542,10 +542,13 @@ be installed. The checks cover:
         (including FSGSBASE, XSAVEOPT, AVX and 1 GiB pages), unaffected by
         Meltdown, and APIC IDs below 256. VMX/SVM and an IOMMU are not
         required;
-  \item at least 3 GiB usable RAM (normally 4 GiB installed). By default
-        dom0 gets half the RAM, capped at 8192 MiB, while leaving at least
-        2 GiB for L4H. \texttt{--memory MiB} and \texttt{--vcpus N}
-        override the allocation; the default is up to four vCPUs;
+  \item at least 768 MiB usable RAM (normally 1 GiB installed). By default
+        dom0 gets half the usable RAM, clamped to 512--8192 MiB.
+        \texttt{--memory MiB} accepts 512--61440 MiB while leaving at least
+        256 MiB for L4H, accounting for guest RAM's 2 MiB allocation blocks.
+        Swap does not count toward this budget; workloads and additional
+        guests may require more RAM. \texttt{--vcpus N} overrides the CPU
+        allocation; the default is up to four vCPUs;
   \item on UEFI, a writable mounted FAT ESP on a plain GPT disk, selected
         with \texttt{--esp PATH} if more than one is mounted;
   \item a plain ext4 or XFS root on NVMe namespace 1, virtio-blk, or

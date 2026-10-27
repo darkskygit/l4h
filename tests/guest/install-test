@@ -127,9 +127,9 @@ elif [[ ! -f phase ]]; then
     useradd --no-create-home --shell /bin/bash l4h-install-test
     echo 'l4h-install-test ALL=(root) NOPASSWD: ALL' > /etc/sudoers.d/l4h-install-test
     chmod 440 /etc/sudoers.d/l4h-install-test
-    sudo -u l4h-install-test bash -c 'cat install.sh | bash -s -- --release v0-install-test --memory 2048 --vcpus 2'
+    sudo -u l4h-install-test bash -c 'cat install.sh | bash -s -- --release v0-install-test'
     # shellcheck disable=SC2002
-    cat install.sh | bash -s -- --check --release v0-install-test --memory 2048 --vcpus 2
+    cat install.sh | bash -s -- --check --release v0-install-test
     sha256sum --check native-files.sha256
     if [[ ! -d /sys/firmware/efi ]]; then
         # BIOS: an L4H entry in custom.cfg, selected once through next_entry.

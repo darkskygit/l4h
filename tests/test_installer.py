@@ -281,6 +281,43 @@ class InstallerTests(Harness):
                 self.args.memory, self.args.vcpus = memory, cpus
                 self.rejected("RAM|vCPUs")
 
+    def test_default_dom0_memory(self):
+        # Include the usable RAM reported by a nominal 1 GiB Vultr VM.
+        for total, expected in ((768, 512), (947, 512), (1024, 512),
+                                (2048, 1024), (3072, 1536), (8192, 4096),
+                                (16384, 8192), (131072, 8192)):
+            with self.subTest(total=total):
+                self.machine.write("/proc/meminfo", f"MemTotal: {total * 1024} kB")
+                plan = self.check()
+                self.assertEqual(plan["memory"], expected)
+                self.assertIn(f"dom0_mem_mb={expected}\n", installer.configuration(plan))
+
+    def test_insufficient_physical_memory_even_with_swap(self):
+        self.machine.write("/proc/meminfo", "MemTotal: 786431 kB\nSwapTotal: 8388608 kB")
+        for memory in (None, 512):
+            with self.subTest(memory=memory):
+                self.args.memory = memory
+                self.rejected("at least 768 MiB usable RAM.*found 767 MiB")
+
+    def test_small_vm_memory_override_preserves_host_reserve(self):
+        self.machine.write("/proc/meminfo", f"MemTotal: {947 * 1024} kB")
+        for memory in (512, 513, 640, 690):
+            with self.subTest(memory=memory):
+                self.args.memory = memory
+                self.assertEqual(self.check()["memory"], memory)
+        # 691 MiB rounds up to 692 MiB in vmmgr, leaving only 255 MiB.
+        for memory in (511, 691, 692, 947):
+            with self.subTest(memory=memory):
+                self.args.memory = memory
+                self.rejected("dom0 RAM must be 512..690 MiB.*reserving 256 MiB")
+
+    def test_maximum_dom0_memory(self):
+        self.machine.write("/proc/meminfo", f"MemTotal: {131072 * 1024} kB")
+        self.args.memory = 61440
+        self.assertEqual(self.check()["memory"], 61440)
+        self.args.memory = 61441
+        self.rejected("dom0 RAM must be 512..61440 MiB")
+
     def test_lvm_and_unsupported_fs(self):
         self.machine.blocks[2]["type"] = "lvm"
         self.rejected("plain disks")

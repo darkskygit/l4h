@@ -15,7 +15,7 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
   --check                 Check compatibility only; do not install packages or change boot
   --release TAG           Install a specific GitHub release (default: latest)
   --esp PATH              Mounted EFI system partition (UEFI; otherwise auto-detect)
-  --memory MiB            dom0 RAM (default: half of physical RAM, capped at 8192 MiB)
+  --memory MiB            dom0 RAM (default: half of usable RAM, clamped to 512..8192 MiB)
   --vcpus N               dom0 CPUs (default: up to 4)
   --variant NAME          generic or xapic-nopcid (otherwise select from CPU features)
   --assume-stable-tsc      Allow missing constant_tsc for experimental installs;
@@ -27,6 +27,7 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
 Requires x86_64 Linux booted with 64-bit UEFI and Secure Boot disabled, or
 booted by BIOS GRUB (grub-pc) from /boot on ext2/3/4 or XFS.
 Supports a plain ext4/XFS root, supported PCI disks and one supported physical NIC.
+Requires at least 768 MiB usable RAM; reserves at least 256 MiB for L4H.
 The existing userspace boots with L4H's kernel. No automatic reboot.
 Run --check first; see the README and docs/manual/l4h-manual.tex for limits and recovery.
 HELP
