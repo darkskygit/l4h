@@ -657,6 +657,14 @@ has been modified, specify \texttt{--variant} explicitly. Successful
 updates record the variant for subsequent runs.
 
 Updates use the same backup and rollback mechanism as installation.
+Native UEFI updates reuse an entry matching the installed ESP and loader,
+prefer the recorded entry when duplicates exist, recreate a missing entry,
+and reactivate an inactive entry. Unrelated entries are left in place.
+BIOS updates can recreate a missing generated \file{custom.cfg}.
+Missing boot payloads can be restored when the variant is recorded or
+specified explicitly. A pending \texttt{BootNext} or GRUB
+\texttt{next\_entry} for another OS is preserved, so the update takes
+effect the next time L4H is selected.
 They do not reboot, and the running kernel and module mount remain in
 use until a host reboot. From dom0 use \cmd{l4hctl host-reboot} to load
 the new files. BIOS dom0 can schedule L4H through GRUB as usual. UEFI

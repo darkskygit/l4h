@@ -171,6 +171,13 @@ the previous release (use `--variant` if that release is unavailable).
 `--check` also works for updates. The selected release must include update
 support.
 
+Native Linux updates recreate missing EFI entries; BIOS updates recreate
+missing generated GRUB entries. Missing boot payloads are restored when the
+variant is known. EFI entries are matched to the installed ESP and loader,
+so changed entry numbers or duplicate labels do not block an update.
+An existing one-time boot selection for another OS is preserved; the new
+files take effect the next time L4H boots.
+
 From dom0, run `sudo l4hctl host-reboot` when ready to load the update.
 The running kernel and mounted modules stay in use until then. BIOS dom0
 can select the next boot through GRUB. **UEFI dom0 cannot change firmware

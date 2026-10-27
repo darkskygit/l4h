@@ -153,6 +153,14 @@ elif [[ ! -f phase ]]; then
     if [[ -d /sys/firmware/efi ]]; then config=/boot/efi/l4h/l4h.conf; else config=/boot/l4h/l4h.conf; fi
     echo '# operator settings survive updates' >> "$config"
     sha256sum "$config" > installed-config.sha256
+    if [[ -d /sys/firmware/efi ]]; then
+        # Model firmware losing the trial entry while the installed files
+        # and installation record survive. Updating must recreate it.
+        entry=$(python3 -c 'import json; print(json.load(open("/var/lib/l4h/install.json"))["entry"])')
+        efibootmgr --delete-bootnext
+        efibootmgr --bootnum "$entry" --delete-bootnum
+        echo 'INSTALLVM: removed the managed EFI entry before updating'
+    fi
     # Updating from native Linux must preserve the edited configuration too.
     # shellcheck disable=SC2002
     cat install.sh | bash -s -- --release v0-install-test

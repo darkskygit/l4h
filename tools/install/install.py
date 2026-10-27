@@ -78,7 +78,12 @@ def boot_state(text):
             "entries": entries, "active": sorted(m[1].upper() for m in matches if m[2])}
 
 
-def l4h_entry(boot):
+def l4h_entry(boot, plan=None, preferred=None):
+    if plan is not None:
+        # Entry numbers and duplicate labels are not identities. Match this
+        # deployment's ESP and loader, preferring its recorded entry or order.
+        order = [preferred, *boot["order"].split(","), *sorted(boot["entries"])]
+        return next((entry for entry in order if owns_entry(boot, entry, plan)), None)
     entries = [num for num, text in boot["entries"].items()
                if text.split()[0] == "L4H" and LOADER.lower() in text.lower()]
     need(len(entries) <= 1, "multiple L4H boot entries; resolve them with efibootmgr first")
@@ -88,7 +93,8 @@ def l4h_entry(boot):
 def owns_entry(boot, entry, plan):
     text = boot["entries"].get(entry, "")
     disk_path = "HD({esp_part},GPT,{esp_partuuid},".format(**plan).lower()
-    return (bool(text) and text.split()[0] == "L4H" and LOADER.lower() in text.lower()
+    loader = re.search(re.escape(LOADER) + r"(?:\)|\s|$)", text, re.I)
+    return (bool(text) and text.split()[0] == "L4H" and loader is not None
             and disk_path in text.lower())
 
 
@@ -493,15 +499,16 @@ class Preflight:
             need(isinstance(saved.get("entry"), str) and re.fullmatch(r"[0-9A-F]{4}", saved["entry"]),
                  "invalid installed EFI boot entry")
             plan["entry"] = saved["entry"]
+            plan["previous_entry"] = saved["entry"]
             if dom0:
                 need(not self.args.make_default, "UEFI boot order changes require native Linux; omit --make-default to update files")
                 plan["boot"] = None  # seL4 does not expose EFI runtime services.
             else:
                 plan["boot"] = boot_state(self.run("efibootmgr", "--verbose"))
-                need(l4h_entry(plan["boot"]) == plan["entry"] and owns_entry(plan["boot"], plan["entry"], plan),
-                     "existing L4H boot entry is missing or points to a different ESP")
-                need(plan["boot"]["next"] in (None, plan["entry"]),
-                     "BootNext is already scheduled for another entry; clear it before updating")
+                # NVRAM can lose or renumber entries independently of the
+                # installed files. Reuse a matching entry, or let commit()
+                # create one after validating the existing deployment below.
+                plan["entry"] = l4h_entry(plan["boot"], plan, saved["entry"])
             directory = Path(plan["esp"]) / "l4h"
             payload = Path(plan["esp"]) / "EFI/L4H/l4h.efi"
         else:
@@ -511,12 +518,11 @@ class Preflight:
                  "existing L4H install uses a different boot configuration")
             custom = self.path(plan["grubdir"] + "/custom.cfg")
             safe_path(custom)
-            need(custom.is_file() and custom.read_text().startswith(GENERATED), "L4H GRUB entry is missing or unmanaged")
-            plan["grub_custom"] = custom.read_text()
-            need("--fs-uuid --set=root " + plan["boot_uuid"] + "\n" in plan["grub_custom"],
-                 "L4H GRUB entry points to a different /boot filesystem")
-            need(plan["grub_env"].get("next_entry") in (None, "", GRUB_ENTRY),
-                 "GRUB next_entry is already set for another entry; clear it before updating")
+            if custom.exists():
+                plan["grub_custom"] = custom.read_text()
+                need(plan["grub_custom"].startswith(GENERATED), "L4H GRUB entry is unmanaged")
+                need("--fs-uuid --set=root " + plan["boot_uuid"] + "\n" in plan["grub_custom"],
+                     "L4H GRUB entry points to a different /boot filesystem")
             plan["default"] = bool(saved.get("default"))
             directory, payload = BIOS_DIR, BIOS_DIR / "bios/kernel.elf"
         config = directory / "l4h.conf"
@@ -527,9 +533,9 @@ class Preflight:
         need([arg for arg in cmdline if arg.startswith("root=")] == ["root=UUID=" + root_uuid],
              "installed dom0 root differs from the mounted root")
         safe_path(self.path(payload))
-        need(self.path(payload).is_file(), "installed boot payload is missing")
         variant = self.args.variant or saved.get("variant")
         if variant is None:
+            need(self.path(payload).is_file(), "installed boot payload is missing and its variant was not recorded; specify --variant")
             key = (saved.get("release"), firmware, digest(self.path(payload)))
             if key not in self.variants:
                 self.variants[key] = installed_variant(*key)
@@ -558,7 +564,7 @@ class Preflight:
         tracked = [STATE, config, payload]
         if firmware == "bios":
             tracked.append(Path(plan["grubdir"]) / "custom.cfg")
-        plan["snapshot"] = {str(p): digest(self.path(p)) for p in tracked}
+        plan["snapshot"] = {str(p): digest(self.path(p)) if self.path(p).is_file() else None for p in tracked}
         return plan
 
     def efi_boot(self, plan):
@@ -747,11 +753,16 @@ class EfiBoot:
     def __init__(self, plan, efi, make_default, command):
         self.plan, self.efi, self.make_default, self.command = plan, efi, make_default, command
         entries = plan["boot"]["entries"] if plan["boot"] else {}
-        self.entry = plan["entry"] or next(("%04X" % n for n in range(65536) if "%04X" % n not in entries), None)
+        previous = plan.get("previous_entry")
+        self.entry = (plan["entry"] or (previous if previous not in entries else None) or
+                      next(("%04X" % n for n in range(65536) if "%04X" % n not in entries), None))
         need(self.entry is not None, "no free EFI boot entry")
         self.fs, self.space = Path(plan["esp"]), "the ESP"
         self.l4h = self.fs / "l4h"
-        self.saved, self.selected = plan["boot"], False
+        self.saved, self.selected, self.activated = plan["boot"], False, False
+        pending = self.saved["next"] if self.saved else None
+        self.foreign_next = (pending is not None and not owns_entry(self.saved, pending, plan) and
+                             not (pending == previous and pending not in entries))
 
     def files(self):
         return [(self.efi, self.fs / "EFI/L4H/l4h.efi", 0o644)]
@@ -773,21 +784,30 @@ class EfiBoot:
         plan, entry, command = self.plan, self.entry, self.command
         if plan["boot"] is None:
             return
-        self.selected = True
         if plan["entry"] is None:
+            self.selected = True
             command("efibootmgr", "--create-only", "--bootnum", entry, "--disk", plan["esp_disk"],
                     "--part", plan["esp_part"], "--label", "L4H", "--loader", LOADER)
         current = boot_state(command("efibootmgr", "--verbose"))
-        need(l4h_entry(current) == entry and owns_entry(current, entry, plan) and current["order"] == plan["boot"]["order"],
+        need(owns_entry(current, entry, plan) and current["order"] == plan["boot"]["order"],
              "firmware did not create the L4H entry without changing BootOrder")
+        if entry not in current["active"]:
+            self.selected = True
+            self.activated = True
+            command("efibootmgr", "--bootnum", entry, "--active")
         order = ",".join([entry] + [n for n in plan["boot"]["order"].split(",") if n != entry])
+        pending = plan["boot"]["next"]
         if self.make_default:
+            self.selected = True
             command("efibootmgr", "--bootorder", order)
-        else:
+        if not self.foreign_next and (not self.make_default or
+                                     pending is not None and pending not in plan["boot"]["entries"]):
+            self.selected = True
             command("efibootmgr", "--bootnext", entry)
+            pending = entry
         self.final = boot_state(command("efibootmgr", "--verbose"))
         need(self.final["order"] == (order if self.make_default else plan["boot"]["order"]) and
-             self.final["next"] == (plan["boot"]["next"] if self.make_default else entry) and entry in self.final["active"],
+             self.final["next"] == pending and entry in self.final["active"],
              "firmware did not retain the requested boot settings")
 
     def undo(self, failures):
@@ -803,6 +823,8 @@ class EfiBoot:
                     commands.append(("efibootmgr", "--bootnum", entry, "--delete-bootnum"))
             except Exception as error:
                 failures.append("cannot determine whether entry was created: " + str(error))
+        elif self.activated:
+            commands.append(("efibootmgr", "--bootnum", entry, "--inactive"))
         commands.append(("efibootmgr", "--bootorder", plan["boot"]["order"]))
         commands.append(("efibootmgr", "--bootnext", plan["boot"]["next"]) if plan["boot"]["next"]
                         else ("efibootmgr", "--delete-bootnext"))
@@ -819,8 +841,12 @@ class EfiBoot:
                   "Select L4H in firmware if it is not already the default.")
             return
         print("BootOrder: " + self.final["order"])
-        print("L4H is the default boot entry." if self.final["order"].split(",")[0] == self.entry else
-              "L4H is selected for the next boot only; the native Linux BootOrder is preserved.")
+        if self.final["order"].split(",")[0] == self.entry:
+            print("L4H is the default boot entry.")
+        if self.foreign_next:
+            print("Preserved BootNext={} for the previously scheduled boot; L4H's files are updated.".format(self.final["next"]))
+        elif not self.make_default:
+            print("L4H is selected for the next boot; the existing BootOrder is preserved.")
 
 
 class GrubBoot:
@@ -834,6 +860,7 @@ class GrubBoot:
         self.fs, self.space, self.l4h = BIOS_DIR.parent, "/boot", BIOS_DIR
         self.env = plan["grubdir"] + "/grubenv"
         self.saved, self.selected = plan["grub_env"], False
+        self.foreign_next = self.saved.get("next_entry") not in (None, "", GRUB_ENTRY)
 
     def files(self):
         bios = self.l4h / "bios"
@@ -864,10 +891,10 @@ class GrubBoot:
 
     def select(self):
         before = self.plan["grub_env"].get("next_entry")
-        if not self.default:
+        if not self.default and not self.foreign_next:
             self.selected = True
             self.command(self.plan["grub_tool"], self.env, "set", "next_entry=" + GRUB_ENTRY)
-        need(self.current().get("next_entry") == (before if self.default else GRUB_ENTRY),
+        need(self.current().get("next_entry") == (before if self.default or self.foreign_next else GRUB_ENTRY),
              "GRUB did not retain the requested boot settings")
 
     def undo(self, failures):
@@ -883,8 +910,12 @@ class GrubBoot:
     def report(self, release, backup):
         print("Installed {} as the GRUB entry L4H ({}/custom.cfg). Backup: {}".format(
             release, self.plan["grubdir"], backup))
-        print("L4H is the default GRUB entry." if self.default else
-              "L4H is selected for the next boot only (GRUB next_entry); the native default is preserved.")
+        if self.default:
+            print("L4H is the default GRUB entry.")
+        if self.foreign_next:
+            print("Preserved GRUB next_entry={} for the previously scheduled boot; L4H's files are updated.".format(self.saved["next_entry"]))
+        elif not self.default:
+            print("L4H is selected for the next boot only (GRUB next_entry); the native default is preserved.")
 
 
 def commit(plan, package, payload, release, make_default, root=Path("/"), command=run):
@@ -894,7 +925,7 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
     path = lambda name: root / str(name).lstrip("/")
     for name, checksum in plan.get("snapshot", {}).items():
         safe_path(path(name))
-        need(path(name).is_file() and digest(path(name)) == checksum,
+        need((digest(path(name)) if path(name).is_file() else None) == checksum,
              "installed files changed during update; rerun the installer")
     boot = (EfiBoot if plan["firmware"] == "uefi" else GrubBoot)(plan, payload, make_default, command)
     with tempfile.TemporaryDirectory() as temp:
@@ -973,10 +1004,10 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
             raise
     boot.report(release, backup)
     if plan.get("dom0"):
-        print("Run /usr/local/bin/l4hctl host-reboot when ready to load the update. "
+        print("Run /usr/local/bin/l4hctl host-reboot when ready to reboot the host. "
               "A normal reboot only restarts dom0; no reboot was performed.")
     else:
-        print("Reboot when ready. The existing Linux userspace will run as dom0; no reboot was performed.")
+        print("Reboot when ready; no reboot was performed.")
 
 
 def arguments(argv=None):

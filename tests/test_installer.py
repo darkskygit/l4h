@@ -125,12 +125,17 @@ class Machine:
                 text = "BootOrder: {}\nBootCurrent: {}\n".format(self.boot["order"], self.boot["current"])
                 if self.boot["next"]:
                     text += "BootNext: " + self.boot["next"] + "\n"
-                return text + "\n".join("Boot{}* {}".format(n, v) for n, v in self.boot["entries"].items())
+                return text + "\n".join("Boot{}{} {}".format(n, "" if n in self.boot.get("inactive", []) else "*", v)
+                                        for n, v in self.boot["entries"].items())
             if "--create-only" in args:
                 self.boot["entries"][args[args.index("--bootnum") + 1]] = (
                     "L4H\tHD(1,GPT,aabbccdd-0011-2233-4455-66778899aabb,0x800,0x80000)/File(" + installer.LOADER + ")")
             elif "--delete-bootnum" in args:
                 self.boot["entries"].pop(args[args.index("--bootnum") + 1], None)
+            elif "--active" in args:
+                self.boot["inactive"].remove(args[args.index("--bootnum") + 1])
+            elif "--inactive" in args:
+                self.boot["inactive"].append(args[args.index("--bootnum") + 1])
             elif "--bootorder" in args:
                 self.boot["order"] = args[2]
             elif "--bootnext" in args:
@@ -311,6 +316,37 @@ class UpdateChecks:
         with self.assertRaisesRegex(installer.Incompatible, "changed during update"):
             self.commit(plan)
         self.assertTrue(config.read_text().endswith("# changed after preflight\n"))
+
+    def payload(self):
+        state = json.loads(self.machine.path(installer.STATE).read_text())
+        return self.machine.path(state["esp"] + "/EFI/L4H/l4h.efi" if state["firmware"] == "uefi" else "/boot/l4h/bios/kernel.elf")
+
+    def test_update_restores_missing_boot_payload(self):
+        self.commit()
+        payload = self.payload()
+        original = payload.read_bytes()
+        payload.unlink()
+        plan = self.check()
+        # A file appearing during download must not be silently overwritten.
+        payload.write_bytes(b"concurrent repair")
+        with self.assertRaisesRegex(installer.Incompatible, "changed during update"):
+            self.commit(plan)
+        payload.unlink()
+        self.commit(plan)
+        self.assertEqual(payload.read_bytes(), original)
+
+    def test_missing_legacy_payload_needs_explicit_variant(self):
+        self.commit()
+        self.payload().unlink()
+        state = self.machine.path(installer.STATE)
+        record = json.loads(state.read_text())
+        record.pop("variant")
+        state.write_text(json.dumps(record))
+        self.machine.calls.clear()
+        self.rejected("specify --variant")
+        self.args.variant = "generic"
+        self.commit()
+        self.assertTrue(self.payload().is_file())
 
 
 class InstallerTests(UpdateChecks, Harness):
@@ -631,11 +667,134 @@ class InstallerTests(UpdateChecks, Harness):
         self.assertEqual(len(self.machine.boot["entries"]), 3)
         self.assertEqual(len(list(self.machine.path("/var/lib/l4h/backups").iterdir())), 2)
 
-    def test_existing_entry_on_wrong_esp(self):
+    def test_update_recreates_missing_efi_entry(self):
+        self.commit()
+        # The old installer recorded only these three fields. The firmware
+        # entry disappeared after the trial, but the deployment is intact.
+        state = self.machine.path(installer.STATE)
+        state.write_text(json.dumps(dict(esp="/boot/efi", entry="0008", release="vtest")))
+        self.machine.boot["entries"].pop("0000")
+        self.machine.boot["next"] = None
+        original = copy.deepcopy(self.machine.boot)
+        config = self.machine.path("/boot/efi/l4h/l4h.conf").read_bytes()
+        with patch.object(installer, "installed_variant", return_value="generic"):
+            plan = self.check()
+        self.assertIsNone(plan["entry"])
+        self.assertEqual(self.machine.boot, original)  # --check does not repair NVRAM.
+        self.commit(plan)
+        record = json.loads(state.read_text())
+        self.assertEqual(record["entry"], "0008")
+        self.assertTrue(installer.owns_entry(installer.boot_state(self.machine.command("efibootmgr", "--verbose")), record["entry"], plan))
+        self.assertEqual(self.machine.boot["order"], original["order"])
+        self.assertEqual(self.machine.boot["next"], record["entry"])
+        self.assertEqual(self.config().read_bytes(), config)
+
+    def test_update_reuses_renumbered_efi_entry(self):
+        self.commit()
+        self.machine.boot["entries"]["0008"] = self.machine.boot["entries"].pop("0000")
+        self.machine.boot["entries"]["0000"] = "Other OS\tHD(other)"
+        self.machine.boot["next"] = "0008"
+        self.machine.calls.clear()
+        self.commit()
+        self.assertEqual(json.loads(self.machine.path(installer.STATE).read_text())["entry"], "0008")
+        self.assertEqual(self.machine.boot["entries"]["0000"], "Other OS\tHD(other)")
+        self.assertFalse(any("--create-only" in call for call in self.machine.calls))
+
+    def test_recreated_entry_does_not_overwrite_reused_number(self):
+        self.commit()
+        self.machine.boot["entries"]["0000"] = "Other OS\tHD(other)"
+        self.machine.boot["next"] = None
+        self.commit()
+        entry = json.loads(self.machine.path(installer.STATE).read_text())["entry"]
+        self.assertNotEqual(entry, "0000")
+        self.assertEqual(self.machine.boot["entries"]["0000"], "Other OS\tHD(other)")
+        self.assertEqual(self.machine.boot["next"], entry)
+
+    def test_missing_entry_repair_rolls_back_on_firmware_failure(self):
+        self.commit()
+        self.machine.boot["entries"].pop("0000")
+        # A dangling BootNext for the recorded entry is also ours to repair.
+        original = copy.deepcopy(self.machine.boot)
+        state = self.machine.path(installer.STATE).read_bytes()
+        payload = self.machine.path("/boot/efi/EFI/L4H/l4h.efi")
+        payload.write_bytes(b"previous EFI payload")
+        self.machine.fail = "--bootnext"
+        with self.assertRaisesRegex(installer.Incompatible, "injected"):
+            self.commit()
+        self.assertEqual(self.machine.boot, original)
+        self.assertEqual(self.machine.path(installer.STATE).read_bytes(), state)
+        self.assertEqual(payload.read_bytes(), b"previous EFI payload")
+        self.commit()
+        self.assertIn(self.machine.boot["next"], self.machine.boot["entries"])
+
+    def test_missing_entry_repair_preserves_foreign_bootnext(self):
+        self.commit()
+        self.machine.boot["entries"]["0000"] = "Other OS\tHD(other)"
+        self.machine.calls.clear()
+        self.commit()
+        self.assertEqual(self.machine.boot["next"], "0000")
+        self.assertEqual(self.machine.boot["entries"]["0000"], "Other OS\tHD(other)")
+        self.assertFalse(any("--bootnext" in call for call in self.machine.calls))
+
+    def test_update_keeps_entry_for_another_esp(self):
         self.commit()
         self.machine.calls.clear()
         self.machine.boot["entries"]["0000"] = self.machine.boot["entries"]["0000"].replace("HD(1,", "HD(2,")
+        other = self.machine.boot["entries"]["0000"]
+        self.machine.boot["next"] = None
+        self.commit()
+        self.assertEqual(self.machine.boot["entries"]["0000"], other)
+        entry = json.loads(self.machine.path(installer.STATE).read_text())["entry"]
+        self.assertNotEqual(entry, "0000")
+        self.assertEqual(self.machine.boot["next"], entry)
+
+    def test_update_rejects_changed_esp_identity(self):
+        self.commit()
+        self.machine.calls.clear()
+        self.machine.blocks[1]["partuuid"] = "bbbbbbbb-0011-2233-4455-66778899aabb"
         self.rejected("different ESP")
+
+    def test_update_does_not_reuse_backup_loader(self):
+        self.commit()
+        other = self.machine.boot["entries"]["0000"].replace("l4h.efi", "l4h.efi.backup")
+        self.machine.boot["entries"]["0000"] = other
+        self.machine.boot["next"] = None
+        self.commit()
+        self.assertEqual(self.machine.boot["entries"]["0000"], other)
+        self.assertNotEqual(self.machine.boot["next"], "0000")
+
+    def test_update_reuses_matching_duplicate_efi_entry(self):
+        self.commit()
+        self.machine.boot["entries"]["0008"] = self.machine.boot["entries"]["0000"]
+        self.machine.boot["entries"]["0009"] = self.machine.boot["entries"]["0000"].replace("HD(1,", "HD(2,")
+        self.machine.calls.clear()
+        self.commit()
+        self.assertEqual(json.loads(self.machine.path(installer.STATE).read_text())["entry"], "0000")
+        self.machine.boot["entries"].pop("0000")
+        self.commit()
+        self.assertEqual(json.loads(self.machine.path(installer.STATE).read_text())["entry"], "0008")
+        self.assertEqual(self.machine.boot["next"], "0008")
+        self.assertFalse(any("--create-only" in call or "--delete-bootnum" in call for call in self.machine.calls))
+
+    def test_update_reactivates_efi_entry_and_undoes_it_on_failure(self):
+        self.commit()
+        self.machine.boot["inactive"] = ["0000"]
+        self.machine.fail = "--bootnext"
+        with self.assertRaisesRegex(installer.Incompatible, "injected"):
+            self.commit()
+        self.assertEqual(self.machine.boot["inactive"], ["0000"])
+        self.commit()
+        self.assertEqual(self.machine.boot["inactive"], [])
+
+    def test_update_preserves_scheduled_native_boot(self):
+        self.commit()
+        self.machine.boot["next"] = "0002"
+        self.commit()
+        self.assertEqual(self.machine.boot["next"], "0002")
+        self.assertEqual(self.machine.boot["order"], "0001,0002")
+        self.commit(default=True)
+        self.assertEqual(self.machine.boot["next"], "0002")
+        self.assertEqual(self.machine.boot["order"], "0000,0001,0002")
 
     def test_make_default_keeps_previous_order(self):
         self.commit(default=True)
@@ -903,7 +1062,26 @@ class BiosInstallerTests(UpdateChecks, Harness):
         self.assertIn("set default=l4h", self.custom())
         self.assertEqual(self.machine.grubenv["next_entry"], "")
         self.machine.grubenv["next_entry"] = "1"
-        self.rejected("next_entry is already set")
+        self.commit()
+        self.assertEqual(self.machine.grubenv["next_entry"], "1")
+
+    def test_update_preserves_scheduled_native_boot(self):
+        self.commit()
+        self.machine.grubenv["next_entry"] = "0"
+        self.commit()
+        self.assertEqual(self.machine.grubenv["next_entry"], "0")
+
+    def test_update_restores_missing_generated_grub_entry(self):
+        self.commit()
+        custom = self.machine.path("/boot/grub/custom.cfg")
+        original = custom.read_bytes()
+        custom.unlink()
+        self.machine.fail = "set"
+        with self.assertRaisesRegex(installer.Incompatible, "injected"):
+            self.commit()
+        self.assertFalse(custom.exists())
+        self.commit()
+        self.assertEqual(custom.read_bytes(), original)
 
     def test_xapic_variant_kernel(self):
         cpu = self.machine.path("/proc/cpuinfo")
