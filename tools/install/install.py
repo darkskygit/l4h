@@ -159,7 +159,13 @@ class Preflight:
                 processors.append(fields)
         need(processors, "cannot read CPU features")
         flags = set.intersection(*(set(cpu.get("flags", "").split()) for cpu in processors))
-        need(CPU_FLAGS <= flags, "CPU is missing required features: " + " ".join(sorted(CPU_FLAGS - flags)))
+        missing = CPU_FLAGS - flags
+        if self.args.assume_stable_tsc:
+            missing.discard("constant_tsc")
+        need(not missing, "CPU is missing required features: " + " ".join(sorted(missing)))
+        if "constant_tsc" not in flags:
+            print("l4h: warning: constant_tsc is not advertised; --assume-stable-tsc "
+                  "assumes a stable TSC without verifying it", file=sys.stderr)
         need(all(cpu.get("vendor_id") in ("GenuineIntel", "AuthenticAMD") for cpu in processors),
              "only Intel and AMD CPUs are supported by this installer")
         need(self.read("/sys/devices/system/cpu/vulnerabilities/meltdown") == "Not affected",
@@ -772,6 +778,8 @@ def arguments(argv=None):
     parser.add_argument("--memory", type=int)
     parser.add_argument("--vcpus", type=int)
     parser.add_argument("--variant", choices=("generic", "xapic-nopcid"))
+    parser.add_argument("--assume-stable-tsc", action="store_true",
+                        help="allow missing constant_tsc for experimental installs; assume TSC stability without verifying it")
     parser.add_argument("--make-default", action="store_true")
     return parser.parse_args(argv)
 

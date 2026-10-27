@@ -239,6 +239,35 @@ class InstallerTests(Harness):
         cpu.write_text(cpu.read_text().replace("xsaveopt", ""))
         self.rejected("xsaveopt")
 
+    def test_constant_tsc_requires_explicit_override(self):
+        cpu = self.machine.path("/proc/cpuinfo")
+        cpu.write_text(cpu.read_text().replace("GenuineIntel", "AuthenticAMD").replace("constant_tsc", ""))
+        self.rejected("required features: constant_tsc")
+        self.args = self.preflight.args = installer.arguments(["--check", "--assume-stable-tsc"])
+        with patch("sys.stderr", new_callable=io.StringIO) as err:
+            plan = self.check()
+            self.assertEqual(self.check(), plan)
+        self.assertIn("constant_tsc is not advertised", err.getvalue())
+        self.assertIn("--assume-stable-tsc", err.getvalue())
+        self.args.assume_stable_tsc = False
+        self.rejected("required features: constant_tsc")
+
+    def test_tsc_override_keeps_other_cpu_requirements(self):
+        self.args.assume_stable_tsc = True
+        cpu = self.machine.path("/proc/cpuinfo")
+        original = cpu.read_text().replace("constant_tsc", "")
+        for feature in ("xsaveopt", "avx", "pdpe1gb"):
+            with self.subTest(feature=feature):
+                cpu.write_text(original.replace(feature, ""))
+                self.rejected("required features: " + feature)
+
+    def test_tsc_override_with_advertised_constant_tsc(self):
+        expected = self.check()
+        self.args.assume_stable_tsc = True
+        with patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(self.check(), expected)
+        self.assertEqual(err.getvalue(), "")
+
     def test_variant_fallback_and_invalid_override(self):
         cpu = self.machine.path("/proc/cpuinfo")
         cpu.write_text(cpu.read_text().replace("pcid", ""))
@@ -526,9 +555,12 @@ class InstallerTests(Harness):
 
     def test_pipe_help_and_bad_option(self):
         script = (ROOT / "tools/install.sh").read_bytes()
-        result = subprocess.run(["bash", "-s", "--", "--help"], input=script, capture_output=True)
-        self.assertEqual(result.returncode, 0)
-        self.assertIn(b"BootNext", result.stdout)
+        for args in (["--help"], ["--assume-stable-tsc", "--help"]):
+            with self.subTest(args=args):
+                result = subprocess.run(["bash", "-s", "--", *args], input=script, capture_output=True)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn(b"BootNext", result.stdout)
+                self.assertIn(b"--assume-stable-tsc", result.stdout)
         result = subprocess.run(["bash", "-s", "--", "--unknown"], input=script, capture_output=True)
         self.assertEqual(result.returncode, 2)
 

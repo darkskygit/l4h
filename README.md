@@ -134,6 +134,12 @@ SATA/USB storage, active AppArmor profiles and DKMS modules are rejected.
 Secure Boot must be disabled. Firmware and application compatibility still
 need a boot test.
 
+Some cloud VMs omit the `constant_tsc` CPU flag. For experimental installs,
+pass `--assume-stable-tsc` to both `--check` and the installation command to
+waive that requirement. This assumes a stable TSC without verifying it;
+L4H still uses the TSC directly, including after host migration. All other
+compatibility checks still apply. The selected release must include this option.
+
 The default installation sets **BootNext for one L4H boot**, preserves the
 existing BootOrder and native EFI loaders, and does not reboot. After
 testing dom0, stop workloads and run `sudo sync; sudo l4hctl host-reboot`

@@ -18,6 +18,8 @@ Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/insta
   --memory MiB            dom0 RAM (default: half of physical RAM, capped at 8192 MiB)
   --vcpus N               dom0 CPUs (default: up to 4)
   --variant NAME          generic or xapic-nopcid (otherwise select from CPU features)
+  --assume-stable-tsc      Allow missing constant_tsc for experimental installs;
+                          assume the TSC is stable without verifying it
   --make-default          Make L4H the default boot entry (default: one-time
                           BootNext on UEFI, GRUB next_entry on BIOS)
   --help                  Show this help
@@ -30,7 +32,7 @@ Run --check first; see the README and docs/manual/l4h-manual.tex for limits and 
 HELP
                 return ;;
             --check) check=1; args+=("$arg") ;;
-            --make-default) args+=("$arg") ;;
+            --make-default|--assume-stable-tsc) args+=("$arg") ;;
             --release|--esp|--memory|--vcpus|--variant)
                 (($#)) || { echo "l4h: $arg needs a value" >&2; return 2; }
                 if [[ $arg == --release ]]; then release=$1; else args+=("$arg" "$1"); fi

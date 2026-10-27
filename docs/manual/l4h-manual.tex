@@ -563,6 +563,13 @@ be installed. The checks cover:
         15 disks with one NIC, or 14 disks with two.
 \end{itemize}
 
+For experimental installations on cloud VMs that omit the
+\texttt{constant\_tsc} CPU flag, pass \texttt{--assume-stable-tsc} to both
+\texttt{--check} and the installation command. This waives only the
+\texttt{constant\_tsc} check and prints a warning; it assumes TSC stability
+without verifying it. L4H still uses the TSC directly, including after
+host migration. The selected release must include this option.
+
 Each physical NIC is assigned to its own switch in ascending PCI address
 order: \texttt{uplink\_nic} selects switch 0's uplink and, with two NICs,
 \texttt{uplink2\_nic} selects switch 1's. Dom0 gets one vNIC on each
