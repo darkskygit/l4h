@@ -363,10 +363,13 @@ class Preflight:
     def network(self):
         # Each physical NIC gets its own switch and a dom0 vNIC with its MAC.
         # The initramfs uses those MACs to restore names independent of ordering.
+        # Software interfaces have no backing device in sysfs. Their names,
+        # types and count are irrelevant to host uplink selection; the
+        # existing userspace recreates them in dom0.
         links = json.loads(self.run("ip", "-json", "link", "show"))
-        links = [link for link in links if link["ifname"] != "lo"]
+        links = [link for link in links if self.path("/sys/class/net/" + link["ifname"] + "/device").exists()]
         need(1 <= len(links) <= 2,
-             "automatic migration requires one or two physical NICs (no bonds, bridges or VLANs)")
+             "automatic migration requires one or two physical NICs")
         uplinks = []
         for link in links:
             name = link["ifname"]
@@ -374,7 +377,7 @@ class Preflight:
             base = "/sys/class/net/" + name
             need(link.get("link_type") == "ether" and "master" not in link and
                  not link.get("linkinfo", {}).get("info_kind") and not self.path(base + "/wireless").exists(),
-                 name + ": need a plain Ethernet uplink (no bonds, bridges or VLANs)")
+                 name + ": need a plain Ethernet uplink (no wireless or master device)")
             pci = self.pci(base + "/device")
             vendor, device = pci["vendor"], pci["device"]
             mem = lambda bar: pci["bars"][bar][0] > 0 and not pci["bars"][bar][1]

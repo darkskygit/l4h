@@ -370,11 +370,12 @@ class InstallerTests(Harness):
         self.machine.write("/etc/crypttab", "# comment\ncrypt UUID=abc none luks\n")
         self.rejected("crypttab")
 
-    def test_unsupported_network_and_bridge(self):
+    def test_unsupported_network_and_enslaved_physical_nic(self):
         self.machine.pci("00:05.0", 0x8086, 0x100E, 0x020000)
         self.rejected("supported uplinks")
         self.machine.pci("00:05.0", 0x1AF4, 0x1041, 0x020000)
         self.machine.links.append(dict(ifname="br0", link_type="ether", linkinfo=dict(info_kind="bridge")))
+        self.machine.links[1]["master"] = "br0"
         self.rejected("plain Ethernet uplink")
 
     def test_two_uplinks_have_separate_switches_and_stable_mac_mappings(self):
@@ -391,6 +392,49 @@ class InstallerTests(Harness):
         self.assertEqual(self.check(), plan)
         self.commit(plan)
         self.assertEqual(self.machine.path("/boot/efi/l4h/l4h.conf").read_text(), config)
+
+    def test_virtual_interfaces_do_not_change_uplink_plan(self):
+        virtual = [
+            dict(ifname="wg-obfs", link_type="none", linkinfo=dict(info_kind="wireguard")),
+            dict(ifname="ppp0", link_type="ppp"),
+            dict(ifname="gre0", link_type="gre"),
+            dict(ifname="tun0", link_type="none"),
+            dict(ifname="tap0", link_type="ether"),
+            dict(ifname="br0", link_type="ether", linkinfo=dict(info_kind="bridge")),
+            dict(ifname="bond0", link_type="ether", linkinfo=dict(info_kind="bond")),
+            dict(ifname="ens3.10", link_type="ether", linkinfo=dict(info_kind="vlan")),
+            dict(ifname="veth0", link_type="ether", master="br0"),
+            dict(ifname="unknown0", link_type="ether", linkinfo=dict(info_kind="unknown")),
+        ]
+        # These links exist in sysfs, but have no backing hardware device.
+        for link in virtual:
+            self.machine.path("/sys/class/net/" + link["ifname"]).mkdir()
+        for nics in (1, 2):
+            with self.subTest(nics=nics):
+                if nics == 2:
+                    self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:57")
+                expected = self.check()
+                self.machine.links.extend(virtual)
+                self.assertEqual(self.check(), expected)
+                self.assertEqual(installer.configuration(self.check()), installer.configuration(expected))
+                del self.machine.links[-len(virtual):]
+
+    def test_virtual_interfaces_do_not_replace_a_physical_uplink(self):
+        self.machine.links = [self.machine.links[0],
+                              dict(ifname="tap0", link_type="ether"),
+                              dict(ifname="wg-obfs", link_type="none", linkinfo=dict(info_kind="wireguard"))]
+        self.rejected("one or two physical NICs")
+
+    def test_virtual_interfaces_do_not_bypass_uplink_checks(self):
+        self.machine.links.append(dict(ifname="wg-obfs", link_type="none", linkinfo=dict(info_kind="wireguard")))
+        self.machine.pci("00:05.0", 0x8086, 0x100E, 0x020000)
+        self.rejected("ens3: supported uplinks")
+        self.machine.pci("00:05.0", 0x1AF4, 0x1041, 0x020000)
+        self.machine.links[1]["master"] = "br0"
+        self.rejected("ens3: need a plain Ethernet")
+        del self.machine.links[1]["master"]
+        self.machine.write("/sys/class/net/ens3/addr_assign_type", "3")
+        self.rejected("ens3: uplink MAC has been changed")
 
     def test_zero_and_three_nics_rejected(self):
         self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:57")

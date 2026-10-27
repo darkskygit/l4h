@@ -126,9 +126,12 @@ NVMe namespace 1 or supported virtio disks, and one or two physical
 virtio-net, gVNIC, ENA or Intel X550 NICs. Each NIC becomes the uplink of its
 own L4H switch (switch 0, then switch 1, in PCI address order). Dom0 gets
 one interface on each switch with the original name and MAC, so existing
-address, route and DNS settings can apply. Profiles tied to a PCI path or
-native driver may need adaptation. Bonds, bridges and VLAN interfaces
-require a custom deployment, as do other unsupported layouts:
+address, route and DNS settings can apply. Software interfaces (including
+WireGuard, PPP, GRE and TUN/TAP) are excluded from uplink selection and the
+physical NIC limit; existing userspace remains responsible for recreating
+them. The guest kernel includes WireGuard. Profiles tied to a PCI path or
+native driver may need adaptation. Physical NICs enslaved to a bond,
+bridge or other master require a custom deployment, as do other unsupported layouts:
 in particular LVM, encrypted volumes, RAID, Btrfs, separate `/usr`,
 SATA/USB storage, active AppArmor profiles and DKMS modules are rejected.
 Secure Boot must be disabled. Firmware and application compatibility still

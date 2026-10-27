@@ -560,9 +560,14 @@ be installed. The checks cover:
         or DKMS modules. An active SELinux mode is carried into dom0's
         command line;
   \item one or two physical Ethernet interfaces, driven by virtio-net,
-        gVNIC, ENA or Intel X550. Automatic migration rejects bonds,
-        bridges, VLAN interfaces, changed or duplicate MACs, and more
-        than two NICs. Dom0's 16 device slots leave room for at most
+        gVNIC, ENA or Intel X550. Only interfaces with a backing device in
+        sysfs are considered: software interfaces such as WireGuard, PPP,
+        GRE and TUN/TAP do not become uplinks or count toward the limit.
+        Existing userspace must recreate them in dom0; the guest kernel
+        includes WireGuard. Automatic migration rejects physical NICs
+        enslaved to a master (such as a bond or bridge), changed or duplicate
+        MACs, and more than two physical NICs.
+        Dom0's 16 device slots leave room for at most
         15 disks with one NIC, or 14 disks with two.
 \end{itemize}
 
