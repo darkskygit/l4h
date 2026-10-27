@@ -161,6 +161,23 @@ are backed up under `/var/lib/l4h/backups`; a failed installation attempts
 to restore both files and EFI settings.
 Ordinary `reboot` inside dom0 restarts only dom0.
 
+Rerun the same command to **update from native Linux or a running L4H
+dom0**. Updates replace the boot payload, initramfs and `l4hctl`, preserving
+`l4h.conf`, the selected kernel variant and existing GRUB customizations.
+Pass `--memory`, `--vcpus` or `--variant` to change those values explicitly.
+The installer recognizes its record in `/var/lib/l4h/install.json`; older
+records identify the variant by matching the installed boot file against
+the previous release (use `--variant` if that release is unavailable).
+`--check` also works for updates. The selected release must include update
+support.
+
+From dom0, run `sudo l4hctl host-reboot` when ready to load the update.
+The running kernel and mounted modules stay in use until then. BIOS dom0
+can select the next boot through GRUB. **UEFI dom0 cannot change firmware
+boot selection**: updates preserve it, and `--make-default` requires native
+Linux. If L4H was only a trial boot, select it again through firmware or
+native Linux to boot the updated release.
+
 ```sh
 # Read-only compatibility check (dependencies must already be installed).
 curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash -s -- --check

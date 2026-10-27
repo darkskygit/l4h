@@ -118,6 +118,8 @@ class Machine:
             return json.dumps(self.links)
         if args[0] == "systemctl":
             return self.target if args[1] == "get-default" else self.display_manager
+        if args == ("/usr/local/bin/l4hctl", "info"):
+            return "cores:  4\nmemory: 4096 MiB free of 7936 MiB\ndisks: 1\nvms: 1"
         if args[0] == "efibootmgr":
             if args[1] == "--verbose":
                 text = "BootOrder: {}\nBootCurrent: {}\n".format(self.boot["order"], self.boot["current"])
@@ -172,6 +174,27 @@ class Machine:
         mbr[510:] = b"\x55\xaa"
         self.write("/dev/vda", bytes(mbr))
 
+    def dom0(self):
+        shutil.rmtree(self.path("/sys/firmware"))
+        shutil.rmtree(self.path("/sys/devices/pci0000:00"))
+        self.path("/sys/kernel/l4h").mkdir(parents=True)
+        self.write("/sys/class/misc/l4hctl/dev", "10:127")
+        self.write("/proc/cpuinfo", "processor: 0\nvendor_id: l4h\nflags: fpu")
+        self.write("/proc/meminfo", "MemTotal: 524288 kB")
+        self.write("/proc/cmdline", "console=hvc0 root=UUID=1234-abcd ro")
+        # Passthrough keeps UUIDs but exposes different block names in dom0.
+        names = {"/dev/vda": "/dev/l4hblk0", "/dev/vda1": "/dev/l4hblk0p1", "/dev/vda2": "/dev/l4hblk0p2"}
+        for old, new in names.items():
+            if self.path(old).is_file():
+                self.path(old).rename(self.path(new))
+        self.write("/sys/class/block/l4hblk0p1/partition", "1")
+        for block in self.blocks:
+            block["name"] = names[block["name"]]
+            block["pkname"] = names.get(block["pkname"])
+        for mount in self.mounts:
+            mount["source"] = names[mount["source"]]
+        self.calls.clear()
+
 
 class Harness(unittest.TestCase):
     def setUp(self):
@@ -206,7 +229,91 @@ class Harness(unittest.TestCase):
                          root=self.root, command=self.machine.command)
 
 
-class InstallerTests(Harness):
+class UpdateChecks:
+    """The same update contract on both firmware layouts."""
+
+    def config(self):
+        state = json.loads(self.machine.path(installer.STATE).read_text())
+        directory = state["esp"] + "/l4h" if state["firmware"] == "uefi" else "/boot/l4h"
+        return self.machine.path(directory + "/l4h.conf")
+
+    def test_native_update_preserves_config_and_variant(self):
+        self.args.variant = "xapic-nopcid"
+        self.commit()
+        self.args.variant = None
+        config = self.config()
+        custom = config.read_text().replace("dom0_mem_mb=4096", "dom0_mem_mb=1536") + "# operator settings\nlog_level=debug\n"
+        config.write_text(custom)
+        config.chmod(0o600)
+        before = config.stat()
+        plan = self.check()
+        self.assertTrue(plan["update"])
+        self.assertFalse(plan["dom0"])
+        self.assertEqual(plan["variant"], "xapic-nopcid")
+        self.commit(plan)
+        self.assertEqual(config.read_text(), custom)
+        after = config.stat()
+        self.assertEqual((after.st_mode, after.st_ino, after.st_mtime_ns),
+                         (before.st_mode, before.st_ino, before.st_mtime_ns))
+
+    def test_dom0_update_uses_installed_layout(self):
+        self.commit()
+        config = self.config().read_bytes()
+        self.machine.dom0()
+        plan = self.check()
+        self.assertTrue(plan["dom0"])
+        self.assertEqual(plan["variant"], "generic")
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.commit(plan)
+        self.assertIn("host-reboot", output.getvalue())
+        self.assertEqual(self.config().read_bytes(), config)
+        self.assertFalse(any(call[0] in ("ip", "efibootmgr", "systemctl") for call in self.machine.calls))
+        if plan["firmware"] == "uefi":
+            self.assertIn("boot selection is unchanged", output.getvalue())
+        else:
+            self.assertEqual(self.machine.grubenv["next_entry"], "l4h")
+
+    def test_dom0_resource_override_uses_host_capacity(self):
+        self.commit()
+        self.machine.dom0()
+        self.args.memory, self.args.vcpus = 2048, 3
+        expected = self.config().read_text().replace("dom0_mem_mb=4096", "dom0_mem_mb=2048").replace("dom0_vcpus=1", "dom0_vcpus=3")
+        self.commit()
+        self.assertEqual(self.config().read_text(), expected)
+        self.args.memory = 8000
+        self.rejected("dom0 RAM")
+
+    def test_legacy_update_identifies_variant_once_and_records_it(self):
+        self.commit()
+        state = self.machine.path(installer.STATE)
+        record = json.loads(state.read_text())
+        for key in ("version", "variant", "root_uuid", "esp_partuuid", "boot_uuid"):
+            record.pop(key, None)
+        state.write_text(json.dumps(record))
+        self.machine.dom0()
+        with patch.object(installer, "installed_variant", return_value="xapic-nopcid") as identify:
+            plan = self.check()
+            self.assertEqual(self.check(), plan)
+            self.commit(plan)
+        identify.assert_called_once()
+        self.assertEqual(json.loads(state.read_text())["variant"], "xapic-nopcid")
+
+    def test_update_rejects_wrong_root_and_concurrent_config_change(self):
+        self.commit()
+        config = self.config()
+        original = config.read_text()
+        self.machine.calls.clear()
+        config.write_text(original.replace("root=UUID=1234-abcd", "root=UUID=5678-abcd"))
+        self.rejected("mounted root")
+        config.write_text(original)
+        plan = self.check()
+        config.write_text(original + "# changed after preflight\n")
+        with self.assertRaisesRegex(installer.Incompatible, "changed during update"):
+            self.commit(plan)
+        self.assertTrue(config.read_text().endswith("# changed after preflight\n"))
+
+
+class InstallerTests(UpdateChecks, Harness):
     def test_supported_machine_and_read_only_preflight(self):
         before = sorted(str(p) for p in self.root.rglob("*"))
         plan = self.check()
@@ -549,12 +656,33 @@ class InstallerTests(Harness):
     def test_update_failure_restores_existing_payload(self):
         self.commit()
         original = copy.deepcopy(self.machine.boot)
-        self.machine.write("/boot/efi/l4h/l4h.conf", "old configuration")
+        config = self.config().read_text() + "# custom configuration\n"
+        self.config().write_text(config)
+        payload = self.machine.path("/boot/efi/EFI/L4H/l4h.efi")
+        payload.write_bytes(b"previous EFI payload")
+        self.args.memory = 2048
         self.machine.fail = "--bootnext"
-        with self.assertRaises(installer.Incompatible):
+        with self.assertRaisesRegex(installer.Incompatible, "injected"):
             self.commit()
-        self.assertEqual(self.machine.path("/boot/efi/l4h/l4h.conf").read_text(), "old configuration")
+        self.assertEqual(self.config().read_text(), config)
+        self.assertEqual(payload.read_bytes(), b"previous EFI payload")
         self.assertEqual(self.machine.boot, original)
+
+    def test_uefi_dom0_cannot_change_firmware_default(self):
+        self.commit()
+        self.machine.dom0()
+        self.args.make_default = True
+        self.rejected("boot order changes require native Linux")
+
+    def test_legacy_efi_variant_matches_release_checksum(self):
+        self.package()
+        checksum = installer.digest(self.root / "new.efi")
+        def download(*args):
+            Path(args[args.index("--output") + 1]).write_text(checksum + "  l4h-xapic-nopcid.efi\n")
+        with patch.object(installer, "run", side_effect=download):
+            self.assertEqual(installer.installed_variant("vold", "uefi", checksum), "xapic-nopcid")
+            with self.assertRaisesRegex(installer.Incompatible, "specify --variant"):
+                installer.installed_variant("vold", "uefi", "0" * 64)
 
     def test_disk_full_before_efi(self):
         plan = self.check()
@@ -655,7 +783,7 @@ def elf(multiboot2=False):
     return bytes(header)
 
 
-class BiosInstallerTests(Harness):
+class BiosInstallerTests(UpdateChecks, Harness):
     def setUp(self):
         super().setUp()
         self.machine.bios()
@@ -762,7 +890,8 @@ class BiosInstallerTests(Harness):
         self.assertIn('source "$l4h/bios/grub.cfg"\n', custom)
         self.assertNotIn("set default", custom)
         state = json.loads(self.machine.path(installer.STATE).read_text())
-        self.assertEqual(state, dict(firmware="bios", grubdir="/boot/grub", default=False, release="vtest"))
+        self.assertEqual(state, dict(version=2, firmware="bios", grubdir="/boot/grub", default=False,
+                                     release="vtest", variant="generic", root_uuid="1234-abcd", boot_uuid="1234-abcd"))
         self.assertFalse(any(c[0] in ("efibootmgr", "reboot", "grub-install", "update-grub", "grub-mkconfig")
                              for c in self.machine.calls))
 
@@ -817,13 +946,43 @@ class BiosInstallerTests(Harness):
     def test_update_failure_restores_existing_payload(self):
         self.commit()
         before = self.custom()
-        self.machine.write("/boot/l4h/l4h.conf", "old configuration")
+        config = self.config().read_text() + "# custom configuration\n"
+        self.config().write_text(config)
+        payload = self.machine.path("/boot/l4h/bios/kernel.elf")
+        payload.write_bytes(b"previous BIOS kernel")
+        self.args.memory = 2048
         self.machine.fail = "set"
-        with self.assertRaises(installer.Incompatible):
+        with self.assertRaisesRegex(installer.Incompatible, "injected"):
             self.commit()
-        self.assertEqual(self.machine.path("/boot/l4h/l4h.conf").read_text(), "old configuration")
+        self.assertEqual(self.config().read_text(), config)
+        self.assertEqual(payload.read_bytes(), b"previous BIOS kernel")
         self.assertEqual(self.custom(), before)
         self.assertEqual(self.machine.grubenv["next_entry"], "l4h")
+
+    def test_update_preserves_custom_grub_content(self):
+        self.commit()
+        custom = self.machine.path("/boot/grub/custom.cfg")
+        text = custom.read_text() + "# operator addition\nset timeout=7\n"
+        custom.write_text(text)
+        self.commit()
+        self.assertEqual(custom.read_text(), text)
+        self.commit(default=True)
+        self.assertTrue(custom.read_text().startswith(text))
+        self.assertIn("set default=l4h", custom.read_text())
+
+    def test_legacy_bios_variant_matches_verified_archive(self):
+        bios = self.bios_package()
+        archive = self.root / "old.tar.xz"
+        with tarfile.open(archive, "w:xz") as tar:
+            tar.add(bios, arcname=installer.BIOS_PACKAGE)
+        def download(*args):
+            dest = Path(args[args.index("--output") + 1])
+            if dest.name == "SHA256SUMS":
+                dest.write_text(installer.digest(archive) + "  " + installer.BIOS_PACKAGE + ".tar.xz\n")
+            else:
+                shutil.copyfile(archive, dest)
+        with patch.object(installer, "run", side_effect=download):
+            self.assertEqual(installer.installed_variant("vold", "bios", installer.digest(bios / "kernel-generic.elf")), "generic")
 
     def test_disk_full_before_grub(self):
         plan = self.check()

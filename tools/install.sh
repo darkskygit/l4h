@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install a tagged x86_64 release under an existing Linux installation.
+# Install or update a tagged x86_64 release from native Linux or L4H dom0.
 # Keep execution inside one function: a truncated curl must not run half an installer.
 l4h_install() {
     set -euo pipefail
@@ -12,7 +12,7 @@ l4h_install() {
             --help|-h)
                 cat <<'HELP'
 Usage: curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash -s -- [options]
-  --check                 Check compatibility only; do not install packages or change boot
+  --check                 Check install/update compatibility; do not change the system
   --release TAG           Install a specific GitHub release (default: latest)
   --esp PATH              Mounted EFI system partition (UEFI; otherwise auto-detect)
   --memory MiB            dom0 RAM (default: half of usable RAM, clamped to 512..8192 MiB)
@@ -30,6 +30,12 @@ Supports a plain ext4/XFS root, supported PCI disks and one supported physical N
 Requires at least 768 MiB usable RAM; reserves at least 256 MiB for L4H.
 The existing userspace boots with L4H's kernel. No automatic reboot.
 Run --check first; see the README and docs/manual/l4h-manual.tex for limits and recovery.
+
+Rerun to update an installer-managed installation, from native Linux or dom0.
+Updates preserve l4h.conf and the kernel variant; --memory, --vcpus and --variant
+override the existing values. From dom0, use l4hctl host-reboot to load the update.
+UEFI dom0 updates preserve firmware boot selection; --make-default requires
+native Linux. BIOS dom0 updates can select L4H through GRUB normally.
 HELP
                 return ;;
             --check) check=1; args+=("$arg") ;;
@@ -53,46 +59,62 @@ HELP
     [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
         echo 'l4h: requires x86_64 Linux' >&2; return 1;
     }
-    # UEFI selects L4H through an NVRAM entry, BIOS through GRUB's environment.
-    local boot_tool=efibootmgr
-    if [[ -d /sys/firmware/efi ]]; then
+    l4h_require_tools() {
+        local missing=0 tool
+        local -a packages=(ca-certificates)
+        for tool in "$@"; do
+            if ! command -v "$tool" >/dev/null; then
+                echo "l4h: dependency needed: $tool" >&2; missing=1
+                case "$tool" in
+                    lsblk|findmnt|blkid) packages+=(util-linux) ;;
+                    ip)
+                        if command -v apt-get >/dev/null; then packages+=(iproute2); else packages+=(iproute); fi ;;
+                    grub-editenv) packages+=(grub-common) ;;
+                    grub2-editenv) packages+=(grub2-tools-minimal) ;;
+                    *) packages+=("$tool") ;;
+                esac
+            fi
+        done
+        if ((missing)); then
+            ((check == 0)) || { echo 'l4h: --check does not install dependencies; install the listed tools first' >&2; return 1; }
+            if command -v apt-get >/dev/null; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+            elif command -v dnf >/dev/null; then
+                dnf install -y "${packages[@]}"
+            elif command -v yum >/dev/null; then
+                yum install -y "${packages[@]}"
+            else
+                echo 'l4h: automatic dependencies require apt-get, dnf or yum' >&2; return 1
+            fi
+        fi
+    }
+    l4h_require_tools curl python3 lsblk findmnt blkid ip
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "l4h: Python 3.9 or later is required")'
+    # Dom0 has no EFI runtime services, even when the host booted through UEFI.
+    # Use the installation record, not dom0's /sys/firmware, to select tools.
+    local boot_tool
+    if [[ -f /sys/class/misc/l4hctl/dev && -f /var/lib/l4h/install.json ]]; then
+        boot_tool=$(python3 -c '
+import json, sys
+state = json.load(open("/var/lib/l4h/install.json"))
+firmware = state.get("firmware", "uefi")
+if firmware == "bios" and state.get("grubdir") in ("/boot/grub", "/boot/grub2"):
+    print("grub2-editenv" if state["grubdir"].endswith("grub2") else "grub-editenv")
+elif firmware != "uefi":
+    sys.exit("l4h: invalid installation record")
+')
+    elif [[ -d /sys/firmware/efi ]]; then
         [[ $(cat /sys/firmware/efi/fw_platform_size) == 64 ]] || {
             echo 'l4h: requires 64-bit UEFI' >&2; return 1;
         }
+        boot_tool=efibootmgr
     elif [[ -f /boot/grub2/grub.cfg ]]; then
         boot_tool=grub2-editenv
     else
         boot_tool=grub-editenv
     fi
-    local missing=0 tool
-    local -a packages=(ca-certificates)
-    for tool in curl python3 "$boot_tool" lsblk findmnt blkid ip; do
-        if ! command -v "$tool" >/dev/null; then
-            echo "l4h: dependency needed: $tool" >&2; missing=1
-            case "$tool" in
-                lsblk|findmnt|blkid) packages+=(util-linux) ;;
-                ip)
-                    if command -v apt-get >/dev/null; then packages+=(iproute2); else packages+=(iproute); fi ;;
-                grub-editenv) packages+=(grub-common) ;;
-                grub2-editenv) packages+=(grub2-tools-minimal) ;;
-                *) packages+=("$tool") ;;
-            esac
-        fi
-    done
-    if ((missing)); then
-        ((check == 0)) || { echo 'l4h: --check does not install dependencies; install the listed tools first' >&2; return 1; }
-        if command -v apt-get >/dev/null; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
-        elif command -v dnf >/dev/null; then
-            dnf install -y "${packages[@]}"
-        elif command -v yum >/dev/null; then
-            yum install -y "${packages[@]}"
-        else
-            echo 'l4h: automatic dependencies require apt-get, dnf or yum' >&2; return 1
-        fi
-    fi
-    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "l4h: Python 3.9 or later is required")'
+    if [[ -n $boot_tool ]]; then l4h_require_tools "$boot_tool"; fi
     work=$(mktemp -d)
     # The trap belongs to this shell, including when invoked through sudo.
     # Capture and shell-quote the pathname now: function locals are gone

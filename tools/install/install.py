@@ -18,6 +18,7 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -96,6 +97,34 @@ def grub_env(text):
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
 
+def config_value(text, key):
+    values = re.findall(r"^[ \t]*" + re.escape(key) + r"=(.*)$", text, re.M)
+    need(len(values) == 1, "installed l4h.conf needs exactly one " + key)
+    words = shlex.split(values[0], comments=True)
+    need(len(words) == 1, "cannot read " + key + " from installed l4h.conf")
+    return words[0]
+
+
+def config_replace(text, key, value):
+    pattern = r"^[ \t]*" + re.escape(key) + r"=[^\n]*$"
+    need(len(re.findall(pattern, text, re.M)) <= 1, "duplicate " + key + " in installed l4h.conf")
+    replaced, count = re.subn(pattern, key + "=" + str(value), text, flags=re.M)
+    return replaced if count else text + ("" if text.endswith("\n") else "\n") + f"{key}={value}\n"
+
+
+def memory_size(total, requested):
+    need(total >= DOM0_MIN_MB + HOST_RESERVE_MB,
+         f"need at least {DOM0_MIN_MB + HOST_RESERVE_MB} MiB usable RAM "
+         f"({DOM0_MIN_MB} MiB for dom0 and {HOST_RESERVE_MB} MiB for L4H); found {total} MiB")
+    # vmmgr allocates guest RAM in 2 MiB blocks.
+    maximum = min((total - HOST_RESERVE_MB) // 2 * 2, DOM0_MAX_MB)
+    memory = requested if requested is not None else max(DOM0_MIN_MB, min(total // 2, 8192))
+    need(DOM0_MIN_MB <= memory <= maximum,
+         f"dom0 RAM must be {DOM0_MIN_MB}..{maximum} MiB on this machine "
+         f"({total} MiB usable RAM, reserving {HOST_RESERVE_MB} MiB for L4H)")
+    return memory
+
+
 def grub_entry(plan, default):
     """custom.cfg: the L4H menu entry, which runs tools/mkbios.sh's grub.cfg.
 
@@ -118,6 +147,7 @@ def grub_entry(plan, default):
 class Preflight:
     def __init__(self, args, root=Path("/"), command=run):
         self.args, self.root, self.run = args, root, command
+        self.variants = {}
 
     def path(self, path):
         return self.root / str(path).lstrip("/")
@@ -181,16 +211,7 @@ class Preflight:
         need(all(int(cpu.get("apicid", "256")) < 256 for cpu in processors),
              "APIC IDs above 255 are not supported by the shipped interrupt routing")
         total = int(re.search(r"^MemTotal:\s+(\d+)", self.read("/proc/meminfo"), re.M)[1]) // 1024
-        need(total >= DOM0_MIN_MB + HOST_RESERVE_MB,
-             f"need at least {DOM0_MIN_MB + HOST_RESERVE_MB} MiB usable RAM "
-             f"({DOM0_MIN_MB} MiB for dom0 and {HOST_RESERVE_MB} MiB for L4H); found {total} MiB")
-        # vmmgr allocates guest RAM in 2 MiB blocks. Round the upper bound
-        # down so an odd --memory value cannot consume the host reserve.
-        maximum = min((total - HOST_RESERVE_MB) // 2 * 2, DOM0_MAX_MB)
-        memory = self.args.memory if self.args.memory is not None else max(DOM0_MIN_MB, min(total // 2, 8192))
-        need(DOM0_MIN_MB <= memory <= maximum,
-             f"dom0 RAM must be {DOM0_MIN_MB}..{maximum} MiB on this machine "
-             f"({total} MiB usable RAM, reserving {HOST_RESERVE_MB} MiB for L4H)")
+        memory = memory_size(total, self.args.memory)
         vcpus = self.args.vcpus if self.args.vcpus is not None else min(len(processors), 4)
         need(1 <= vcpus <= min(len(processors), 64), "dom0 vCPUs must fit the available CPUs (maximum 64)")
         return variant, memory, vcpus
@@ -303,7 +324,7 @@ class Preflight:
         plan.update(self.esp() if plan["firmware"] == "uefi" else self.grub())
         return plan
 
-    def esp(self):
+    def esp(self, physical=True, target=None):
         candidates = []
         for mount in self.mounts():
             if mount["fstype"] != "vfat":
@@ -311,15 +332,17 @@ class Preflight:
             block = next((b for b in self.blocks.values() if b["maj:min"] == mount["maj:min"]), {})
             if (block.get("parttype") or "").lower() == ESP_TYPE:
                 candidates.append((mount, block))
-        if self.args.esp:
-            candidates = [(m, b) for m, b in candidates if m["target"] == str(Path(self.args.esp).resolve())]
+        target = self.args.esp or target
+        if target:
+            candidates = [(m, b) for m, b in candidates if m["target"] == str(Path(target).resolve())]
         need(len(candidates) == 1, "need one mounted GPT EFI system partition; use --esp to select it")
         esp, partition = candidates[0]
         need("rw" in esp["options"].split(","), "EFI system partition is read-only")
         disk = self.blocks.get(partition["pkname"], {})
         need(partition["type"] == "part" and disk.get("type") == "disk" and disk.get("pttype") == "gpt",
              "ESP must be a partition on a plain GPT disk")
-        self.disk(partition)
+        if physical:
+            self.disk(partition)
         partnum = self.read("/sys/class/block/" + Path(partition["name"]).name + "/partition")
         need(partnum.isdigit() and int(partnum) > 0, "cannot determine the ESP partition number")
         partuuid = partition.get("partuuid") or ""
@@ -327,10 +350,10 @@ class Preflight:
              "cannot determine the ESP partition UUID")
         return dict(esp=esp["target"], esp_disk=disk["name"], esp_part=partnum, esp_partuuid=partuuid)
 
-    def grub(self):
+    def grub(self, physical=True):
         # The distribution's BIOS GRUB, whose grub.cfg (grub-mkconfig's) sources
         # custom.cfg and consumes a one-time next_entry before it boots it.
-        need("BOOT_IMAGE=" in self.read("/proc/cmdline"),
+        need(not physical or "BOOT_IMAGE=" in self.read("/proc/cmdline"),
              "BIOS installation needs native Linux booted by GRUB (no BOOT_IMAGE= on the kernel command line)")
         dirs = [d for d in ("/boot/grub", "/boot/grub2") if self.path(d + "/grub.cfg").is_file()]
         need(len(dirs) == 1, "need exactly one of /boot/grub/grub.cfg and /boot/grub2/grub.cfg")
@@ -344,11 +367,13 @@ class Preflight:
              grubdir + " must be on the /boot filesystem")
         # GRUB rewrites grubenv in place to consume next_entry; it can on these.
         need(mount["fstype"] in ("ext2", "ext3", "ext4", "xfs"), "/boot must be ext2/3/4 or XFS for BIOS GRUB")
+        need("rw" in mount["options"].split(","), "/boot must be mounted read-write")
         matches = [b for b in self.blocks.values() if b["maj:min"] == mount["maj:min"]]
         need(len(matches) == 1 and matches[0].get("uuid"), "cannot identify the /boot filesystem")
         block = matches[0]
         need(block["type"] in ("part", "disk"), "/boot must be a plain disk or partition")
-        self.disk(block)
+        if physical:
+            self.disk(block)
         disk = self.blocks[block["pkname"]] if block["type"] == "part" else block
         with self.path(disk["name"]).open("rb") as stream:
             mbr = stream.read(512)
@@ -400,6 +425,10 @@ class Preflight:
         return sorted(uplinks, key=lambda n: n["bdf"])
 
     def check(self):
+        if self.path(STATE).exists():
+            return self.update()
+        need(not self.path("/sys/kernel/l4h").exists(),
+             "dom0 updates require an existing installer-managed installation; install from native Linux first")
         variant, memory, vcpus = self.hardware()
         plan = self.storage()
         uplinks = self.network()
@@ -429,6 +458,107 @@ class Preflight:
         plan.update(variant=variant, memory=memory, vcpus=vcpus, uplinks=uplinks,
                     dom0_disks=max_disks, lsm=lsm)
         plan.update(self.efi_boot(plan) if plan["firmware"] == "uefi" else self.grub_boot(plan))
+        return plan
+
+    def update(self):
+        """Update an existing deployment without reinterpreting dom0 as its host."""
+        need(platform.system() == "Linux" and platform.machine() == "x86_64",
+             "only x86_64 Linux is supported")
+        safe_path(self.path(STATE))
+        saved = json.loads(self.read(STATE))
+        need(isinstance(saved, dict) and saved.get("version", 1) in (1, 2), "unsupported installation record")
+        dom0 = self.path("/sys/class/misc/l4hctl/dev").is_file()
+        need(dom0 or not self.path("/sys/kernel/l4h").exists(), "updates must run from dom0 or native Linux")
+        firmware = saved.get("firmware", "uefi")
+        need(firmware in ("uefi", "bios"), "invalid installed firmware type")
+        need(dom0 or firmware == self.firmware(), "boot native Linux in the installation's firmware mode")
+        data = json.loads(self.run("lsblk", "--json", "--list", "--paths", "--output",
+                                  "NAME,TYPE,PKNAME,FSTYPE,UUID,PARTUUID,LABEL,PARTLABEL,PARTTYPE,PTTYPE,MAJ:MIN"))
+        self.blocks = {b["name"]: b for b in data["blockdevices"]}
+        root = self.mount("/")
+        blocks = [b for b in self.blocks.values() if b["maj:min"] == root["maj:min"]]
+        need(len(blocks) == 1 and blocks[0]["type"] in ("disk", "part") and
+             root["fstype"] in ("ext4", "xfs") and "rw" in root["options"].split(","),
+             "root must be a writable plain ext4 or XFS disk/partition")
+        root_uuid = blocks[0].get("uuid")
+        need(root_uuid and re.fullmatch(r"[a-fA-F0-9-]+", root_uuid), "root needs a filesystem UUID")
+        need(saved.get("root_uuid", root_uuid) == root_uuid, "root filesystem differs from the installed root")
+        plan = dict(update=True, dom0=dom0, firmware=firmware, root_uuid=root_uuid, root_type=root["fstype"])
+        if firmware == "uefi":
+            need(isinstance(saved.get("esp"), str) and saved["esp"].startswith("/"), "invalid installed ESP path")
+            plan.update(self.esp(physical=False, target=saved["esp"]))
+            need(plan["esp"] == saved["esp"] and
+                 saved.get("esp_partuuid", plan["esp_partuuid"]) == plan["esp_partuuid"],
+                 "existing L4H install is on a different ESP")
+            need(isinstance(saved.get("entry"), str) and re.fullmatch(r"[0-9A-F]{4}", saved["entry"]),
+                 "invalid installed EFI boot entry")
+            plan["entry"] = saved["entry"]
+            if dom0:
+                need(not self.args.make_default, "UEFI boot order changes require native Linux; omit --make-default to update files")
+                plan["boot"] = None  # seL4 does not expose EFI runtime services.
+            else:
+                plan["boot"] = boot_state(self.run("efibootmgr", "--verbose"))
+                need(l4h_entry(plan["boot"]) == plan["entry"] and owns_entry(plan["boot"], plan["entry"], plan),
+                     "existing L4H boot entry is missing or points to a different ESP")
+                need(plan["boot"]["next"] in (None, plan["entry"]),
+                     "BootNext is already scheduled for another entry; clear it before updating")
+            directory = Path(plan["esp"]) / "l4h"
+            payload = Path(plan["esp"]) / "EFI/L4H/l4h.efi"
+        else:
+            plan.update(self.grub(physical=False))
+            need(saved.get("grubdir") == plan["grubdir"] and
+                 saved.get("boot_uuid", plan["boot_uuid"]) == plan["boot_uuid"],
+                 "existing L4H install uses a different boot configuration")
+            custom = self.path(plan["grubdir"] + "/custom.cfg")
+            safe_path(custom)
+            need(custom.is_file() and custom.read_text().startswith(GENERATED), "L4H GRUB entry is missing or unmanaged")
+            plan["grub_custom"] = custom.read_text()
+            need("--fs-uuid --set=root " + plan["boot_uuid"] + "\n" in plan["grub_custom"],
+                 "L4H GRUB entry points to a different /boot filesystem")
+            need(plan["grub_env"].get("next_entry") in (None, "", GRUB_ENTRY),
+                 "GRUB next_entry is already set for another entry; clear it before updating")
+            plan["default"] = bool(saved.get("default"))
+            directory, payload = BIOS_DIR, BIOS_DIR / "bios/kernel.elf"
+        config = directory / "l4h.conf"
+        safe_path(self.path(config))
+        need(self.path(config).is_file(), "installed l4h.conf is missing")
+        original = text = self.path(config).read_text()
+        cmdline = shlex.split(config_value(text, "dom0_cmdline"))
+        need([arg for arg in cmdline if arg.startswith("root=")] == ["root=UUID=" + root_uuid],
+             "installed dom0 root differs from the mounted root")
+        safe_path(self.path(payload))
+        need(self.path(payload).is_file(), "installed boot payload is missing")
+        variant = self.args.variant or saved.get("variant")
+        if variant is None:
+            key = (saved.get("release"), firmware, digest(self.path(payload)))
+            if key not in self.variants:
+                self.variants[key] = installed_variant(*key)
+            variant = self.variants[key]
+        need(variant in ("generic", "xapic-nopcid"), "invalid installed kernel variant")
+        plan["variant"] = variant
+        # Explicit overrides use host capacity, never dom0's allocated RAM/CPUs.
+        if self.args.memory is not None or self.args.vcpus is not None:
+            if dom0:
+                info = self.run("/usr/local/bin/l4hctl", "info")
+                ram = re.search(r"^memory:.* of (\d+) MiB$", info, re.M)
+                cores = re.search(r"^cores:\s+(\d+)$", info, re.M)
+                need(ram and cores, "cannot read host capacity from l4hctl info")
+                total, cpus = int(ram[1]), int(cores[1])
+            else:
+                total = int(re.search(r"^MemTotal:\s+(\d+)", self.read("/proc/meminfo"), re.M)[1]) // 1024
+                cpus = len(re.findall(r"^processor\s*:", self.read("/proc/cpuinfo"), re.M))
+            if self.args.memory is not None:
+                text = config_replace(text, "dom0_mem_mb", memory_size(total, self.args.memory))
+            if self.args.vcpus is not None:
+                need(1 <= self.args.vcpus <= min(cpus, 64), "dom0 vCPUs must fit the available CPUs (maximum 64)")
+                text = config_replace(text, "dom0_vcpus", self.args.vcpus)
+        plan["configuration"] = text
+        plan["config_changed"] = text != original
+        plan["config_mode"] = self.path(config).stat().st_mode & 0o777
+        tracked = [STATE, config, payload]
+        if firmware == "bios":
+            tracked.append(Path(plan["grubdir"]) / "custom.cfg")
+        plan["snapshot"] = {str(p): digest(self.path(p)) for p in tracked}
         return plan
 
     def efi_boot(self, plan):
@@ -470,6 +600,8 @@ class Preflight:
 
 
 def configuration(plan):
+    if plan.get("update"):
+        return plan["configuration"]
     nic_config = "".join("{}={}\n".format(key, nic["bdf"]) for key, nic in
                          zip(("uplink_nic", "uplink2_nic"), plan["uplinks"]))
     net_cmdline = " ".join("l4h.net={mac},{ifname}".format(**nic) for nic in plan["uplinks"])
@@ -549,6 +681,45 @@ def download_bios(args, plan, work):
     return unpack_bios(archive, work, plan["variant"])
 
 
+def installed_variant(release, firmware, installed_hash):
+    """Older installation records omitted the variant. Match their boot file
+    to the recorded release rather than guessing from dom0's virtual CPU."""
+    need(isinstance(release, str) and re.fullmatch(r"v[A-Za-z0-9][A-Za-z0-9._-]*", release),
+         "cannot identify the installed variant; specify --variant")
+    with tempfile.TemporaryDirectory() as work:
+        work = Path(work)
+        sums = work / "SHA256SUMS"
+        try:
+            run("curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https",
+                "--proto-redir", "=https", "--retry", "3", "--output", str(sums),
+                "https://github.com/losfair/l4h/releases/download/" + release + "/SHA256SUMS")
+            variants = ("generic", "xapic-nopcid")
+            if firmware == "uefi":
+                lines = [line.split() for line in sums.read_text().splitlines()]
+                matches = [v for v in variants if
+                           [p[0] for p in lines if len(p) == 2 and p[1] == "l4h-" + v + ".efi"] == [installed_hash]]
+            else:
+                archive = work / (BIOS_PACKAGE + ".tar.xz")
+                release_file(argparse.Namespace(release=release, checksums=sums), archive.name, archive)
+                matches = []
+                with tarfile.open(archive, "r:xz") as tar:
+                    for variant in variants:
+                        members = [m for m in tar.getmembers()
+                                   if m.name == BIOS_PACKAGE + "/kernel-" + variant + ".elf"]
+                        if len(members) != 1 or not members[0].isfile():
+                            continue
+                        value = hashlib.sha256()
+                        with tar.extractfile(members[0]) as stream:
+                            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                                value.update(block)
+                        if value.hexdigest() == installed_hash:
+                            matches.append(variant)
+            need(len(matches) == 1, "installed boot file does not match a unique release variant")
+            return matches[0]
+        except (Incompatible, OSError, tarfile.TarError) as error:
+            raise Incompatible("cannot identify the installed variant; specify --variant: " + str(error)) from error
+
+
 def safe_path(path):
     for part in (path, *path.parents):
         need(not part.is_symlink(), "refusing symlink in install path: " + str(part))
@@ -575,7 +746,7 @@ class EfiBoot:
 
     def __init__(self, plan, efi, make_default, command):
         self.plan, self.efi, self.make_default, self.command = plan, efi, make_default, command
-        entries = plan["boot"]["entries"]
+        entries = plan["boot"]["entries"] if plan["boot"] else {}
         self.entry = plan["entry"] or next(("%04X" % n for n in range(65536) if "%04X" % n not in entries), None)
         need(self.entry is not None, "no free EFI boot entry")
         self.fs, self.space = Path(plan["esp"]), "the ESP"
@@ -588,16 +759,20 @@ class EfiBoot:
     def selection(self, temp):
         return []
 
-    def state(self, release):
-        return dict(esp=self.plan["esp"], entry=self.entry, release=release)
+    def state(self):
+        return dict(esp=self.plan["esp"], esp_partuuid=self.plan["esp_partuuid"], entry=self.entry)
 
     def unchanged(self):
         # Re-read immediately before publishing in case another boot tool ran.
+        if self.plan["boot"] is None:
+            return
         need(boot_state(self.command("efibootmgr", "--verbose")) == self.plan["boot"],
              "EFI boot state changed during installation; rerun the installer")
 
     def select(self):
         plan, entry, command = self.plan, self.entry, self.command
+        if plan["boot"] is None:
+            return
         self.selected = True
         if plan["entry"] is None:
             command("efibootmgr", "--create-only", "--bootnum", entry, "--disk", plan["esp_disk"],
@@ -639,8 +814,12 @@ class EfiBoot:
 
     def report(self, release, backup):
         print("Installed {} as Boot{}. Backup: {}".format(release, self.entry, backup))
+        if self.plan["boot"] is None:
+            print("UEFI boot selection is unchanged: dom0 cannot access firmware variables. "
+                  "Select L4H in firmware if it is not already the default.")
+            return
         print("BootOrder: " + self.final["order"])
-        print("L4H is the default boot entry." if self.make_default else
+        print("L4H is the default boot entry." if self.final["order"].split(",")[0] == self.entry else
               "L4H is selected for the next boot only; the native Linux BootOrder is preserved.")
 
 
@@ -663,12 +842,19 @@ class GrubBoot:
 
     def selection(self, temp):
         # Published after the files it boots; GRUB lists it from then on.
+        text = self.plan.get("grub_custom")
+        if text is not None:
+            if self.default == self.plan["default"]:
+                return []
+            text = text.rstrip("\n") + '\nif [ -z "$boot_once" ]; then set default=l4h; fi\n'
+        else:
+            text = grub_entry(self.plan, self.default)
         custom = temp / "custom.cfg"
-        custom.write_text(grub_entry(self.plan, self.default))
+        custom.write_text(text)
         return [(custom, Path(self.plan["grubdir"]) / "custom.cfg", 0o644)]
 
-    def state(self, release):
-        return dict(firmware="bios", grubdir=self.plan["grubdir"], default=self.default, release=release)
+    def state(self):
+        return dict(grubdir=self.plan["grubdir"], boot_uuid=self.plan["boot_uuid"], default=self.default)
 
     def current(self):
         return grub_env(self.command(self.plan["grub_tool"], self.env, "list"))
@@ -706,19 +892,26 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
 
     payload is the UEFI application, or the unpacked BIOS package."""
     path = lambda name: root / str(name).lstrip("/")
+    for name, checksum in plan.get("snapshot", {}).items():
+        safe_path(path(name))
+        need(path(name).is_file() and digest(path(name)) == checksum,
+             "installed files changed during update; rerun the installer")
     boot = (EfiBoot if plan["firmware"] == "uefi" else GrubBoot)(plan, payload, make_default, command)
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
         config = temp / "l4h.conf"
         config.write_text(configuration(plan))
         state = temp / "install.json"
-        state.write_text(json.dumps(boot.state(release), indent=2) + "\n")
+        record = dict(version=2, firmware=plan["firmware"], variant=plan["variant"],
+                      root_uuid=plan["root_uuid"], release=release, **boot.state())
+        state.write_text(json.dumps(record, indent=2) + "\n")
+        configs = ([(config, boot.l4h / "l4h.conf", plan.get("config_mode", 0o644))]
+                   if not plan.get("update") or plan["config_changed"] else [])
         files = (boot.files() +
                  [(package / "install/initrd", boot.l4h / "dom0/initrd", 0o644),
-                  (config, boot.l4h / "l4h.conf", 0o644),
                   (package / "bin/l4hctl", Path("/usr/local/bin/l4hctl"), 0o755),
                   (package / "share/licenses/l4hctl/LICENSE", Path("/usr/local/share/licenses/l4hctl/LICENSE"), 0o644)] +
-                 boot.selection(temp) + [(state, STATE, 0o600)])
+                 configs + boot.selection(temp) + [(state, STATE, 0o600)])
         for source, target, _ in files:
             need(source.is_file() and source.stat().st_size > 0, "release file missing/empty: " + str(source))
             safe_path(path(target))
@@ -779,7 +972,11 @@ def commit(plan, package, payload, release, make_default, root=Path("/"), comman
                 print("l4h: rollback incomplete: " + "; ".join(failures), file=sys.stderr)
             raise
     boot.report(release, backup)
-    print("Reboot when ready. The existing Linux userspace will run as dom0; no reboot was performed.")
+    if plan.get("dom0"):
+        print("Run /usr/local/bin/l4hctl host-reboot when ready to load the update. "
+              "A normal reboot only restarts dom0; no reboot was performed.")
+    else:
+        print("Reboot when ready. The existing Linux userspace will run as dom0; no reboot was performed.")
 
 
 def arguments(argv=None):
@@ -801,13 +998,19 @@ def main():
     args = arguments()
     need(os.geteuid() == 0, "run as root to read PCI configuration, disks and EFI variables")
     package = Path(__file__).resolve().parent.parent
-    plan = Preflight(args).check()
+    preflight = Preflight(args)
+    plan = preflight.check()
     boot = plan["esp"] if plan["firmware"] == "uefi" else "BIOS GRUB " + plan["grubdir"]
-    print("Compatible: {} on {}, root UUID={}, dom0 {} MiB / {} CPUs".format(
-        plan["variant"], boot, plan["root_uuid"], plan["memory"], plan["vcpus"]))
-    for switch, nic in enumerate(plan["uplinks"]):
-        print("  Switch {}: uplink {} (PCI {}, MAC {})".format(switch, nic["ifname"], nic["bdf"], nic["mac"]))
-    print("Firmware behavior and application compatibility still require a boot test.")
+    if plan.get("update"):
+        print("Update: {} on {}, root UUID={} (from {})".format(
+            plan["variant"], boot, plan["root_uuid"], "dom0" if plan["dom0"] else "native Linux"))
+        print("Preserving l4h.conf" + (" with the requested resource overrides." if plan["config_changed"] else "."))
+    else:
+        print("Compatible: {} on {}, root UUID={}, dom0 {} MiB / {} CPUs".format(
+            plan["variant"], boot, plan["root_uuid"], plan["memory"], plan["vcpus"]))
+        for switch, nic in enumerate(plan["uplinks"]):
+            print("  Switch {}: uplink {} (PCI {}, MAC {})".format(switch, nic["ifname"], nic["bdf"], nic["mac"]))
+        print("Firmware behavior and application compatibility still require a boot test.")
     if args.check:
         return
     need(args.release and re.fullmatch(r"v[A-Za-z0-9][A-Za-z0-9._-]*", args.release) and args.checksums,
@@ -821,7 +1024,7 @@ def main():
         # Serialize installers, then repeat preflight before any persistent write.
         with open("/run/l4h-install.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            need(Preflight(args).check() == plan, "system changed during download; rerun the installer")
+            need(preflight.check() == plan, "system changed during download; rerun the installer")
             commit(plan, package, payload, args.release, args.make_default)
 
 

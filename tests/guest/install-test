@@ -8,6 +8,14 @@ trap 'echo "INSTALLVM: FAIL at line $LINENO"; sync; systemctl poweroff' ERR
 cd "$work"
 if [[ $(uname -r) == *-l4h ]]; then
     echo "INSTALLVM: dom0 kernel $(uname -r)"
+    if [[ $(cat phase) == updated-dom0 ]]; then
+        sha256sum --check installed-config.sha256
+        echo dom0 > phase
+        echo 'INSTALLVM: booted after dom0 update; returning to native Linux'
+        sync
+        l4hctl host-reboot
+        exit
+    fi
     [[ $(cat phase) == installed ]]
     sha256sum --check native-files.sha256
     [[ $(cat marker) == native-linux ]]
@@ -47,6 +55,20 @@ if [[ $(uname -r) == *-l4h ]]; then
     echo l4h-dom0 > marker
     echo dom0 > phase
     echo 'INSTALLVM: existing userspace, modules, network and persistent root passed'
+    # Update from the paravirtual kernel, with no ACPI/PCI or EFI runtime.
+    # Its read-only module mount and smaller RAM/CPU allocation must not
+    # become first-install migration inputs or replace the saved settings.
+    # shellcheck disable=SC2002
+    cat install.sh | bash -s -- --release v0-install-test
+    sha256sum --check installed-config.sha256
+    sha256sum --check native-files.sha256
+    [[ $(findmnt -n -o OPTIONS -T /lib/modules) == *ro* ]]
+    echo 'INSTALLVM: dom0 update preserved configuration and running modules'
+    if [[ -f /boot/grub/custom.cfg ]]; then
+        # BIOS dom0 can schedule another trial; UEFI dom0 leaves NVRAM alone.
+        grub-editenv /boot/grub/grubenv list | grep -qx 'next_entry=l4h'
+        echo updated-dom0 > phase
+    fi
     sync
     l4hctl host-reboot
 elif [[ ! -f phase ]]; then
@@ -128,6 +150,14 @@ elif [[ ! -f phase ]]; then
     echo 'l4h-install-test ALL=(root) NOPASSWD: ALL' > /etc/sudoers.d/l4h-install-test
     chmod 440 /etc/sudoers.d/l4h-install-test
     sudo -u l4h-install-test bash -c 'cat install.sh | bash -s -- --release v0-install-test'
+    if [[ -d /sys/firmware/efi ]]; then config=/boot/efi/l4h/l4h.conf; else config=/boot/l4h/l4h.conf; fi
+    echo '# operator settings survive updates' >> "$config"
+    sha256sum "$config" > installed-config.sha256
+    # Updating from native Linux must preserve the edited configuration too.
+    # shellcheck disable=SC2002
+    cat install.sh | bash -s -- --release v0-install-test
+    sha256sum --check installed-config.sha256
+    echo 'INSTALLVM: native update preserved configuration'
     # shellcheck disable=SC2002
     cat install.sh | bash -s -- --check --release v0-install-test
     sha256sum --check native-files.sha256

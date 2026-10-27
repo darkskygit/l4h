@@ -635,6 +635,36 @@ pending trial; \cmd{efibootmgr --bootnum XXXX --delete-bootnum} removes
 the L4H entry (substitute its number). EFI-variable management must run
 under native Linux; dom0 does not expose the firmware's EFI runtime.
 
+\subsection*{Updating an installed system}
+
+Rerun the same command from native Linux or a running L4H dom0 to update
+an installer-managed deployment. The selected release must include update
+support. The installer recognizes \file{/var/lib/l4h/install.json},
+checks that root and the boot filesystem match the existing deployment,
+and replaces the boot payload, dom0 initramfs and \cmd{l4hctl}. It preserves
+\file{l4h.conf}, the kernel variant and existing GRUB customizations.
+\texttt{--memory}, \texttt{--vcpus} and \texttt{--variant} override only
+those settings; dom0 resource overrides use host capacity reported by
+\cmd{l4hctl info}, not dom0's smaller allocation. \texttt{--check} supports
+this update path too. Migration-only hardware and userspace checks are
+not rerun against dom0's virtual devices or its read-only module mount.
+
+Older installation records lack the selected variant. The updater
+identifies it by matching the installed EFI application or BIOS kernel
+against the recorded release, downloading its checksums and, on BIOS,
+its verified archive. If that release is unavailable or the boot file
+has been modified, specify \texttt{--variant} explicitly. Successful
+updates record the variant for subsequent runs.
+
+Updates use the same backup and rollback mechanism as installation.
+They do not reboot, and the running kernel and module mount remain in
+use until a host reboot. From dom0 use \cmd{l4hctl host-reboot} to load
+the new files. BIOS dom0 can schedule L4H through GRUB as usual. UEFI
+dom0 updates only files and preserves firmware selection; it rejects
+\texttt{--make-default}, which requires native Linux. After a one-time
+UEFI trial, select L4H again in firmware or from native Linux to boot
+the update.
+
 \subsection*{BIOS machines}
 
 Many smaller clouds boot their VMs with BIOS only (SeaBIOS), such as
