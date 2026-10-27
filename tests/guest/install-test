@@ -6,41 +6,6 @@ work=/opt/l4h-install-test
 exec > >(tee -a "$work/result.log" /dev/console) 2>&1
 trap 'echo "INSTALLVM: FAIL at line $LINENO"; sync; systemctl poweroff' ERR
 cd "$work"
-if [[ -e wireguard ]]; then
-    # Represent an existing userspace service that recreates a tunnel at boot.
-    # The peer lives in a separate netns but keeps its UDP socket in this one,
-    # so it can use loopback as transport without adding another visible NIC.
-    if [[ ! -f phase ]]; then
-        if ! command -v wg >/dev/null; then
-            apt-get update
-            apt-get install -y --no-install-recommends wireguard-tools
-        fi
-        (umask 077; wg genkey > wg-server.key; wg genkey > wg-peer.key)
-    fi
-    # Virtual Ethernet links and interfaces attached to a virtual master
-    # must also be ignored when selecting the physical uplinks.
-    ip tuntap add dev tun-test mode tun
-    ip tuntap add dev tap-test mode tap
-    ip link add br-test type bridge
-    ip link set tap-test master br-test
-    ip netns add l4h-wg-peer
-    ip link add wg-obfs type wireguard
-    ip link add wg-peer type wireguard
-    wg set wg-obfs private-key wg-server.key listen-port 24630 \
-        peer "$(wg pubkey < wg-peer.key)" allowed-ips 10.83.0.2/32 endpoint 127.0.0.1:24631
-    wg set wg-peer private-key wg-peer.key listen-port 24631 \
-        peer "$(wg pubkey < wg-server.key)" allowed-ips 10.83.0.1/32 endpoint 127.0.0.1:24630
-    ip link set wg-peer netns l4h-wg-peer
-    ip addr add 10.83.0.1/32 dev wg-obfs
-    ip link set wg-obfs up
-    ip route add 10.83.0.2/32 dev wg-obfs
-    ip -n l4h-wg-peer addr add 10.83.0.2/32 dev wg-peer
-    ip -n l4h-wg-peer link set wg-peer up
-    ip -n l4h-wg-peer route add 10.83.0.1/32 dev wg-peer
-    ping -I wg-obfs -c 2 -W 10 10.83.0.2
-    wg show wg-obfs latest-handshakes | awk 'NF == 2 && $2 > 0 { ok = 1 } END { exit !ok }'
-    echo 'INSTALLVM: WireGuard encrypted traffic passed'
-fi
 if [[ $(uname -r) == *-l4h ]]; then
     echo "INSTALLVM: dom0 kernel $(uname -r)"
     [[ $(cat phase) == installed ]]

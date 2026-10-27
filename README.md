@@ -129,8 +129,10 @@ one interface on each switch with the original name and MAC, so existing
 address, route and DNS settings can apply. Software interfaces (including
 WireGuard, PPP, GRE and TUN/TAP) are excluded from uplink selection and the
 physical NIC limit; existing userspace remains responsible for recreating
-them. The guest kernel includes WireGuard. Profiles tied to a PCI path or
-native driver may need adaptation. Physical NICs enslaved to a bond,
+them. The guest kernel includes WireGuard, PPP, GRE/IP tunnels, L2TP,
+VXLAN, GENEVE and MAC/IP VLANs, plus nftables FIB lookups and redirects.
+Profiles tied to a PCI path or native driver may need adaptation.
+Physical NICs enslaved to a bond,
 bridge or other master require a custom deployment, as do other unsupported layouts:
 in particular LVM, encrypted volumes, RAID, Btrfs, separate `/usr`,
 SATA/USB storage, active AppArmor profiles and DKMS modules are rejected.

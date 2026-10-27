@@ -212,7 +212,7 @@ A Linux x86\_64 build machine with:
         rust-sel4's
         \file{rust-\allowbreak toolchain.toml};
   \item the usual Linux kernel build dependencies (flex, bison, bc,
-        libelf, OpenSSL headers);
+        libelf, OpenSSL headers, pahole for BTF generation);
   \item QEMU (\texttt{qemu-system-x86\_64}) with KVM, to run hosts locally;
   \item a static busybox, cpio and e2fsprogs, for initramfs and disk images;
   \item for UEFI images: GRUB EFI (\texttt{grub-efi-amd64-bin}), mtools,
@@ -339,6 +339,19 @@ router with a firewall, tagged VLANs, XFS and FAT) and its sandboxes
 (EROFS, dm-crypt, dm-verity with SHA-256, Docker through
 \texttt{iptables-nft}, the NFS client), so that the shipped kernel serves
 both.
+
+Software networking is built in: WireGuard and TUN/TAP; PPP with async and
+sync TTY channels, compression, MPPE, multilink, PPPoE, PPTP and PPPoL2TP;
+GRE/GRETAP and IP tunnels over IPv4 and IPv6, SIT/6RD, VTI, FOU/GUE,
+L2TPv3 Ethernet and IP encapsulation, VXLAN, GENEVE, bare UDP and GTP.
+The kernel also includes bonding, all team modes, VLAN-aware bridges,
+MACVLAN/MACVTAP, IPVLAN/IPVTAP, MACsec, VRF and IFB.
+Nftables supports \texttt{fib} expressions in the \texttt{ip}, \texttt{ip6}
+and \texttt{inet} families, including \texttt{fib daddr type}, and
+\texttt{redirect} NAT rules.
+Kernel BTF is built in and exposed at \file{/sys/kernel/btf/vmlinux} for
+\texttt{bpftool} and BPF CO-RE programs; the build uses \texttt{pahole}
+to generate it from DWARF debug information.
 
 It also has what Android's userspace needs from a kernel: Binder and
 binderfs, SELinux, PSI, bootconfig, userfaultfd, an RTC with alarms,

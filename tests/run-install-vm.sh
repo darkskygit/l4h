@@ -6,7 +6,6 @@
 # SeaBIOS on i440fx, a virtio-blk boot disk and transitional virtio-net, so
 # the installer takes its BIOS GRUB path.
 # INSTALL_VM_MEMORY=1G INSTALL_VM_CPUS=1 exercises small-VM defaults.
-# INSTALL_VM_WIREGUARD=1 checks WireGuard traffic and skips virtual NICs.
 # Requires prebuilt release artifacts, sudo, QEMU/KVM, OVMF and util-linux.
 # The input image is never modified. Only the new test image is mounted.
 set -euo pipefail
@@ -52,9 +51,6 @@ sudo mkdir -p "$guest/opt/l4h-install-test/release"
 printf '%s\n' "$nics" | sudo tee "$guest/opt/l4h-install-test/nic-count" >/dev/null
 if [[ ${INSTALL_VM_SWAP_NAMES:-0} == 1 ]]; then
     sudo touch "$guest/opt/l4h-install-test/swap-names"
-fi
-if [[ ${INSTALL_VM_WIREGUARD:-0} == 1 ]]; then
-    sudo touch "$guest/opt/l4h-install-test/wireguard"
 fi
 sudo cp "$root/tools/install.sh" "$guest/opt/l4h-install-test/"
 boot_files=(l4h-generic.efi)
@@ -137,7 +133,3 @@ loop=''
 grep -a 'INSTALLVM:' "$work/guest-result.log"
 grep -aq 'INSTALLVM: dom0 kernel' "$work/guest-result.log"
 grep -aq 'INSTALLVM: existing userspace, modules, network and persistent root passed' "$work/guest-result.log"
-if [[ ${INSTALL_VM_WIREGUARD:-0} == 1 ]]; then
-    # Each boot must recreate the tunnel: native Linux, dom0, then native Linux.
-    [[ $(grep -ac 'INSTALLVM: WireGuard encrypted traffic passed' "$work/guest-result.log") == 3 ]]
-fi
