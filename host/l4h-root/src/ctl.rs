@@ -93,7 +93,7 @@ pub fn host_op(h: &mut Host, op: u32, a: &[u64; 6], data: &mut [u8; abi::CTL_DAT
             vals[1] = h.netd.nics.iter().position(|n| n.switch == Some(sw)).map_or(u64::MAX, |i| i as u64);
         }
         // Returns only on failure.
-        abi::CTL_HOST_REBOOT => return Err(crate::reset::reboot(h)),
+        abi::CTL_HOST_REBOOT => return Err(crate::reset::reboot(h, "dom0")),
         abi::CTL_RTC_SET => h.rtc.set_secs(&mut h.wins.a, a[0])?,
         _ => return Err(ENOSYS),
     }

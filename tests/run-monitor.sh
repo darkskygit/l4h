@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The l4h-root serial monitor: list guests and restart dom0 from COM1.
+# The l4h-root serial monitor: list guests, restart dom0 and reset the
+# host from COM1.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/tools/guest-env.sh"
@@ -35,9 +36,23 @@ printf 'restart-dom0\r' >&3
 wait_for "GUEST: ready" 2 120
 printf 'info\r' >&3
 wait_for "monitor: 4 cores" 1 30
-kill "$qemu" 2>/dev/null || true
+# The way out when nothing else answers.  QEMU runs with -no-reboot, so
+# the reset ends it.
+printf 'reboot\r' >&3
+if [ "${L4H_ARCH:-x86_64}" = aarch64 ]; then
+    wait_for "monitor: reboot failed: error 38" 1 30
+    kill "$qemu" 2>/dev/null || true
+else
+    wait_for "l4h-root: host reboot (monitor)" 1 30
+    end=$((SECONDS + 30))
+    while kill -0 "$qemu" 2>/dev/null; do
+        [ "$SECONDS" -lt "$end" ] || { echo "monitor: the host did not reset"; kill "$qemu"; exit 1; }
+        sleep 0.5
+    done
+    ! grep -aq "reboot failed" "$log"
+fi
 wait "$qemu" 2>/dev/null || true
-grep -aE "monitor:|restarting dom0" "$log"
+grep -aE "monitor:|restarting dom0|host reboot" "$log"
 echo "monitor: PASS"
 
 if [ "${L4H_ARCH:-x86_64}" = x86_64 ]; then

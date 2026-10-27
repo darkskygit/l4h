@@ -533,7 +533,9 @@ pub fn set_mr(i: usize, v: u64) {
 }
 
 /// The serve loop's reply object, made from an Untyped of its own so that
-/// one left unanswered can be replaced without using more memory.
+/// one left unanswered can be replaced without using more memory.  It is
+/// in SLOT_REPLY, where the keeper finds it if vmmgr fails: the caller it
+/// holds then gets an answer (l4h_rt::abort_trap).
 struct ReplySlot {
     ut: cap::Untyped,
     reply: cap::Reply,
@@ -541,9 +543,12 @@ struct ReplySlot {
 
 impl ReplySlot {
     fn new(alloc: &mut Alloc) -> Self {
-        let (ut_slot, slot) = (alloc.slots.alloc(), alloc.slots.alloc());
+        let ut_slot = alloc.slots.alloc();
         let ut = alloc.split(12, ut_slot).expect("reply object memory").cap;
-        let r = ReplySlot { ut, reply: sel4::Cap::from_bits(slot as u64) };
+        let reply = sel4::Cap::from_bits(host::SLOT_REPLY);
+        // The one root made, which we cannot replace.
+        slot::CNODE.cap().absolute_cptr(reply).delete().expect("delete reply object");
+        let r = ReplySlot { ut, reply };
         r.make();
         r
     }

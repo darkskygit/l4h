@@ -76,11 +76,11 @@ impl Reset {
 
 /// Reset the machine.  Returns only if every method failed: -EIO
 /// (-ENOSYS on aarch64, which has none yet).
-pub fn reboot(h: &mut Host) -> i64 {
+pub fn reboot(h: &mut Host, by: &str) -> i64 {
     if cfg!(not(target_arch = "x86_64")) {
         return crate::ctl::ENOSYS;
     }
-    sel4::debug_println!("l4h-root: host reboot (dom0)");
+    sel4::debug_println!("l4h-root: host reboot ({})", by);
     reset(h);
     sel4::debug_println!("l4h-root: host reboot failed: the machine did not reset");
     crate::ctl::EIO

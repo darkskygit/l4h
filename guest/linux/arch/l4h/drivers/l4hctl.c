@@ -76,6 +76,9 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		}
 	}
 	memset(resp, 0, sizeof(*resp));
+	/* The host writes every response: one it never wrote (vmmgr failed,
+	 * and its keeper answered dom0's VMM) fails. */
+	resp->status = -EIO;
 	l4h_hypercall(L4H_HC_CTL, &mr, 0, 1);
 	if (req->op == L4H_CTL_GPU_READ && !resp->status) {
 		unsigned long n = resp->vals[0];

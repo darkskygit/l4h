@@ -147,18 +147,25 @@ extern "C" fn keeper() -> ! {
     answer_failed()
 }
 
-/// Answer l4h-root as a failed component: u64::MAX and zeros to every
-/// call, the one this thread's reply object holds (if any) first.
+/// Answer the callers of a failed component: u64::MAX and zeros to every
+/// call, the one the main thread's reply object holds (if any) first.
+/// Faults sent to it (vmmgr's guests' and VMMs') stay unanswered.
 fn answer_failed() -> ! {
     let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
+    let mut answer = true;
     loop {
-        sel4::with_ipc_buffer_mut(|b| {
-            let m = b.msg_regs_mut();
-            m[0] = u64::MAX;
-            m[1..8].fill(0);
-        });
-        ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 8), reply);
+        let (_, badge) = if answer {
+            sel4::with_ipc_buffer_mut(|b| {
+                let m = b.msg_regs_mut();
+                m[0] = u64::MAX;
+                m[1..8].fill(0);
+            });
+            ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 8), reply)
+        } else {
+            ep.recv(reply)
+        };
+        answer = badge & host::BADGE_FAULT == 0;
     }
 }
 
@@ -167,9 +174,10 @@ pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
 }
 
 /// Where an aborted component ends.  l4h-root calls blkd, netd and memd
-/// synchronously and could not wait for their faults to be reported: one
-/// that has failed keeps answering on its service endpoint (a fault, its
-/// keeper does).  Any other component faults, which root handles.
+/// synchronously, and guests' VMMs call vmmgr, and could not wait for
+/// their faults to be reported: one that has failed keeps answering on its
+/// service endpoint (a fault, its keeper does).  Any other component
+/// faults, which root handles.
 #[doc(hidden)]
 pub fn abort_trap() -> ! {
     let h = INFO.header();

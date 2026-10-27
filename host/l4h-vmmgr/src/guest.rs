@@ -64,7 +64,7 @@ pub const MAX_GUEST_DEVICES: usize = 16;
 pub const MAX_VSPACES: usize = 64;
 
 /// Badge layout of vmmgr's fault endpoint for guest kernels.
-pub const HYP_BADGE_FAULT: u64 = 1 << 24;
+pub const HYP_BADGE_FAULT: u64 = host::BADGE_FAULT;
 pub fn hyp_badge(guest: usize, vcpu: usize) -> u64 {
     (guest as u64) | ((vcpu as u64) << 16)
 }
@@ -1035,10 +1035,8 @@ pub fn create(
             g.share_block(alloc, kernel, b);
         }
     }
-    // ---- Hypercall endpoint (served by l4h-vmm), and its notification,
-    // which root's backends signal.
+    // ---- Hypercall endpoint (served by l4h-vmm).
     g.vmm_ep = g.arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
-    g.vmm_ntfn = g.arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     g.give_badged(
         abi::SLOT_HYP_EP,
         g.vmm_ep,
@@ -1048,13 +1046,15 @@ pub fn create(
 
     // ---- I/O pool: root's physically contiguous memory, whose frames we
     // map after RAM in the direct map.  The guest gets these mappings
-    // only, never a capability to the pool.
+    // only, never a capability to the pool.  And the VMM's notification,
+    // which root's backends signal: root's too.
     let pool_radix = cfg.io_pool.trailing_zeros() as usize - 12;
-    let new = match root::guest_new(alloc, id, cfg.io_pool, pool_gpa, cfg.dom0, g.vmm_ntfn) {
+    let new = match root::guest_new(alloc, id, cfg.io_pool, pool_gpa, cfg.dom0) {
         Ok(new) => new,
         Err(_) => return Err(Some(g)),
     };
     g.instance = new.instance;
+    g.vmm_ntfn = new.vmm_ntfn;
     g.pool = IoPool { gpa: pool_gpa, size: cfg.io_pool, frames: new.pool_frames, radix: pool_radix };
     let tmp = alloc.slots.alloc();
     let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });

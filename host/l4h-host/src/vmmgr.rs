@@ -8,7 +8,8 @@
 //! events through the events page and its notification.
 //!
 //! Capabilities cross in vmmgr's exchange slots, which root reaches through
-//! the CNode it holds of vmmgr's (root dominates vmmgr).  Root takes ids,
+//! the CNode it holds of vmmgr's (root dominates vmmgr).  Root empties a
+//! slot before it puts a capability there, and takes none from vmmgr.  Root takes ids,
 //! disk numbers, windows and sizes from vmmgr, and checks them against its
 //! own tables, but never a physical address.
 
@@ -84,12 +85,12 @@ pub const BADGE_ROOT_EVENT: u64 = 1 << 42;
 /// 0 or an errno, values follow.
 ///
 /// MR0 = guest, MR1 = I/O pool bytes (a power of two), MR2 = its GPA, MR3
-/// = dom0; exchange slot 0 = the guest's l4h-vmm notification.  Root
-/// makes the pool and takes the notification (backends signal it).
-/// Exchange slot 0 = the CNode of the pool's frames (radix: the pool's
-/// pages), and if the guest gets an attestation device, slot 1 its page
-/// and slot 2 its kick capability (badged).  MR1 = the guest's instance,
-/// MR2 = whether it has an attestation device.
+/// = dom0.  Root makes the pool and the guest's l4h-vmm notification,
+/// which backends signal (root's, so that it is one).  Exchange slot 0 =
+/// the CNode of the pool's frames (radix: the pool's pages), slot 3 = the
+/// notification, and if the guest gets an attestation device, slot 1 its
+/// page and slot 2 its kick capability (badged).  MR1 = the guest's
+/// instance, MR2 = whether it has an attestation device.
 pub const VMMGR_GUEST_NEW: u64 = 0x100;
 /// MR0 = guest, stopped and torn down by vmmgr: drain its disks, remove
 /// its ports, forget it in trustd, revoke its pool.  MR1 = bytes of pool

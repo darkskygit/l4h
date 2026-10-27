@@ -1509,6 +1509,9 @@ Command & Effect \\
 \texttt{destroy VM} & destroy a VM other than dom0 \\
 \texttt{restart-dom0} & destroy dom0 and boot it again (or boot it, if it
   is not running) \\
+\texttt{reboot} & reset the host at once: every VM stops without notice.
+  The way back when dom0 does not answer and \cmd{l4hctl host-reboot} is
+  out of reach \\
 \bottomrule
 \end{longtable}
 

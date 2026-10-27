@@ -161,7 +161,11 @@ impl Memd {
             let from = abs(self.mem.slot(i, k));
             match c {
                 Client::Root => xchg(c, n).move_(&from).expect("memd: move to exchange"),
-                Client::Vmmgr => xchg(c, n).copy(&from, CapRights::all()).expect("memd: copy to mailbox"),
+                Client::Vmmgr => {
+                    // Whatever vmmgr left in its mailbox must not make us fail.
+                    let _ = xchg(c, n).delete();
+                    xchg(c, n).copy(&from, CapRights::all()).expect("memd: copy to mailbox")
+                }
             }
         }
         // Invocations use the message registers: the reply's go last.
@@ -347,6 +351,7 @@ impl Memd {
             return EINVAL;
         };
         // Fails if the block already has a copy.
+        let _ = xchg(Client::Vmmgr, 0).delete();
         if xchg(Client::Vmmgr, 0).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
             return EINVAL;
         }
