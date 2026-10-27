@@ -1,4 +1,6 @@
-//! Untyped memory and CSpace slot management for the root task.
+//! Untyped memory and CSpace slot management for the root task, and for
+//! l4h-vmmgr, which includes this file: `crate::slot` names the task's own
+//! CNode, in which every slot is reached at depth 64 (one level, guarded).
 //!
 //! All kernel objects are carved out of Untyped capabilities.  We keep our
 //! own copy of each Untyped's watermark so that we know the physical address
@@ -10,7 +12,7 @@ use core::ops::Range;
 
 use l4h_host::fixed::{ArrayVec, StaticCell};
 
-use sel4::init_thread::slot;
+use crate::slot;
 use l4h_host::memd::BLOCK_BITS;
 use sel4::{ObjectBlueprint, cap};
 
@@ -18,8 +20,8 @@ use crate::memd::MemdLink;
 
 pub type Slot = usize;
 
-/// Slots of the root task's CNode.
-pub const ROOT_SLOTS: usize = 1 << sel4::sel4_cfg_usize!(ROOT_CNODE_SIZE_BITS);
+/// Slots of the task's CNode.
+pub const ROOT_SLOTS: usize = crate::CNODE_SLOTS;
 const WORDS: usize = ROOT_SLOTS / 64;
 
 /// Owner of the slots of global objects (`Slots::global`).
@@ -374,6 +376,13 @@ impl Alloc {
         Self::with_tables(Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants }, bootinfo)
     }
 
+    /// An allocator with no memory until it is given a link to memd
+    /// (vmmgr's: all it has are grants).
+    pub fn empty(slots: Slots) -> Self {
+        let AllocTables { blocks, parents, grants } = ALLOC_TABLES.take();
+        Alloc { slots, pool: UtPool::empty(), blocks, parents, memd: None, grants }
+    }
+
     /// A new allocator for `bootinfo`, with this one's slots and tables:
     /// both are statics taken once (tests/alloc.rs makes several).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -418,6 +427,11 @@ impl Alloc {
 
     fn local_bytes(&self) -> usize {
         self.blocks.iter().map(|b| 1usize << b.size_bits).sum()
+    }
+
+    /// Free memory here, not in memd.
+    pub fn local_free_bytes(&self) -> usize {
+        self.local_bytes() + self.pool.free_bytes()
     }
 
     /// Free memory, here and in memd.
@@ -724,7 +738,7 @@ const ARENA_REGIONS: usize = 96;
 /// Arena::reserve: the largest object allocated in quantity (a 16 KiB RAM
 /// CNode) and the space before it.
 pub const ARENA_TAIL: usize = 32 << 10;
-const ARENA_OWNED: usize = ARENA_REGIONS + 1 + crate::guest::MAX_GUEST_DEVICES;
+const ARENA_OWNED: usize = ARENA_REGIONS + 1 + crate::MAX_GUEST_DEVICES;
 
 /// Untyped memory dedicated to one guest (or host component).
 ///

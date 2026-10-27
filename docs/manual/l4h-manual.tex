@@ -123,7 +123,7 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \node[host, below=0.7cm of dom0, minimum width=3.2cm] (v0) {l4h-vmm (0)};
   \node[host, below=0.7cm of ga, minimum width=3.2cm] (va) {l4h-vmm (1)};
   \node[host, below=0.7cm of gb, minimum width=3.2cm] (vb) {l4h-vmm ($n$)};
-  \node[host, below=0.9cm of v0, minimum width=3.2cm] (root) {l4h-root\\\footnotesize resources, control API,\\\footnotesize balancer, monitor};
+  \node[host, below=0.9cm of v0, minimum width=3.2cm] (root) {l4h-vmmgr\\\footnotesize guests, control API,\\\footnotesize balancer};
   \node[host, below=0.9cm of va, minimum width=3.2cm] (netd) {l4h-netd\\\footnotesize switches, NIC drivers};
   \node[host, below=0.9cm of vb, minimum width=3.2cm] (blkd) {l4h-blkd\\\footnotesize one per attached disk};
   \node[box, below=0.6cm of netd, minimum width=10.8cm, fill=gray!15] (k) {seL4 microkernel (MCS, SMP) with l4h patches};
@@ -141,12 +141,15 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \item[seL4] with fourteen l4h patches (\file{kernel/patches}): trapping guest
     system calls, FPU state access, per-thread deadline timers and a few
     fixes.
-  \item[l4h-root] is the root task. It owns the devices, creates and
-    destroys guests, executes control-API requests, balances vCPUs across
-    cores, and runs the serial monitor.
+  \item[l4h-root] is the root task (not drawn). It owns the devices, starts
+    the other components, gives guests their disks, vNICs and I/O pools
+    when vmmgr asks, and runs the serial monitor and the dashboard.
+  \item[l4h-vmmgr] creates and destroys guests, executes control-API
+    requests, and balances vCPUs across cores. Nothing a guest or dom0
+    sends reaches \texttt{l4h-root}.
   \item[l4h-memd] owns the free memory and every guest's RAM. The root task
-    gets the memory for its own objects from it, and it reports free
-    memory to the hypervisor when l4h runs in a VM.
+    and vmmgr get the memory for their own objects from it, and it reports
+    free memory to the hypervisor when l4h runs in a VM.
   \item[l4h-vmm] runs once per guest. It serves the guest's hypercalls and
     virtio devices. It maps only its own guest's I/O pool (below), never its
     RAM, so a compromised VMM can harm only that guest.
@@ -156,8 +159,8 @@ are seL4 user-level programs; only the seL4 kernel runs privileged.
   \item[l4h-netd] holds every switch and drives the uplink NICs.
 \end{description}
 
-\paragraph{Trust.} The seL4 kernel, \texttt{l4h-root}, \texttt{l4h-memd},
-\texttt{l4h-blkd} and \texttt{l4h-netd} are trusted by everyone. dom0 is trusted to decide what
+\paragraph{Trust.} The seL4 kernel, \texttt{l4h-root}, \texttt{l4h-vmmgr},
+\texttt{l4h-memd}, \texttt{l4h-blkd} and \texttt{l4h-netd} are trusted by everyone. dom0 is trusted to decide what
 runs, and nothing more. Guest kernels are untrusted, and capabilities confine
 them. The trusted drivers validate every DMA address, and guests never touch
 device registers. On an AMD or Intel host with a supported IOMMU, \texttt{l4h-root} also confines every
@@ -283,7 +286,8 @@ Command & Result \\
 \cmd{tools/build-kmods.sh} & Builds the guest kernel and its module tree,
   \file{build/linux-l4h/kmods.erofs} (Section~\ref{sec:kmods}). \\
 \cmd{tools/build-host.sh} & Builds \texttt{l4h-vmm}, \texttt{l4h-blkd},
-  \texttt{l4h-netd} and the root task \texttt{l4h-root}, which embeds them
+  \texttt{l4h-netd}, \texttt{l4h-vmmgr} (which embeds \texttt{l4h-vmm}) and
+  the root task \texttt{l4h-root}, which embeds the others
   (dom0 is not built in, Chapter~\ref{ch:dom0}). The result is
   \file{host/target/\allowbreak x86\_64-sel4-roottask/\allowbreak debug/\allowbreak l4h-root.elf}. \\
 \cmd{cd tools/l4hctl \&\& cargo build --release} & Builds the static
@@ -703,9 +707,9 @@ At boot, \texttt{l4h-root}:
 \begin{enumerate}
   \item finds the cores, memory, disks and NICs;
   \item creates switch 0 and makes NIC 0, if there is one, its uplink;
-  \item creates dom0 with the configured disks and vNICs (dom0's vNICs are
-        on switch 0, with locked MAC addresses);
-  \item starts dom0 and then serves control requests.
+  \item starts \texttt{l4h-vmmgr}, which creates dom0 with the configured
+        disks and vNICs (dom0's vNICs are on switch 0, with locked MAC
+        addresses), starts it and then serves control requests.
 \end{enumerate}
 dom0 sees its disks as \file{/dev/vda}, \file{/dev/vdb}, \ldots{} in host
 disk order, and its vNICs as \texttt{eth0}, \texttt{eth1}, \ldots
@@ -835,8 +839,8 @@ tools/run-qemu.sh host/target/x86_64-sel4-roottask/debug/l4h-root.elf \
         \texttt{[vm$N$]}. The serial monitor (Chapter~\ref{ch:recovery})
         reads it.
   \item To leave QEMU, type \texttt{Ctrl-a x}. The host never powers off by
-        itself; when every guest has stopped, \texttt{l4h-root} prints
-        \texttt{l4h-root: all guests stopped}.
+        itself; when every guest has stopped, \texttt{l4h-vmmgr} prints
+        \texttt{l4h-vmmgr: all guests stopped}.
 \end{itemize}
 
 \cmd{tools/run-dom0.sh INITRD [CMDLINE] [TIMEOUT]} combines the steps for
@@ -1089,7 +1093,7 @@ again.
 \section{The console}
 
 Each VM has a console, \texttt{hvc0}, with an output buffer of about 16~KiB
-that \texttt{l4h-root} keeps even after the VM stops.
+that \texttt{l4h-vmmgr} keeps even after the VM stops.
 
 \begin{lstlisting}
 l4hctl console VM [--follow] [--until STRING] [--timeout SECS]
@@ -1407,7 +1411,7 @@ not be allocated on a native machine.
 
 
 
-\texttt{l4h-root} checks every request against the memory and other kernel
+\texttt{l4h-vmmgr} checks every request against the memory and other kernel
 resources it would need, and refuses it with \texttt{out of memory} instead
 of running out. A host runs at most about 61 guests at once, dom0 included:
 each guest uses 66 of the 4096 address-space identifiers seL4 has on
@@ -1422,7 +1426,7 @@ I/O. CPU may be overcommitted: 30 guests on 4 cores work, though each gets
 a share of a core.
 
 New vCPUs are placed on physical cores in turn before filling their SMT
-siblings. Every 100~ms, \texttt{l4h-root} measures how busy each vCPU was.
+siblings. Every 100~ms, \texttt{l4h-vmmgr} measures how busy each vCPU was.
 It balances busy vCPUs across physical cores first, then across logical
 CPUs, preferring to keep a guest's vCPUs on distinct physical cores where
 possible. A moved vCPU stays put for one second. On x86, CPU topology is
@@ -1471,10 +1475,10 @@ to use a full core shows about 75\% steal.
 
 \section{When dom0 fails}
 
-If dom0 powers off, reboots or crashes, \texttt{l4h-root} destroys it and
+If dom0 powers off, reboots or crashes, \texttt{l4h-vmmgr} destroys it and
 boots it again from the host image. The other guests keep running. The new
 dom0 finds them with \cmd{l4hctl list} and can manage them as before.
-\texttt{l4h-root} keeps the authoritative state; dom0 needs to store
+The host keeps the authoritative state; dom0 needs to store
 nothing to recover it. Disks and vNICs that dom0 had are recreated from the
 image's settings.
 

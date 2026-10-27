@@ -8,14 +8,21 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 export L4H_VERSION=$("$root/tools/version.sh")
 cd "$root/host"
-cargo build -q --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd
 out=$root/host/target/x86_64-sel4/debug
 mkdir -p "$out/stripped"
-for c in vmm blkd netd trustd memd; do
-    # Replace the copy only when it changes: root rebuilds when it does.
-    objcopy --strip-debug "$out/l4h-$c.elf" "$out/stripped/l4h-$c.elf.new"
-    cmp -s "$out/stripped/l4h-$c.elf.new" "$out/stripped/l4h-$c.elf" \
-        && rm "$out/stripped/l4h-$c.elf.new" || mv "$out/stripped/l4h-$c.elf.new" "$out/stripped/l4h-$c.elf"
-    export "L4H_$(echo $c | tr a-z A-Z)_ELF=$out/stripped/l4h-$c.elf"
-done
+strip() {
+    for c in "$@"; do
+        # Replace the copy only when it changes: whatever embeds it rebuilds
+        # when it does.
+        objcopy --strip-debug "$out/l4h-$c.elf" "$out/stripped/l4h-$c.elf.new"
+        cmp -s "$out/stripped/l4h-$c.elf.new" "$out/stripped/l4h-$c.elf" \
+            && rm "$out/stripped/l4h-$c.elf.new" || mv "$out/stripped/l4h-$c.elf.new" "$out/stripped/l4h-$c.elf"
+        export "L4H_$(echo $c | tr a-z A-Z)_ELF=$out/stripped/l4h-$c.elf"
+    done
+}
+cargo build -q --target x86_64-sel4 -p l4h-vmm -p l4h-blkd -p l4h-netd -p l4h-trustd -p l4h-memd
+strip vmm blkd netd trustd memd
+# vmmgr embeds l4h-vmm, root embeds vmmgr.
+cargo build -q --target x86_64-sel4 -p l4h-vmmgr
+strip vmmgr
 cargo build -q -p l4h-root "$@"

@@ -26,12 +26,12 @@ log=$root/build/qemu-debian.log
 qemu=$!
 end=$((SECONDS + ${DEBIAN_TIMEOUT:-300}))
 while kill -0 "$qemu" 2>/dev/null; do
-    grep -aq "l4h-root: all guests stopped\|Kernel panic" "$log" && { sleep 1; kill "$qemu"; break; }
+    grep -aq "l4h-vmmgr: all guests stopped\|Kernel panic" "$log" && { sleep 1; kill "$qemu"; break; }
     [ "$SECONDS" -lt "$end" ] || { kill "$qemu"; break; }
     sleep 1
 done
 wait "$qemu" 2>/dev/null || true
-grep -a "DEBIAN:\|WORKLOAD:\|Kernel panic\|Failed to start\|l4h-root: guest" "$log" || true
+grep -a "DEBIAN:\|WORKLOAD:\|Kernel panic\|Failed to start\|l4h-vmmgr: guest" "$log" || true
 if [ -n "${DEBIAN_ROLE:-}" ]; then
     grep -aq "WORKLOAD: done" "$log"
 else

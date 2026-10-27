@@ -46,7 +46,7 @@ boot() {  # boot <name> <tpm-crb|tpm-tis> [extra initramfs files...]
         -device "$dev",tpmdev=tpm0 "${qemu_extra[@]}" </dev/null >"$log" 2>&1 &
     local qemu=$!
     while kill -0 "$qemu" 2>/dev/null; do
-        grep -aq "ATTEST: done\|l4h-root: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
+        grep -aq "ATTEST: done\|l4h-vmmgr: all guests stopped" "$log" && { sleep 1; kill "$qemu"; break; }
         sleep 1
     done
     wait "$qemu" 2>/dev/null || true

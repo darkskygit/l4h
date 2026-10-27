@@ -161,17 +161,40 @@ impl Monitor {
     }
 }
 
+/// A guest's state as vmmgr reports it (GuestStatus::state).
+pub fn state_name(state: u8) -> &'static str {
+    match state.wrapping_sub(1) as u32 {
+        l4h_abi::VM_CREATED => "Created",
+        l4h_abi::VM_RUNNING => "Running",
+        l4h_abi::VM_STOPPED => "Stopped",
+        _ => "?",
+    }
+}
+
+/// A guest's name as vmmgr reports it.
+pub fn name(g: &l4h_host::vmmgr::GuestStatus) -> &str {
+    let n = g.name.iter().position(|&c| c == 0).unwrap_or(g.name.len());
+    core::str::from_utf8(&g.name[..n]).unwrap_or("?")
+}
+
 fn run(h: &mut Host, line: &str) {
     let mut words = line.split_whitespace();
     let cmd = words.next().unwrap_or("");
+    let Some(v) = &h.vmmgr else {
+        sel4::debug_println!("monitor: vmmgr is not running");
+        return;
+    };
+    // Guests are vmmgr's: it runs what changes them.
+    let send = |cmd, arg| if !v.monitor(cmd, arg) { sel4::debug_println!("monitor: vmmgr is busy, try again") };
     match cmd {
         "help" => sel4::debug_println!("monitor: help | list | info | destroy <vm> | restart-dom0"),
         "list" => {
-            for g in h.guests.iter().flatten() {
+            for id in 0..crate::MAX_GUESTS {
+                let Some(g) = v.guest(id) else { continue };
                 sel4::debug_println!(
-                    "monitor: vm {} '{}': {:?}, {} vCPU(s), {} MiB{}",
-                    g.id, g.name, g.state, g.vcpus.len(), g.owned_ram() >> 20,
-                    if g.dom0 { ", dom0" } else { "" }
+                    "monitor: vm {} '{}': {}, {} vCPU(s), {} MiB{}",
+                    id, name(&g), state_name(g.state), g.vcpus, g.ram_mb,
+                    if g.dom0 != 0 { ", dom0" } else { "" }
                 );
             }
         }
@@ -180,16 +203,11 @@ fn run(h: &mut Host, line: &str) {
             h.info.cores, h.alloc.free_bytes() >> 20, h.total_bytes >> 20, h.alloc.reported_bytes() >> 20,
             h.disks.len(), h.netd.nics.len()
         ),
-        "destroy" => match words.next().and_then(|w| w.parse::<usize>().ok()) {
-            Some(id) if h.guest(id).is_some_and(|g| !g.dom0) => {
-                let _ = h.destroy_guest(id);
-            }
+        "destroy" => match words.next().and_then(|w| w.parse::<u32>().ok()) {
+            Some(id) if v.guest(id as usize).is_some_and(|g| g.dom0 == 0) => send(l4h_host::vmmgr::MONITOR_DESTROY, id),
             _ => sel4::debug_println!("monitor: destroy <vm> (not dom0; use restart-dom0)"),
         },
-        "restart-dom0" => match h.guests.iter().flatten().find(|g| g.dom0).map(|g| g.id) {
-            Some(id) => crate::restart_dom0(h, id),
-            None => crate::boot_dom0(h),
-        },
+        "restart-dom0" => send(l4h_host::vmmgr::MONITOR_RESTART_DOM0, 0),
         _ => sel4::debug_println!("monitor: unknown command '{}' (try 'help')", cmd),
     }
 }

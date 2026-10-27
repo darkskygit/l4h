@@ -1,5 +1,5 @@
 //! Definitions shared by l4h-root and the host components it spawns
-//! (l4h-vmm, blkd, netd, trustd, memd): the component address-space and CSpace layout,
+//! (l4h-vmmgr, l4h-vmm, blkd, netd, trustd, memd): the component address-space and CSpace layout,
 //! the component info page, and the inter-component queue formats.
 
 #![no_std]
@@ -11,6 +11,7 @@ pub mod iopool;
 pub mod memd;
 pub mod net;
 pub mod trust;
+pub mod vmmgr;
 
 /// Whether host components print informational messages.  Every print is a
 /// synchronous serial write by the seL4 kernel, which stalls the core for
@@ -35,9 +36,18 @@ pub const STACK_TOP: usize = 0x1100_0000;
 pub const STACK_SIZE: usize = 256 * 1024;
 pub const KEEPER_STACK_TOP: usize = 0x1080_0000;
 pub const KEEPER_STACK_SIZE: usize = 16 * 1024;
+/// vmmgr's main stack, larger (it builds guests as root did, with root's
+/// stack): it has no keeper.
+pub const VMMGR_STACK_SIZE: usize = 1 << 20;
 // Unmapped pages below each stack.
 const _: () = assert!(KEEPER_IPCBUF_VA + 0x1000 < KEEPER_STACK_TOP - KEEPER_STACK_SIZE);
 const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - STACK_SIZE);
+const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - VMMGR_STACK_SIZE && !has_keeper(KIND_VMMGR));
+
+/// The size of the main stack of a component of `kind`.
+pub const fn stack_size(kind: u32) -> usize {
+    if kind == KIND_VMMGR { VMMGR_STACK_SIZE } else { STACK_SIZE }
+}
 /// Shared regions (device pages, queues, buffers) are mapped from here.
 pub const SHARED_VA: usize = 0x2000_0000_0000;
 /// Device MMIO (drivers).
@@ -57,7 +67,8 @@ const _: () = assert!(blk::BLKD_SLOT_CLIENT_DONE as usize + blk::MAX_CLIENTS <= 
 pub const SLOT_CNODE: u64 = 1;
 pub const SLOT_VSPACE: u64 = 2;
 pub const SLOT_TCB: u64 = 3;
-/// Endpoint to l4h-root (badged with the component id).
+/// Endpoint to the component's parent: l4h-root, or l4h-vmmgr for a guest's
+/// l4h-vmm (badged with the component id).
 pub const SLOT_ROOT_EP: u64 = 4;
 /// Notification bound to the component's TCB.
 pub const SLOT_NTFN: u64 = 5;
@@ -82,6 +93,7 @@ pub const KIND_BLKD: u32 = 2;
 pub const KIND_NETD: u32 = 3;
 pub const KIND_TRUSTD: u32 = 4;
 pub const KIND_MEMD: u32 = 5;
+pub const KIND_VMMGR: u32 = 6;
 
 /// The kinds l4h-root calls synchronously (blkd, netd, memd): root could
 /// not wait for their faults to be reported, so a keeper thread answers
@@ -108,7 +120,8 @@ pub struct InfoHeader {
 
 pub const CONFIG_OFFSET: usize = 64;
 
-/// Labels of calls from components to l4h-root (SLOT_ROOT_EP).
+/// Labels of calls from components to their parent (SLOT_ROOT_EP): a
+/// guest's l4h-vmm calls l4h-vmmgr, trustd calls l4h-root.
 pub const ROOT_CALL_GUEST_POWER: u64 = 1; // MR0 = guest id, MR1 = abi POWER_*
 pub const ROOT_CALL_LOG: u64 = 2;
 /// l4h-vmm has initialised the device pages: start the guest (MR0 = guest id).
@@ -206,7 +219,7 @@ pub const fn vmm_device_page_va(d: usize) -> usize {
     SHARED_VA + 0x100_0000 + d * 0x1000
 }
 /// Console output ring of the guest, shared by l4h-vmm (writer) and
-/// l4h-root (reader).
+/// l4h-vmmgr (reader).
 pub const VMM_CONSOLE_RING_VA: usize = SHARED_VA + 0x80_0000;
 pub const CONSOLE_RING_PAGES: usize = 4;
 pub const CONSOLE_RING_DATA: usize = CONSOLE_RING_PAGES * 4096 - 64;
@@ -228,7 +241,7 @@ const _: () = assert!(gpu::SHARED_VA == SHARED_VA && vmm_chan_va(VMM_MAX_DEVICES
 /// bit 32 + d = completion from the backend of device d.
 pub const VMM_BADGE_KICK_SHIFT: u32 = 0;
 pub const VMM_BADGE_DONE_SHIFT: u32 = 32;
-/// From l4h-root: the guest's hotplug target changed.
+/// From l4h-vmmgr: the guest's hotplug target changed.
 pub const VMM_BADGE_MEM: u64 = 1 << 31;
 const _: () = assert!(VMM_MAX_DEVICES <= 31);
 

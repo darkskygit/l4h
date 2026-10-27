@@ -1,4 +1,4 @@
-// Embeds the host components ($L4H_VMM_ELF, $L4H_BLKD_ELF, $L4H_NETD_ELF,
+// Embeds the host components ($L4H_VMMGR_ELF, which embeds l4h-vmm, $L4H_BLKD_ELF, $L4H_NETD_ELF,
 // $L4H_TRUSTD_ELF, $L4H_MEMD_ELF; built by tools/build-host.sh), empty
 // placeholders when unset.  dom0 is not built in: it comes as boot
 // modules, or appended to the built ELF by tools/add-modules.py.  The other variables are the settings' defaults
@@ -9,7 +9,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=L4H_VERSION");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     for (var, file) in [
-        ("L4H_VMM_ELF", "l4h-vmm.elf"),
+        ("L4H_VMMGR_ELF", "l4h-vmmgr.elf"),
         ("L4H_BLKD_ELF", "l4h-blkd.elf"),
         ("L4H_NETD_ELF", "l4h-netd.elf"),
         ("L4H_TRUSTD_ELF", "l4h-trustd.elf"),

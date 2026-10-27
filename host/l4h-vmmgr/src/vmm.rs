@@ -2,8 +2,6 @@
 //! pool (not its RAM), event pages, device pages and the vCPU
 //! notifications.
 
-use core::ops::Range;
-
 use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
@@ -12,7 +10,7 @@ use l4h_host::fixed::{ArrayVec, Scratch};
 
 use crate::component::{self, Component, SpawnArgs};
 use crate::guest::{Guest, dev_event};
-use crate::mem::{Alloc, Arena, Slot};
+use crate::mem::{Alloc, Arena};
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
 
@@ -69,12 +67,14 @@ pub enum Backend {
         kick: cap::Notification,
     },
     Net {
-        /// Slots of the frames of the netd port, mapped at vmm_chan_va(d).
-        chan: Range<Slot>,
+        /// CNode of the frames of the netd port (root's, radix
+        /// vmmgr::PORT_RADIX), mapped at vmm_chan_va(d).
+        chan: cap::CNode,
         /// Notification of netd (badged for this port).
         kick: cap::Notification,
         mac: [u8; 6],
-        /// CNode (radix 10) for the VMM's mapping capabilities of the port.
+        /// CNode (radix PORT_RADIX) for the VMM's mapping capabilities of
+        /// the port.
         keep: cap::CNode,
     },
     /// virtio-gpu (gpu.rs): frame i < display_pages is page i of the
@@ -163,10 +163,10 @@ fn create(
                 dev.chan_size = (chan.len() * PAGE) as u64;
                 dev.chan_kick_slot = SLOT_KICK_BASE + d as u64;
             }
-            Backend::Net { chan, mac, .. } => {
+            Backend::Net { mac, .. } => {
                 dev.kind = host::VDEV_NET;
                 dev.chan_va = host::vmm_chan_va(d) as u64;
-                dev.chan_size = (chan.len() * PAGE) as u64;
+                dev.chan_size = (host::net::PORT_PAGES * PAGE) as u64;
                 dev.chan_kick_slot = SLOT_KICK_BASE + d as u64;
                 dev.mac[..6].copy_from_slice(mac);
             }
@@ -233,7 +233,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     }
     if g.mem_dev.is_some() {
         let dst = comp.slot(host::VMM_SLOT_MEMD_EP);
-        crate::memd::mint_vmm_ep(alloc, g.id, &dst);
+        crate::memd::give_vmm_ep(g.id, &dst);
     }
     for (i, f) in g.console_ring.iter().enumerate() {
         let p = crate::component::abs_of(*f);
@@ -249,9 +249,9 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
                 comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
             }
             Backend::Net { chan, kick, keep, .. } => {
-                for (i, f) in chan.clone().enumerate() {
-                    let fc = crate::component::abs_of(sel4::init_thread::Slot::<cap_type::Granule>::from_index(f).cap());
-                    let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, 10);
+                for i in 0..host::net::PORT_PAGES {
+                    let fc = chan.absolute_cptr_from_bits_with_depth(i as u64, l4h_host::vmmgr::PORT_RADIX);
+                    let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, l4h_host::vmmgr::PORT_RADIX);
                     comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
                 }
                 comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());

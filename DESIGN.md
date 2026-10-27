@@ -24,7 +24,7 @@ memory owner, `l4h-memd`, and §17 memory hotplug.
 | R1 | No hardware virtualization. Paravirtualize, as Xen PV does. Avoid instruction emulation. | The guest kernel is a new Linux architecture, `ARCH=l4h`, that runs in ring 3 as an seL4 thread and calls seL4 directly. Guest user code runs unmodified. Its `syscall` instructions and exceptions reach the guest kernel as seL4 fault IPC. |
 | R2 | x86_64 first, but friendly to aarch64. | Each layer is split into ISA-independent and ISA-specific parts (§11). seL4, rust-sel4 and sDDF already support aarch64. Nothing in the design relies on an x86-only mechanism such as segmentation, rings 1/2 or Xen-style page-table validation. |
 | R3 | virtio-blk and virtio-net. Block devices are passed through. Network is multiplexed by virtual switches. | The guest runs stock Linux `virtio_blk`/`virtio_net` drivers over a new paravirtual transport, `virtio-l4h`, with no trapped MMIO (§8). All device buffers use a host-owned I/O pool; the guest copies block data between its RAM and the pool, and the device DMAs into the pool (§15.1). For networking, the hypervisor provides **only L2 virtual switches**. A VM can have several vNICs, each on a switch, and a physical NIC is just an uplink port on a switch. Routing and NAT, when wanted, are done by a VM. |
-| R6 | A runtime management API, available to "dom0", the first guest started at boot. | `l4h-root` exposes a control API through a `l4hctl` paravirtual device that only dom0 receives (§9.1). dom0 has no device-driver duties. |
+| R6 | A runtime management API, available to "dom0", the first guest started at boot. | `l4h-vmmgr` exposes a control API through a `l4hctl` paravirtual device that only dom0 receives (§9.1). dom0 has no device-driver duties. |
 | R7 | Targets: QEMU with virtio devices first, then GCP. | QEMU uses virtio-net-pci, virtio-blk-pci, virtio-scsi-pci and nvme. GCE N2 is tested with virtio-net and C3 with gVNIC, both with NVMe local SSDs (§10). |
 | R4 | SMP guests. | Each guest vCPU is an seL4 kernel-context thread with its own scheduling context. IPIs are seL4 notifications (§6). |
 | R5 | Many guests per host, e.g. 30 guests on 4 CPUs. | seL4 MCS scheduling contexts give each vCPU a budget. Idle guests consume no CPU because the guest kernel is tickless and idle means blocked in `seL4_Recv`. A host balancer moves vCPUs between cores (§7). Each guest makes its kernel objects from its own RAM (§15). |
@@ -62,8 +62,8 @@ components and device drivers are written in Rust on rust-sel4.**
  │  Guest A (untrusted)                  dom0 (guest #0)        Host services  │
  │  ┌──────────────────────────────┐     same as any guest,     (trusted)      │
  │  │ guest procs: one seL4 VSpace │     plus an l4hctl device  ┌───────────┐  │
- │  │ + one TCB per Linux thread   │     ──── control API ────► │ l4h-root  │  │
- │  │ (trap-syscall flag)          │                            │ resources │  │
+ │  │ + one TCB per Linux thread   │     ──── control API ────► │ l4h-vmmgr │  │
+ │  │ (trap-syscall flag)          │                            │ guests    │  │
  │  │   │ fault IPC  ▲ reply       │                            │ lifecycle │  │
  │  │   ▼            │             │                            │ ctl API   │  │
  │  │ guest kernel: ARCH=l4h vmlinux                            │ balancer  │  │
@@ -88,13 +88,18 @@ components and device drivers are written in Rust on rust-sel4.**
    Cloud VM hardware (QEMU/KVM, GCE …) with no VT-x exposed
 ```
 
+`l4h-root` (not drawn) spawns the host services and keeps the hardware:
+PCI, the IOMMU, interrupts, and the memory devices reach, each guest's I/O
+pool, disk channels and netd ports, which it makes when `l4h-vmmgr` asks
+(§9.3). Nothing a guest, its VMM or dom0 sends reaches root.
+
 Each `l4h-blkd` drives one attached disk. `l4h-netd` combines all switches
 and uplink NIC drivers in one component. The drivers are Rust: virtio-net,
 gVNIC after Linux `gve`, ENA after Linux `ena` and the X550 after Linux
 `ixgbe`.
 
-Trust: the seL4 kernel, `l4h-root`, `l4h-memd`, `l4h-blkd`, `l4h-netd`
-and `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
+Trust: the seL4 kernel, `l4h-root`, `l4h-vmmgr`, `l4h-memd`, `l4h-blkd`,
+`l4h-netd` and `l4h-trustd` form the host TCB, which a TPM can attest (§9.2). dom0 is trusted for control-plane decisions (§9.1) but cannot
 read other guests' memory. Each `l4h-vmm` is trusted only by its own
 guest: it maps that guest's I/O pool and host-owned device, event and
 queue pages, and never its RAM (§15), so a compromised VMM can harm only
@@ -1254,8 +1259,8 @@ bootconfig and a display stay off.
     band, threads with budget left are scheduled round-robin.
   - Caps limit each vCPU's combined kernel and user CPU time, with the
     reconfiguration allowance described below.
-- **Placement and balancing.** seL4 does no load balancing, so `l4h-root`
-  runs a balancer thread at low frequency (about 100 ms):
+- **Placement and balancing.** seL4 does no load balancing, so `l4h-vmmgr`
+  runs a balancer at low frequency (about 100 ms):
   - It reads `Consumed` for every SC.
   - It moves vCPUs between cores by re-running `SchedControl_Configure` on
     another core's SchedControl cap. `SC_K` and `SC_U` of a vCPU always move
@@ -1299,7 +1304,7 @@ bootconfig and a display stay off.
   its VSpace (`seL4_X64_PML4_Flush`, patch 0017) once back on its boot
   CPU, which drops the others (`vspace::flush_tlb_bitmap`).
 
-  Every 100 ms `l4h-root` reads `SchedContext_Consumed` for both SCs of
+  Every 100 ms `l4h-vmmgr` reads `SchedContext_Consumed` for both SCs of
   every vCPU.
   - A vCPU is *busy* if it got at least half of its fair share among the
     vCPUs active on its core. Measuring this way still counts a starved
@@ -1402,7 +1407,7 @@ bootconfig and a display stay off.
     and blocks often uses it, keeps being merged into later refills.
 - **Steal time.**
   - The guest accumulates its idle time in the event page (`idle_ticks`).
-  - Each balancer period, `l4h-root` computes, per vCPU,
+  - Each balancer period, `l4h-vmmgr` computes, per vCPU,
     `steal = wall − consumed − idle`, counting from the vCPU's first run.
     It publishes the result monotonically as `steal_ns`.
   - The guest returns it as Linux's paravirt steal clock
@@ -1417,9 +1422,9 @@ bootconfig and a display stay off.
   its I/O pool (4 MiB by default) and about 6 MiB of host objects, so a
   256 MiB guest costs about 266 MiB.
 
-- **Limits.** `l4h-root` checks a request's memory, ASIDs and root CNode
-  slots before starting it, and refuses with ENOMEM instead of exhausting
-  itself.
+- **Limits.** `l4h-vmmgr` checks a request's memory, ASIDs and CNode slots
+  before starting it, and refuses with ENOMEM instead of exhausting itself;
+  root does the same for what it makes for the guest (§9.3).
   - x86_64 seL4 has 4096 ASIDs, and a guest holds 66 of them: its
     VSpace, its pool of 64 process VSpaces, and its VMM. That allows about
     61 guests per host; `MAX_GUESTS` is 64.
@@ -1435,14 +1440,15 @@ bootconfig and a display stay off.
     16–79 (at most 64 disks are used).
 - **Dashboard.** With a linear framebuffer from the boot loader (GRUB on
   UEFI; seL4 patch 0011 makes the multiboot2 header ask for one),
-  `l4h-root` draws a read-only status screen every second: host, VMs,
-  disks, switches. Changed character cells only; 8x8 public-domain font.
+  `l4h-root` draws a read-only status screen every second: host, VMs (from
+  vmmgr's status page, §9.3), disks, switches. Changed character cells only; 8x8 public-domain font.
 - **Serial monitor.** `l4h-root` reads COM1 (I/O ports and IOAPIC IRQ 4)
-  and runs `help`, `list`, `info`, `destroy <vm>` and `restart-dom0`. The
+  and runs `help`, `list`, `info`, `destroy <vm>` and `restart-dom0`, the
+  last two by vmmgr, which root asks through the events page (§9.3). The
   kernel keeps using the port for output (`tests/run-monitor.sh`). An
   absent UART (line status reads as `0xff`) disables the monitor. Input
   uses interrupts, including a remapped I/O APIC entry under Intel VT-d.
-- **dom0 restart.** If dom0 reboots or crashes, `l4h-root` destroys it and
+- **dom0 restart.** If dom0 reboots or crashes, `l4h-vmmgr` destroys it and
   boots it again from the boot image. Other guests keep running, and the
   new dom0 sees them through the control API (`tests/run-m6test.sh`).
 - **Density gate.** `tests/run-density.sh` runs 30 guests of 256 MiB on 4
@@ -1964,30 +1970,32 @@ the host keeps that dynamic plumbing simple.
 
 | Component | Instances | Role |
 |-----------|-----------|------|
-| `l4h-root` | 1 | Allocates I/O pools, host objects and vCPU scheduling contexts, from memory it gets from memd. Builds guest CSpaces, kernel VSpaces and boot info, loads dom0's images (modules) and copies runtime image uploads. Runs lifecycle, control, balancing, monitor and dashboard; authorizes disk and NIC attachments. |
-| `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to root. |
+| `l4h-root` | 1 | Boots the host and spawns the other components. Owns PCI, the IOMMU, interrupts, disks, reset and the RTC. Makes guests' I/O pools, disk channels and netd ports when vmmgr asks, and authorizes disk and NIC attachments. Serves the control ops on the host's disks, switches and NICs, runs the monitor and the dashboard. |
+| `l4h-vmmgr` | 1 | Builds guest CSpaces, kernel VSpaces, vCPUs and boot info, from memory it gets from memd; loads dom0's images (modules) and copies runtime image uploads; spawns guests' VMMs. Runs lifecycle, the control API and balancing (§9.3). |
+| `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to vmmgr. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
 | `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC, ENA and X550 uplink drivers. |
 | `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§9.2). |
-| `l4h-memd` | 1 | Owns the free memory and every guest's RAM blocks; gives root memory for host objects; reports free memory to the hypervisor (§16). |
+| `l4h-memd` | 1 | Owns the free memory and every guest's RAM blocks; gives root and vmmgr memory for host objects; reports free memory to the hypervisor (§16). |
 
 **No dynamic allocation.** Host components are built so that nothing a
 guest, dom0 or a device does can exhaust their memory: a component that
-runs out cannot recover, and with it go every guest it serves (root or
-memd: the whole host). So their state is sized when they start, from
+runs out cannot recover, and with it go every guest it serves (root,
+vmmgr or memd: the whole host). So their state is sized when they start, from
 constants (`MAX_GUESTS`, queue sizes) or from the host (memd's table),
 and lives in fixed arrays and tables, not on a heap. Where allocation is
 truly needed, it is bounded by a stated limit that is checked before
 the allocation, fails as an error rather than a panic, and is never
 made per request on a path whose size a guest or a client controls.
 A component without a heap says so (`component!(main, no_heap)`), and
-does not link `alloc`. The root task, memd, netd, blkd and the VMM have
+does not link `alloc`. The root task, vmmgr, memd, netd, blkd and the VMM have
 no heap; per-request state is in fixed tables, and state too large for
 a stack is in statics (`l4h_host::fixed::{StaticCell, Scratch}`).
 Every stack has an unmapped page below it, so an overflow faults rather
 than writing over statics: root maps each component's stacks (its main
-thread's and its keeper's) in a region of their own (`l4h_host::STACK_TOP`),
-and unmaps the lowest page of its own stack, which seL4 places in its
+thread's and its keeper's) in a region of their own (`l4h_host::STACK_TOP`;
+vmmgr's main stack is 1 MiB, as root's, since it builds guests as root
+did), and unmaps the lowest page of its own stack, which seL4 places in its
 `.bss`, at boot. Stack probes touch every page of a large frame in
 order, so one page catches any overflow. This was missing until root's
 1 MiB stack overflowed into its disk table: its allocator's 240 KiB of
@@ -2014,9 +2022,9 @@ whole message and breaks timing, so prints are kept rare:
 - The serial monitor's replies and the opt-in watchdog dumps always print.
 
 **Guest boot protocol.** The guest boots without firmware or a bootloader.
-Root parses dom0's ELF (§9.1). For runtime guests, the dom0 `l4hctl`
-client parses the ELF and root copies uploaded segments and initramfs
-bytes into the new guest's boot frames. Root constructs the kernel VSpace
+vmmgr parses the guest kernel's ELF (§9.1). For runtime guests, the dom0
+`l4hctl` client parses the ELF and vmmgr copies uploaded segments and
+initramfs bytes into the new guest's boot frames. vmmgr constructs the kernel VSpace
 and `struct l4h_bootinfo`, then starts vCPU0 at the entry point with `rdi`
 (`x0` on aarch64) pointing at boot info. It holds:
 
@@ -2038,7 +2046,8 @@ The control protocol has its own version, currently 1.
 ### 9.1 Control plane: dom0 and the runtime API
 
 **Starting dom0.** `tools/build-host.sh` builds the services and root,
-and `host/l4h-root/build.rs` embeds the services' ELFs. The guest kernel
+and `host/l4h-root/build.rs` embeds the services' ELFs (vmmgr's embeds
+l4h-vmm's). The guest kernel
 and its module tree (§5.6), dom0's initramfs and the host settings are
 named modules (`guest-kernel`, `guest-kmods`, `dom0-initrd`,
 `l4h-config`); root has none of them built in. They come from:
@@ -2062,7 +2071,9 @@ named modules (`guest-kernel`, `guest-kmods`, `dom0-initrd`,
   `L4H_CONFIG` (`tools/dom0-modules.sh`).
 
 Boot loader modules win over appended ones of the same name. Without a
-`guest-kernel`, root starts no guests and serves only the serial monitor.
+`guest-kernel`, root starts no vmmgr, and no guests, and serves only the
+serial monitor. Root maps the guest kernel, its module tree and dom0's
+initramfs into vmmgr, which loads dom0 from them.
 
 The settings (dom0's memory, vCPUs, I/O pool, disks and its window of
 disk 0, NICs, internal
@@ -2082,7 +2093,7 @@ off. GRUB measures them into the TPM, though, so a host's attestation
 shows what dom0 booted (§9.2).
 
 dom0 is guest #0 and receives a host-owned `l4hctl` device page. Its VMM
-has a control forwarding capability to root. Other guests' VMMs do not.
+has a control forwarding capability to vmmgr. Other guests' VMMs do not.
 dom0 runs no host hardware drivers; those stay in blkd and netd.
 
 **API surface.** Requests and responses are synchronous, fixed-layout,
@@ -2107,22 +2118,23 @@ external orchestration can run in dom0.
 
 - The `l4hctl` device is a single shared page rather than virtqueues:
   dom0 writes a fixed-layout request (`struct l4h_ctl_req` in `abi.h`) and
-  issues `L4H_HC_CTL`. dom0's `l4h-vmm` forwards the call to `l4h-root`,
+  issues `L4H_HC_CTL`. dom0's `l4h-vmm` forwards the call to `l4h-vmmgr`,
   which executes it synchronously and writes the response into the same
   page. Image loads are bounded at 1 MiB per call.
 - `/dev/l4hctl` takes one ioctl that carries a request, its response and,
   for `VM_LOAD`, a user buffer. The driver stages it in the control
   device's data area, 1 MiB of host-owned frames mapped into dom0, and
   sets the request's source offset to 0 and length to the ioctl buffer
-  length: `l4h-root` never reads dom0's RAM.
+  length: vmmgr never reads dom0's RAM.  The data area is root's memory,
+  made once and mapped into every dom0.
 - `l4hctl` loads the initramfs with raw `VM_LOAD(vm, gpa, bytes)` writes,
-  from the GPA `vm_create` returns. `l4h-root` copies page by page from the
+  from the GPA `vm_create` returns. vmmgr copies page by page from the
   data area to the new guest's frames and never parses what guests load.
   The lifecycle is `vm_create` → (`blk_attach` / `nic_create` / `vm_load`)* → `vm_start`
   (loads the guest kernel, writes the boot info and spawns the guest's
   `l4h-vmm`) → `vm_destroy`.
 - `vm_shutdown` (`l4hctl shutdown [--reboot]`) is the ACPI-power-button
-  equivalent. `l4h-root` sets `power_request` in the guest's console page
+  equivalent. vmmgr sets `power_request` in the guest's console page
   and raises the console's event line on vCPU 0. The guest runs
   `orderly_poweroff()` or `orderly_reboot()`, which signals init. The
   guest also reads `power_request` once its handler is installed: an
@@ -2132,7 +2144,8 @@ external orchestration can run in dom0.
   not stop a user thread that holds SC_U.
 - `host_reboot` (`l4hctl host-reboot`) resets the machine, so that dom0
   can boot a new l4h or dom0 it wrote to the EFI partition without a way
-  in from outside. `l4h-root` resets as Linux does:
+  in from outside. vmmgr passes it to `l4h-root`, which resets as Linux
+  does:
   the FADT's reset register (`RESET_REG_SUP`; system I/O, memory or PCI
   configuration space, prepared at boot), the PCI reset control register
   at 0xcf9 (through root's PCI configuration ports, 0xcf8-0xcff), and the
@@ -2143,17 +2156,19 @@ external orchestration can run in dom0.
   wrote first, and root's serve loop does not block on disks while the
   machine is about to go down.
 - Console output goes into a per-guest ring that `l4h-vmm` writes and
-  `l4h-root` reads for `console_read`. It is also copied to the serial port
+  vmmgr reads for `console_read`. It is also copied to the serial port
   with a `[vmN]` line prefix. Console input is a ring in the guest's
   console device page, which hvc polls.
-- **Reclaim.** Each guest holds RAM block Untypeds, its I/O pool, a
-  host-object arena and its blkds' arenas. Root CNode slots allocated
-  on the guest's behalf are tracked: the root task keeps a bitmap of its
-  free slots and an owner byte per slot (`mem::Slots`, 576 KiB for 2^19
-  slots), and `vm_destroy` deletes the guest's by a scan of the owner
-  bytes. `vm_destroy` first quiesces the
-  attached disks, then revokes those Untypeds, returns them to the free
-  pool and deletes the tracked slots. ASIDs are released by the kernel
+- **Reclaim.** Each guest holds RAM block Untypeds and a host-object
+  arena in vmmgr, and in root its I/O pool and an arena for its disk
+  channels and netd ports. CNode slots allocated on the guest's behalf are
+  tracked: vmmgr and root each keep a bitmap of their free slots and an
+  owner byte per slot (`mem::Slots`, 288 KiB for vmmgr's 2^18 slots, 576
+  KiB for root's 2^19), and `vm_destroy` deletes the guest's by a scan of
+  the owner bytes. `vm_destroy` revokes vmmgr's Untypeds first (its
+  VSpaces die first, so nothing is unmapped page by page), returns them
+  to the free pool and deletes its slots; then root quiesces the attached
+  disks, and only then revokes its own (`VMMGR_GUEST_DEL`, §9.3). ASIDs are released by the kernel
   when VSpaces die. Repeated create/destroy leaves free memory unchanged
   (`tests/run-ctltest.sh`).
 - **Disk detach.** A disk window is detached only when its guest is destroyed; the shared controller remains running.
@@ -2190,15 +2205,15 @@ external orchestration can run in dom0.
 
 **Policy and safety.**
 
-- `l4h-root` enforces resource accounting (memory, cores, disk ownership: a
-  writable window is attached to at most one VM; read-only windows may be
-  shared) and rejects
+- vmmgr enforces resource accounting for guests (memory, cores), and root
+  for what it makes for them and for disk ownership (a writable window is
+  attached to at most one VM; read-only windows may be shared). Both reject
   invalid requests. dom0 cannot breach host isolation, but it is fully trusted
   to decide *what* runs. In particular, dom0 can attach any disk to itself.
-- If dom0 crashes, the other guests keep running. `l4h-root` restarts dom0
+- If dom0 crashes, the other guests keep running. vmmgr restarts dom0
   from the same images and settings, and the new dom0 recovers state
   with `vm_list` and `switch_info`. The authoritative state lives in
-  `l4h-root`.
+  vmmgr (guests) and root (disks, switches).
 - Debugging fallback: a minimal serial monitor in `l4h-root` (`list`,
   `destroy`, `restart-dom0`) stays available on COM1, which is the GCE serial
   console.
@@ -2239,12 +2254,14 @@ The chain has four links.
    reset. After start, the TPM is only used for ActivateCredential. With
    swtpm, start takes about 0.4 to 0.6 s. Requests that guests make before
    then are answered once it is done.
-3. **Reports on guests.** Root measures each guest as it boots it, dom0
+3. **Reports on guests.** vmmgr measures each guest as it boots it, dom0
    included. The launch digest is `SHA-256("l4h-launch-v1" ‖ ram_base_va ‖
    entry ‖ kernel_end ‖ RAM[0, kernel_end) ‖ initrd size ‖ initrd ‖ cmdline
    length ‖ cmdline)`, with u64 little-endian integers.
-   - Root reads the image back from guest RAM before the guest starts.
+   - vmmgr reads the image back from guest RAM before the guest starts.
      `vm_start` fails if dom0 loaded anything outside the initramfs.
+     vmmgr is in the host TCB for this: whoever builds a guest can make
+     it run anything.
    - Root writes {instance, RAM, vCPUs, dom0, digest} into a registry page
      that trustd maps read-only. Root never waits for trustd's main
      thread, whose TPM commands can take seconds; its passive flags
@@ -2488,6 +2505,79 @@ for it, and counts on QEMU's debug port. QEMU ignores the start bit without
 a locality, so a command only runs if trustd ran the `_DSM`.
 `tools/mkefi.sh` swaps the tables with `L4H_ACPI_TABLES` and
 `L4H_ACPI_EXCLUDE`, which can also work around broken firmware tables.
+
+### 9.3 Guest manager: l4h-vmmgr
+
+Root holds every capability on the host: device memory, interrupts, I/O
+ports, PCI configuration, the IOMMU and the components' CSpaces. It used
+to build and run the guests too, and parse dom0's control requests, so a
+bug anywhere on that path ran with all of it. `l4h-vmmgr` now builds and
+runs the guests, and root keeps the hardware. Nothing a guest, its VMM or
+dom0 sends reaches root; only vmmgr and trustd call it.
+
+- **vmmgr holds** memd grants for guest objects, the guests' CNodes,
+  VSpaces, vCPUs and VMMs, every core's SchedControl (copies), and the ASID
+  pools: root makes all eight at boot and hands them over, keeping
+  ASIDControl. It runs guest creation, image loading and the launch
+  digest, start, shutdown and destroy, dom0's boot and restart, the
+  balancer and steal time (§7), and the control API. Guests' VMMs call it,
+  and guest kernels and VMMs fault to it.
+- **Root holds** what devices reach. A guest's I/O pool is root's: root
+  maps it into the IOMMU domains of the disks the guest is given, by
+  physical address. If vmmgr made the pools and named their addresses, a
+  compromised vmmgr could have root give a device any memory, root's own
+  included. So vmmgr names guest ids, disk numbers, LBA windows and sizes,
+  root checks them against its own table (`vmmgr::RootGuest`), and every
+  address root gives the IOMMU, blkd or netd comes from that table.
+  Disk channels and netd ports are root's as well, in a per-guest arena
+  root revokes when vmmgr is done with the guest. Root also numbers guest
+  instances, so they stay unique since boot whatever vmmgr does.
+- **The interface** (`l4h_host::vmmgr`) is a handful of calls from vmmgr
+  to root, with integers in message registers: `GUEST_NEW` (the pool, the
+  attestation device; vmmgr passes the VMM notification that backends
+  signal), `GUEST_DEL`, `DISK_ATTACH`, `NIC_ADD`, `TRUST_REGISTER` (the
+  launch digest), and `HOST_OP`, which carries the control ops on the
+  host's disks, switches and NICs, reset and RTC, as their `CTL_*` number
+  and six arguments. vmmgr parses dom0's request and passes these on;
+  their data comes back in a result page. Capabilities cross in vmmgr's
+  exchange slots, which root reaches through the CNode of vmmgr's it
+  holds. Root never calls vmmgr, so calls cannot deadlock; it signals
+  vmmgr's notification instead, with news in an events page: trustd
+  answered a guest (vmmgr raises its attestation device's event), or the
+  serial monitor's `destroy` or `restart-dom0`. vmmgr publishes its guests
+  in a status page for the monitor's `list` and the dashboard.
+- **Destroy** is ordered as before: vmmgr stops the guest and revokes its
+  own arena (VSpaces first) and the guest's RAM, then `GUEST_DEL` has root
+  forget it in trustd, remove its ports, quiesce its disks and only then
+  revoke the pool, which it keeps out of use if a disk did not stop. The
+  call is synchronous: a disk reset still holds up vmmgr for its timeout.
+- **memd** has two clients. Root calls it for its own memory; vmmgr, with
+  a badge of its own (`BADGE_VMMGR`), for its memory and guests' RAM. memd
+  is more trusted than vmmgr, so vmmgr gets no capability to memd's CNode:
+  the two share a small mailbox CNode instead, and memd keeps the
+  original of every block it grants vmmgr, giving a copy. Freeing a grant
+  revokes the original, so a mislabelled capability in the mailbox cannot
+  confuse memd's table. Root mints the endpoints of guests' VMMs to memd
+  (badged per guest), since vmmgr's own badged one cannot be minted again.
+- **Boot modules.** Root maps the guest kernel, its module tree and dom0's
+  initramfs read-only into vmmgr, with a CNode of their frames: guests
+  share the kernel's read-only blocks and the module tree as before. Root
+  clears what follows the module tree in its last page before mapping it.
+  dom0's control data area is root's memory, mapped into vmmgr (read-write,
+  for `VM_LOAD` and `GPU_READ`) and root (read-only, for `BLK_WRITE`).
+- **dom0's devices.** Root makes the switches at boot, attaches the
+  uplinks, and chooses dom0's disks and vNICs (`Dom0Plan`); vmmgr creates
+  every dom0 with them.
+- **Trust.** vmmgr is in every guest's TCB, as root was: whoever builds a
+  guest's CSpace can copy its frames. The console seals (§9.2) are vmmgr's
+  to keep: it reads the VMM-written console rings and display areas, and
+  acts on trustd's flags with root's former capability. A bug in vmmgr
+  reaches guests' memory but not the hardware, the IOMMU, the TPM's ports
+  or root. If vmmgr faults, root reports it and guests keep running, but
+  nothing can create, change or destroy them.
+- **Scheduling.** vmmgr runs on core 0 at `PRIO_KERNEL + 2`, above every
+  guest and VMM, with a full budget, and has its own deadline timer for the
+  balancer. Its main stack is 1 MiB.
 
 ---
 

@@ -11,11 +11,10 @@ use l4h_host::{self as host, net};
 use crate::blkd::{BAR_STRIDE, VirtioRegions, bar_pages, is_legacy_virtio, keep_bits, map_bar_mask, virtio_bar_mask, virtio_regions};
 use crate::component::{self, Component, SpawnArgs, abs_of};
 use crate::devmem::DevMem;
-use crate::guest::Guest;
 use crate::iommu::Iommu;
 use crate::mem::{Alloc, Arena, Dest, Slot, UtRegion};
 use crate::pci::{self, Pci};
-use crate::vmm;
+use crate::vmmgr::RootGuest;
 use crate::vspace::FRAME_BP;
 use crate::window::Window;
 use crate::{AsidPools, HostInfo, ctl, mr, set_mr};
@@ -26,7 +25,8 @@ const PAGE: usize = 4096;
 const NIC_DMA_BITS: usize = 22;
 /// Port memory: the channel plus the CNode keeping netd's mappings of it.
 const PORT_BITS: usize = 22;
-const PORT_KEEP_BITS: usize = 10;
+const PORT_KEEP_BITS: usize = l4h_host::vmmgr::PORT_RADIX;
+const _: () = assert!(net::PORT_PAGES <= 1 << PORT_KEEP_BITS);
 /// MSI vectors of NICs start here.
 const NIC_MSI_BASE: u64 = crate::pci::VECTOR_NIC_BASE;
 const NETD_ID: u32 = 0x200;
@@ -337,12 +337,13 @@ impl Netd {
     }
 
     /// Connect guest device `d` of `g` to `switch` as port `p` (free_port),
-    /// using `memory` (port_memory).  Returns the backend for the guest's
-    /// l4h-vmm.
+    /// using `memory` (port_memory).  Returns for the guest's l4h-vmm the
+    /// CNode of the port's frames (radix PORT_KEEP_BITS) and a kick
+    /// capability, in a slot of its own.
     #[allow(clippy::too_many_arguments)]
     pub fn add_port(
         &mut self,
-        g: &mut Guest,
+        g: &mut RootGuest,
         d: usize,
         p: usize,
         switch: u32,
@@ -351,20 +352,18 @@ impl Netd {
         isolated: bool,
         (s, region): (Slot, UtRegion),
         alloc: &mut Alloc,
-    ) -> vmm::Backend {
-        // Port memory comes from the guest: it is reclaimed with it.
+    ) -> (cap::CNode, cap::Notification) {
+        // Port memory is the guest's: it is reclaimed with it.
         g.arena.own(s, region.paddr, PORT_BITS);
         let mut pool = region;
-        let frames = alloc.slots.alloc_range(net::PORT_PAGES);
-        let chan_slots = frames.clone();
-        pool.retype(&FRAME_BP, frames.len(), Dest::root(frames.start)).expect("port frames");
-        // CNodes keeping netd's and the VMM's mappings of the port.
-        let keep_slots = alloc.slots.alloc_range(2);
-        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 2, Dest::root(keep_slots.start)).expect("port CNodes");
-        let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slots.start).cap();
-        let vmm_keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(keep_slots.start + 1).cap();
-        let chan = frames.map(|i| sel4::init_thread::Slot::<cap_type::Granule>::from_index(i).cap());
-        for (i, f) in chan.enumerate() {
+        // CNodes keeping netd's mappings of the port, and its frames.
+        let cnodes = alloc.slots.alloc_range(2);
+        pool.retype(&ObjectBlueprint::CNode { size_bits: PORT_KEEP_BITS }, 2, Dest::root(cnodes.start)).expect("port CNodes");
+        let keep = sel4::init_thread::Slot::<cap_type::CNode>::from_index(cnodes.start).cap();
+        let chan = sel4::init_thread::Slot::<cap_type::CNode>::from_index(cnodes.start + 1).cap();
+        pool.retype(&FRAME_BP, net::PORT_PAGES, Dest { cnode: abs_of(chan), offset: 0 }).expect("port frames");
+        for i in 0..net::PORT_PAGES {
+            let f = chan.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
             let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, PORT_KEEP_BITS);
             // Paging structures for the port come from netd's own pool, and
             // outlive the guest: their root slots must not be tracked into
@@ -372,7 +371,7 @@ impl Netd {
             // grew into) while other ports still use them.
             let (comp, arena) = (&self.comp, &mut self.arena);
             alloc.global(|alloc| {
-                comp.map_copy(alloc, arena, &abs_of(f), net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
+                comp.map_copy(alloc, arena, &f, net::port_va(p) + i * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, dst)
             });
         }
         self.comp.give_badged(
@@ -391,8 +390,7 @@ impl Netd {
             sel4::debug_println!("l4h-root: netd failed adding port {}", p);
         }
         self.ports[p] = Some(PortInfo { vm: g.id, switch, mac });
-        let mac_bytes = mac.to_be_bytes();
-        vmm::Backend::Net { chan: chan_slots, kick, mac: mac_bytes[2..8].try_into().unwrap(), keep: vmm_keep }
+        (chan, kick)
     }
 
     /// Disconnect port `p`; netd stops using its memory.
@@ -405,7 +403,7 @@ impl Netd {
 
     /// CPU time netd used since the last call, in timer ticks.
     pub fn consumed(&self) -> u64 {
-        crate::sched::consumed(self.comp.sc)
+        crate::sched_consumed(self.comp.sc)
     }
 
     /// The MAC address of host NIC `n`.

@@ -1,23 +1,23 @@
 //! The attestation service, l4h-trustd (DESIGN.md §9.2): finding the TPM,
-//! starting trustd with it, giving guests their attestation device, the
-//! registry page through which trustd learns about guests, and what
-//! trustd asks root for: raising a device's event when it has answered,
-//! and the hardware accesses of its AML interpreter.
+//! starting trustd with it, making guests' attestation devices (vmmgr adds
+//! them to guests), the registry page through which trustd learns about
+//! guests, and what trustd asks root for: raising a device's event when it
+//! has answered (vmmgr raises it), and the hardware accesses of its AML
+//! interpreter.
 //!
 //! Only x86 finds a TPM (in ACPI) so far; other hosts run flags only.
 #![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
 
 
-use sel4::{CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
+use sel4::{CNodeCapData, CapRights, ObjectBlueprint, VmAttributes, cap, cap_type};
 
 use l4h_abi as abi;
 use l4h_host as host;
 use l4h_host::fixed::ArrayVec;
 use l4h_host::trust::{self, GuestRecord, TrustdConfig};
 
-use crate::component::{self, Component, SpawnArgs, abs_of};
+use crate::component::{self, Component, SpawnArgs, abs_of, component_badge, root_cap};
 use crate::devmem::DevMem;
-use crate::guest::Guest;
 use crate::mem::{Alloc, Arena, ObjCtx};
 use crate::vspace::{FRAME_BP, map_frame};
 use crate::window::Window;
@@ -47,6 +47,8 @@ pub struct Trustd {
     pages: [cap::Granule; trust::MAX_RECORDS],
     /// Guests signal it, badged with trust::kick_badge(id).
     kick: cap::Notification,
+    /// The flags table, which root and vmmgr map read-only.
+    flags: [cap::Granule; trust::FLAGS_SIZE / PAGE],
     /// Device memory carved for trustd's ranges and its AML's accesses.
     #[cfg(target_arch = "x86_64")]
     frames: crate::acpi::Frames,
@@ -368,13 +370,14 @@ fn finish(
     });
     let kick = arena.object_cap::<cap_type::Notification>(alloc, ObjectBlueprint::Notification);
     comp.give(trust::SLOT_KICK, kick, CapRights::all());
-    for p in 0..trust::FLAGS_SIZE / PAGE {
+    let flags = core::array::from_fn(|p| {
         let f = arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
         comp.map_copy(alloc, &mut arena, &abs_of(f), trust::FLAGS_WRITE_VA + p * PAGE, CapRights::read_write(), VmAttributes::DEFAULT, keep());
         map_frame(&mut ObjCtx::global(alloc), sel4::init_thread::slot::VSPACE.cap(), f,
             crate::layout::TRUSTD_FLAGS.base + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT);
-    }
+        f
+    });
     let ep = arena.object_cap::<cap_type::Endpoint>(alloc, ObjectBlueprint::Endpoint);
     comp.give(trust::SLOT_FLAGS_EP, ep, CapRights::all());
     let call_rights = sel4::CapRightsBuilder::none().write(true).grant_reply(true).build();
@@ -382,7 +385,7 @@ fn finish(
     let slot = alloc.slots.alloc();
     let flags_ep = sel4::init_thread::Slot::<cap_type::Endpoint>::from_index(slot).cap();
     abs_of(flags_ep).mint(&abs_of(ep), call_rights, trust::FLAGS_ROOT).expect("root flags endpoint");
-    let bootstrap = component::flags_thread(&comp, alloc, &mut arena, info);
+    let bootstrap = flags_thread(&comp, alloc, &mut arena, info);
     component::start(&comp);
     // reply_recv puts the worker back on the endpoint before returning
     // this reply. Unbind only now: subsequent calls donate their SC.
@@ -390,36 +393,27 @@ fn finish(
     flags_ep.call(sel4::MessageInfo::new(0, 0, 0, 8));
     bootstrap.unbind().expect("passive flags server");
     Some(Trustd { comp, arena, registry: REGISTRY_VA as *mut GuestRecord,
-        flags_ep, no_reports, failed: false, pages, kick,
+        flags_ep, no_reports, failed: false, pages, kick, flags,
         #[cfg(target_arch = "x86_64")] frames })
 }
 
 impl Trustd {
-    pub fn flags(&self, g: &Guest) -> trust::Flags {
-        unsafe { &*(crate::layout::TRUSTD_FLAGS.base as *const trust::FlagsEntry).add(g.id) }
-            .read().for_instance(g.instance)
+    /// Give vmmgr the flags: read-only at FLAGS_VA, and the capability to
+    /// act on them for the console (root's, FLAGS_ROOT).
+    pub fn give_vmmgr(&self, vmmgr: &Component, alloc: &mut Alloc, arena: &mut Arena, keep: &mut impl FnMut() -> sel4::AbsoluteCPtr) {
+        vmmgr.give(l4h_host::vmmgr::SLOT_FLAGS_EP, self.flags_ep, CapRights::all());
+        for (p, &f) in self.flags.iter().enumerate() {
+            vmmgr.map_copy(alloc, arena, &abs_of(f), l4h_host::vmmgr::FLAGS_VA + p * PAGE, CapRights::read_only(), VmAttributes::DEFAULT, keep());
+        }
     }
 
-    /// Seal check on every op, ACT only for its first taint. `effect`
-    /// is false for an empty read/write: it checks seals without tainting.
-    pub fn act(&self, g: &Guest, caller: usize, bits: u64, effect: bool) -> Result<(), i64> {
-        if g.id == caller { return Ok(()); }
-        self.flags(g).act(bits, effect, || {
-            sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[..8].copy_from_slice(
-                &[trust::FLAGS_ACT, g.id as u64, g.instance, bits, 0, 0, 0, 0]));
-            let reply = self.flags_ep.call(sel4::MessageInfo::new(0, 0, 0, 8));
-            if reply.length() != 10 { return Err(crate::ctl::EIO); }
-            let status = mr(0) as i64;
-            if status == 0 { Ok(()) } else { Err(-status) }
-        })
-    }
-
-    /// Give guest `g` (being created) its attestation device: its id's
-    /// request page, cleared, and a kick capability badged with its id.
-    pub fn give(&self, g: &mut Guest, alloc: &mut Alloc, win: &mut Window) {
-        if self.failed { return; }
-        let page = self.pages[g.id];
-        win.with_frame(&abs_of(page), |p| unsafe {
+    /// Make guest `id`'s attestation device: its request page, cleared,
+    /// copied into `page`, and a kick capability badged with its id, into
+    /// `kick`.  False if trustd has failed.
+    pub fn give(&self, id: usize, win: &mut Window, page: &sel4::AbsoluteCPtr, kick: &sel4::AbsoluteCPtr) -> bool {
+        if self.failed { return false; }
+        let p = self.pages[id];
+        win.with_frame(&abs_of(p), |p| unsafe {
             // Do not carry any guest-writable state across instances.
             // If TPM initialization failed, trustd also sets NO_REPORTS
             // on the new guest's probe request before answering it.
@@ -427,28 +421,20 @@ impl Trustd {
             core::ptr::addr_of_mut!((*(p as *mut abi::AttestPage)).state)
                 .write_volatile(if self.no_reports { abi::ATTEST_NO_REPORTS } else { 0 });
         });
-        if g.add_device_with(alloc, crate::guest::DevKind::Attest, page, (self.kick, trust::kick_badge(g.id))).is_some() {
-            g.attest = true;
-        }
+        page.copy(&abs_of(p), CapRights::all()).expect("attestation page");
+        kick.mint(&abs_of(self.kick), CapRights::write_only(), trust::kick_badge(id)).expect("attestation kick");
+        true
     }
 
-    /// Guest `g` starts: its reports describe it from now on.
-    pub fn register(&mut self, g: &Guest) {
+    /// Guest `id`, instance `instance`, starts: its reports describe it
+    /// from now on.
+    pub fn register(&mut self, id: usize, instance: u64, record: GuestRecord) {
         if self.failed { return; }
-        let Some(launch) = g.launch else { return };
-        let r = GuestRecord {
-            instance: 0,
-            ram: g.owned_ram() as u64,
-            vcpus: g.vcpus.len() as u32,
-            flags: if g.dom0 { trust::RECORD_DOM0 } else { 0 },
-            launch,
-            reserved: 0,
-        };
-        let p = self.registry.wrapping_add(g.id);
+        let p = self.registry.wrapping_add(id);
         unsafe {
-            p.write_volatile(r);
+            p.write_volatile(record);
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            core::ptr::addr_of_mut!((*p).instance).write_volatile(g.instance);
+            core::ptr::addr_of_mut!((*p).instance).write_volatile(instance);
         }
     }
 
@@ -466,7 +452,7 @@ impl Trustd {
         let kick = abs_of(self.kick);
         let _ = kick.revoke();
         for id in 0..h.guests.len() {
-            if h.guest(id).is_none_or(|g| !g.attest) {
+            if h.guests[id].as_ref().is_none_or(|g| !g.attest) {
                 continue;
             }
             h.wins.a.with_frame(&abs_of(self.pages[id]), |p| unsafe {
@@ -496,12 +482,13 @@ pub fn fault(h: &mut Host, id: u32) {
     }
 }
 
-/// ROOT_CALL_ATTEST_DONE: trustd answered guest `id`; raise the event of
-/// its attestation device.
+/// ROOT_CALL_ATTEST_DONE: trustd answered guest `id`; vmmgr raises the
+/// event of its attestation device.
 pub fn done(h: &mut Host, id: usize) {
-    let Some(g) = h.guests.get(id).and_then(|g| g.as_ref()) else { return };
-    if let Some(d) = g.devices.iter().position(|d| d.kind == crate::guest::DevKind::Attest) {
-        g.raise_event(&mut h.alloc, crate::guest::dev_event(d));
+    if h.guests.get(id).and_then(|g| g.as_ref()).is_some_and(|g| g.attest) {
+        if let Some(v) = &h.vmmgr {
+            v.attest_done(id);
+        }
     }
 }
 
@@ -579,4 +566,37 @@ fn io(alloc: &mut Alloc, port: usize, width: usize, write: bool, value: u64) -> 
     let _ = abs_of(cap).delete();
     alloc.slots.free(cap.bits() as usize);
     Some(r)
+}
+
+/// trustd's passive flags server. Its temporary SC is unbound after the
+/// initial reply_recv handshake; thereafter only callers supply budget.
+fn flags_thread(c: &Component, alloc: &mut Alloc, arena: &mut Arena, info: &HostInfo) -> cap::SchedContext {
+    use host::trust;
+    let mut ctx = ObjCtx::arena(alloc, arena);
+    let tcb = ctx.cap::<cap_type::Tcb>(ObjectBlueprint::Tcb);
+    let sc = ctx.cap::<cap_type::SchedContext>(ObjectBlueprint::SchedContext {
+        size_bits: sel4::sys::seL4_MinSchedContextBits as usize,
+    });
+    let ipc = ctx.cap::<cap_type::Granule>(FRAME_BP);
+    let reply = ctx.cap::<cap_type::Reply>(ObjectBlueprint::Reply);
+    map_frame(&mut ctx, c.vspace, ipc, trust::FLAGS_IPCBUF_VA, CapRights::read_write(), VmAttributes::DEFAULT);
+    for va in (trust::FLAGS_STACK_TOP - trust::FLAGS_STACK_SIZE..trust::FLAGS_STACK_TOP).step_by(PAGE) {
+        let f = ctx.cap::<cap_type::Granule>(FRAME_BP);
+        map_frame(&mut ctx, c.vspace, f, va, CapRights::read_write(), VmAttributes::DEFAULT);
+    }
+    let fault_slot = ctx.alloc.slots.alloc();
+    abs_of(root_cap::<cap_type::Null>(fault_slot))
+        .mint(&abs_of(info.hyp_ep), CapRights::all(), component_badge(FLAGS_ID) | crate::HYP_BADGE_FAULT)
+        .expect("flags fault ep");
+    tcb.tcb_configure(c.cnode, CNodeCapData::new(0, 64 - c.cnode_bits), c.vspace, trust::FLAGS_IPCBUF_VA as u64, ipc)
+        .expect("flags TCB configure");
+    info.sched_control(info.cores - 1).sched_control_configure_flags(sc, info.timeslice_us, info.timeslice_us, 0, 0, 0)
+        .expect("flags bootstrap SC");
+    // Root is the initial task, at the maximum priority.
+    let prio = 255;
+    tcb.tcb_set_sched_params(crate::slot::TCB.cap(), prio, prio, sc, root_cap::<cap_type::Endpoint>(fault_slot))
+        .expect("flags sched params");
+    c.give(trust::SLOT_FLAGS_TCB, tcb, CapRights::all());
+    c.give(trust::SLOT_FLAGS_REPLY, reply, CapRights::all());
+    sc
 }

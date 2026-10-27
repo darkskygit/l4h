@@ -113,20 +113,41 @@ fn set_mr(i: usize, v: u64) {
     sel4::with_ipc_buffer_mut(|b| b.msg_regs_mut()[i] = v)
 }
 
-fn xchg(i: usize) -> sel4::AbsoluteCPtr {
-    abs(memd::SLOT_XCHG + i as u64)
+/// Who calls: l4h-root, or l4h-vmmgr (memd::BADGE_VMMGR).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Client {
+    Root,
+    Vmmgr,
+}
+
+/// Slot `i` of the caller's mailbox: root's in our CNode, vmmgr's in the
+/// CNode we share with it.
+fn mailbox(c: Client, i: u64) -> sel4::AbsoluteCPtr {
+    match c {
+        Client::Root => abs(i),
+        Client::Vmmgr => cap::<cap_type::CNode>(memd::SLOT_MAILBOX).absolute_cptr_from_bits_with_depth(i, memd::MAILBOX_RADIX),
+    }
+}
+
+/// Exchange slot `i` of the caller.
+fn xchg(c: Client, i: usize) -> sel4::AbsoluteCPtr {
+    match c {
+        Client::Root => mailbox(c, memd::SLOT_XCHG + i as u64),
+        Client::Vmmgr => mailbox(c, memd::MAILBOX_XCHG + i as u64),
+    }
 }
 
 impl Memd {
     /// MEMD_ALLOC: `count` blocks of 2^bits bytes into the exchange slots.
-    fn alloc(&mut self, bits: usize, count: usize) -> u64 {
+    /// Root gets them, vmmgr copies.
+    fn alloc(&mut self, c: Client, bits: usize, count: usize) -> u64 {
         let k = match bits.checked_sub(BLOCK_BITS) {
             Some(k) if k < memd::ORDERS && count <= XCHG_SLOTS => k,
             _ => return EINVAL,
         };
         let mut got = [0u32; XCHG_SLOTS];
         for n in 0..count {
-            match self.mem.take(k, State::Root) {
+            match self.mem.take(k, if c == Client::Root { State::Root } else { State::Vmmgr }) {
                 Some(i) => got[n] = i,
                 None => {
                     for &i in &got[..n] {
@@ -137,7 +158,11 @@ impl Memd {
             }
         }
         for (n, &i) in got[..count].iter().enumerate() {
-            xchg(n).move_(&abs(self.mem.slot(i, k))).expect("memd: move to exchange");
+            let from = abs(self.mem.slot(i, k));
+            match c {
+                Client::Root => xchg(c, n).move_(&from).expect("memd: move to exchange"),
+                Client::Vmmgr => xchg(c, n).copy(&from, CapRights::all()).expect("memd: copy to mailbox"),
+            }
         }
         // Invocations use the message registers: the reply's go last.
         for (n, &i) in got[..count].iter().enumerate() {
@@ -146,8 +171,10 @@ impl Memd {
         0
     }
 
-    /// MEMD_FREE: blocks from the exchange slots.
-    fn free(&mut self, count: usize) -> u64 {
+    /// MEMD_FREE: blocks from the exchange slots.  Of vmmgr's, we keep the
+    /// originals: revoking one deletes its copy wherever vmmgr put it, and
+    /// all that was made of it.
+    fn free(&mut self, c: Client, count: usize) -> u64 {
         if count > XCHG_SLOTS {
             return EINVAL;
         }
@@ -158,13 +185,23 @@ impl Memd {
             let Some((i, k)) = self.mem.block_at(mr(1 + 2 * n) as usize, mr(2 + 2 * n) as usize) else {
                 return EINVAL;
             };
-            if !matches!(self.mem.state(i), State::None | State::Root) {
+            let ours = match c {
+                Client::Root => matches!(self.mem.state(i), State::None | State::Root),
+                Client::Vmmgr => self.mem.state(i) == State::Vmmgr,
+            };
+            if !ours {
                 return EINVAL;
             }
             *b = (i, k);
         }
         for (n, &(i, k)) in blocks[..count].iter().enumerate() {
-            abs(self.mem.slot(i, k)).move_(&xchg(n)).expect("memd: move from exchange");
+            match c {
+                Client::Root => abs(self.mem.slot(i, k)).move_(&xchg(c, n)).expect("memd: move from exchange"),
+                Client::Vmmgr => {
+                    let _ = xchg(c, n).delete();
+                    abs(self.mem.slot(i, k)).revoke().expect("memd: revoke vmmgr block");
+                }
+            }
             self.mem.add(i, k);
         }
         0
@@ -181,6 +218,14 @@ impl Memd {
 
     fn guest_create(&mut self, g: usize, n: usize, radix: usize, hp_count: usize) -> u64 {
         if g >= MAX_GUESTS || self.guests[g].live || n == 0 || radix > 20 || n > 1 << radix || hp_count > HP_MAX {
+            return EINVAL;
+        }
+        // The guest's CNodes, from vmmgr's mailbox.
+        let (bcn, hcn) = (abs(memd::SLOT_GUEST_BCN + g as u64), abs(memd::SLOT_GUEST_HCN + g as u64));
+        let _ = (bcn.delete(), hcn.delete());
+        if bcn.move_(&mailbox(Client::Vmmgr, memd::MAILBOX_BCN)).is_err()
+            || hcn.move_(&mailbox(Client::Vmmgr, memd::MAILBOX_HCN)).is_err()
+        {
             return EINVAL;
         }
         let mut blocks = List::EMPTY;
@@ -302,7 +347,7 @@ impl Memd {
             return EINVAL;
         };
         // Fails if the block already has a copy.
-        if xchg(0).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
+        if xchg(Client::Vmmgr, 0).copy(&abs(self.mem.slot(i, 0)), CapRights::all()).is_err() {
             return EINVAL;
         }
         set_mr(1, (i as u64) << BLOCK_BITS);
@@ -423,7 +468,9 @@ fn main(info: &'static Info) -> ! {
             (msg, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
             continue;
         }
-        if badge != 0 {
+        let client = if badge & memd::BADGE_VMMGR != 0 {
+            Client::Vmmgr
+        } else if badge != 0 {
             // The timer.
             let delay = balloon::REPORT_DELAY_MS * d.ticks_per_ms;
             d.mem.report_free(host::ticks::now(), delay);
@@ -431,25 +478,29 @@ fn main(info: &'static Info) -> ! {
             arm_timer(d.ticks_per_ms);
             (msg, badge) = ep.recv(reply);
             continue;
-        }
-        // A call from l4h-root.
+        } else {
+            Client::Root
+        };
+        // A call from l4h-root (its own memory) or l4h-vmmgr (its own, and
+        // guests' RAM).
+        let vmmgr = client == Client::Vmmgr;
         let mut len = 1;
         let resp = match msg.label() {
             memd::MEMD_ALLOC => {
                 let count = mr(1) as usize;
                 len += count;
-                d.alloc(mr(0) as usize, count)
+                d.alloc(client, mr(0) as usize, count)
             }
-            memd::MEMD_FREE => d.free(mr(0) as usize),
-            memd::MEMD_GUEST_CREATE => d.guest_create(mr(0) as usize, mr(1) as usize, mr(2) as usize, mr(3) as usize),
-            memd::MEMD_SET_TARGET => d.set_target(mr(0) as usize, mr(1) as usize),
-            memd::MEMD_GUEST_COPY => {
+            memd::MEMD_FREE => d.free(client, mr(0) as usize),
+            memd::MEMD_GUEST_CREATE if vmmgr => d.guest_create(mr(0) as usize, mr(1) as usize, mr(2) as usize, mr(3) as usize),
+            memd::MEMD_SET_TARGET if vmmgr => d.set_target(mr(0) as usize, mr(1) as usize),
+            memd::MEMD_GUEST_COPY if vmmgr => {
                 len = 2;
                 d.guest_copy(mr(0) as usize, mr(1) as usize)
             }
-            memd::MEMD_GUEST_GIVE => d.guest_give(mr(0) as usize, mr(1) as usize, mr(2) as usize),
-            memd::MEMD_GUEST_DESTROY => d.guest_destroy(mr(0) as usize),
-            memd::MEMD_BALLOON => d.balloon(),
+            memd::MEMD_GUEST_GIVE if vmmgr => d.guest_give(mr(0) as usize, mr(1) as usize, mr(2) as usize),
+            memd::MEMD_GUEST_DESTROY if vmmgr => d.guest_destroy(mr(0) as usize),
+            memd::MEMD_BALLOON if !vmmgr => d.balloon(),
             _ => EINVAL,
         };
         d.write_status();

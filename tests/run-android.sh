@@ -38,7 +38,7 @@ L4H_QEMU_ARGS="-drive file=$out/screen.img,if=none,id=d0,format=raw -device virt
     "console=hvc0 L4H_TEST_SLOW=$l4h_test_slow android_mem=${ANDROID_MEM_MB:-3072} android_vcpus=${1:-4} android_gpu=$gpu" \
     "${ANDROID_TIMEOUT:-$((1200 * l4h_test_slow))}" >/dev/null
 cp "$root/build/qemu.log" "$root/build/qemu-android.log"
-grep -a "ANDROIDVM\|\[vm1\] init: \(Service .* exited\|.*boot_completed\)\|Kernel panic\|l4h-root: guest" \
+grep -a "ANDROIDVM\|\[vm1\] init: \(Service .* exited\|.*boot_completed\)\|Kernel panic\|l4h-vmmgr: guest" \
     "$root/build/qemu-android.log" | tail -30 || true
 grep -aq "ANDROIDVM: PASS" "$root/build/qemu-android.log"
 # The screenshot (PPM) as a PNG, which must not be blank.

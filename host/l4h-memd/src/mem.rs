@@ -60,6 +60,8 @@ pub enum State {
     Reported,
     /// Given to l4h-root.
     Root,
+    /// A copy given to l4h-vmmgr, the original kept here.
+    Vmmgr,
     /// RAM of a guest, on its list.
     Guest,
 }

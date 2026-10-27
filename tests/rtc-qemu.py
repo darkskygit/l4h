@@ -109,7 +109,7 @@ def run_case(directory, mode, control):
                         assert reg(hardware, 0x0b) == control
                         configured = True
                         qmp(monitor, "cont")
-                    if "l4h-root: all guests stopped" in text:
+                    if "l4h-vmmgr: all guests stopped" in text:
                         break
                     time.sleep(0.1)
                 else:

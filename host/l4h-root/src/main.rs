@@ -1,6 +1,8 @@
-//! l4h-root: the l4h root task.  Owns the devices, creates and destroys
-//! guests with their host components, and serves the control API for dom0.
-//! Memory is l4h-memd's once it runs (memd.rs).  See DESIGN.md §9.
+//! l4h-root: the l4h root task.  Owns the devices and spawns the host
+//! components, l4h-vmmgr last, which builds and runs the guests (vmmgr.rs).
+//! Root makes what devices reach for guests when vmmgr asks: their I/O
+//! pools, disk channels and netd ports.  Memory is l4h-memd's once it runs
+//! (memd.rs).  See DESIGN.md §9.
 
 #![no_std]
 #![no_main]
@@ -27,10 +29,7 @@ mod dashboard;
 mod devmem;
 mod elf;
 mod font;
-mod gpu;
-mod guest;
 mod iommu;
-mod kimage;
 mod layout;
 mod mem;
 mod memd;
@@ -39,9 +38,9 @@ mod netd;
 mod pci;
 mod reset;
 mod rtc;
-mod sched;
+mod topology;
 mod trustd;
-mod vmm;
+mod vmmgr;
 #[cfg(target_arch = "x86_64")]
 mod vtd;
 mod vspace;
@@ -49,7 +48,8 @@ mod window;
 
 use l4h_host::fixed::StaticCell;
 
-use sel4::init_thread::slot;
+/// The root task's own capabilities, for the files it shares with vmmgr.
+pub use sel4::init_thread::slot;
 use sel4::{ObjectBlueprint, cap, cap_type};
 use sel4_root_task::{Never, root_task};
 
@@ -58,18 +58,23 @@ use l4h_host::fixed::ArrayVec;
 
 use crate::blkd::{Controller, Disk};
 use crate::component::ROOT_BADGE_COMPONENT;
-use crate::guest::{Guest, GuestConfig, HYP_BADGE_FAULT, State, hyp_badge_guest, hyp_badge_vcpu};
 use crate::mem::{Alloc, Slots};
+use crate::vmmgr::{Dom0Plan, RootGuest};
 use crate::window::{Window, Windows};
 
+pub use crate::vmmgr::MAX_GUEST_DEVICES;
+
+pub const CNODE_SLOTS: usize = 1 << sel4::sel4_cfg_usize!(ROOT_CNODE_SIZE_BITS);
 pub const RETYPE_FAN_OUT: usize = 16384;
 pub const MAX_GUESTS: usize = 64;
-/// The guests, by id: too large for a stack.
-static GUESTS: StaticCell<[Option<Guest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
+/// Badge bit of a component's fault on the root endpoint.
+pub const HYP_BADGE_FAULT: u64 = 1 << 24;
+/// What root made for vmmgr's guests, by id.
+static GUESTS: StaticCell<[Option<RootGuest>; MAX_GUESTS]> = StaticCell::new([const { None }; MAX_GUESTS]);
 /// Memory and root CNode slots kept back from guest requests.
 const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 32768;
-/// Longest free slot range kept for vNIC ports and disk DMA buffers.
+/// Longest free slot range kept for disk DMA buffers.
 const RESERVE_RANGE: usize = 4096;
 
 const TIMER_BADGE: u64 = 1 << 40;
@@ -87,7 +92,7 @@ static mut DISKS: ArrayVec<Disk, MAX_DISKS> = ArrayVec::new();
 /// Facts about the host the guests run on.
 pub struct HostInfo {
     pub cores: usize,
-    pub topology: sched::topology::Topology,
+    pub topology: topology::Topology,
     pub tsc_hz: u64,
     /// AArch64 feature ID registers for the guests' bootinfo (`cpu_id`).
     pub cpu_id: [u64; 5],
@@ -98,24 +103,17 @@ pub struct HostInfo {
     /// count when it was read.
     pub epoch_ns: u64,
     pub epoch_ticks: u64,
-    /// Round-robin placement of new guests.
-    placement: core::cell::Cell<usize>,
 }
 
 impl HostInfo {
-    /// CPU for the next vCPU, visiting physical cores before SMT siblings.
-    pub fn next_core(&self) -> usize {
-        let c = self.placement.get();
-        self.placement.set(c + 1);
-        self.topology.placement(c)
-    }
-
     pub fn sched_control(&self, core: usize) -> cap::SchedControl {
         sel4::init_thread::Slot::<cap_type::SchedControl>::from_index(self.sched_control_base + core).cap()
     }
 }
 
-/// ASID pools; x86_64 seL4 has 8 pools of 512 ASIDs each in total.
+/// ASID pools; x86_64 seL4 has 8 pools of 512 ASIDs each in total.  Root
+/// assigns ASIDs to its components until vmmgr runs, and then gives it
+/// every pool (`make_all`).
 pub struct AsidPools {
     pools: ArrayVec<(cap::AsidPool, usize), { 1 << sel4::sys::seL4_NumASIDPoolsBits }>,
     /// ASIDs assigned to live VSpaces (exact: guests return theirs).
@@ -151,16 +149,34 @@ impl AsidPools {
                 return;
             }
         }
+        let pool = self.make(alloc);
+        pool.asid_pool_assign(vspace).expect("ASID assign");
+        // At most seL4_NumASIDPoolsBits pools: in_use < ASID_CAPACITY.
+        self.pools.must_push((pool, 1));
+    }
+
+    fn make(&mut self, alloc: &mut Alloc) -> cap::AsidPool {
         let (ut_slot, pool_slot) = alloc.slots.global(|slots| (slots.alloc(), slots.alloc()));
         let ut = alloc.split(sel4::sys::seL4_ASIDPoolBits as usize, ut_slot).expect("ASID pool memory");
         slot::ASID_CONTROL
             .cap()
             .asid_control_make_pool(ut.cap, &slot::CNODE.cap().absolute_cptr(sel4::init_thread::Slot::<cap_type::Null>::from_index(pool_slot).cap()))
             .expect("out of ASID pools");
-        let pool = sel4::init_thread::Slot::<cap_type::AsidPool>::from_index(pool_slot).cap();
-        pool.asid_pool_assign(vspace).expect("ASID assign");
-        // At most seL4_NumASIDPoolsBits pools: in_use < ASID_CAPACITY.
-        self.pools.must_push((pool, 1));
+        sel4::init_thread::Slot::<cap_type::AsidPool>::from_index(pool_slot).cap()
+    }
+
+    /// Make every pool vmmgr can take.
+    pub fn make_all(&mut self, alloc: &mut Alloc) {
+        assert!(self.pools.len() <= l4h_host::vmmgr::MAX_ASID_POOLS);
+        while !self.pools.is_full() && self.pools.len() < l4h_host::vmmgr::MAX_ASID_POOLS {
+            let pool = self.make(alloc);
+            self.pools.must_push((pool, 0));
+        }
+    }
+
+    /// The pools, and the ASIDs used in each.
+    pub fn pools(&self) -> &[(cap::AsidPool, usize)] {
+        &self.pools
     }
 }
 
@@ -211,41 +227,23 @@ pub struct Host {
     pub ctrls: &'static mut ArrayVec<Controller, { pci::MAX_DISK_CTRLS }>,
     pub disks: &'static mut ArrayVec<Disk, MAX_DISKS>,
     pub netd: netd::Netd,
-    pub guests: &'static mut [Option<Guest>; MAX_GUESTS],
+    /// What root made for vmmgr's guests.
+    pub guests: &'static mut [Option<RootGuest>; MAX_GUESTS],
     pub total_bytes: usize,
     pub monitor: Option<monitor::Monitor>,
     pub dashboard: Option<dashboard::Dashboard>,
     pub cfg: config::Config,
-    /// The kernel all guests run, and its module image (kimage.rs).
-    pub kernel: Option<kimage::Kernel>,
-    pub kmods: Option<kimage::Kmods>,
-    /// dom0's initramfs, the module `dom0-initrd` (bootmod); kept for
-    /// restarts.
-    pub dom0_initrd: &'static [u8],
     pub trustd: Option<trustd::Trustd>,
-    next_instance: u64,
+    /// Guest instances are root's to number: unique since boot, whatever
+    /// vmmgr does.
+    pub next_instance: u64,
     pub memd: memd::Memd,
     pub reset: reset::Reset,
     pub rtc: rtc::Rtc,
+    pub vmmgr: Option<vmmgr::Vmmgr>,
 }
 
 impl Host {
-    /// Run `f` on guest `id` with root slot allocations tracked into it.
-    pub fn with_guest<R>(&mut self, id: usize, f: impl FnOnce(&mut Host, &mut Guest) -> R) -> Option<R> {
-        let mut g = self.guests.get_mut(id)?.take()?;
-        self.alloc.slots.track(id);
-        let asids = self.asids.in_use;
-        let r = f(self, &mut g);
-        g.asids += self.asids.in_use - asids;
-        self.alloc.slots.untrack();
-        self.guests[id] = Some(g);
-        Some(r)
-    }
-
-    pub fn guest(&self, id: usize) -> Option<&Guest> {
-        self.guests.get(id)?.as_ref()
-    }
-
     /// Resources a guest operation may need, checked before starting it so
     /// that requests fail cleanly instead of exhausting the root task.
     pub fn can_afford(&self, bytes: usize, asids: usize, slots: usize) -> bool {
@@ -253,45 +251,6 @@ impl Host {
             && self.asids.available() >= asids
             && self.alloc.slots.available() >= RESERVE_SLOTS + slots
             && self.alloc.slots.largest_range() >= RESERVE_RANGE
-    }
-
-    pub fn create_guest(&mut self, cfg: &GuestConfig) -> Option<usize> {
-        let kernel = self.kernel.as_ref()?;
-        let kmods = self.kmods.as_ref().map_or(0, |k| k.bytes());
-        let bytes = cfg.ram.checked_add(cfg.io_pool)?.checked_add(kmods)?;
-        if !self.can_afford(bytes, cfg.vspaces + 4, 0) {
-            return None;
-        }
-        let id = (0..MAX_GUESTS).find(|&i| self.guest(i).is_none())?;
-        self.alloc.slots.track(id);
-        let asids = self.asids.in_use;
-        let instance = self.next_instance;
-        self.next_instance = instance.checked_add(1).expect("guest instance exhausted");
-        let mut g = guest::create(id, instance, cfg, &mut self.alloc, &mut self.asids, &self.info, kernel);
-        if let (Ok(g), Some(t)) = (&mut g, &self.trustd) {
-            t.give(g, &mut self.alloc, &mut self.wins.a);
-        }
-        if let (Ok(g), Some(k)) = (&mut g, &self.kmods) {
-            k.map(g, &mut self.alloc);
-        }
-        self.alloc.slots.untrack();
-        match g {
-            Ok(mut g) => {
-                g.asids = self.asids.in_use - asids;
-                self.guests[id] = Some(g);
-                Some(id)
-            }
-            Err(partial) => {
-                // Give back whatever was built.
-                self.asids.in_use = asids;
-                match partial {
-                    Some(g) => g.destroy(&mut self.alloc, false),
-                    None => self.alloc.slots.free_owned(id),
-                }
-                info!("l4h-root: cannot create guest '{}': out of memory", cfg.name);
-                None
-            }
-        }
     }
 
     /// Learn the geometry of host disk `disk` if its controller could
@@ -341,147 +300,6 @@ impl Host {
             }
         }
     }
-
-    /// Pass host disk `disk` (or sectors [lba_start, lba_start + lba_count)
-    /// of it; 0 = to the end) through to guest `id` before it starts.
-    /// The window must be aligned to blkd::WINDOW_ALIGN sectors.
-    pub fn attach_disk(&mut self, id: usize, disk: usize, read_only: bool, lba_start: u64, lba_count: u64) -> Result<(), i64> {
-        if lba_start % blkd::WINDOW_ALIGN != 0 || lba_count % blkd::WINDOW_ALIGN != 0 {
-            return Err(ctl::EINVAL);
-        }
-        self.ensure_disk(disk)?;
-        let (c, unit) = (self.disks[disk].ctrl, self.disks[disk].unit);
-        let ctrl = &self.ctrls[c];
-        let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, self.disks[disk].capacity).ok_or(ctl::EINVAL)?;
-        let read_only = read_only || self.disks[disk].read_only;
-        if ctrl.attachments(disk).any(|(_, a)| window.conflicts(read_only, a.window, a.read_only)) {
-            return Err(ctl::EBUSY);
-        }
-        if ctrl.clients.iter().all(Option::is_some) { return Err(ctl::ENOSPC); }
-        if !self.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
-        self.with_guest(id, |h, g| {
-            if g.state != State::Created {
-                return Err(ctl::EBUSY);
-            }
-            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
-            let (client, backend) = blkd::attach(&mut h.ctrls[c], disk, g, d, window, read_only, &mut h.alloc, &mut h.iommu);
-            let active = blkd::activate(&mut h.ctrls[c], unit, client, g, &backend, &mut h.wins.a, &h.pci);
-            // One each per device, of which add_device allows no more.
-            g.backends.must_push((d, backend));
-            g.disks.must_push((c, client));
-            active
-        })
-        .ok_or(ctl::ENOENT)?
-    }
-
-    /// Spawn the guest's l4h-vmm; the guest starts when the VMM is ready.
-    pub fn start_guest(&mut self, id: usize) -> Result<(), i64> {
-        self.with_guest(id, |h, g| {
-            if g.state != State::Created || g.vmm.is_some() {
-                return Err(ctl::EBUSY);
-            }
-            let maps: usize = g.backends.iter().map(|(_, b)| b.map_bytes()).sum();
-            if !g.reserve(&mut h.alloc, vmm::start_bytes(g.pool.size, g.vcpus.len(), g.devices.len()) + maps) {
-                return Err(ctl::ENOMEM);
-            }
-            if let Some(t) = &mut h.trustd {
-                t.register(g);
-            }
-            let v = vmm::spawn(g, &mut h.alloc, &mut h.wins.a, &mut h.asids, &h.info);
-            component::start(&v);
-            g.vmm = Some(v);
-            Ok(())
-        })
-        .ok_or(ctl::ENOENT)?
-    }
-
-    /// Give guest `id` (before it starts) a virtio-net device on `switch`.
-    /// Returns the MAC.
-    pub fn create_nic(&mut self, id: usize, switch: u32, mac: u64, lock: bool, isolated: bool) -> Result<u64, i64> {
-        if !self.can_afford(8 << 20, 0, 0) {
-            return Err(ctl::ENOMEM);
-        }
-        self.with_guest(id, |h, g| {
-            if g.state != State::Created || g.vmm.is_some() {
-                return Err(ctl::EBUSY);
-            }
-            // Everything that can fail comes before the device is added:
-            // it stays with the guest until it is destroyed.
-            if g.devices.len() >= guest::MAX_GUEST_DEVICES {
-                return Err(ctl::ENOSPC);
-            }
-            let p = h.netd.free_port(switch)?;
-            let mac = if mac == 0 { 0x02_4c_34_00_00_00 | ((id as u64) << 8) | p as u64 } else { mac & 0xffff_ffff_ffff };
-            if mac >> 40 & 1 != 0 {
-                return Err(ctl::EINVAL);
-            }
-            let memory = netd::Netd::port_memory(&mut h.alloc)?;
-            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(1)).expect("guest device room checked");
-            let backend = h.netd.add_port(g, d, p, switch, mac, lock, isolated, memory, &mut h.alloc);
-            g.backends.must_push((d, backend));
-            g.ports.must_push(p);
-            Ok(mac)
-        })
-        .ok_or(ctl::ENOENT)?
-    }
-
-    /// Give guest `id` (before it starts) a virtio-gpu device with one
-    /// scanout of `width` x `height` pixels.
-    pub fn attach_gpu(&mut self, id: usize, width: u64, height: u64) -> Result<(), i64> {
-        if !gpu::valid_size(width, height) {
-            return Err(ctl::EINVAL);
-        }
-        let (width, height) = (width as u32, height as u32);
-        let bytes = gpu::attach_bytes(width, height);
-        let pages = host::gpu::display_pages(width, height);
-        // The display area's mappings in the root task: a slot and page
-        // tables, from the global allocator.
-        if !self.can_afford(bytes + gpu::table_bytes(pages), 0, pages) {
-            return Err(ctl::ENOMEM);
-        }
-        self.with_guest(id, |h, g| {
-            if g.state != State::Created || g.vmm.is_some() || g.gpu.is_some() {
-                return Err(ctl::EBUSY);
-            }
-            // The guest's buffers bounce through the pool.
-            if g.pool.size < l4h_abi::GPU_POOL_IMAGES * host::gpu::image_bytes(width, height) {
-                return Err(ctl::EINVAL);
-            }
-            if g.devices.len() >= guest::MAX_GUEST_DEVICES {
-                return Err(ctl::ENOSPC);
-            }
-            let backend = gpu::attach(g, &mut h.alloc, width, height)?;
-            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(16)).expect("guest device room checked");
-            g.backends.must_push((d, backend));
-            Ok(())
-        })
-        .ok_or(ctl::ENOENT)?
-    }
-
-    pub fn destroy_guest(&mut self, id: usize) -> Result<(), i64> {
-        let mut g = self.guests.get_mut(id).and_then(|g| g.take()).ok_or(ctl::ENOENT)?;
-        g.stop();
-        if let Some(t) = &mut self.trustd {
-            t.unregister(id);
-        }
-        for &p in &g.ports {
-            self.netd.remove_port(p);
-        }
-        // Disks are quiesced, or cut off by the IOMMU, before any memory
-        // they were given is reused.
-        let mut quiet = true;
-        for &(ctrl, client) in &g.disks {
-            quiet &= blkd::remove(&mut self.ctrls[ctrl], client, &self.pci, &mut self.iommu);
-        }
-        let name = g.name.clone();
-        self.asids.in_use -= g.asids;
-        g.destroy(&mut self.alloc, !quiet);
-        info!(
-            "l4h-root: guest {} '{}' destroyed, {} MiB free",
-            id, name, self.alloc.free_bytes() >> 20
-        );
-        Ok(())
-    }
 }
 
 /// The root task's stack, its lowest page a guard (layout::guard_stack).
@@ -492,7 +310,7 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     layout::guard_stack(bootinfo);
     layout::check_image(bootinfo);
     let cores = bootinfo.inner().numNodes as usize;
-    let topology = sched::topology::discover(bootinfo);
+    let topology = topology::discover(bootinfo);
     info!("l4h-root: CPU physical cores {:?}", topology.physical());
     let mut alloc = Alloc::new(Slots::new(bootinfo.empty().range()), bootinfo);
     let total_bytes = alloc.free_bytes();
@@ -509,13 +327,6 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
     let modules = bootmod::load(bootinfo, &mut alloc, &mut devmem);
     let module = |name: &str| modules.iter().find(|m| m.name == name).map(|m| m.data);
     let cfg = config::Config::new(module("l4h-config"));
-    let kernel = module("guest-kernel").and_then(|k| {
-        kimage::Kernel::parse(k, &modules)
-            .inspect_err(|e| sel4::debug_println!("l4h-root: the guest kernel cannot be loaded: {}", e))
-            .ok()
-    });
-    let kmods = module("guest-kmods").and_then(|m| kimage::Kmods::new(&modules, &mut wins.a, m));
-    let dom0_initrd = module("dom0-initrd").unwrap_or(&[]);
     // ACPI table frames are shared by RTC discovery, reset and trustd.
     #[cfg(target_arch = "x86_64")]
     let mut acpi_frames = acpi::Frames::new();
@@ -533,7 +344,6 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         timeslice_us: 5000,
         epoch_ns: rtc.read_ns(&mut wins.a),
         epoch_ticks: rdtsc(),
-        placement: core::cell::Cell::new(0),
     };
     let mut asids = AsidPools { pools: [(slot::ASID_POOL.cap(), 1)].into_iter().collect(), in_use: 1 };
     // From here on, memory comes from memd.
@@ -632,46 +442,38 @@ fn main(bootinfo: &sel4::BootInfoPtr) -> sel4::Result<Never> {
         monitor: None,
         dashboard: None,
         cfg,
-        kernel,
-        kmods,
-        dom0_initrd,
         trustd,
         next_instance: 1,
         memd,
         reset,
         rtc,
+        vmmgr: None,
     };
     h.scan_disks();
     h.monitor = monitor::Monitor::new(&mut h.alloc, &mut h.devmem, wd_ntfn, h.cfg.serial_port, h.cfg.serial_irq, &mut h.iommu);
     h.dashboard = dashboard::Dashboard::new(bootinfo, &mut h.alloc, &mut h.devmem, h.cfg.fb_console);
 
-    if h.kernel.is_none() {
+    if module("guest-kernel").is_none() {
         sel4::debug_println!("l4h-root: no guest kernel, nothing to do");
     } else {
-        boot_dom0(&mut h);
+        let plan = dom0_plan(&mut h);
+        h.vmmgr = Some(vmmgr::spawn(&mut h, &modules, &plan));
     }
     serve(&mut h, reply)
 }
 
-pub fn boot_dom0(h: &mut Host) {
-    let ram_base = h.kernel.as_ref().expect("guest kernel").ram_base;
+/// dom0's disks and vNICs, the same for every dom0 vmmgr starts: the
+/// first dom0_disks host disks, and vNICs on switch 0 (with the uplink
+/// NIC) and the other switches root makes now.
+fn dom0_plan(h: &mut Host) -> Dom0Plan {
+    let mut plan = Dom0Plan::default();
     // By default, room for full receive rings on all of dom0's vNICs (one
     // per uplink switch it is given, one per internal switch).
     let nics = h.cfg.dom0_nics + h.cfg.uplink2_nic.is_some() as usize + h.cfg.dom0_internal_switches;
-    let io_pool = match h.cfg.dom0_io_pool_mb {
-        0 => l4h_host::iopool::for_nics(nics, guest::IO_POOL_DEFAULT).min(guest::IO_POOL_MAX),
+    plan.io_pool = match h.cfg.dom0_io_pool_mb {
+        0 => l4h_host::iopool::for_nics(nics, vmmgr::IO_POOL_DEFAULT).min(256 << 20),
         mb => mb << 20,
     };
-    let cfg = GuestConfig {
-        name: "dom0",
-        ram: h.cfg.dom0_mem_mb << 20,
-        vcpus: h.cfg.dom0_vcpus,
-        io_pool,
-        vspaces: 64,
-        ram_base,
-        dom0: true,
-    };
-    let id = h.create_guest(&cfg).expect("cannot create dom0");
     for d in 0..h.disks.len().min(h.cfg.dom0_disks) {
         // Of disk 0, only the first dom0_disk0_mb MiB if the disk is larger.
         let mut sectors = 0;
@@ -679,36 +481,33 @@ pub fn boot_dom0(h: &mut Host) {
             let n = (h.cfg.dom0_disk0_mb as u64) << 11;
             if n < h.disks[d].capacity { sectors = n; }
         }
-        if let Err(e) = h.attach_disk(id, d, false, 0, sectors) {
-            sel4::debug_println!("l4h-root: cannot give disk {} to dom0: error {}", d, e);
+        if plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, sectors }).is_err() {
+            sel4::debug_println!("l4h-root: dom0 gets the first {} disks only", l4h_host::vmmgr::DOM0_MAX_DISKS);
+            break;
         }
     }
     // Switch 0, with the uplink NIC (if any; by default the first) as its
-    // uplink (on first boot).
+    // uplink.
     let sw = 0;
-    if h.netd.switches == 0 {
-        h.netd.create_switch();
-        let nic = match h.cfg.uplink_nic {
-            None => (!h.netd.nics.is_empty()).then_some(0),
-            Some(bdf) => {
-                let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
-                if n.is_none() {
-                    sel4::debug_println!("l4h-root: no uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
-                }
-                n
+    h.netd.create_switch();
+    let nic = match h.cfg.uplink_nic {
+        None => (!h.netd.nics.is_empty()).then_some(0),
+        Some(bdf) => {
+            let n = h.netd.nics.iter().position(|n| netd::bdf(&n.pci) == bdf);
+            if n.is_none() {
+                sel4::debug_println!("l4h-root: no uplink NIC at {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
             }
-        };
-        if let Some(nic) = nic {
-            if let Err(e) = h.netd.attach_uplink(sw, nic) {
-                sel4::debug_println!("l4h-root: no uplink on switch {}: error {}", sw, e);
-            }
+            n
+        }
+    };
+    if let Some(nic) = nic {
+        if let Err(e) = h.netd.attach_uplink(sw, nic) {
+            sel4::debug_println!("l4h-root: no uplink on switch {}: error {}", sw, e);
         }
     }
-    // Like a disk, a vNIC dom0 cannot have (netd has failed: EIO) is left
-    // out.
-    let add_nic = |h: &mut Host, sw: u32, mac: u64| {
-        if let Err(e) = h.create_nic(id, sw, mac, true, false) {
-            sel4::debug_println!("l4h-root: cannot give dom0 a NIC on switch {}: error {}", sw, e);
+    let mut add_nic = |switch: u32, mac: u64| {
+        if plan.nics.push(l4h_host::vmmgr::Dom0Nic { switch: switch as u64, mac }).is_err() {
+            sel4::debug_println!("l4h-root: dom0 gets {} vNICs only", l4h_host::vmmgr::DOM0_MAX_NICS);
         }
     };
     // dom0's first vNIC takes the uplink NIC's MAC address: networks
@@ -717,7 +516,7 @@ pub fn boot_dom0(h: &mut Host) {
     let uplink = h.netd.nics.iter().position(|n| n.switch == Some(sw));
     for i in 0..h.cfg.dom0_nics {
         let mac = if i == 0 { uplink.and_then(|n| h.netd.nic_mac(n)).unwrap_or(0) } else { 0 };
-        add_nic(h, sw, mac);
+        add_nic(sw, mac);
     }
     // The second uplink NIC, if any, on switch 1, then the internal
     // switches. dom0 finds its vNICs by MAC, not by their order.
@@ -729,71 +528,52 @@ pub fn boot_dom0(h: &mut Host) {
         n
     });
     if let Some(nic) = uplink2 {
-        if h.netd.switches == 1 {
-            h.netd.create_switch();
-            if let Err(e) = h.netd.attach_uplink(1, nic) {
-                sel4::debug_println!("l4h-root: no uplink on switch 1: error {}", e);
-            }
+        h.netd.create_switch();
+        if let Err(e) = h.netd.attach_uplink(1, nic) {
+            sel4::debug_println!("l4h-root: no uplink on switch 1: error {}", e);
         }
-        let mac = h.netd.nic_mac(nic).unwrap_or(0);
-        add_nic(h, 1, mac);
+        add_nic(1, h.netd.nic_mac(nic).unwrap_or(0));
     }
     let first = 1 + uplink2.is_some() as usize;
     while (h.netd.switches as usize) < first + h.cfg.dom0_internal_switches {
         h.netd.create_switch();
     }
     for i in first..first + h.cfg.dom0_internal_switches {
-        add_nic(h, i as u32, 0);
+        add_nic(i as u32, 0);
     }
-    let cmdline = h.cfg.dom0_cmdline;
-    h.with_guest(id, |h, g| {
-        let kernel = h.kernel.as_ref().unwrap();
-        assert!(
-            guest::boot_with(g, &mut h.alloc, &mut h.wins.a, &h.info, kernel, h.dom0_initrd, cmdline),
-            "dom0 image does not fit"
-        );
-    });
-    h.start_guest(id).expect("start dom0");
+    plan
 }
 
-/// dom0 rebooted or crashed: replace it.  Other guests keep running; the
-/// new dom0 finds them with the control API.
-pub fn restart_dom0(h: &mut Host, id: usize) {
-    sel4::debug_println!("l4h-root: restarting dom0");
-    let _ = h.destroy_guest(id);
-    boot_dom0(h);
+/// CPU time a scheduling context used since the last call, in timer ticks.
+pub fn sched_consumed(sc: sel4::cap::SchedContext) -> u64 {
+    let r = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_SchedContext_Consumed(sc.bits()));
+    if r.error != 0 {
+        sel4::debug_println!("l4h-root: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
+        return 0;
+    }
+    r.consumed
 }
 
 fn rdtsc() -> u64 {
     host::ticks::now()
 }
 
-/// The root task's periodic timer: balancer and watchdog.
+/// The root task's timer period: dashboard, IOMMU faults and watchdog.
+const TIMER_MS: u64 = 100;
+
 fn arm_timer(info: &HostInfo) {
-    let deadline = rdtsc() + info.tsc_hz * sched::BALANCE_MS / 1000;
+    let deadline = rdtsc() + info.tsc_hz * TIMER_MS / 1000;
     let tcb = slot::TCB.cap();
     sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_TCB_SetTimer(tcb.bits(), deadline, TIMER_BADGE));
 }
 
+/// Root's part of the watchdog dump (vmmgr dumps the guests' vCPUs).
 fn watchdog_dump(h: &Host) {
+    let ms = |ticks: u64| ticks * 1000 / h.info.tsc_hz.max(1);
     sel4::debug_println!(
-        "l4h-root: watchdog: netd used {} ms since the last dump",
-        h.netd.consumed() * 1000 / h.info.tsc_hz.max(1)
+        "l4h-root: watchdog: netd used {} ms, vmmgr {} ms since the last dump",
+        ms(h.netd.consumed()), ms(h.vmmgr.as_ref().map_or(0, |v| v.consumed()))
     );
-    for g in h.guests.iter().flatten() {
-        if g.state != State::Running {
-            continue;
-        }
-        for (v, vcpu) in g.vcpus.iter().enumerate() {
-            match vcpu.ktcb.tcb_read_all_registers(false) {
-                Ok(r) => sel4::debug_println!(
-                    "l4h-root: watchdog: guest {} vCPU {} rip={:#x} rsp={:#x}",
-                    g.id, v, *r.pc(), *r.sp()
-                ),
-                Err(e) => sel4::debug_println!("l4h-root: watchdog: guest {} vCPU {}: {:?}", g.id, v, e),
-            }
-        }
-    }
 }
 
 pub fn mr(i: usize) -> u64 {
@@ -836,12 +616,13 @@ impl ReplySlot {
     }
 }
 
+/// Serve calls and faults of host components, and the timer and serial
+/// interrupts.
 fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
     let reply = reply_slot.reply;
     let hyp_ep = h.info.hyp_ep;
     arm_timer(&h.info);
     let mut next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
-    let mut last_balance = rdtsc();
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
@@ -849,41 +630,26 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
         if badge & monitor::MONITOR_BADGE != 0 {
             monitor::Monitor::interrupt(h);
         }
-        let resp = if badge & monitor::MONITOR_BADGE != 0 && badge & TIMER_BADGE == 0 {
-            None
-        } else if badge & TIMER_BADGE != 0 {
-            let now = rdtsc();
-            sched::balance(h, (now - last_balance) * 1_000_000 / h.info.tsc_hz);
-            last_balance = now;
-            dashboard::Dashboard::tick(h);
-            h.iommu.poll();
-            if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
-                watchdog_dump(h);
-                next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+        let resp = if notified {
+            if badge & TIMER_BADGE != 0 {
+                dashboard::Dashboard::tick(h);
+                h.iommu.poll();
+                if h.cfg.watchdog_secs != 0 && rdtsc() >= next_watchdog {
+                    watchdog_dump(h);
+                    next_watchdog = rdtsc() + h.info.tsc_hz * h.cfg.watchdog_secs as u64;
+                }
+                arm_timer(&h.info);
             }
-            arm_timer(&h.info);
             None
         } else if badge & ROOT_BADGE_COMPONENT != 0 {
             component_call(h, badge, &info)
-        } else if badge & HYP_BADGE_FAULT != 0 {
-            let gid = hyp_badge_guest(badge);
-            let vcpu = hyp_badge_vcpu(badge);
-            let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
-            sel4::debug_println!("l4h-root: guest {} vCPU {} kernel fault: {:x?}", gid, vcpu, fault);
-            if h.guest(gid).is_some_and(|g| g.dom0) {
-                restart_dom0(h, gid);
-            } else if let Some(Some(g)) = h.guests.get_mut(gid) {
-                g.stop();
-            }
-            None
         } else {
             sel4::debug_println!("l4h-root: unexpected message, badge {:#x} label {}", badge, info.label());
             None
         };
         match resp {
-            Some(v) => {
-                set_mr(0, v);
-                (info, badge) = hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 1), reply);
+            Some(len) => {
+                (info, badge) = hyp_ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, len), reply);
             }
             None => {
                 // A reply object left unanswered (a faulted or stopped
@@ -897,54 +663,34 @@ fn serve(h: &mut Host, reply_slot: ReplySlot) -> ! {
     }
 }
 
-/// A call or fault from a host component.  Returns the reply value, or
-/// None to leave the caller blocked.
-fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<u64> {
-    let id = (badge & 0xffff) as usize;
+/// A call or fault from a host component.  Sets the reply's message
+/// registers and returns its length, or None to leave the caller blocked.
+fn component_call(h: &mut Host, badge: u64, info: &sel4::MessageInfo) -> Option<usize> {
+    let id = (badge & 0xffff) as u32;
     if badge & HYP_BADGE_FAULT != 0 {
         let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, info));
         sel4::debug_println!("l4h-root: component {:#x} fault: {:x?}", id, fault);
-        trustd::fault(h, id as u32);
+        if id == l4h_host::vmmgr::VMMGR_ID {
+            // Guests keep running, but nothing can change them any more.
+            sel4::debug_println!("l4h-root: vmmgr failed: guests can no longer be created, changed or destroyed");
+        }
+        trustd::fault(h, id);
         return None;
     }
-    // Component ids below 0x100 are guest VMMs; the id is the guest's.
-    let is_vmm = id < MAX_GUESTS;
+    let reply = |v: u64| {
+        set_mr(0, v);
+        Some(1)
+    };
     match info.label() {
-        host::ROOT_CALL_VMM_READY if is_vmm => {
-            h.guests.get_mut(id)?.as_mut()?.start();
-            Some(0)
-        }
-        host::ROOT_CALL_GUEST_POWER if is_vmm => {
-            let how = mr(1);
-            info!("l4h-root: guest {} power request {}", id, how);
-            if how != l4h_abi::POWER_OFF && h.guest(id).is_some_and(|g| g.dom0) {
-                // The caller (dom0's VMM) is destroyed: no reply.
-                restart_dom0(h, id);
-                return None;
-            }
-            if let Some(Some(g)) = h.guests.get_mut(id) {
-                for v in &g.vcpus {
-                    let _ = v.ktcb.tcb_suspend();
-                }
-                g.state = State::Stopped;
-            }
-            if h.guests.iter().flatten().all(|g| g.state != State::Running) {
-                info!("l4h-root: all guests stopped");
-            }
-            Some(0)
-        }
-        host::ROOT_CALL_HW if id == trustd::TRUSTD_ID as usize => Some(trustd::hw(h)),
-        host::ROOT_CALL_ATTEST_DONE if id == trustd::TRUSTD_ID as usize => {
+        host::ROOT_CALL_HW if id == trustd::TRUSTD_ID => reply(trustd::hw(h)),
+        host::ROOT_CALL_ATTEST_DONE if id == trustd::TRUSTD_ID => {
             trustd::done(h, mr(0) as usize);
-            Some(0)
+            reply(0)
         }
-        host::ROOT_CALL_CTL if is_vmm && h.guest(id).is_some_and(|g| g.dom0) => {
-            ctl::handle(h, id);
-            Some(0)
-        }
+        label if id == l4h_host::vmmgr::VMMGR_ID => Some(vmmgr::call(h, label)),
         other => {
             sel4::debug_println!("l4h-root: component {:#x}: unknown call {}", id, other);
-            Some(u64::MAX)
+            reply(u64::MAX)
         }
     }
 }

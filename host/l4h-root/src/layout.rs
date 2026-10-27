@@ -5,8 +5,8 @@
 //! address space: two modules once chose the same address for different
 //! mappings, and root failed at boot only on hosts with a module image.
 //!
-//! Component address spaces are laid out in `l4h_host`, guests' in
-//! `include/l4h/abi.h`.
+//! Component address spaces are laid out in `l4h_host` (vmmgr's also in its
+//! layout.rs), guests' in `include/l4h/abi.h`.
 
 /// A region of the root task's address space: [base, base + size).
 pub struct Region {
@@ -82,11 +82,11 @@ regions! {
     UART = 0x6000_0200_0000, PAGE;
     /// The two windows on frames of guests and components (window.rs).
     WINDOWS = 0x7000_0000_0000, 2 * PAGE;
-    /// Each guest's console, control and event pages, GUEST_STRIDE apart
-    /// (guest.rs).
-    GUEST_PAGES = 0x7100_0000_0000, crate::MAX_GUESTS * GUEST_STRIDE;
-    /// dom0's control data area (VM_LOAD source), CTL_LOAD_MAX per guest id.
-    CTL_DATA = 0x7180_0000_0000, crate::MAX_GUESTS * l4h_abi::CTL_LOAD_MAX as usize;
+    /// The events, status and result pages root shares with vmmgr
+    /// (vmmgr.rs).
+    VMMGR_PAGES = 0x7100_0000_0000, 3 * PAGE;
+    /// dom0's control data area (CTL_BLK_WRITE source), read-only.
+    CTL_DATA = 0x7180_0000_0000, l4h_abi::CTL_LOAD_MAX as usize;
     /// The boot framebuffer (dashboard.rs).
     FRAMEBUFFER = 0x7200_0000_0000, GIB;
     /// The boot loader's modules, one after another (bootmod.rs).
@@ -102,14 +102,7 @@ regions! {
     /// The IOMMUs' device table, I/O page tables, command buffers and
     /// event logs, in 2 MiB chunks (amdvi.rs, vtd.rs): page tables for 4 TiB.
     IOMMU_TABLES = 0x7900_0000_0000, 8 * GIB;
-    /// Each guest's virtio-gpu display area, DISPLAY_STRIDE apart (gpu.rs).
-    DISPLAY = 0x7a00_0000_0000, crate::MAX_GUESTS * DISPLAY_STRIDE;
 }
-
-/// Distance between two guests' pages in GUEST_PAGES.
-pub const GUEST_STRIDE: usize = MIB;
-/// Distance between two guests' display areas in DISPLAY.
-pub const DISPLAY_STRIDE: usize = 16 * MIB;
 
 /// Check that what seL4 mapped for the root task (image, IPC buffer, boot
 /// info) lies in IMAGE.

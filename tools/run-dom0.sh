@@ -36,7 +36,7 @@ qemu=$!
 # stopped, or at the timeout.
 end=$((SECONDS + tmo))
 while kill -0 "$qemu" 2>/dev/null; do
-    if grep -aq "l4h-root: all guests stopped" "$log" || [ "$SECONDS" -ge "$end" ]; then
+    if grep -aq "l4h-vmmgr: all guests stopped" "$log" || [ "$SECONDS" -ge "$end" ]; then
         sleep 0.5
         kill "$qemu" 2>/dev/null || true
         break

@@ -8,10 +8,10 @@
 use l4h_host::fixed::{ArrayVec, Scratch};
 
 use crate::guest::{State, Vcpu};
-use crate::{Host, HostInfo};
+use crate::{HostInfo, Vmmgr};
 
 mod policy;
-pub mod topology;
+use crate::topology;
 
 /// Balancer period.
 pub const BALANCE_MS: u64 = 100;
@@ -21,7 +21,7 @@ const COOLDOWN: u32 = 10;
 pub fn consumed(sc: sel4::cap::SchedContext) -> u64 {
     let r = sel4::with_ipc_buffer_mut(|ipc| ipc.inner_mut().seL4_SchedContext_Consumed(sc.bits()));
     if r.error != 0 {
-        sel4::debug_println!("l4h-root: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
+        sel4::debug_println!("l4h-vmmgr: SchedContext_Consumed({:#x}) failed: {}", sc.bits(), r.error);
         return 0;
     }
     r.consumed
@@ -76,7 +76,7 @@ pub fn budgets(timeslice_us: u64, cap_pct: u32, k_share: u32) -> (u64, u64, u64)
 /// uses survives that throttling, so it is what the split follows.
 fn adapt_share(timeslice_us: u64, cap_pct: u32, k_share: u32, ck: u64, cu: u64, elapsed_us: u64) -> Option<u32> {
     // More than the elapsed time: consumption from an earlier period
-    // reported late (the root task ran late), not a measure of this one.
+    // reported late (vmmgr ran late), not a measure of this one.
     if cap_pct == 0 || cap_pct >= 100 || ck + cu > elapsed_us || ck + cu == 0 {
         return None;
     }
@@ -103,7 +103,7 @@ pub fn configure(info: &HostInfo, gid: usize, v: usize, vcpu: &Vcpu, cap_pct: u3
         .sched_control_configure_flags(vcpu.sc_k, budget_k, period, EXTRA_REFILLS, 0, 0)
         .and_then(|_| sc.sched_control_configure_flags(vcpu.sc_u, budget_u, period, EXTRA_REFILLS, 0, 0));
     if let Err(e) = r {
-        sel4::debug_println!("l4h-root: configure guest {} vCPU {} on core {}: {:?}", gid, v, core, e);
+        sel4::debug_println!("l4h-vmmgr: configure guest {} vCPU {} on core {}: {:?}", gid, v, core, e);
     }
     r.is_ok()
 }
@@ -118,7 +118,7 @@ impl core::fmt::Debug for Cores<'_> {
 }
 
 /// Apply a new CPU cap to every vCPU of guest `gid`.
-pub fn set_cap(h: &mut Host, gid: usize, cap_pct: u32) -> bool {
+pub fn set_cap(h: &mut Vmmgr, gid: usize, cap_pct: u32) -> bool {
     let Some(Some(g)) = h.guests.get_mut(gid) else { return false };
     g.cpu_cap_pct = cap_pct.min(100);
     g.vcpus.iter().enumerate().all(|(v, vcpu)| configure(&h.info, gid, v, vcpu, g.cpu_cap_pct, vcpu.core))
@@ -139,7 +139,7 @@ static SAMPLES: Scratch<ArrayVec<policy::Sample, { crate::MAX_GUESTS * l4h_abi::
 /// logical CPU (among the vCPUs active there). Balance their number per
 /// physical core first, then per logical CPU. SMT siblings share execution
 /// resources even when each has only one busy vCPU.
-pub fn balance(h: &mut Host, elapsed_us: u64) {
+pub fn balance(h: &mut Vmmgr, elapsed_us: u64) {
     let cores = h.info.cores;
     if elapsed_us == 0 {
         return;
@@ -188,7 +188,7 @@ pub fn balance(h: &mut Host, elapsed_us: u64) {
     let Some(g) = h.guest(gid) else { return };
     if configure(&h.info, gid, v, &g.vcpus[v], g.cpu_cap_pct, dst) {
         info!(
-            "l4h-root: balancer: guest {} vCPU {}: core {} -> {} (physical {} -> {})",
+            "l4h-vmmgr: balancer: guest {} vCPU {}: core {} -> {} (physical {} -> {})",
             gid, v, src, dst, h.info.topology.core(src), h.info.topology.core(dst)
         );
         let g = h.guests[gid].as_mut().unwrap();
