@@ -517,6 +517,10 @@ impl Backend for Gpu {
         false
     }
 
+    fn pending(&self) -> bool {
+        false
+    }
+
     fn reset(&mut self) {
         for r in self.t.res.iter_mut() {
             *r = Resource { id: 0, format: 0, width: 0, height: 0, first: 0, count: 0, bytes: 0 };

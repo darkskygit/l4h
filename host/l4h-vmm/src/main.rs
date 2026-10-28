@@ -186,13 +186,14 @@ fn main(info: &'static Info) -> ! {
                     m.target_changed(&vcpus);
                 }
             }
-            // Notification: device kicks and backend completions.
+            // Notification: device kicks and backend completions, from any
+            // device.
             for idx in devices.iter().map(|d| d.guest_index as usize) {
                 let Some(d) = devs[idx].as_mut() else { continue };
-                if badge & (1 << (host::VMM_BADGE_DONE_SHIFT as usize + idx)) != 0 {
+                if badge & host::VMM_BADGE_DONE != 0 {
                     d.complete(&mem, &vcpus);
                 }
-                if badge & (1 << (host::VMM_BADGE_KICK_SHIFT as usize + idx)) != 0 {
+                if badge & host::VMM_BADGE_KICK != 0 {
                     d.poll(&mem, &vcpus);
                 }
             }

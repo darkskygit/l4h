@@ -480,7 +480,7 @@ impl Guest {
             return None;
         }
         let page = self.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
-        let kick = (self.vmm_ntfn, 1 << (host::VMM_BADGE_KICK_SHIFT as usize + d));
+        let kick = (self.vmm_ntfn, host::VMM_BADGE_KICK);
         self.add_device_with(alloc, kind, page, kick)
     }
 

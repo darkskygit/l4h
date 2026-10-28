@@ -338,7 +338,7 @@ impl Netd {
         }
     }
 
-    /// Connect guest device `d` of `g` to `switch` as port `p` (free_port),
+    /// Connect a guest device of `g` to `switch` as port `p` (free_port),
     /// using `memory` (port_memory).  Returns for the guest's l4h-vmm the
     /// CNode of the port's frames (radix PORT_KEEP_BITS) and a kick
     /// capability, in a slot of its own.
@@ -346,7 +346,6 @@ impl Netd {
     pub fn add_port(
         &mut self,
         g: &mut RootGuest,
-        d: usize,
         p: usize,
         switch: u32,
         mac: u64,
@@ -380,7 +379,7 @@ impl Netd {
             net::NETD_SLOT_CLIENT_BASE + p as u64,
             g.vmm_ntfn,
             CapRights::write_only(),
-            1 << (host::VMM_BADGE_DONE_SHIFT as usize + d),
+            host::VMM_BADGE_DONE,
         );
         let kick_slot = alloc.slots.alloc();
         let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();

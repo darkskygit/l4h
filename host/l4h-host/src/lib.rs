@@ -251,13 +251,16 @@ pub const fn vmm_chan_va(d: usize) -> usize {
 }
 const _: () = assert!(gpu::SHARED_VA == SHARED_VA && vmm_chan_va(VMM_MAX_DEVICES) <= gpu::VMM_DISPLAY_VA);
 
-/// Badges of the VMM's bound notification: bit d = kick from guest device d,
-/// bit 32 + d = completion from the backend of device d.
-pub const VMM_BADGE_KICK_SHIFT: u32 = 0;
-pub const VMM_BADGE_DONE_SHIFT: u32 = 32;
+// Badges of the VMM's bound notification.  They say what kind of source
+// signalled, not which device: the VMM checks each device's kick word and
+// backend ring, which is a load or two for an idle one.
+
+/// A guest device was kicked.
+pub const VMM_BADGE_KICK: u64 = 1 << 0;
+/// A device backend (blkd, netd) has completions or room.
+pub const VMM_BADGE_DONE: u64 = 1 << 1;
 /// From l4h-vmmgr: the guest's hotplug target changed.
-pub const VMM_BADGE_MEM: u64 = 1 << 31;
-const _: () = assert!(VMM_MAX_DEVICES <= 31);
+pub const VMM_BADGE_MEM: u64 = 1 << 2;
 
 /// The architectural time counter that seL4 deadlines (seL4_TCB_SetTimer)
 /// are expressed in: the TSC on x86_64, the virtual counter on aarch64.

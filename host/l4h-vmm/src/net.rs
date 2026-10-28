@@ -38,11 +38,14 @@ pub struct Net {
     mac: [u8; 6],
     /// The receive queue's size (host::iopool::rx_queue_size).
     rx_queue: u32,
+    /// Transmit stopped at a full port ring: netd frees slots, then
+    /// signals.
+    tx_blocked: bool,
 }
 
 impl Net {
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, mac: [u8; 6], rx_queue: u32) -> Self {
-        Net { chan: chan_va as *mut Port, kick, mac, rx_queue: rx_queue.min(QUEUE_SIZE) }
+        Net { chan: chan_va as *mut Port, kick, mac, rx_queue: rx_queue.min(QUEUE_SIZE), tx_blocked: false }
     }
 
     fn tx_full(&self) -> bool {
@@ -56,8 +59,10 @@ impl Net {
     /// Guest -> port.  Returns (returned to guest, queued to the port).
     fn transmit(&mut self, mem: &GuestMem, q: &mut Queue) -> (bool, bool) {
         let (mut returned, mut queued) = (false, false);
+        self.tx_blocked = false;
         loop {
             if self.tx_full() {
+                self.tx_blocked = true;
                 break;
             }
             let Some(head) = q.pop(mem) else { break };
@@ -235,7 +240,13 @@ impl Backend for Net {
         returned
     }
 
+    fn pending(&self) -> bool {
+        self.tx_blocked
+            || unsafe { addr_of!((*self.chan).rx.tail).read_volatile() != addr_of!((*self.chan).rx.head).read_volatile() }
+    }
+
     fn reset(&mut self) {
+        self.tx_blocked = false;
         unsafe {
             addr_of_mut!((*self.chan).rx_csum).write_volatile(0);
             addr_of_mut!((*self.chan).rx_gso).write_volatile(0);

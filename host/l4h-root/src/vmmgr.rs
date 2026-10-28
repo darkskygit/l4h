@@ -487,7 +487,7 @@ fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
         if g.disks.is_full() {
             return Err(ctl::ENOSPC);
         }
-        let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, dev, window, read_only, &mut h.alloc, &mut h.iommu);
+        let (client, chan, kick) = crate::blkd::attach(&mut h.ctrls[c], disk, g, window, read_only, &mut h.alloc, &mut h.iommu);
         g.disks.must_push((c, client));
         crate::blkd::activate(&mut h.ctrls[c], unit, client, g, &chan, &mut h.wins.a, &h.pci)?;
         for (i, f) in chan.iter().enumerate() {
@@ -519,7 +519,7 @@ fn nic_add(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
             return Err(ctl::EINVAL);
         }
         let memory = crate::netd::Netd::port_memory(&mut h.alloc)?;
-        let (chan, kick) = h.netd.add_port(g, dev, p, switch, mac, lock, isolated, memory, &mut h.alloc);
+        let (chan, kick) = h.netd.add_port(g, p, switch, mac, lock, isolated, memory, &mut h.alloc);
         g.ports.must_push(p);
         xchg(h, 0).copy(&abs_of(chan), CapRights::all()).expect("vmmgr port frames");
         xchg(h, 1).move_(&abs_of(kick)).expect("vmmgr port kick");

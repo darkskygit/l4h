@@ -324,6 +324,11 @@ impl Backend for Blk {
         returned
     }
 
+    fn pending(&self) -> bool {
+        self.stalled.is_some()
+            || unsafe { addr_of!((*self.chan).cq.tail).read_volatile() != addr_of!((*self.chan).cq.head).read_volatile() }
+    }
+
     fn drain(&mut self) {
         self.stalled = None;
         while self.outstanding != 0 {

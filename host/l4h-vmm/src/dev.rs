@@ -34,6 +34,10 @@ pub trait Backend {
     fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool;
     /// Backend completions arrived.  Returns true if buffers were returned.
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool;
+    /// Whether `complete` may have work: completions in the backend's
+    /// ring, or requests waiting for room in it.  The completion signal is
+    /// shared by all devices, so this must be cheap.
+    fn pending(&self) -> bool;
     /// Wait until no request can still access guest memory (devices DMA
     /// into it), dropping the completions: the driver is resetting the
     /// device or a queue and may reuse the buffers once we return.
@@ -206,7 +210,13 @@ impl<B: Backend> Device<B> {
     /// The guest kicked: process queues whose kick bits are set (all
     /// queues in `extra`).
     pub fn poll(&mut self, mem: &GuestMem, vcpus: &Vcpus, extra: u64) {
-        let bits = self.kick_word().swap(0, Ordering::SeqCst) | extra;
+        // The kick signal is shared by all devices: load first, so that the
+        // guest's cache line stays shared for a device it did not kick.
+        let kick = self.kick_word();
+        if extra == 0 && kick.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let bits = kick.swap(0, Ordering::SeqCst) | extra;
         if self.status() & STATUS_DRIVER_OK == 0 {
             return;
         }
@@ -217,8 +227,11 @@ impl<B: Backend> Device<B> {
         }
     }
 
-    /// The backend signalled completions.
+    /// A backend signalled completions, maybe this one.
     pub fn complete(&mut self, mem: &GuestMem, vcpus: &Vcpus) {
+        if !self.backend.pending() {
+            return;
+        }
         if self.backend.complete(mem, &mut self.queues) {
             for q in 0..self.backend.num_queues() {
                 self.interrupt(mem, vcpus, q);

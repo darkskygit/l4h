@@ -365,11 +365,11 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 }
 
 /// Attach a checked window of host disk `disk` to one client of its
-/// running shared controller, for its device `dev_index`.  Returns the
-/// client, the channel frames (the client's) and a kick capability (in a
-/// slot of its own) for the client's l4h-vmm.
+/// running shared controller.  Returns the client, the channel frames (the
+/// client's) and a kick capability (in a slot of its own) for the client's
+/// l4h-vmm.
 #[allow(clippy::too_many_arguments)]
-pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest, dev_index: usize,
+pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
     window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
     let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
     let driver = ctrl.driver.as_mut().expect("started blkd");
@@ -383,7 +383,7 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest, dev_in
             keep.absolute_cptr_from_bits_with_depth(page as u64, 10)));
     }
     driver.comp.give_badged(blk::BLKD_SLOT_CLIENT_DONE + i as u64, client.vmm_ntfn,
-        CapRights::write_only(), 1 << (host::VMM_BADGE_DONE_SHIFT as usize + dev_index));
+        CapRights::write_only(), host::VMM_BADGE_DONE);
     let kick_slot = alloc.slots.alloc();
     let kick = sel4::init_thread::Slot::<cap_type::Notification>::from_index(kick_slot).cap();
     abs_of(kick).mint(&abs_of(driver.comp.ntfn), CapRights::write_only(), blk::BLKD_BADGE_KICK).expect("blkd kick");
