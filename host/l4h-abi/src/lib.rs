@@ -356,8 +356,6 @@ pub struct CtlVm {
 
 pub const HC_POWER: u64 = 2;
 pub const HC_DEV_WRITE: u64 = 3;
-pub const HC_DEV_READ: u64 = 4;
-pub const HC_SET_IRQ_AFFINITY: u64 = 5;
 pub const HC_GET_TIME: u64 = 6;
 
 pub const ATTEST_REPORT: u32 = 1;

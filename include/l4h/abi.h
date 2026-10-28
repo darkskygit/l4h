@@ -602,8 +602,6 @@ struct l4h_ctl_vm {
 enum l4h_hypercall {
 	L4H_HC_POWER = 2,           /* MR0 = L4H_POWER_* */
 	L4H_HC_DEV_WRITE = 3,       /* MR0 = device index, MR1 = L4H_VIRTIO_OP_*, MR2.. = args */
-	L4H_HC_DEV_READ = 4,        /* MR0 = device index, MR1 = register; returns MR0 */
-	L4H_HC_SET_IRQ_AFFINITY = 5,/* MR0 = device index, MR1 = vCPU */
 	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */
 };
 
