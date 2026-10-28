@@ -204,6 +204,12 @@ typedef int64_t l4h_s64;
  * L4H_SLOT_CONSOLE_KICK if the host had caught up (tail equal to the old
  * head, read after head is written).  The host prints the records of all
  * vCPUs in seq order, advancing each tail, then checks the heads again.
+ * A reserved sequence may not be published yet. The host waits up to
+ * 100 ms for a gap, then reports the missing records and skips it;
+ * records published after their sequences were skipped are discarded.
+ * This bounds the delay a stalled writer can impose on other vCPUs,
+ * at the cost of losing late output, including tty output. Poweroff
+ * flushing skips gaps immediately.
  *
  * Writers never wait.  When a record does not fit, the guest writes what
  * fits; output it gives up on is added to `lost`, which the host reports.

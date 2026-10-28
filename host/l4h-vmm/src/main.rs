@@ -139,7 +139,7 @@ fn main(info: &'static Info) -> ! {
         m.refresh();
     }
 
-    let mut console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event);
+    let mut console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event, tsc_hz);
     let mut console_pending = false;
     let root_ep = cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP);
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
@@ -188,6 +188,9 @@ fn main(info: &'static Info) -> ! {
                 // hypercall arguments across rebinding the notification.
                 let args: [u64; 4] = core::array::from_fn(mr);
                 tcb.tcb_bind_notification(ntfn).expect("bind VMM notification");
+                // A gap timer may have expired while unbound, losing its
+                // notification. Re-arm before sleeping; args are still saved.
+                console.rearm_timer();
                 if call.1 != 0 {
                     for (i, a) in args.into_iter().enumerate() {
                         set_mr(i, a);

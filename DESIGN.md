@@ -1717,8 +1717,20 @@ NAT, DHCP and firewalling belong in a VM.
   distance distinguishes full from empty without aliasing unread data.
   The VMM drains at most one ring's worth before polling for other work;
   it carries any remainder forward even when the guest did not kick again.
+  It tracks the next sequence, so a ring sampled empty cannot let a later
+  record from another vCPU overtake it. A missing sequence gets 100 ms
+  from the first observed gap to appear; further kicks do not extend that
+  deadline. A one-shot timer wakes the VMM, which can sleep or serve other
+  work meanwhile. On expiry it reports the missing records and skips to
+  the oldest published sequence, discarding any skipped records that arrive
+  later. This can lose late tty output as well as logs, but a stalled
+  writer cannot indefinitely hold up other vCPUs' output. Poweroff flushing
+  skips gaps immediately, within its byte budget.
   It polls the endpoint with its notification temporarily unbound, so a
   stream of console kicks cannot take precedence over queued hypercalls.
+  After rebinding it re-arms any gap deadline: seL4 drops timer expiries
+  while no notification is bound. Hypercall arguments are preserved across
+  both TCB invocations.
   Writers never wait: output that does not fit is
   counted, and the VMM reports the count, except tty output, which hvc
   holds until the VMM raises the console event for room. Console input

@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Exercise the production C writer and Rust consumer together, including
-//! deterministic interleavings while the host writes a serial character.
+//! deterministic publication races, missing sequences and timer expiry.
 extern crate self as l4h_rt;
-pub use l4h_host as host;
+pub mod host {
+    pub use l4h_host::*;
+    pub mod ticks {
+        pub fn now() -> u64 { crate::NOW.load(crate::Ordering::Relaxed) }
+    }
+}
 
 use core::ptr::{addr_of, addr_of_mut};
 use l4h_abi as abi;
 use std::cell::RefCell;
 use std::sync::{Mutex, MutexGuard, Once};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static LOCK: Mutex<()> = Mutex::new(());
 static MAP: Once = Once::new();
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
+static NOW: AtomicU64 = AtomicU64::new(1000);
+static TIMER: AtomicU64 = AtomicU64::new(0);
+static ARMS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 const VCPUS: usize = 2;
 const EVENT: u32 = 7;
 thread_local! {
@@ -23,12 +31,28 @@ thread_local! {
 macro_rules! debug_print { ($($a:tt)*) => {{ let _ = format_args!($($a)*); }}; }
 pub mod sel4 {
     pub use crate::debug_print;
+    pub mod cap_type { pub struct Tcb; }
+    pub struct Cap<T>(pub u64, pub core::marker::PhantomData<T>);
+    impl<T> Cap<T> { pub fn bits(&self) -> u64 { self.0 } }
+    pub struct IpcBuffer;
+    impl IpcBuffer {
+        pub fn inner_mut(&mut self) -> &mut Self { self }
+        #[allow(non_snake_case)]
+        pub fn seL4_TCB_SetTimer(&mut self, tcb: u64, deadline: u64, badge: u64) -> u64 {
+            assert_eq!((tcb, badge), (crate::host::SLOT_TCB, crate::host::VMM_BADGE_CONSOLE));
+            crate::TIMER.store(deadline, crate::Ordering::Relaxed);
+            crate::ARMS.lock().unwrap().push(deadline);
+            0
+        }
+    }
+    pub fn with_ipc_buffer_mut<R>(f: impl FnOnce(&mut IpcBuffer) -> R) -> R { f(&mut IpcBuffer) }
     pub fn debug_put_char(c: u8) {
         crate::SERIAL.with(|s| {
             if let Some(f) = s.borrow_mut().as_mut() { f(c); }
         });
     }
 }
+pub fn cap<T>(bits: u64) -> sel4::Cap<T> { sel4::Cap(bits, core::marker::PhantomData) }
 mod guest {
     pub struct Vcpus { pub n: usize }
     impl Vcpus {
@@ -45,6 +69,7 @@ unsafe extern "C" {
     fn mmap(a: usize, n: usize, prot: i32, flags: i32, fd: i32, off: usize) -> usize;
     fn console_test_select(page: *mut abi::EventPage);
     fn console_test_reset();
+    fn console_test_sequence(seq: u32);
     fn console_test_kicks() -> u32;
     fn l4h_console_try_write(s: *const u8, n: u32) -> u32;
 }
@@ -57,6 +82,12 @@ fn write(v: usize, bytes: &[u8]) -> usize {
         console_test_select(page(v));
         l4h_console_try_write(bytes.as_ptr(), bytes.len() as u32) as usize
     }
+}
+fn sequence(seq: u32) { unsafe { console_test_sequence(seq) }; }
+fn expire_timer() {
+    let deadline = TIMER.swap(0, Ordering::Relaxed);
+    assert_ne!(deadline, 0, "a gap must have a wakeup even without another kick");
+    NOW.store(deadline, Ordering::Relaxed);
 }
 fn output() -> Vec<u8> {
     let r = host::VMM_CONSOLE_RING_VA as *const host::ConsoleRing;
@@ -81,7 +112,10 @@ impl Fixture {
             console_test_reset();
         }
         EVENTS.store(0, Ordering::Relaxed);
-        Self { _lock: lock, console: console::Console::new(true, None, EVENT), vcpus: guest::Vcpus { n: VCPUS } }
+        NOW.store(1000, Ordering::Relaxed);
+        TIMER.store(0, Ordering::Relaxed);
+        ARMS.lock().unwrap().clear();
+        Self { _lock: lock, console: console::Console::new(true, None, EVENT, 1000), vcpus: guest::Vcpus { n: VCPUS } }
     }
     fn drain(&mut self) -> bool { self.console.drain(&self.vcpus) }
 }
@@ -193,5 +227,172 @@ fn invalid_guest_cursor_or_record_is_skipped() {
     assert_eq!(head(0), tail(0));
     assert_eq!(write(0, b"good"), 4);
     assert!(!f.drain());
-    assert_eq!(output(), b"good");
+    assert!(output().is_empty());
+    expire_timer();
+    assert!(!f.drain());
+    assert_eq!(output(), b"[l4h: skipped 1 missing console records]\ngood");
+}
+
+#[test]
+fn publication_between_head_samples_is_rescanned_in_sequence_order() {
+    let mut f = Fixture::new();
+    f.console.after_head = Some(|v| {
+        assert_eq!(v, 0);
+        // CPU 0 was sampled empty, then two fully ordered writes arrive.
+        assert_eq!(write(0, b"A"), 1);
+        assert_eq!(write(1, b"B"), 1);
+    });
+    assert!(!f.drain());
+    assert_eq!(output(), b"AB");
+    assert!(ARMS.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unpublished_reservation_waits_without_polling_and_publication_cancels_timer() {
+    let mut f = Fixture::new();
+    sequence(1); // CPU 0 reserved sequence 0, but has not published it.
+    assert_eq!(write(1, b"B"), 1);
+    assert!(!f.drain(), "the event loop must sleep or serve other work while waiting");
+    assert!(output().is_empty());
+    assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
+
+    NOW.store(1099, Ordering::Relaxed);
+    sequence(0); // The delayed producer publishes its already-reserved 0.
+    let kicks = unsafe { console_test_kicks() };
+    assert_eq!(write(0, b"A"), 1);
+    assert_eq!(unsafe { console_test_kicks() }, kicks + 1);
+    assert!(!f.drain());
+    assert_eq!(output(), b"AB");
+    assert_eq!(*ARMS.lock().unwrap(), [1100, 0]);
+}
+
+#[test]
+fn kicks_do_not_extend_a_gap_and_expiry_discards_late_records() {
+    let mut f = Fixture::new();
+    sequence(1);
+    assert_eq!(write(1, b"B"), 1);
+    assert!(!f.drain());
+    NOW.store(1050, Ordering::Relaxed);
+    assert_eq!(write(1, b"C"), 1);
+    assert!(!f.drain());
+    NOW.store(1099, Ordering::Relaxed);
+    assert!(!f.drain());
+    assert_eq!(*ARMS.lock().unwrap(), [1100]);
+    // No further guest kick: the one-shot timer alone makes progress.
+    expire_timer();
+    assert!(!f.drain());
+    let expected = b"[l4h: skipped 1 missing console records]\nBC";
+    assert_eq!(output(), expected);
+
+    // Late output is dropped, but frees the ring and wakes its writer.
+    sequence(0);
+    let late = vec![b'A'; abi::CONSOLE_OUT_SIZE - 8];
+    assert_eq!(write(0, &late), late.len());
+    assert_eq!(write(0, b"retry"), 0);
+    assert!(!f.drain());
+    assert_eq!(output(), expected);
+    assert_eq!(head(0), tail(0));
+    assert_eq!(EVENTS.load(Ordering::Relaxed), 1);
+    sequence(3);
+    assert_eq!(write(0, b"D"), 1);
+    assert!(!f.drain());
+    assert!(output().ends_with(b"BCD"));
+}
+
+#[test]
+fn notification_rebind_rearms_a_timer_lost_while_unbound() {
+    let mut f = Fixture::new();
+    sequence(1);
+    assert_eq!(write(1, b"B"), 1);
+    assert!(!f.drain());
+    // seL4 consumes the expired timer even if its TCB has no bound
+    // notification. Rearming the original (now past) deadline wakes it.
+    expire_timer();
+    f.console.rearm_timer();
+    assert_eq!(TIMER.load(Ordering::Relaxed), 1100);
+    assert_eq!(*ARMS.lock().unwrap(), [1100, 1100]);
+    expire_timer();
+    assert!(!f.drain());
+    assert_eq!(output(), b"[l4h: skipped 1 missing console records]\nB");
+}
+
+#[test]
+fn late_records_still_obey_the_drain_budget() {
+    let mut f = Fixture::new();
+    sequence(2);
+    assert_eq!(write(1, b"current"), 7);
+    assert!(!f.drain());
+    expire_timer();
+    assert!(!f.drain());
+    let expected = output();
+    sequence(0);
+    let late = vec![b'x'; abi::CONSOLE_OUT_SIZE - 8];
+    assert_eq!(write(0, &late), late.len());
+    assert_eq!(write(1, &late), late.len());
+    assert!(f.drain());
+    assert_eq!(head(0), tail(0));
+    assert_ne!(head(1), tail(1));
+    assert!(!f.drain());
+    assert_eq!(head(1), tail(1));
+    assert_eq!(output(), expected);
+}
+
+#[test]
+fn sequence_wrap_preserves_order() {
+    let mut f = Fixture::new();
+    // Advance in two steps within the signed comparison window, rather
+    // than generating four billion records to reach the wrap boundary.
+    for seq in [0x7fff_fffe, 0xffff_fffc] {
+        sequence(seq);
+        assert_eq!(write(0, b"anchor\n"), 7);
+        assert!(!f.drain());
+        expire_timer();
+        assert!(!f.drain());
+    }
+    assert_eq!(write(0, b"A"), 1); // fffffffd
+    assert_eq!(write(1, b"B"), 1); // fffffffe
+    assert_eq!(write(0, b"C"), 1); // ffffffff
+    assert_eq!(write(1, b"D"), 1); // 0
+    assert!(!f.drain());
+    assert!(output().ends_with(b"ABCD"));
+    assert_eq!(TIMER.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_gap_crossing_sequence_wrap_counts_and_discards_skipped_records() {
+    let mut f = Fixture::new();
+    for seq in [0x7fff_fffe, 0xffff_fffd] {
+        sequence(seq);
+        assert_eq!(write(0, b"anchor\n"), 7);
+        assert!(!f.drain());
+        expire_timer();
+        assert!(!f.drain());
+    }
+    // Missing fffffffe, ffffffff, 0: sequence 1 is ahead across wrap.
+    sequence(1);
+    assert_eq!(write(1, b"B"), 1);
+    assert!(!f.drain());
+    expire_timer();
+    assert!(!f.drain());
+    let expected = output();
+    assert!(expected.ends_with(b"[l4h: skipped 3 missing console records]\nB"));
+    for seq in [u32::MAX - 1, u32::MAX, 0] {
+        sequence(seq);
+        assert_eq!(write(0, b"late"), 4);
+    }
+    assert!(!f.drain());
+    assert_eq!(output(), expected);
+    assert_eq!(head(0), tail(0));
+}
+
+#[test]
+fn poweroff_flush_skips_a_gap_without_waiting() {
+    let mut f = Fixture::new();
+    sequence(2);
+    assert_eq!(write(1, b"crash report"), 12);
+    assert!(!f.drain());
+    f.console.flush(&f.vcpus);
+    assert_eq!(output(), b"[l4h: skipped 2 missing console records]\ncrash report");
+    assert_eq!(TIMER.load(Ordering::Relaxed), 0);
+    assert_eq!(head(1), tail(1));
 }
