@@ -115,7 +115,7 @@ Configuration:
 - `KernelIsMCS=ON`: scheduling contexts with budget and period are required for
   multi-tenant fairness (§7).
 - `KernelMaxNumNodes`: up to 64 cores.
-- `KernelFastpath=ON`.
+- `KernelFastpath=OFF`.
 - `KernelFSGSBase=inst`.
 - `KernelXSave=XSAVEOPT`, with `KernelXSaveFeatureSet=7` covering x87,
   SSE and AVX. The guest hides AVX-512, AMX and PKU, which seL4 does not
