@@ -257,7 +257,7 @@ unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, i
 	return seL4_MessageInfo_get_length(info) ? seL4_GetMR(0) : 0;
 }
 
-void l4h_console_write(const char *s, unsigned int len)
+static void console_hypercall(const char *s, unsigned int len)
 {
 	unsigned long mrs[1 + L4H_HC_CONSOLE_MAX_WORDS];
 
@@ -278,6 +278,75 @@ void l4h_console_write(const char *s, unsigned int len)
 		s += n;
 		len -= n;
 	}
+}
+
+/* The console output ring (L4H_DEV_CONSOLE_OUT), if the host gives one. */
+static struct l4h_console_out_page *console_out;
+static unsigned long console_out_kick;
+static int console_out_looked;
+/* Taken with a trylock: a writer that finds it held (another vCPU, or a
+ * crash on this one) uses the hypercall, which never waits for it. */
+static int console_out_lock;
+
+static void console_find_out(void)
+{
+	const struct l4h_bootinfo *bi = l4h_bootinfo;
+	unsigned long i;
+
+	if (!bi)
+		return;
+	console_out_looked = 1;
+	if (bi->magic != L4H_BOOTINFO_MAGIC || bi->abi_version != L4H_ABI_VERSION)
+		return;
+	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++) {
+		const struct l4h_dev_desc *d = &bi->devices[i];
+
+		if (d->type == L4H_DEV_CONSOLE_OUT && d->page_size >= sizeof(*console_out)) {
+			console_out_kick = L4H_CPTR2(L4H_SLOT_DEV_CNODE, d->kick_slot);
+			console_out = (struct l4h_console_out_page *)d->page_va;
+		}
+	}
+}
+
+/* Put as much of s in the ring as fits; returns how much. */
+static unsigned int console_ring_write(const char *s, unsigned int len)
+{
+	struct l4h_console_out_page *p = console_out;
+	unsigned int head = p->head;
+	/* The host is done with the bytes before tail. */
+	unsigned int used = head - __atomic_load_n(&p->tail, __ATOMIC_ACQUIRE);
+	unsigned int n, i;
+
+	n = used < L4H_CONSOLE_OUT_SIZE ? L4H_CONSOLE_OUT_SIZE - used : 0;
+	if (n > len)
+		n = len;
+	if (!n)
+		return 0;
+	for (i = 0; i < n; i++)
+		p->out[(head + i) % L4H_CONSOLE_OUT_SIZE] = s[i];
+	__atomic_store_n(&p->head, head + n, __ATOMIC_RELEASE);
+	/* Kick only a host that caught up: one still copying looks at head
+	 * again after publishing its tail. */
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&p->tail, __ATOMIC_RELAXED) == head)
+		seL4_Signal(console_out_kick);
+	return n;
+}
+
+void l4h_console_write(const char *s, unsigned int len)
+{
+	unsigned int n = 0;
+
+	if (!console_out_looked)
+		console_find_out();
+	if (console_out && !__atomic_exchange_n(&console_out_lock, 1, __ATOMIC_ACQUIRE)) {
+		n = console_ring_write(s, len);
+		__atomic_store_n(&console_out_lock, 0, __ATOMIC_RELEASE);
+	}
+	/* The host drains the ring before it prints what the hypercall
+	 * carries. */
+	if (n < len)
+		console_hypercall(s + n, len - n);
 }
 
 void l4h_power(int how)

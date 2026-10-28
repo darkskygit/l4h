@@ -110,6 +110,7 @@ pub const DEV_CONSOLE: u32 = 2;
 pub const DEV_CTL: u32 = 3;
 pub const DEV_ATTEST: u32 = 4;
 pub const DEV_MEM: u32 = 5;
+pub const DEV_CONSOLE_OUT: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -211,6 +212,16 @@ pub struct ConsolePage {
     pub input: [u8; CONSOLE_IN_SIZE],
 }
 
+pub const CONSOLE_OUT_SIZE: usize = 4032;
+
+#[repr(C)]
+pub struct ConsoleOutPage {
+    pub head: u32,
+    pub tail: u32,
+    pub reserved: [u32; 14],
+    pub out: [u8; CONSOLE_OUT_SIZE],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct MemPage {
@@ -219,7 +230,12 @@ pub struct MemPage {
     pub plugged: u32,
     pub reserved0: u32,
     pub plugged_map: [u64; HP_MAX / 64],
-    pub reserved: [u64; 6],
+    pub req_op: u32,
+    pub req_block: u32,
+    pub req_seq: u32,
+    pub done_seq: u32,
+    pub result: i64,
+    pub reserved: [u64; 3],
 }
 
 pub const MEM_PLUG: u64 = 1;
@@ -228,6 +244,7 @@ pub const MEM_UNPLUG: u64 = 2;
 /// Bump only for incompatible changes to existing ops (see abi.h).
 pub const CTL_VERSION: u32 = 3;
 pub const CTL_RESP_OFF: usize = 2048;
+pub const CTL_SYNC_OFF: usize = 2040;
 pub const CTL_DATA_MAX: usize = 1984;
 pub const CTL_LOAD_MAX: u64 = 1 << 20;
 pub const CTL_NAME_MAX: usize = 32;
@@ -247,6 +264,12 @@ pub struct CtlResp {
     pub status: i64,
     pub vals: [u64; 6],
     pub data: [u8; CTL_DATA_MAX],
+}
+
+#[repr(C)]
+pub struct CtlSync {
+    pub seq: u32,
+    pub done: u32,
 }
 
 pub const CTL_HOST_INFO: u32 = 1;
@@ -326,8 +349,6 @@ pub const HC_DEV_WRITE: u64 = 3;
 pub const HC_DEV_READ: u64 = 4;
 pub const HC_SET_IRQ_AFFINITY: u64 = 5;
 pub const HC_GET_TIME: u64 = 6;
-pub const HC_CTL: u64 = 7;
-pub const HC_MEM: u64 = 8;
 pub const HC_CONSOLE_MAX_WORDS: usize = 32;
 
 pub const ATTEST_REPORT: u32 = 1;
@@ -393,7 +414,9 @@ const _: () = assert!(core::mem::size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() == 88 + 16 * 40);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() <= VIRTIO_CONFIG_OFF);
 const _: () = assert!(core::mem::size_of::<ConsolePage>() == 4096);
-const _: () = assert!(core::mem::size_of::<CtlReq>() <= CTL_RESP_OFF);
+const _: () = assert!(core::mem::size_of::<ConsoleOutPage>() == 4096);
+const _: () = assert!(core::mem::size_of::<CtlReq>() <= CTL_SYNC_OFF);
+const _: () = assert!(CTL_SYNC_OFF + core::mem::size_of::<CtlSync>() <= CTL_RESP_OFF);
 const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
 const _: () = assert!(core::mem::size_of::<CtlVm>() == 56);
 const _: () = assert!(core::mem::size_of::<MemPage>() == 128);

@@ -140,8 +140,6 @@ pub const ROOT_CALL_GUEST_POWER: u64 = 1; // MR0 = guest id, MR1 = abi POWER_*
 pub const ROOT_CALL_LOG: u64 = 2;
 /// l4h-vmm has initialised the device pages: start the guest (MR0 = guest id).
 pub const ROOT_CALL_VMM_READY: u64 = 3;
-/// dom0's l4h-vmm: execute the control request in dom0's control page.
-pub const ROOT_CALL_CTL: u64 = 4;
 /// trustd: a hardware access for the firmware's AML (trust::HW_*).
 pub const ROOT_CALL_HW: u64 = 5;
 /// trustd: it answered guest MR0's request; raise its device's event.
@@ -219,7 +217,9 @@ pub struct VmmConfig {
     pub hp_count: u32,
     /// Event line of the memory device.
     pub mem_event: u32,
-    pub reserved1: u32,
+    /// The guest's console output device: its boot info index plus one
+    /// (0: none); its page is at vmm_device_page_va(index).
+    pub console_out_dev: u32,
 }
 
 /// The VMM's capability to memd's service endpoint, badged for its guest.
@@ -261,6 +261,10 @@ pub const VMM_BADGE_KICK: u64 = 1 << 0;
 pub const VMM_BADGE_DONE: u64 = 1 << 1;
 /// From l4h-vmmgr: the guest's hotplug target changed.
 pub const VMM_BADGE_MEM: u64 = 1 << 2;
+/// The guest wrote to its console output ring.
+pub const VMM_BADGE_CONSOLE: u64 = 1 << 3;
+/// The guest made a hotplug request in its memory device page.
+pub const VMM_BADGE_MEM_REQ: u64 = 1 << 4;
 
 /// The architectural time counter that seL4 deadlines (seL4_TCB_SetTimer)
 /// are expressed in: the TSC on x86_64, the virtual counter on aarch64.

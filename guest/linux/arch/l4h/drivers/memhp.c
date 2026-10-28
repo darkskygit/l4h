@@ -10,9 +10,9 @@
  *   block 63      the seL4 objects that map blocks 0-62 (l4h_hp_map()),
  *                 kept PageOffline: never in the page allocator
  *
- * Plug: the CNodes the host copies the Untypeds into, L4H_HC_MEM, map the
- * frames, add_memory.  Unplug: offline_and_remove_memory, unmap, then
- * L4H_HC_MEM, which revokes the Untypeds.  Memory that cannot be offlined
+ * Plug: the CNodes the host copies the Untypeds into, a plug request, map
+ * the frames, add_memory.  Unplug: offline_and_remove_memory, unmap, then
+ * an unplug request, which revokes the Untypeds.  Memory that cannot be offlined
  * (pinned or unmovable pages) stays: the host then sees plugged > target.
  */
 #include <linux/bitmap.h>
@@ -24,6 +24,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/page_ref.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <irq_kern.h>
 #include <l4h_sys.h>
@@ -56,12 +57,21 @@ static u64 block_gpa(unsigned int m)
 	return region_gpa + (u64)m * L4H_HP_SIZE;
 }
 
+/* Requests go through the device page and are answered with its event,
+ * so the vCPU runs other tasks meanwhile. */
+static unsigned long mem_kick;
+static u32 mem_seq;
+static DECLARE_WAIT_QUEUE_HEAD(mem_wq);
+
+/* Callers hold memhp_mutex: one request at a time. */
 static long mem_call(unsigned long op, unsigned int m)
 {
-	unsigned long mr[2] = { op, m };
-
-	l4h_hypercall(L4H_HC_MEM, mr, 2, 1);
-	return (long)mr[0];
+	WRITE_ONCE(page->req_op, op);
+	WRITE_ONCE(page->req_block, m);
+	smp_store_release(&page->req_seq, ++mem_seq);
+	l4h_signal(mem_kick);
+	wait_event(mem_wq, smp_load_acquire(&page->done_seq) == mem_seq);
+	return READ_ONCE(page->result);
 }
 
 /* Is `pfn` in the object block of a hotplug block? */
@@ -292,8 +302,10 @@ out:
 		schedule_delayed_work(&memhp_work, delay);
 }
 
+/* A new target, or a request answered. */
 static irqreturn_t memhp_interrupt(int irq, void *data)
 {
+	wake_up(&mem_wq);
 	mod_delayed_work(system_wq, &memhp_work, 0);
 	return IRQ_HANDLED;
 }
@@ -311,6 +323,8 @@ static int __init l4h_memhp_init(void)
 	if (i == bi->nr_devices || i == L4H_MAX_DEVICES || !bi->hp_count)
 		return 0;
 	page = (struct l4h_mem_page *)bi->devices[i].page_va;
+	mem_seq = READ_ONCE(page->req_seq);
+	mem_kick = L4H_CPTR2(L4H_SLOT_DEV_CNODE, bi->devices[i].kick_slot);
 	region_gpa = bi->hp_gpa;
 	region_count = min_t(u64, bi->hp_count, L4H_HP_MAX);
 	if (!mhp_supports_memmap_on_memory())

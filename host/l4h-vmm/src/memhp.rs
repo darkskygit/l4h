@@ -1,9 +1,9 @@
 //! The memory device (L4H_DEV_MEM, DESIGN.md §17): the guest's hotplug
 //! target and state in its device page, and its plug and unplug requests
-//! (L4H_HC_MEM), which go to l4h-memd.  memd checks every request against
+//! (in the page too), which go to l4h-memd.  memd checks every request against
 //! its own state; this only relays them.
 
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{Ordering, fence};
 
 use l4h_abi as abi;
@@ -74,8 +74,8 @@ impl MemDev {
         vcpus.raise(0, self.event);
     }
 
-    /// L4H_HC_MEM: the result as -errno.
-    pub fn hypercall(&mut self, op: u64, m: u64) -> i64 {
+    /// A plug or unplug request: the result as -errno.
+    fn serve(&mut self, op: u64, m: u64) -> i64 {
         let label = match op {
             abi::MEM_PLUG => memd::MEMD_HP_PLUG,
             abi::MEM_UNPLUG => memd::MEMD_HP_UNPLUG,
@@ -90,5 +90,24 @@ impl MemDev {
         };
         self.refresh();
         r
+    }
+
+    /// The guest kicked: serve the request in the device page if it is a
+    /// new one, and raise the device's event.
+    pub fn request(&mut self, vcpus: &Vcpus) {
+        let p = self.page;
+        let seq = unsafe { addr_of!((*p).req_seq).read_volatile() };
+        if seq == unsafe { addr_of!((*p).done_seq).read_volatile() } {
+            return;
+        }
+        fence(Ordering::Acquire);
+        let (op, m) = unsafe { (addr_of!((*p).req_op).read_volatile(), addr_of!((*p).req_block).read_volatile()) };
+        let r = self.serve(op as u64, m as u64);
+        unsafe {
+            addr_of_mut!((*p).result).write_volatile(r);
+            fence(Ordering::Release);
+            addr_of_mut!((*p).done_seq).write_volatile(seq);
+        }
+        vcpus.raise(0, self.event);
     }
 }

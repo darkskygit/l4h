@@ -19,7 +19,10 @@
 #include <linux/uaccess.h>
 #include <linux/gfp.h>
 #include <linux/capability.h>
+#include <linux/interrupt.h>
+#include <linux/wait.h>
 #include <asm/page.h>
+#include <irq_kern.h>
 #include <l4h_sys.h>
 
 struct l4hctl_call {
@@ -36,12 +39,38 @@ static void *stage;
 static unsigned long stage_size;
 static DEFINE_MUTEX(ctl_lock);
 
+/* Requests are kicked and answered with the device's event, so the vCPU
+ * runs other tasks meanwhile. */
+static struct l4h_ctl_sync *ctl_sync;
+static unsigned long ctl_kick;
+static u32 ctl_seq;
+static DECLARE_WAIT_QUEUE_HEAD(ctl_wq);
+
+static irqreturn_t l4hctl_interrupt(int irq, void *data)
+{
+	wake_up(&ctl_wq);
+	return IRQ_HANDLED;
+}
+
+static bool ctl_done(void)
+{
+	return smp_load_acquire(&ctl_sync->done) == ctl_seq;
+}
+
+/* Have the host execute the request in the control page.  -EINTR if we
+ * were killed while it still has the request: the next caller waits. */
+static long ctl_call(void)
+{
+	smp_store_release(&ctl_sync->seq, ++ctl_seq);
+	l4h_signal(ctl_kick);
+	return wait_event_killable(ctl_wq, ctl_done()) ? -EINTR : 0;
+}
+
 static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct l4h_ctl_req *req = ctl_page;
 	struct l4h_ctl_resp *resp = ctl_page + L4H_CTL_RESP_OFF;
 	struct l4hctl_call call;
-	unsigned long mr = 0;
 	long ret = 0;
 
 	if (cmd != L4HCTL_IOC_CALL)
@@ -53,6 +82,11 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	 * userfaultfd or FUSE page): waiters stay killable. */
 	if (mutex_lock_killable(&ctl_lock))
 		return -EINTR;
+	/* A request whose caller was killed may still use the page. */
+	if (wait_event_killable(ctl_wq, ctl_done())) {
+		ret = -EINTR;
+		goto out;
+	}
 	if (copy_from_user(req, u64_to_user_ptr(call.req), sizeof(*req))) {
 		ret = -EFAULT;
 		goto out;
@@ -75,11 +109,9 @@ static long l4hctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			goto out;
 		}
 	}
-	memset(resp, 0, sizeof(*resp));
-	/* The host writes every response: one it never wrote (vmmgr failed,
-	 * and its keeper answered dom0's VMM) fails. */
-	resp->status = -EIO;
-	l4h_hypercall(L4H_HC_CTL, &mr, 0, 1);
+	ret = ctl_call();
+	if (ret)
+		goto out;
 	if (req->op == L4H_CTL_GPU_READ && !resp->status) {
 		unsigned long n = resp->vals[0];
 
@@ -122,19 +154,32 @@ static struct miscdevice l4hctl_dev = {
 static int __init l4hctl_init(void)
 {
 	const struct l4h_bootinfo *bi = l4h_bootinfo;
+	const struct l4h_dev_desc *desc = NULL;
 	unsigned int i;
+	int irq, ret;
 
 	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++) {
 		if (bi->devices[i].type == L4H_DEV_CTL) {
-			ctl_page = (void *)bi->devices[i].page_va;
-			stage = (void *)bi->devices[i].data_va;
-			stage_size = min_t(unsigned long, bi->devices[i].data_size, L4H_CTL_LOAD_MAX);
+			desc = &bi->devices[i];
+			ctl_page = (void *)desc->page_va;
+			stage = (void *)desc->data_va;
+			stage_size = min_t(unsigned long, desc->data_size, L4H_CTL_LOAD_MAX);
 		}
 	}
 	if (!ctl_page)
 		return 0;
 	if (!stage || !stage_size)
 		return -ENODEV;
+
+	ctl_sync = ctl_page + L4H_CTL_SYNC_OFF;
+	ctl_seq = READ_ONCE(ctl_sync->seq);
+	ctl_kick = L4H_CPTR2(L4H_SLOT_DEV_CNODE, desc->kick_slot);
+	irq = l4h_event_irq(desc->event);
+	if (irq < 0)
+		return irq;
+	ret = request_irq(irq, l4hctl_interrupt, 0, "l4hctl", NULL);
+	if (ret)
+		return ret;
 
 	pr_info("l4hctl: control device present\n");
 	return misc_register(&l4hctl_dev);

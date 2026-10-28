@@ -44,6 +44,28 @@ pub fn handle(h: &mut Vmmgr, caller: usize) {
     unsafe { (page.add(abi::CTL_RESP_OFF) as *mut abi::CtlResp).write_volatile(resp) };
 }
 
+/// dom0 kicked: execute the request of each dom0 whose control page has a
+/// new seq (abi::CtlSync), then mark it done and raise the device's event.
+pub fn kicked(h: &mut Vmmgr) {
+    for id in 0..MAX_GUESTS {
+        let Some((page, instance)) = h.guest(id).filter(|g| g.dom0).and_then(|g| Some((g.ctl_page()?, g.instance))) else { continue };
+        let sync = unsafe { page.add(abi::CTL_SYNC_OFF) as *mut abi::CtlSync };
+        let seq = unsafe { addr_of!((*sync).seq).read_volatile() };
+        if seq == unsafe { addr_of!((*sync).done).read_volatile() } {
+            continue;
+        }
+        fence(Ordering::Acquire);
+        handle(h, id);
+        // The request may have restarted dom0: the page is a new one then,
+        // and no one waits.
+        let Some(g) = h.guests[id].as_ref().filter(|g| g.instance == instance) else { continue };
+        let Some(d) = g.devices.iter().position(|d| d.kind == crate::guest::DevKind::Ctl) else { continue };
+        fence(Ordering::Release);
+        unsafe { addr_of_mut!((*sync).done).write_volatile(seq) };
+        g.raise_event(&mut h.alloc, crate::guest::dev_event(d));
+    }
+}
+
 fn vm_arg(a: u64) -> Result<usize, i64> {
     let id = a as usize;
     if id >= MAX_GUESTS { Err(ENOENT) } else { Ok(id) }

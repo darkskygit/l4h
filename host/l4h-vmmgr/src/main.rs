@@ -55,6 +55,7 @@ pub mod slot {
     pub const CNODE: Slot<cap_type::CNode> = Slot::from_index(host::SLOT_CNODE as usize);
     pub const VSPACE: Slot<cap_type::VSpace> = Slot::from_index(host::SLOT_VSPACE as usize);
     pub const TCB: Slot<cap_type::Tcb> = Slot::from_index(host::SLOT_TCB as usize);
+    pub const NTFN: Slot<cap_type::Notification> = Slot::from_index(host::SLOT_NTFN as usize);
 }
 
 pub const CNODE_SLOTS: usize = 1 << proto::CNODE_BITS;
@@ -70,6 +71,8 @@ const RESERVE_BYTES: usize = 32 << 20;
 const RESERVE_SLOTS: usize = 16384;
 
 const TIMER_BADGE: u64 = 1 << 40;
+/// dom0 made a control request in its device page (abi::CtlSync).
+pub const CTL_KICK_BADGE: u64 = 1 << 41;
 
 /// Facts about the host the guests run on.
 pub struct HostInfo {
@@ -575,9 +578,12 @@ fn serve(h: &mut Vmmgr, reply_slot: ReplySlot) -> ! {
     let (mut info, mut badge) = hyp_ep.recv(reply);
     loop {
         h.alloc.refill();
-        let notified = badge & (TIMER_BADGE | proto::BADGE_ROOT_EVENT) != 0;
+        let notified = badge & (TIMER_BADGE | proto::BADGE_ROOT_EVENT | CTL_KICK_BADGE) != 0;
         if badge & proto::BADGE_ROOT_EVENT != 0 {
             root_events(h);
+        }
+        if badge & CTL_KICK_BADGE != 0 {
+            ctl::kicked(h);
         }
         let resp = if notified {
             if badge & TIMER_BADGE != 0 {
@@ -688,10 +694,6 @@ fn component_call(h: &mut Vmmgr, badge: u64, info: &sel4::MessageInfo) -> Option
             if h.guests.iter().flatten().all(|g| g.state != State::Running) {
                 info!("l4h-vmmgr: all guests stopped");
             }
-            Some(0)
-        }
-        host::ROOT_CALL_CTL if h.guest(id).is_some_and(|g| g.dom0) => {
-            ctl::handle(h, id);
             Some(0)
         }
         other => {

@@ -1974,7 +1974,7 @@ the host keeps that dynamic plumbing simple.
 |-----------|-----------|------|
 | `l4h-root` | 1 | Boots the host and spawns the other components. Owns PCI, the IOMMU, interrupts, disks, reset and the RTC. Makes guests' I/O pools, disk channels and netd ports when vmmgr asks, and authorizes disk and NIC attachments. Serves the control ops on the host's disks, switches and NICs, runs the monitor and the dashboard. |
 | `l4h-vmmgr` | 1 | Builds guest CSpaces, kernel VSpaces, vCPUs and boot info, from memory it gets from memd; loads dom0's images (modules) and copies runtime image uploads; spawns guests' VMMs. Runs lifecycle, the control API and balancing (§9.3). |
-| `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. Forwards control requests from dom0 to vmmgr. |
+| `l4h-vmm` | 1 per guest | Serves virtio backends, console and hypercalls using the guest's I/O pool and host-owned shared pages. Never maps guest RAM. |
 | `l4h-blkd` | 1 per attached disk | Validates pool addresses and LBA windows and drives a virtio-blk, virtio-scsi or NVMe PCI disk. |
 | `l4h-netd` | 1 | Runs all L2 switches, dynamic guest ports and the virtio-net, gVNIC, ENA and X550 uplink drivers. |
 | `l4h-trustd` | 1 | Maintains taint/seal flags; with a TPM, quotes its signing key and signs guests' reports (§9.2). |
@@ -2157,10 +2157,12 @@ external orchestration can run in dom0.
 **Transport and lifecycle.**
 
 - The `l4hctl` device is a single shared page rather than virtqueues:
-  dom0 writes a fixed-layout request (`struct l4h_ctl_req` in `abi.h`) and
-  issues `L4H_HC_CTL`. dom0's `l4h-vmm` forwards the call to `l4h-vmmgr`,
-  which executes it synchronously and writes the response into the same
-  page. Image loads are bounded at 1 MiB per call.
+  dom0 writes a fixed-layout request (`struct l4h_ctl_req` in `abi.h`),
+  bumps the page's `seq` and signals the device's kick, a notification of
+  `l4h-vmmgr` itself. vmmgr executes the request, writes the response into
+  the same page, sets `done` and raises the device's event; the calling
+  task sleeps meanwhile, and the vCPU runs others. Image loads are
+  bounded at 1 MiB per call.
 - `/dev/l4hctl` takes one ioctl that carries a request, its response and,
   for `VM_LOAD`, a user buffer. The driver stages it in the control
   device's data area, 1 MiB of host-owned frames mapped into dom0, and
@@ -3612,9 +3614,10 @@ through `l4h-root`.
 - **VMM.** The memory device (`L4H_DEV_MEM`, `struct l4h_mem_page`) is
   one more device page: target, plugged count and bitmap, which the VMM
   refreshes from memd (`MEMD_HP_STATE`) at start, after each request and
-  when root signals a new target, raising the device's event then. The
-  hypercall `L4H_HC_MEM` (op, m) becomes one memd call; memd does every
-  check.
+  when root signals a new target, raising the device's event then. A
+  request (op, m) becomes one memd call; memd does every check. The guest
+  writes it in the page and kicks the VMM, which answers in the page and
+  raises the device's event.
 - **Guest kernel.** `arch/l4h` moved from FLATMEM to `SPARSEMEM_VMEMMAP`
   with 128 MiB sections, and `ARCH_FORCE_MAX_ORDER` 9: Linux puts a memory
   block's memmap in the block (`memmap_on_memory`) only if it is whole
@@ -3640,14 +3643,14 @@ through `l4h-root`.
   memory only the 2 KiB level-2 hotplug CNode, a level-1 RAM CNode per
   new GiB, a 1 KiB table of page-table slots, and the vmemmap's page
   tables (a Linux and an seL4 page table per hotplug block, kept for the
-  next plug there). Plug: those CNodes, `L4H_HC_MEM(PLUG)`, map,
+  next plug there). Plug: those CNodes, a plug request, map,
   `add_memory_driver_managed`. Block 63's pages are skipped by an online
   page callback, and a memory notifier drops and restores their
   reference around offlining, as virtio-mem does for unplugged ranges, so
   offlining skips them. Unplug: `offline_and_remove_memory`, then
   revoking the copy of block 63 deletes the page tables and RAM CNodes
   (and with them every frame), then the other copies, then
-  `L4H_HC_MEM(UNPLUG)`. A guest that skips that only harms itself. When
+  an unplug request. A guest that skips that only harms itself. When
   memd is too busy to take a block back (`EBUSY`), it stays pending, and
   the driver retries every second until memd has it, whether or not the
   target changes again. If a failed plug's rollback finds that Linux will

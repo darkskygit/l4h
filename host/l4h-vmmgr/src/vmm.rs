@@ -148,6 +148,7 @@ fn create(
     cfg.mem_dev = g.mem_dev.map_or(0, |d| d as u32 + 1);
     cfg.hp_count = g.hp_count as u32;
     cfg.mem_event = g.mem_dev.map_or(0, dev_event);
+    cfg.console_out_dev = g.console_out_dev.map_or(0, |d| d as u32 + 1);
     assert!(backends.len() <= host::VMM_MAX_DEVICES);
     cfg.nr_devices = backends.len() as u32;
     for (i, (d, b)) in backends.iter().enumerate() {

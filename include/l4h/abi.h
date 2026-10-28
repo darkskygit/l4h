@@ -116,7 +116,7 @@ typedef int64_t l4h_s64;
  *
  * Root slot L4H_SLOT_HP is a level-1 CNode (radix 9, guard 3) made by the
  * host.  Its slot m is empty until the guest retypes a level-2 CNode
- * (radix 6, no guard) there; plugging m (L4H_HC_MEM) puts the copy of the
+ * (radix 6, no guard) there; plugging m (l4h_mem_page) puts the copy of the
  * Untyped of block i of the hotplug block in its slot i, which the guest
  * names L4H_HP_BLOCK_CPTR(m, i).  Unplugging m revokes them.  Frames of
  * hotplugged memory are named by L4H_FRAME_CPTR, like the rest of RAM: the
@@ -218,6 +218,7 @@ enum l4h_dev_type {
 	L4H_DEV_CTL = 3,        /* dom0 control channel (l4hctl) */
 	L4H_DEV_ATTEST = 4,     /* attestation by l4h-trustd, see l4h_attest_page */
 	L4H_DEV_MEM = 5,        /* memory hotplug, see l4h_mem_page */
+	L4H_DEV_CONSOLE_OUT = 6,/* console output ring, see l4h_console_out_page */
 };
 
 struct l4h_dev_desc {
@@ -333,7 +334,8 @@ enum l4h_virtio_op {
 
 /* ------------------------------------------------------------------------
  * Console device (L4H_DEV_CONSOLE): input ring written by the host.
- * Output goes through L4H_HC_CONSOLE_WRITE.
+ * Output goes through the console output device if there is one, else
+ * through L4H_HC_CONSOLE_WRITE.
  */
 #define L4H_CONSOLE_IN_SIZE     4032
 struct l4h_console_page {
@@ -347,11 +349,30 @@ struct l4h_console_page {
 	l4h_u8 in[L4H_CONSOLE_IN_SIZE];
 };
 
+/* Console output device (L4H_DEV_CONSOLE_OUT): the guest writes bytes at
+ * out[head % SIZE], then advances head, then signals the device's kick
+ * notification if the host had caught up (tail equal to the old head,
+ * read after head is written).  The host copies bytes up to head and
+ * advances tail, then checks head again.  If the ring is full, the guest
+ * sends the rest with L4H_HC_CONSOLE_WRITE, which the host answers after
+ * draining the ring, so output stays in order. */
+#define L4H_CONSOLE_OUT_SIZE    4032
+struct l4h_console_out_page {
+	l4h_u32 head;           /* written by the guest */
+	l4h_u32 tail;           /* written by the host */
+	l4h_u32 reserved[14];
+	l4h_u8 out[L4H_CONSOLE_OUT_SIZE];
+};
+
 /* ------------------------------------------------------------------------
  * Memory device (L4H_DEV_MEM): the hotplug target and state, written by the
  * host, which raises the device's event when the target changes.  The guest
- * plugs and unplugs hotplug blocks with L4H_HC_MEM until `plugged` equals
- * `target`.
+ * plugs and unplugs hotplug blocks until `plugged` equals `target`.
+ *
+ * A request: the guest writes req_op and req_block, then a new req_seq
+ * (the previous one plus one), and signals the device's kick notification.
+ * The host writes result, then done_seq = req_seq, and raises the device's
+ * event line.
  */
 struct l4h_mem_page {
 	l4h_u32 generation;     /* bumped after every change */
@@ -359,10 +380,15 @@ struct l4h_mem_page {
 	l4h_u32 plugged;
 	l4h_u32 reserved0;
 	l4h_u64 plugged_map[L4H_HP_MAX / 64]; /* bit m: hotplug block m is plugged */
-	l4h_u64 reserved[6];
+	l4h_u32 req_op;         /* written by the guest: enum l4h_mem_op */
+	l4h_u32 req_block;
+	l4h_u32 req_seq;
+	l4h_u32 done_seq;       /* written by the host */
+	l4h_s64 result;
+	l4h_u64 reserved[3];
 };
 
-/* L4H_HC_MEM: MR0 = op, MR1 = hotplug block.  Result (MR0): 0, or -EINVAL
+/* req_op of l4h_mem_page.  result: 0, or -EINVAL
  * (out of range, already plugged or not plugged, no level-2 CNode in its
  * slot or a slot of it not empty), -ENOSPC (a plug with as many plugged as
  * the target), -EBUSY (the host is short of memory, or the guest plugs and
@@ -374,10 +400,13 @@ enum l4h_mem_op {
 
 /* ------------------------------------------------------------------------
  * Control device (L4H_DEV_CTL, dom0 only): a request at offset 0 of the
- * device page and the response at L4H_CTL_RESP_OFF, exchanged with
- * L4H_HC_CTL.  Bulk data (images) is passed in the device's data area
- * (l4h_dev_desc.data_va), which belongs to the host: the host never reads
- * dom0's RAM.  See DESIGN.md §9.1.
+ * device page and the response at L4H_CTL_RESP_OFF.  The guest writes a
+ * new seq in the l4h_ctl_sync at L4H_CTL_SYNC_OFF (the previous one plus
+ * one) and signals the device's kick notification; the host writes the
+ * response, then done = seq, and raises the device's event line.  Bulk
+ * data (images) is passed in the device's data area (l4h_dev_desc.data_va),
+ * which belongs to the host: the host never reads dom0's RAM.  See
+ * DESIGN.md §9.1.
  *
  * l4h-root refuses every request whose version is not its own, so a bump
  * makes l4hctl of one release unable to talk to the host of another, in
@@ -387,6 +416,7 @@ enum l4h_mem_op {
  */
 #define L4H_CTL_VERSION         3
 #define L4H_CTL_RESP_OFF        2048
+#define L4H_CTL_SYNC_OFF        2040    /* between request and response */
 #define L4H_CTL_DATA_MAX        1984
 #define L4H_CTL_LOAD_MAX        (1u << 20)
 #define L4H_CTL_NAME_MAX        32
@@ -402,6 +432,11 @@ struct l4h_ctl_resp {
 	l4h_s64 status;         /* 0 or -errno */
 	l4h_u64 vals[6];
 	l4h_u8 data[L4H_CTL_DATA_MAX];
+};
+
+struct l4h_ctl_sync {
+	l4h_u32 seq;            /* written by the guest */
+	l4h_u32 done;           /* written by the host */
 };
 
 enum l4h_ctl_op {
@@ -558,8 +593,6 @@ enum l4h_hypercall {
 	L4H_HC_DEV_READ = 4,        /* MR0 = device index, MR1 = register; returns MR0 */
 	L4H_HC_SET_IRQ_AFFINITY = 5,/* MR0 = device index, MR1 = vCPU */
 	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */
-	L4H_HC_CTL = 7,             /* dom0: execute the request in the control device page */
-	L4H_HC_MEM = 8,             /* MR0 = L4H_MEM_*, MR1 = hotplug block (see l4h_mem_page) */
 };
 #define L4H_HC_CONSOLE_MAX_WORDS 32
 
