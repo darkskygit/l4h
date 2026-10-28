@@ -310,7 +310,7 @@ without it, the host reports `unknown`.
 | `tests/run-alloctest.sh` | host allocator growth under fragmentation, reclaim, fixed-container panic safety and memd grant validation |
 | `tests/run-devicetest.sh [--qemu]` | console ordering, bounded sequence gaps, cursor wrap, draining and writer wakeups; memory-hotplug completion and retry scheduling; control completions after manager failure; with QEMU, hypercalls under continuous console output |
 | `tests/run-abitest.sh` | guest ABI and seL4 extensions, from a module built against the module tree |
-| `python3 tests/bootmem-qemu.py` | boot clearing of seeded nonzero RAM and initial untyped watermarks; built debug kernel/root and GDB required, `L4H_ARCH=aarch64` also needs the loader and gdb-multiarch |
+| `python3 tests/bootmem-qemu.py` | boot clearing of seeded nonzero RAM, initial untyped watermarks and root-task entry after CPU startup; built debug kernel/root and GDB required, `L4H_ARCH=aarch64` also needs the loader and gdb-multiarch |
 | `tests/run-selftest.sh [vcpus]` | syscalls, memory, signals, fork, threads, futex, SMP stress |
 | `tests/run-kemutest.sh [vcpus]` | AArch64 userspace on x86_64: kemu syscalls, signals, TLS, threads, fork/exec, ptrace, single-step, vector state and FP exception flags |
 | `tests/run-reclaimtest.sh [secs]` | 128 MiB checking workload in a 64 MiB memcg, with 32 MiB read-only hot data and swap; `RECLAIM_SWAP_DIR=/dev/shm` puts swap in host RAM |

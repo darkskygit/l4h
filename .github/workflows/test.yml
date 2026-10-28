@@ -82,6 +82,8 @@ jobs:
         run: tests/run-devicetest.sh --qemu
       - name: Guest ABI and seL4 extensions (module), module tree
         run: tests/run-abitest.sh
+      - name: Boot RAM clearing and root-task handoff
+        run: python3 tests/bootmem-qemu.py
       - name: Linux self-test, 1 vCPU
         run: tests/run-selftest.sh 1
       - name: Linux self-test, 4 vCPUs
@@ -232,6 +234,8 @@ jobs:
         run: tools/build-linux.sh vmlinux
       - name: Guest ABI and PCI (EL1)
         run: tests/run-abitest.sh
+      - name: Boot RAM clearing and root-task handoff
+        run: python3 tests/bootmem-qemu.py
       - name: Guest ABI (EL2 entry)
         run: L4H_QEMU_VIRTUALIZATION=on tests/run-abitest.sh
       - name: Linux self-test, 1 vCPU

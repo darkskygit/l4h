@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Check boot RAM clearing and untyped watermarks before root-task handoff.
+"""Check boot RAM clearing, untyped watermarks and root-task handoff.
 
 Requires built debug seL4 and l4h-root, QEMU and GDB. L4H_ARCH=aarch64
 also requires the kernel loader and gdb-multiarch. Linux need not boot.
@@ -40,6 +40,7 @@ def main():
     # x86 also has an identity-mapped entry segment before its high mapping.
     boot = min((p for p in loads if p[3] >= 0xffffff8000000000), key=lambda p: p[4])
     kernel_offset = boot[3] - boot[4]
+    root_entry = struct.unpack_from("<Q", APP.read_bytes(), 24)[0]
 
     with tempfile.TemporaryDirectory(prefix="l4h-bootmem-") as tmp:
         work = Path(tmp)
@@ -110,7 +111,14 @@ for i in range(int(bi['untyped']['end']) - first):
         assert not recycled
         poison_cap = True
 assert all(counts) and poison_cap, (counts, poison_cap)
-print('BOOTMEM: dirty RAM cleared; device and live boot memory deferred; first-use watermarks: PASS')
+end
+# Continue past secondary-CPU startup: the loader's page tables must stay
+# valid until every CPU has switched to the kernel's own tables.
+thbreak *{root_entry:#x}
+continue
+python
+assert int(gdb.parse_and_eval('$pc')) == {root_entry}, 'root task did not start'
+print('BOOTMEM: dirty RAM cleared; device and live boot memory deferred; first-use watermarks; root-task entry: PASS')
 end
 detach
 quit
@@ -119,12 +127,13 @@ quit
         with log.with_suffix(".serial.log").open("w") as output:
             proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=output)
             try:
-                result = subprocess.run([
-                    "gdb-multiarch" if ARM else "gdb", "-q", "-batch", "-x", str(script), str(KERNEL)
-                ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
-                log.with_suffix(".gdb.log").write_text(result.stdout)
-                assert result.returncode == 0 and "BOOTMEM:" in result.stdout, result.stdout
-                print(next(line for line in result.stdout.splitlines() if line.startswith("BOOTMEM:")))
+                with log.with_suffix(".gdb.log").open("w") as debug_output:
+                    result = subprocess.run([
+                        "gdb-multiarch" if ARM else "gdb", "-q", "-batch", "-x", str(script), str(KERNEL)
+                    ], stdout=debug_output, stderr=subprocess.STDOUT, text=True, timeout=120)
+                debug_log = log.with_suffix(".gdb.log").read_text()
+                assert result.returncode == 0 and "BOOTMEM:" in debug_log, debug_log
+                print(next(line for line in debug_log.splitlines() if line.startswith("BOOTMEM:")))
             finally:
                 proc.terminate()
                 try:

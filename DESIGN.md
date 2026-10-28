@@ -380,9 +380,12 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
 - **0019, Clear ordinary free RAM once at boot without backing zero pages.**
   Before any user code runs, the kernel scans the free RAM it will hand
   out as Untypeds and clears each page only if a word is non-zero. On Arm
-  the scan first cleans and invalidates the cache range to account for
-  cache state inherited from boot. These initial caps have a zero free
-  index, so their first use does not clear the memory again. Reading
+  all secondary CPUs switch to the kernel's translation tables before
+  the scan can clear the loader's tables in free RAM. Untypeds and
+  bootinfo are then finalized under the kernel lock, before the initial
+  thread runs. The scan first cleans and invalidates the cache range to
+  account for cache state inherited from boot. These initial caps have a
+  zero free index, so their first use does not clear the memory again. Reading
   unbacked memory maps the hypervisor's shared zero page, preserving the
   saving until that memory is written.
   Device regions are never scanned or cleared. Recycled kernel boot
