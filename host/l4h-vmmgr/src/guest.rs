@@ -847,6 +847,7 @@ impl Guest {
     /// I/O pool out of use for good if a disk could not be stopped.
     pub fn destroy(mut self, alloc: &mut Alloc) {
         self.stop();
+        crate::ctl_failure::remove(self.id);
         // The arena first: it holds the VSpace roots, and once they are
         // gone, deleting the guest's frames (and the pool's, which root
         // revokes) unmaps nothing.  The other way round, every frame is
@@ -1164,7 +1165,12 @@ pub fn create(
         g.console_ring.must_push(f);
     }
     if cfg.dom0 {
-        g.add_device(alloc, DevKind::Ctl).unwrap();
+        let d = g.add_device(alloc, DevKind::Ctl).unwrap();
+        // The failure service cannot allocate a notification after the
+        // manager has failed. Keep this cap in the guest's tracked slots.
+        let done = self_cap::<cap_type::Notification>(alloc.slots.alloc());
+        abs(done).mint(&abs(g.vcpus[0].ntfn), CapRights::write_only(), abi::BADGE_EVENT).expect("control failure event");
+        unsafe { crate::ctl_failure::register(g.id, g.ctl_page().unwrap(), g.event_page(0), dev_event(d), done.bits()) };
     }
     if hp_count != 0 {
         g.mem_dev = g.add_device(alloc, DevKind::Mem);

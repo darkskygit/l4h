@@ -19,6 +19,7 @@ macro_rules! info {
 
 mod component;
 mod ctl;
+mod ctl_failure;
 mod gpu;
 mod guest;
 mod kimage;
@@ -397,6 +398,7 @@ fn module(r: &proto::ModuleRange) -> Option<&'static [u8]> {
 }
 
 fn main(info: &'static Info) -> ! {
+    l4h_rt::set_failure_handler(&ctl_failure::HANDLER);
     let cfg: &'static VmmgrConfig = unsafe { info.config() };
     let slots = Slots::new(slot::CNODE.cap(), SLOT_STORAGE.take(), proto::SLOT_DYN_BASE as usize..CNODE_SLOTS);
     let mut alloc = Alloc::empty(slots, ALLOC_STORAGE.take());

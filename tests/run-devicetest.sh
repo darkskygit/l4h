@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Production console ring protocol and memory-hotplug scheduling. --qemu also
-# checks that sustained console kicks cannot starve the VMM's hypercalls.
+# Production console rings, memory-hotplug scheduling and control failure
+# replies. --qemu also checks hypercalls under sustained console kicks.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/build/devicetest
@@ -38,6 +38,10 @@ rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     -C link-arg="$out/console-guest.o" "$root/tests/console.rs" -o "$out/console-tests"
 "$out/console-tests"
+rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
+    "$root/tests/control-failure.rs" -o "$out/control-failure-tests"
+"$out/control-failure-tests"
 if [ "${1:-}" = --qemu ]; then
     # shellcheck source=tools/guest-env.sh
     source "$root/tools/guest-env.sh"

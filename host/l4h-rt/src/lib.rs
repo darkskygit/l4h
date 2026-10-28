@@ -28,7 +28,10 @@ pub use sel4_panicking_env;
 #[doc(hidden)]
 pub use sel4_runtime_common;
 
+mod failure;
 pub mod ioport;
+
+pub use failure::{FailureHandler, set_failure_handler};
 
 /// Limits a recurring critical error (such as failed I/O) to its first few
 /// prints: each one is a synchronous kernel print (see `host::VERBOSE`).
@@ -150,29 +153,7 @@ extern "C" fn keeper() -> ! {
     let (info, _) = cap::<sel4::cap_type::Endpoint>(host::SLOT_FAULT_EP).recv(reply);
     let fault = sel4::with_ipc_buffer(|b| sel4::Fault::new(b, &info));
     sel4::debug_println!("l4h-rt: component {:#x} fault: {:x?}", INFO.header().id, fault);
-    answer_failed()
-}
-
-/// Answer the callers of a failed component: u64::MAX and zeros to every
-/// call, the one the main thread's reply object holds (if any) first.
-/// Faults sent to it (vmmgr's guests' and VMMs') stay unanswered.
-fn answer_failed() -> ! {
-    let ep = cap::<sel4::cap_type::Endpoint>(host::SLOT_SERVICE_EP);
-    let reply = cap::<sel4::cap_type::Reply>(host::SLOT_REPLY);
-    let mut answer = true;
-    loop {
-        let (_, badge) = if answer {
-            sel4::with_ipc_buffer_mut(|b| {
-                let m = b.msg_regs_mut();
-                m[0] = u64::MAX;
-                m[1..8].fill(0);
-            });
-            ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 8), reply)
-        } else {
-            ep.recv(reply)
-        };
-        answer = badge & host::BADGE_FAULT == 0;
-    }
+    failure::answer_failed(host::SLOT_KEEPER)
 }
 
 pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
@@ -188,7 +169,7 @@ pub fn cap<T: sel4::CapType>(slot: u64) -> sel4::Cap<T> {
 pub fn abort_trap() -> ! {
     let h = INFO.header();
     if h.magic == INFO_MAGIC && host::has_keeper(h.kind) {
-        answer_failed();
+        failure::answer_failed(host::SLOT_TCB);
     }
     loop {
         unsafe {

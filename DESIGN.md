@@ -2636,9 +2636,13 @@ dom0 sends reaches root; only vmmgr and trustd call it.
   a keeper thread (l4h_rt), which reports the fault and answers every
   later call with a failure, the call vmmgr was serving first (its reply
   object is in `SLOT_REPLY`). So a VMM's call returns instead of blocking
-  it: dom0's control requests fail with EIO (its driver marks the
-  response unanswered before each one), and a guest's power request
-  returns. Faults of guest kernels and VMMs stay unanswered; those vCPUs
+  it, and a guest's power request returns. For dom0's asynchronous control
+  requests, the failure service writes EIO, publishes the completion and
+  raises the device event, both for an outstanding request and later ones.
+  It uses pages and a notification registered before dom0 starts, without
+  accessing the manager's mutable guest or allocator state. A keeper takes
+  over the main thread's bound notification; a panicking main thread serves
+  it itself. Faults of guest kernels and VMMs stay unanswered; those vCPUs
   stop. Nothing can create, change or destroy guests any more, attestation
   answers no longer reach guests, and the balancer stops. The serial
   monitor's `reboot` resets the host.
