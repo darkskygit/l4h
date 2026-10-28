@@ -1713,7 +1713,13 @@ NAT, DHCP and firewalling belong in a VM.
   from one counter of the guest, into a ring in its event page, and kicks
   the VMM. The VMM prints the records of all rings in that order into a
   host-owned per-guest ring and to the serial port; root reads that ring
-  for `console_read`. Writers never wait: output that does not fit is
+  for `console_read`. Head and tail wrap at twice the ring size, so their
+  distance distinguishes full from empty without aliasing unread data.
+  The VMM drains at most one ring's worth before polling for other work;
+  it carries any remainder forward even when the guest did not kick again.
+  It polls the endpoint with its notification temporarily unbound, so a
+  stream of console kicks cannot take precedence over queued hypercalls.
+  Writers never wait: output that does not fit is
   counted, and the VMM reports the count, except tty output, which hvc
   holds until the VMM raises the console event for room. Console input
   and power requests use the shared console device page.

@@ -78,6 +78,8 @@ jobs:
         run: tests/run-schedtest.sh
       - name: Build Linux
         run: tools/build-linux.sh vmlinux && ccache -s
+      - name: Console rings, hotplug scheduling and hypercalls under console load
+        run: tests/run-devicetest.sh --qemu
       - name: Guest ABI and seL4 extensions (module), module tree
         run: tests/run-abitest.sh
       - name: Linux self-test, 1 vCPU

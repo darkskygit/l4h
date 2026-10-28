@@ -72,6 +72,7 @@ mod dev {
         fn init_config(&self, config: &mut [u8]);
         fn kick(&mut self, mem: &GuestMem, queues: &mut [Queue], q: usize) -> bool;
         fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool;
+        fn pending(&self) -> bool;
         fn drain(&mut self) {}
         fn reset(&mut self);
         fn features_accepted(&mut self, _features: u64) {}

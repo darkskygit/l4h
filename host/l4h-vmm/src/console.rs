@@ -16,6 +16,7 @@ use crate::guest::Vcpus;
 
 const REC: usize = core::mem::size_of::<abi::ConsoleRec>();
 const SIZE: usize = abi::CONSOLE_OUT_SIZE;
+const WRAP: u32 = abi::CONSOLE_OUT_WRAP;
 
 pub struct Console {
     ring: *mut host::ConsoleRing,
@@ -77,7 +78,11 @@ impl Console {
     fn pending(&mut self, v: usize) -> Option<u32> {
         let p = out(v);
         let head = unsafe { addr_of!((*p).head).read_volatile() };
-        let avail = head.wrapping_sub(self.tail[v]);
+        if head >= WRAP {
+            self.consume(v, head % WRAP);
+            return None;
+        }
+        let avail = (head + WRAP - self.tail[v]) % WRAP;
         if avail == 0 {
             return None;
         }
@@ -98,8 +103,19 @@ impl Console {
         fence(Ordering::SeqCst);
     }
 
-    /// Print the records of all vCPUs' rings, oldest first.
-    pub fn drain(&mut self, vcpus: &Vcpus) {
+    /// Print at most one ring's worth, oldest first. Return whether more
+    /// remains, so the event loop polls for other work before draining again.
+    pub fn drain(&mut self, vcpus: &Vcpus) -> bool {
+        self.drain_limit(vcpus, SIZE)
+    }
+
+    /// Before poweroff, allow enough bytes for all currently queued data.
+    /// Still bounded if another vCPU continues writing while we print.
+    pub fn flush(&mut self, vcpus: &Vcpus) {
+        self.drain_limit(vcpus, SIZE * vcpus.n);
+    }
+
+    fn drain_limit(&mut self, vcpus: &Vcpus, mut budget: usize) -> bool {
         loop {
             let mut next: Option<(usize, u32, u32)> = None;
             for v in 0..vcpus.n {
@@ -114,18 +130,35 @@ impl Console {
             let t = self.tail[v];
             let len = word(p, t.wrapping_add(4));
             if len as usize > avail as usize - REC {
-                self.consume(v, t.wrapping_add(avail));
+                self.consume(v, (t + avail) % WRAP);
+                budget = budget.saturating_sub(avail as usize);
+                if budget == 0 {
+                    break;
+                }
                 continue;
+            }
+            let bytes = REC + len as usize;
+            if bytes > budget {
+                break;
             }
             for i in 0..len {
                 self.put(byte(p, t.wrapping_add(REC as u32 + i)));
             }
-            self.consume(v, t.wrapping_add(REC as u32 + len));
+            self.consume(v, (t + bytes as u32) % WRAP);
+            budget -= bytes;
+            if budget == 0 {
+                break;
+            }
         }
 
         let mut room = false;
+        let mut more = false;
         for v in 0..vcpus.n {
             let p = out(v);
+            // This check follows publishing tail: a writer that saw an old
+            // tail need not kick, so carry its new data into the next batch.
+            let avail = self.pending(v).unwrap_or(0) as usize;
+            more |= avail != 0;
             let lost = unsafe { addr_of!((*p).lost).read_volatile() };
             if lost != self.lost[v] {
                 let n = lost.wrapping_sub(self.lost[v]);
@@ -135,7 +168,7 @@ impl Console {
                 }
                 let _ = writeln!(self, "[l4h: vCPU {} lost {} bytes of console output]", v, n);
             }
-            if unsafe { addr_of!((*p).want_space).read_volatile() } != 0 {
+            if SIZE - avail > REC && unsafe { addr_of!((*p).want_space).read_volatile() } != 0 {
                 unsafe { addr_of_mut!((*p).want_space).write_volatile(0) };
                 room = true;
             }
@@ -143,6 +176,7 @@ impl Console {
         if room {
             vcpus.raise(0, self.event);
         }
+        more
     }
 }
 

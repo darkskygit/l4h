@@ -5,7 +5,7 @@
 
 #![no_std]
 
-pub const ABI_VERSION: u64 = 5;
+pub const ABI_VERSION: u64 = 6;
 
 pub const ROOT_CNODE_BITS: usize = 12;
 pub const L2_INDEX_BITS: usize = 18;
@@ -94,6 +94,7 @@ pub const EP_BADGE_TASK: u64 = 1 << 62;
 pub const NR_EVENTS: usize = 512;
 
 pub const CONSOLE_OUT_SIZE: usize = 3904;
+pub const CONSOLE_OUT_WRAP: u32 = 2 * CONSOLE_OUT_SIZE as u32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -84,6 +84,7 @@ fn main(info: &'static Info) -> ! {
     // Block backends announce themselves ready (capacity known) on the
     // channel and signal our notification.
     let ntfn = cap::<cap_type::Notification>(host::SLOT_NTFN);
+    let tcb = cap::<cap_type::Tcb>(host::SLOT_TCB);
     let devices = &cfg.devices[..cfg.nr_devices as usize];
     while !devices
         .iter()
@@ -139,6 +140,7 @@ fn main(info: &'static Info) -> ! {
     }
 
     let mut console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event);
+    let mut console_pending = false;
     let root_ep = cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP);
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
@@ -149,9 +151,7 @@ fn main(info: &'static Info) -> ! {
     let (mut info, mut badge) = ep.recv(reply);
     loop {
         if badge & host::VMM_BADGE_HYPERCALL == 0 {
-            if badge & host::VMM_BADGE_CONSOLE != 0 {
-                console.drain(&vcpus);
-            }
+            console_pending |= badge & host::VMM_BADGE_CONSOLE != 0;
             if badge & host::VMM_BADGE_MEM != 0 {
                 if let Some(m) = memdev.as_mut() {
                     m.target_changed(&vcpus);
@@ -173,7 +173,32 @@ fn main(info: &'static Info) -> ! {
                     d.poll(&mem, &vcpus);
                 }
             }
-            (info, badge) = ep.recv(reply);
+            let served_console = console_pending;
+            if served_console {
+                console_pending = console.drain(&vcpus);
+            }
+            if served_console {
+                // Bound notifications take precedence over endpoint calls,
+                // even in NBRecv. A guest retrying a full console ring can
+                // keep that notification active: give a queued call a turn.
+                // Signals remain pending on ntfn while it is unbound.
+                tcb.tcb_unbind_notification().expect("unbind VMM notification");
+                let call = ep.nb_recv(reply);
+                // TCB invocations use the IPC buffer too: preserve the
+                // hypercall arguments across rebinding the notification.
+                let args: [u64; 4] = core::array::from_fn(mr);
+                tcb.tcb_bind_notification(ntfn).expect("bind VMM notification");
+                if call.1 != 0 {
+                    for (i, a) in args.into_iter().enumerate() {
+                        set_mr(i, a);
+                    }
+                    (info, badge) = call;
+                    continue;
+                }
+            }
+            // A producer may have extended a nonempty ring without a kick.
+            // Poll between bounded batches instead of waiting for a new kick.
+            (info, badge) = if console_pending { ep.nb_recv(reply) } else { ep.recv(reply) };
             continue;
         }
         let resp = match info.label() {
@@ -182,7 +207,7 @@ fn main(info: &'static Info) -> ! {
                 // before it stops.  l4h-root stops the vCPUs, which cancels
                 // this call: do not reply.
                 let how = mr(0);
-                console.drain(&vcpus);
+                console.flush(&vcpus);
                 set_mr(0, cfg.guest_id as u64);
                 set_mr(1, how);
                 root_ep.call(sel4::MessageInfo::new(host::ROOT_CALL_GUEST_POWER, 0, 0, 2));
@@ -199,8 +224,17 @@ fn main(info: &'static Info) -> ! {
             abi::HC_GET_TIME => wall_clock_ns(cfg, tsc_hz),
             _ => u64::MAX,
         };
+        if console_pending {
+            console_pending = console.drain(&vcpus);
+        }
         set_mr(0, resp);
-        (info, badge) = ep.reply_recv(sel4::MessageInfo::new(0, 0, 0, 1), reply);
+        let response = sel4::MessageInfo::new(0, 0, 0, 1);
+        (info, badge) = if console_pending {
+            reply.send(response);
+            ep.nb_recv(reply)
+        } else {
+            ep.reply_recv(response, reply)
+        };
     }
 }
 

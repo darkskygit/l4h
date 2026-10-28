@@ -29,7 +29,7 @@ typedef int32_t l4h_s32;
 typedef int64_t l4h_s64;
 #endif
 
-#define L4H_ABI_VERSION 5
+#define L4H_ABI_VERSION 6
 
 /* ------------------------------------------------------------------------
  * Guest CSpace layout
@@ -196,8 +196,11 @@ typedef int64_t l4h_s64;
 #define L4H_NR_EVENTS           512
 /* Console output of one vCPU, which only that vCPU writes: a ring of
  * records, each a struct l4h_console_rec and len bytes, at
- * data[offset % L4H_CONSOLE_OUT_SIZE] (records wrap around).  The guest
- * writes a record at head, then advances head past it, then signals
+ * data[offset % L4H_CONSOLE_OUT_SIZE] (records wrap around).  Head and
+ * tail wrap at L4H_CONSOLE_OUT_WRAP, a multiple of the ring size: native
+ * u32 wrap would alias unread bytes because the size is not a power of
+ * two.  Their distance modulo WRAP is at most SIZE (full), or 0 (empty).
+ * The guest writes a record at head, advances head past it, then signals
  * L4H_SLOT_CONSOLE_KICK if the host had caught up (tail equal to the old
  * head, read after head is written).  The host prints the records of all
  * vCPUs in seq order, advancing each tail, then checks the heads again.
@@ -208,6 +211,7 @@ typedef int64_t l4h_s64;
  * host clears it once it has read that ring, and raises the console
  * device's event. */
 #define L4H_CONSOLE_OUT_SIZE    3904
+#define L4H_CONSOLE_OUT_WRAP    (2u * L4H_CONSOLE_OUT_SIZE)
 struct l4h_console_rec {
 	l4h_u32 seq;            /* from a counter shared by the guest's vCPUs */
 	l4h_u32 len;

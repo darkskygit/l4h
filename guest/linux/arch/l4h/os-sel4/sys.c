@@ -290,7 +290,7 @@ static unsigned int console_out(const char *s, unsigned int len, int retry)
 	if (!v->in_console) {
 		v->in_console = 1;
 		/* The host is done with the bytes before tail. */
-		used = head - __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+		used = (head + L4H_CONSOLE_OUT_WRAP - __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE)) % L4H_CONSOLE_OUT_WRAP;
 		room = used < L4H_CONSOLE_OUT_SIZE ? L4H_CONSOLE_OUT_SIZE - used : 0;
 		if (room > sizeof(rec))
 			n = len < room - sizeof(rec) ? len : room - (unsigned int)sizeof(rec);
@@ -299,7 +299,7 @@ static unsigned int console_out(const char *s, unsigned int len, int retry)
 			rec.len = n;
 			console_put(r, head, &rec, sizeof(rec));
 			console_put(r, head + sizeof(rec), s, n);
-			__atomic_store_n(&r->head, head + sizeof(rec) + n, __ATOMIC_RELEASE);
+			__atomic_store_n(&r->head, (head + sizeof(rec) + n) % L4H_CONSOLE_OUT_WRAP, __ATOMIC_RELEASE);
 		}
 		v->in_console = 0;
 	}

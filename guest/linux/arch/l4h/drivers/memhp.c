@@ -61,6 +61,8 @@ static u64 block_gpa(unsigned int m)
  * so the vCPU runs other tasks meanwhile. */
 static unsigned long mem_kick;
 static u32 mem_seq;
+/* The target the worker is currently reconciling, not the last IRQ. */
+static u32 mem_target;
 static DECLARE_WAIT_QUEUE_HEAD(mem_wq);
 
 /* Callers hold memhp_mutex: one request at a time. */
@@ -245,6 +247,8 @@ static void memhp_work_fn(struct work_struct *w)
 	unsigned int m, n, target;
 
 	mutex_lock(&memhp_mutex);
+	target = min(READ_ONCE(page->target), region_count);
+	WRITE_ONCE(mem_target, target);
 	/* First what the host has yet to take back. */
 	for_each_set_bit(m, pending, region_count) {
 		if (mem_call(L4H_MEM_UNPLUG, m)) {
@@ -253,7 +257,6 @@ static void memhp_work_fn(struct work_struct *w)
 		}
 		__clear_bit(m, pending);
 	}
-	target = min(READ_ONCE(page->target), region_count);
 	n = bitmap_weight(added, region_count);
 	while (n < target) {
 		long ret;
@@ -298,7 +301,11 @@ out:
 	if (!delay && !bitmap_empty(pending, region_count))
 		delay = RETRY_BUSY;
 	mutex_unlock(&memhp_mutex);
-	if (delay)
+	/* Catch a target changed before the worker published mem_target,
+	 * even if its interrupt already ran. */
+	if (min(READ_ONCE(page->target), region_count) != target)
+		mod_delayed_work(system_wq, &memhp_work, 0);
+	else if (delay)
 		schedule_delayed_work(&memhp_work, delay);
 }
 
@@ -306,7 +313,9 @@ out:
 static irqreturn_t memhp_interrupt(int irq, void *data)
 {
 	wake_up(&mem_wq);
-	mod_delayed_work(system_wq, &memhp_work, 0);
+	/* A completion alone must not override the worker's retry delay. */
+	if (min(READ_ONCE(page->target), region_count) != READ_ONCE(mem_target))
+		mod_delayed_work(system_wq, &memhp_work, 0);
 	return IRQ_HANDLED;
 }
 
@@ -327,6 +336,7 @@ static int __init l4h_memhp_init(void)
 	mem_kick = L4H_CPTR2(L4H_SLOT_DEV_CNODE, bi->devices[i].kick_slot);
 	region_gpa = bi->hp_gpa;
 	region_count = min_t(u64, bi->hp_count, L4H_HP_MAX);
+	mem_target = min(READ_ONCE(page->target), region_count);
 	if (!mhp_supports_memmap_on_memory())
 		pr_warn("l4h-memhp: no memmap_on_memory: plugged memory takes its memmap from boot RAM\n");
 	ret = set_online_page_callback(memhp_online_page);
