@@ -101,6 +101,7 @@ struct l4h_vcpu {
 	int irqs_enabled;
 	int irqs_pending;
 	int in_irq;
+	int in_console;		/* writing its console ring */
 	/* The user context currently holding SC_U on this vCPU. */
 	struct l4h_uctx *sc_owner;
 	/* Stack and entry for secondary vCPU startup. */
@@ -204,7 +205,11 @@ void l4h_deliver_events(int timer, unsigned long ipi, unsigned long *events);
 void l4h_dispatch_user_interrupt(void);
 
 /* ---- console, power, hypercalls */
+/* Console output, which never waits: what does not fit in the vCPU's ring
+ * is counted as lost.  try_write returns how much it took instead; the
+ * console device's event follows when there is room. */
 void l4h_console_write(const char *s, unsigned int n);
+unsigned int l4h_console_try_write(const char *s, unsigned int n);
 void __attribute__((noreturn)) l4h_power(int how);
 unsigned long long l4h_steal_ns(int cpu);
 unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, int n_out);

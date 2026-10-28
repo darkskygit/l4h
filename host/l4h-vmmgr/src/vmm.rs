@@ -9,7 +9,7 @@ use l4h_host as host;
 use l4h_host::fixed::{ArrayVec, Scratch};
 
 use crate::component::{self, Component, SpawnArgs};
-use crate::guest::{Guest, dev_event};
+use crate::guest::{DevKind, Guest, dev_event};
 use crate::mem::{Alloc, Arena};
 use crate::window::Window;
 use crate::{AsidPools, HostInfo};
@@ -148,7 +148,7 @@ fn create(
     cfg.mem_dev = g.mem_dev.map_or(0, |d| d as u32 + 1);
     cfg.hp_count = g.hp_count as u32;
     cfg.mem_event = g.mem_dev.map_or(0, dev_event);
-    cfg.console_out_dev = g.console_out_dev.map_or(0, |d| d as u32 + 1);
+    cfg.console_event = g.devices.iter().position(|d| d.kind == DevKind::Console).map_or(0, dev_event);
     assert!(backends.len() <= host::VMM_MAX_DEVICES);
     cfg.nr_devices = backends.len() as u32;
     for (i, (d, b)) in backends.iter().enumerate() {

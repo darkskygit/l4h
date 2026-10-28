@@ -1709,10 +1709,14 @@ NAT, DHCP and firewalling belong in a VM.
 
 ### 8.4 Console and other devices
 
-- **Console.** `hvc_l4h` sends output to the VMM using hypercalls. The VMM
-  appends it to a host-owned per-guest ring and writes to the serial port;
-  root reads the ring for `console_read`. Console input and power requests
-  use the shared console device page.
+- **Console.** Each vCPU writes its console output, as records numbered
+  from one counter of the guest, into a ring in its event page, and kicks
+  the VMM. The VMM prints the records of all rings in that order into a
+  host-owned per-guest ring and to the serial port; root reads that ring
+  for `console_read`. Writers never wait: output that does not fit is
+  counted, and the VMM reports the count, except tty output, which hvc
+  holds until the VMM raises the console event for room. Console input
+  and power requests use the shared console device page.
 - **Control.** `l4hctl`, dom0 only (§9.1).
 - **RTC.** `/dev/rtc0`, with alarms, on the host's wall clock (§5.8).
 - **Display.** virtio-gpu, 2D (§8.6).

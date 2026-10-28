@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * hvc0 console of the l4h guest: output through the console hypercall,
+ * hvc0 console of the l4h guest: output through this vCPU's console ring,
  * input from the ring in the L4H_DEV_CONSOLE page (polled by hvc).
  */
 #include <linux/init.h>
@@ -14,10 +14,12 @@
 #include <hvc_console.h>
 #include <l4h_sys.h>
 
+/* Never waits: with the ring full, hvc keeps the rest (tty output) until
+ * the console event says there is room, or drops it (printk, whose log
+ * keeps it). */
 static ssize_t l4h_hvc_put_chars(uint32_t vt, const u8 *buf, size_t count)
 {
-	l4h_console_write((const char *)buf, count);
-	return count;
+	return l4h_console_try_write((const char *)buf, count);
 }
 
 static struct l4h_console_page *l4h_console_in;
@@ -39,6 +41,8 @@ static ssize_t l4h_hvc_get_chars(uint32_t vt, u8 *buf, size_t count)
 }
 
 static unsigned int l4h_console_event;
+/* hvc is up: there is a khvcd to kick. */
+static bool l4h_hvc_up;
 
 static void l4h_hvc_find_input(void)
 {
@@ -52,10 +56,14 @@ static void l4h_hvc_find_input(void)
 		}
 }
 
-/* The host asks for a clean shutdown or reboot (l4hctl shutdown). */
-static irqreturn_t l4h_power_interrupt(int irq, void *data)
+/* The host asks for a clean shutdown or reboot (l4hctl shutdown), or a
+ * console ring that was full has room. */
+static irqreturn_t l4h_console_interrupt(int irq, void *data)
 {
 	u32 req = xchg(&l4h_console_in->power_request, 0);
+
+	if (l4h_hvc_up)
+		hvc_kick();
 
 	if (req == L4H_POWER_OFF + 1) {
 		pr_info("l4h: shutdown requested by the host\n");
@@ -64,7 +72,7 @@ static irqreturn_t l4h_power_interrupt(int irq, void *data)
 		pr_info("l4h: reboot requested by the host\n");
 		orderly_reboot();
 	}
-	return req ? IRQ_HANDLED : IRQ_NONE;
+	return IRQ_HANDLED;
 }
 
 static const struct hv_ops l4h_hvc_ops = {
@@ -84,15 +92,16 @@ static int __init l4h_hvc_init(void)
 {
 	struct hvc_struct *hp = hvc_alloc(0, 0, &l4h_hvc_ops, 256);
 
+	l4h_hvc_up = !IS_ERR(hp);
 	if (l4h_console_in) {
 		int irq = l4h_event_irq(l4h_console_event);
 
-		if (irq < 0 || request_irq(irq, l4h_power_interrupt, 0, "l4h-power", NULL))
-			pr_warn("l4h: no power request interrupt\n");
+		if (irq < 0 || request_irq(irq, l4h_console_interrupt, 0, "l4h-console", NULL))
+			pr_warn("l4h: no console interrupt\n");
 		else
 			/* The event of a request made before there was a
 			 * handler was dropped as spurious: look once. */
-			l4h_power_interrupt(irq, NULL);
+			l4h_console_interrupt(irq, NULL);
 	}
 	return PTR_ERR_OR_ZERO(hp);
 }

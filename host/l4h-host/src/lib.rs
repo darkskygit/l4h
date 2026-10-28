@@ -217,9 +217,9 @@ pub struct VmmConfig {
     pub hp_count: u32,
     /// Event line of the memory device.
     pub mem_event: u32,
-    /// The guest's console output device: its boot info index plus one
-    /// (0: none); its page is at vmm_device_page_va(index).
-    pub console_out_dev: u32,
+    /// Event line of the console device, raised when a console output ring
+    /// the guest found full has room.
+    pub console_event: u32,
 }
 
 /// The VMM's capability to memd's service endpoint, badged for its guest.

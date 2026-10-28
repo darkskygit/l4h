@@ -257,96 +257,74 @@ unsigned long l4h_hypercall(unsigned long label, unsigned long *mrs, int n_in, i
 	return seL4_MessageInfo_get_length(info) ? seL4_GetMR(0) : 0;
 }
 
-static void console_hypercall(const char *s, unsigned int len)
+/* Record sequence numbers, shared by the vCPUs: the host prints the
+ * records of all rings in this order. */
+static unsigned int console_seq;
+
+static void console_put(struct l4h_console_out *r, unsigned int off, const void *src, unsigned int n)
 {
-	unsigned long mrs[1 + L4H_HC_CONSOLE_MAX_WORDS];
+	const unsigned char *b = src;
+	unsigned int i;
 
-	while (len) {
-		unsigned int n = len < 8 * L4H_HC_CONSOLE_MAX_WORDS ? len : 8 * L4H_HC_CONSOLE_MAX_WORDS;
-		unsigned int w;
-
-		mrs[0] = n;
-		for (w = 0; w < (n + 7) / 8; w++) {
-			unsigned long v = 0;
-			unsigned int b;
-
-			for (b = 0; b < 8 && w * 8 + b < n; b++)
-				v |= (unsigned long)(unsigned char)s[w * 8 + b] << (8 * b);
-			mrs[1 + w] = v;
-		}
-		l4h_hypercall(L4H_HC_CONSOLE_WRITE, mrs, 1 + (n + 7) / 8, 0);
-		s += n;
-		len -= n;
-	}
-}
-
-/* The console output ring (L4H_DEV_CONSOLE_OUT), if the host gives one. */
-static struct l4h_console_out_page *console_out;
-static unsigned long console_out_kick;
-static int console_out_looked;
-/* Taken with a trylock: a writer that finds it held (another vCPU, or a
- * crash on this one) uses the hypercall, which never waits for it. */
-static int console_out_lock;
-
-static void console_find_out(void)
-{
-	const struct l4h_bootinfo *bi = l4h_bootinfo;
-	unsigned long i;
-
-	if (!bi)
-		return;
-	console_out_looked = 1;
-	if (bi->magic != L4H_BOOTINFO_MAGIC || bi->abi_version != L4H_ABI_VERSION)
-		return;
-	for (i = 0; i < bi->nr_devices && i < L4H_MAX_DEVICES; i++) {
-		const struct l4h_dev_desc *d = &bi->devices[i];
-
-		if (d->type == L4H_DEV_CONSOLE_OUT && d->page_size >= sizeof(*console_out)) {
-			console_out_kick = L4H_CPTR2(L4H_SLOT_DEV_CNODE, d->kick_slot);
-			console_out = (struct l4h_console_out_page *)d->page_va;
-		}
-	}
-}
-
-/* Put as much of s in the ring as fits; returns how much. */
-static unsigned int console_ring_write(const char *s, unsigned int len)
-{
-	struct l4h_console_out_page *p = console_out;
-	unsigned int head = p->head;
-	/* The host is done with the bytes before tail. */
-	unsigned int used = head - __atomic_load_n(&p->tail, __ATOMIC_ACQUIRE);
-	unsigned int n, i;
-
-	n = used < L4H_CONSOLE_OUT_SIZE ? L4H_CONSOLE_OUT_SIZE - used : 0;
-	if (n > len)
-		n = len;
-	if (!n)
-		return 0;
 	for (i = 0; i < n; i++)
-		p->out[(head + i) % L4H_CONSOLE_OUT_SIZE] = s[i];
-	__atomic_store_n(&p->head, head + n, __ATOMIC_RELEASE);
-	/* Kick only a host that caught up: one still copying looks at head
-	 * again after publishing its tail. */
+		r->data[(off + i) % L4H_CONSOLE_OUT_SIZE] = b[i];
+}
+
+/*
+ * Write s as one record in this vCPU's console ring, as much of it as fits,
+ * and return how much: this never waits.  Only this vCPU writes its ring,
+ * and nothing interrupts kernel code here, so it takes no lock.  With
+ * retry, the caller sends the rest later, and the host raises the console
+ * event when there is room; without, the rest is counted as lost.
+ */
+static unsigned int console_out(const char *s, unsigned int len, int retry)
+{
+	struct l4h_vcpu *v = l4h_this_vcpu();
+	struct l4h_console_out *r = &v->evt->console;
+	struct l4h_console_rec rec;
+	unsigned int head = r->head, used, room, n = 0;
+
+	if (!len)
+		return 0;
+	/* A fault in here would come back (a crash report): drop that. */
+	if (!v->in_console) {
+		v->in_console = 1;
+		/* The host is done with the bytes before tail. */
+		used = head - __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+		room = used < L4H_CONSOLE_OUT_SIZE ? L4H_CONSOLE_OUT_SIZE - used : 0;
+		if (room > sizeof(rec))
+			n = len < room - sizeof(rec) ? len : room - (unsigned int)sizeof(rec);
+		if (n) {
+			rec.seq = __atomic_fetch_add(&console_seq, 1, __ATOMIC_RELAXED);
+			rec.len = n;
+			console_put(r, head, &rec, sizeof(rec));
+			console_put(r, head + sizeof(rec), s, n);
+			__atomic_store_n(&r->head, head + sizeof(rec) + n, __ATOMIC_RELEASE);
+		}
+		v->in_console = 0;
+	}
+	if (n < len) {
+		if (retry)
+			__atomic_store_n(&r->want_space, 1, __ATOMIC_RELAXED);
+		else
+			__atomic_store_n(&r->lost, r->lost + (len - n), __ATOMIC_RELAXED);
+	}
+	/* Kick a host that caught up (one still reading looks at head again
+	 * after publishing its tail), or that should tell us about room. */
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	if (__atomic_load_n(&p->tail, __ATOMIC_RELAXED) == head)
-		seL4_Signal(console_out_kick);
+	if (__atomic_load_n(&r->tail, __ATOMIC_RELAXED) == head || (retry && n < len))
+		seL4_Signal(L4H_CPTR(L4H_SLOT_CONSOLE_KICK));
 	return n;
+}
+
+unsigned int l4h_console_try_write(const char *s, unsigned int len)
+{
+	return console_out(s, len, 1);
 }
 
 void l4h_console_write(const char *s, unsigned int len)
 {
-	unsigned int n = 0;
-
-	if (!console_out_looked)
-		console_find_out();
-	if (console_out && !__atomic_exchange_n(&console_out_lock, 1, __ATOMIC_ACQUIRE)) {
-		n = console_ring_write(s, len);
-		__atomic_store_n(&console_out_lock, 0, __ATOMIC_RELEASE);
-	}
-	/* The host drains the ring before it prints what the hypercall
-	 * carries. */
-	if (n < len)
-		console_hypercall(s + n, len - n);
+	console_out(s, len, 0);
 }
 
 void l4h_power(int how)

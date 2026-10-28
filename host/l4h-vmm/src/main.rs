@@ -6,6 +6,7 @@
 #![no_main]
 
 mod blk;
+mod console;
 mod dev;
 mod gpu;
 mod guest;
@@ -14,15 +15,13 @@ mod memhp;
 mod net;
 mod virtq;
 
-use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{Ordering, fence};
-
 use l4h_abi as abi;
 use l4h_rt::host::{self, VmmConfig};
 use l4h_rt::sel4;
 use l4h_rt::{Info, cap};
 use sel4::cap_type;
 
+use crate::console::Console;
 use crate::dev::Device;
 use crate::guest::{GuestMem, Vcpus};
 use crate::memhp::MemDev;
@@ -55,65 +54,6 @@ impl Dev {
             Dev::Blk(d) => d.complete(mem, vcpus),
             Dev::Net(d) => d.complete(mem, vcpus),
             Dev::Gpu(d) => d.complete(mem, vcpus),
-        }
-    }
-}
-
-/// Guest console output: into the ring l4h-root reads, and optionally to
-/// the serial port, each line prefixed with the guest id (except dom0).
-struct Console {
-    ring: *mut host::ConsoleRing,
-    serial: bool,
-    prefix: Option<u32>,
-    line_start: bool,
-    /// The guest's output ring (abi::ConsoleOutPage), if it has one, and
-    /// how far we read it.  The guest only reads `tail`.
-    out: Option<*mut abi::ConsoleOutPage>,
-    out_tail: u32,
-}
-
-impl Console {
-    fn put(&mut self, c: u8) {
-        unsafe {
-            let head = core::ptr::addr_of!((*self.ring).head).read_volatile();
-            core::ptr::addr_of_mut!((*self.ring).data[head as usize % host::CONSOLE_RING_DATA]).write_volatile(c);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            core::ptr::addr_of_mut!((*self.ring).head).write_volatile(head + 1);
-        }
-        if self.serial {
-            if self.line_start {
-                if let Some(id) = self.prefix {
-                    sel4::debug_print!("[vm{}] ", id);
-                }
-            }
-            sel4::debug_put_char(c);
-            self.line_start = c == b'\n';
-        }
-    }
-
-    /// Copy what the guest wrote to its output ring.  Done before every
-    /// console hypercall, which carries what did not fit in the ring.
-    fn drain(&mut self) {
-        let Some(p) = self.out else { return };
-        loop {
-            let head = unsafe { addr_of!((*p).head).read_volatile() };
-            if head == self.out_tail {
-                return;
-            }
-            fence(Ordering::Acquire);
-            // More than the ring holds: the guest overwrote some of it.
-            if head.wrapping_sub(self.out_tail) as usize > abi::CONSOLE_OUT_SIZE {
-                self.out_tail = head.wrapping_sub(abi::CONSOLE_OUT_SIZE as u32);
-            }
-            while self.out_tail != head {
-                let c = unsafe { addr_of!((*p).out[self.out_tail as usize % abi::CONSOLE_OUT_SIZE]).read_volatile() };
-                self.put(c);
-                self.out_tail = self.out_tail.wrapping_add(1);
-            }
-            // The guest kicks only if it sees we caught up, after writing
-            // head: look at head again after publishing tail.
-            unsafe { addr_of_mut!((*p).tail).write_volatile(self.out_tail) };
-            fence(Ordering::SeqCst);
         }
     }
 }
@@ -198,15 +138,7 @@ fn main(info: &'static Info) -> ! {
         m.refresh();
     }
 
-    let mut console = Console {
-        ring: host::VMM_CONSOLE_RING_VA as *mut host::ConsoleRing,
-        serial: cfg.serial != 0,
-        prefix: if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) },
-        line_start: true,
-        out: (cfg.console_out_dev != 0)
-            .then(|| host::vmm_device_page_va(cfg.console_out_dev as usize - 1) as *mut abi::ConsoleOutPage),
-        out_tail: 0,
-    };
+    let mut console = Console::new(cfg.serial != 0, if cfg.dom0 != 0 { None } else { Some(cfg.guest_id) }, cfg.console_event);
     let root_ep = cap::<cap_type::Endpoint>(host::SLOT_ROOT_EP);
     let ep = cap::<cap_type::Endpoint>(host::SLOT_SERVICE_EP);
     let reply = cap::<cap_type::Reply>(host::SLOT_REPLY);
@@ -216,10 +148,10 @@ fn main(info: &'static Info) -> ! {
 
     let (mut info, mut badge) = ep.recv(reply);
     loop {
-        // Console output goes first: what the guest prints next (a console
-        // hypercall, a crash) comes after it.
-        console.drain();
         if badge & host::VMM_BADGE_HYPERCALL == 0 {
+            if badge & host::VMM_BADGE_CONSOLE != 0 {
+                console.drain(&vcpus);
+            }
             if badge & host::VMM_BADGE_MEM != 0 {
                 if let Some(m) = memdev.as_mut() {
                     m.target_changed(&vcpus);
@@ -245,18 +177,12 @@ fn main(info: &'static Info) -> ! {
             continue;
         }
         let resp = match info.label() {
-            abi::HC_CONSOLE_WRITE => {
-                let len = (mr(0) as usize).min(abi::HC_CONSOLE_MAX_WORDS * 8);
-                for i in 0..len {
-                    let w = mr(1 + i / 8);
-                    console.put((w >> ((i % 8) * 8)) as u8);
-                }
-                0
-            }
             abi::HC_POWER => {
-                // l4h-root stops the vCPUs, which cancels this call: do not
-                // reply.
+                // What the guest printed before (a crash report) goes out
+                // before it stops.  l4h-root stops the vCPUs, which cancels
+                // this call: do not reply.
                 let how = mr(0);
+                console.drain(&vcpus);
                 set_mr(0, cfg.guest_id as u64);
                 set_mr(1, how);
                 root_ep.call(sel4::MessageInfo::new(host::ROOT_CALL_GUEST_POWER, 0, 0, 2));

@@ -67,6 +67,7 @@ typedef int64_t l4h_s64;
 #define L4H_SLOT_VSPACE         2   /* guest-kernel VSpace root */
 #define L4H_SLOT_HYP_EP         3   /* Call: hypercalls served by l4h-vmm */
 #define L4H_SLOT_ASID_POOL      4   /* reserved */
+#define L4H_SLOT_CONSOLE_KICK   5   /* notification: console output written */
 
 
 /* Per-vCPU objects: root slots L4H_SLOT_VCPU(v) + L4H_VCPU_* */
@@ -193,6 +194,33 @@ typedef int64_t l4h_s64;
  * with an atomic exchange.
  */
 #define L4H_NR_EVENTS           512
+/* Console output of one vCPU, which only that vCPU writes: a ring of
+ * records, each a struct l4h_console_rec and len bytes, at
+ * data[offset % L4H_CONSOLE_OUT_SIZE] (records wrap around).  The guest
+ * writes a record at head, then advances head past it, then signals
+ * L4H_SLOT_CONSOLE_KICK if the host had caught up (tail equal to the old
+ * head, read after head is written).  The host prints the records of all
+ * vCPUs in seq order, advancing each tail, then checks the heads again.
+ *
+ * Writers never wait.  When a record does not fit, the guest writes what
+ * fits; output it gives up on is added to `lost`, which the host reports.
+ * A writer that will try again (the tty) sets want_space and kicks: the
+ * host clears it once it has read that ring, and raises the console
+ * device's event. */
+#define L4H_CONSOLE_OUT_SIZE    3904
+struct l4h_console_rec {
+	l4h_u32 seq;            /* from a counter shared by the guest's vCPUs */
+	l4h_u32 len;
+};
+struct l4h_console_out {
+	l4h_u32 head;           /* written by the guest */
+	l4h_u32 tail;           /* written by the host */
+	l4h_u32 lost;           /* written by the guest: bytes, cumulative */
+	l4h_u32 want_space;     /* set by the guest, cleared by the host */
+	l4h_u32 reserved[12];
+	l4h_u8 data[L4H_CONSOLE_OUT_SIZE];
+};
+
 struct l4h_event_page {
 	l4h_u64 pending[L4H_NR_EVENTS / 64];
 	l4h_u64 steal_ns;      /* written by the host: time the vCPU was runnable
@@ -200,7 +228,8 @@ struct l4h_event_page {
 	l4h_u64 idle_ticks;    /* written by the guest: time the vCPU blocked
 	                        * idle, in time-counter ticks, cumulative (the
 	                        * host derives steal_ns from it) */
-	l4h_u64 reserved[502];
+	l4h_u64 reserved[6];
+	struct l4h_console_out console;
 };
 
 /* ------------------------------------------------------------------------
@@ -218,7 +247,6 @@ enum l4h_dev_type {
 	L4H_DEV_CTL = 3,        /* dom0 control channel (l4hctl) */
 	L4H_DEV_ATTEST = 4,     /* attestation by l4h-trustd, see l4h_attest_page */
 	L4H_DEV_MEM = 5,        /* memory hotplug, see l4h_mem_page */
-	L4H_DEV_CONSOLE_OUT = 6,/* console output ring, see l4h_console_out_page */
 };
 
 struct l4h_dev_desc {
@@ -334,8 +362,8 @@ enum l4h_virtio_op {
 
 /* ------------------------------------------------------------------------
  * Console device (L4H_DEV_CONSOLE): input ring written by the host.
- * Output goes through the console output device if there is one, else
- * through L4H_HC_CONSOLE_WRITE.
+ * Output goes through each vCPU's ring (struct l4h_console_out).  The
+ * device's event: a power request, or room in a ring (want_space).
  */
 #define L4H_CONSOLE_IN_SIZE     4032
 struct l4h_console_page {
@@ -347,21 +375,6 @@ struct l4h_console_page {
 	l4h_u32 power_request;
 	l4h_u32 reserved[13];
 	l4h_u8 in[L4H_CONSOLE_IN_SIZE];
-};
-
-/* Console output device (L4H_DEV_CONSOLE_OUT): the guest writes bytes at
- * out[head % SIZE], then advances head, then signals the device's kick
- * notification if the host had caught up (tail equal to the old head,
- * read after head is written).  The host copies bytes up to head and
- * advances tail, then checks head again.  If the ring is full, the guest
- * sends the rest with L4H_HC_CONSOLE_WRITE, which the host answers after
- * draining the ring, so output stays in order. */
-#define L4H_CONSOLE_OUT_SIZE    4032
-struct l4h_console_out_page {
-	l4h_u32 head;           /* written by the guest */
-	l4h_u32 tail;           /* written by the host */
-	l4h_u32 reserved[14];
-	l4h_u8 out[L4H_CONSOLE_OUT_SIZE];
 };
 
 /* ------------------------------------------------------------------------
@@ -587,14 +600,12 @@ struct l4h_ctl_vm {
  * in message registers, result in MR0.
  */
 enum l4h_hypercall {
-	L4H_HC_CONSOLE_WRITE = 1,   /* MR0 = len (<= 8*L4H_HC_CONSOLE_MAX_WORDS), MR1.. = bytes */
 	L4H_HC_POWER = 2,           /* MR0 = L4H_POWER_* */
 	L4H_HC_DEV_WRITE = 3,       /* MR0 = device index, MR1 = L4H_VIRTIO_OP_*, MR2.. = args */
 	L4H_HC_DEV_READ = 4,        /* MR0 = device index, MR1 = register; returns MR0 */
 	L4H_HC_SET_IRQ_AFFINITY = 5,/* MR0 = device index, MR1 = vCPU */
 	L4H_HC_GET_TIME = 6,        /* returns MR0 = wall clock ns since epoch */
 };
-#define L4H_HC_CONSOLE_MAX_WORDS 32
 
 /* ------------------------------------------------------------------------
  * Attestation/flags device (L4H_DEV_ATTEST, flags work without a TPM): requests to

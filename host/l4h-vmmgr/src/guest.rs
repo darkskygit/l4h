@@ -118,8 +118,6 @@ pub enum DevKind {
     Attest,
     /// Memory hotplug (abi::MemPage), written by l4h-vmm.
     Mem,
-    /// Console output ring (abi::ConsoleOutPage), read by l4h-vmm.
-    ConsoleOut,
 }
 
 pub struct GuestDev {
@@ -289,8 +287,6 @@ pub struct Guest {
     pub hp_count: usize,
     /// Its memory device (DevKind::Mem).
     pub mem_dev: Option<usize>,
-    /// Its console output device (DevKind::ConsoleOut).
-    pub console_out_dev: Option<usize>,
 }
 
 pub(crate) fn abs(c: impl sel4::HasCPtrWithDepth) -> sel4::AbsoluteCPtr {
@@ -487,7 +483,6 @@ impl Guest {
         let kick = match kind {
             // Control requests go to vmmgr itself, not through the VMM.
             DevKind::Ctl => (crate::slot::NTFN.cap(), crate::CTL_KICK_BADGE),
-            DevKind::ConsoleOut => (self.vmm_ntfn, host::VMM_BADGE_CONSOLE),
             DevKind::Mem => (self.vmm_ntfn, host::VMM_BADGE_MEM_REQ),
             _ => (self.vmm_ntfn, host::VMM_BADGE_KICK),
         };
@@ -518,7 +513,7 @@ impl Guest {
         let self_va = match kind {
             DevKind::Ctl => Some(self_guest_va(self.id)),
             DevKind::Console => Some(self_guest_va(self.id) + PAGE),
-            DevKind::Virtio(_) | DevKind::Attest | DevKind::Mem | DevKind::ConsoleOut => None,
+            DevKind::Virtio(_) | DevKind::Attest | DevKind::Mem => None,
         };
         if let Some(va) = self_va {
             self.map_in_self(alloc, page, va);
@@ -749,7 +744,6 @@ impl Guest {
                 DevKind::Virtio(id) => (abi::DEV_VIRTIO, id),
                 DevKind::Attest => (abi::DEV_ATTEST, 0),
                 DevKind::Mem => (abi::DEV_MEM, 0),
-                DevKind::ConsoleOut => (abi::DEV_CONSOLE_OUT, 0),
             };
             let (data_va, data_size) = match dev.kind {
                 DevKind::Ctl => (abi::CTL_DATA_VA, abi::CTL_LOAD_MAX),
@@ -1001,7 +995,6 @@ pub fn create(
         hp_gpa,
         hp_count,
         mem_dev: None,
-        console_out_dev: None,
     };
 
     let Some(cnodes) = vmm::Cnodes::new(&mut g.arena, alloc, cfg.io_pool) else {
@@ -1067,6 +1060,8 @@ pub fn create(
     };
     g.instance = new.instance;
     g.vmm_ntfn = new.vmm_ntfn;
+    // The vCPUs' console output rings (in their event pages) are l4h-vmm's.
+    g.give_badged(abi::SLOT_CONSOLE_KICK, g.vmm_ntfn, CapRights::write_only(), host::VMM_BADGE_CONSOLE);
     g.pool = IoPool { gpa: pool_gpa, size: cfg.io_pool, frames: new.pool_frames, radix: pool_radix };
     let tmp = alloc.slots.alloc();
     let keep = g.arena.object_cap::<cap_type::CNode>(alloc, ObjectBlueprint::CNode { size_bits: pool_radix });
@@ -1162,7 +1157,6 @@ pub fn create(
 
     // ---- Console (input page, output ring) and, for dom0, control.
     g.add_device(alloc, DevKind::Console).unwrap();
-    g.console_out_dev = g.add_device(alloc, DevKind::ConsoleOut);
     for i in 0..host::CONSOLE_RING_PAGES {
         let f = g.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP);
         let va = self_guest_va(id) + GUEST_RING_OFF + i * PAGE;

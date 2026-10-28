@@ -23,6 +23,7 @@ pub const CNODE_CPTR: u64 = cptr2(SLOT_META, 0);
 pub const ROOT_DEPTH: usize = ROOT_GUARD_BITS + ROOT_CNODE_BITS;
 pub const SLOT_VSPACE: usize = 2;
 pub const SLOT_HYP_EP: usize = 3;
+pub const SLOT_CONSOLE_KICK: usize = 5;
 
 
 pub const SLOT_VCPU_BASE: usize = 64;
@@ -92,12 +93,32 @@ pub const EP_BADGE_TASK: u64 = 1 << 62;
 
 pub const NR_EVENTS: usize = 512;
 
+pub const CONSOLE_OUT_SIZE: usize = 3904;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConsoleRec {
+    pub seq: u32,
+    pub len: u32,
+}
+
+#[repr(C)]
+pub struct ConsoleOut {
+    pub head: u32,
+    pub tail: u32,
+    pub lost: u32,
+    pub want_space: u32,
+    pub reserved: [u32; 12],
+    pub data: [u8; CONSOLE_OUT_SIZE],
+}
+
 #[repr(C)]
 pub struct EventPage {
     pub pending: [u64; NR_EVENTS / 64],
     pub steal_ns: u64,
     pub idle_ticks: u64,
-    pub reserved: [u64; 502],
+    pub reserved: [u64; 6],
+    pub console: ConsoleOut,
 }
 
 pub const BOOTINFO_MAGIC: u64 = 0x3154_4f4f_4248_344c;
@@ -110,7 +131,6 @@ pub const DEV_CONSOLE: u32 = 2;
 pub const DEV_CTL: u32 = 3;
 pub const DEV_ATTEST: u32 = 4;
 pub const DEV_MEM: u32 = 5;
-pub const DEV_CONSOLE_OUT: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -212,15 +232,6 @@ pub struct ConsolePage {
     pub input: [u8; CONSOLE_IN_SIZE],
 }
 
-pub const CONSOLE_OUT_SIZE: usize = 4032;
-
-#[repr(C)]
-pub struct ConsoleOutPage {
-    pub head: u32,
-    pub tail: u32,
-    pub reserved: [u32; 14],
-    pub out: [u8; CONSOLE_OUT_SIZE],
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -343,13 +354,11 @@ pub struct CtlVm {
     pub name: [u8; CTL_NAME_MAX],
 }
 
-pub const HC_CONSOLE_WRITE: u64 = 1;
 pub const HC_POWER: u64 = 2;
 pub const HC_DEV_WRITE: u64 = 3;
 pub const HC_DEV_READ: u64 = 4;
 pub const HC_SET_IRQ_AFFINITY: u64 = 5;
 pub const HC_GET_TIME: u64 = 6;
-pub const HC_CONSOLE_MAX_WORDS: usize = 32;
 
 pub const ATTEST_REPORT: u32 = 1;
 pub const ATTEST_EVIDENCE: u32 = 2;
@@ -414,7 +423,6 @@ const _: () = assert!(core::mem::size_of::<BootInfo>() as u64 <= BOOTINFO_SIZE);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() == 88 + 16 * 40);
 const _: () = assert!(core::mem::size_of::<VirtioRegs>() <= VIRTIO_CONFIG_OFF);
 const _: () = assert!(core::mem::size_of::<ConsolePage>() == 4096);
-const _: () = assert!(core::mem::size_of::<ConsoleOutPage>() == 4096);
 const _: () = assert!(core::mem::size_of::<CtlReq>() <= CTL_SYNC_OFF);
 const _: () = assert!(CTL_SYNC_OFF + core::mem::size_of::<CtlSync>() <= CTL_RESP_OFF);
 const _: () = assert!(CTL_RESP_OFF + core::mem::size_of::<CtlResp>() <= 4096);
