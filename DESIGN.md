@@ -467,6 +467,14 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   seL4 writes the remappable RTE format and retains its normal pin masking,
   acknowledgement and capability lifecycle; it does not manage the IOMMU.
   The vector and trigger mode must agree with the IRTE for EOI broadcasts.
+- **0026, save AArch64 TLS before the kernel lock.** The entry assembly
+  saves `TPIDR_EL0` and `TPIDRRO_EL0` with the general registers. A remote
+  stall handled while waiting for the lock can switch to idle and return
+  without reaching the C entry hook. Saving TLS only in that hook loses
+  direct user writes to the thread pointer, potentially restoring zero
+  just after exec. The boot regression checks a user-written thread
+  pointer in the saved context at the first C syscall entry, before the
+  lock can handle a stall.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Check boot RAM clearing, untyped watermarks and root-task handoff.
+"""Check boot RAM clearing, untyped watermarks and initial user context.
 
 Requires built debug seL4 and l4h-root, QEMU and GDB. L4H_ARCH=aarch64
 also requires the kernel loader and gdb-multiarch. Linux need not boot.
@@ -41,6 +41,27 @@ def main():
     boot = min((p for p in loads if p[3] >= 0xffffff8000000000), key=lambda p: p[4])
     kernel_offset = boot[3] - boot[4]
     root_entry = struct.unpack_from("<Q", APP.read_bytes(), 24)[0]
+    # Exercise a user-written TLS register at the very first kernel entry.
+    # A remote stall can abandon lock acquisition before the C entry hook,
+    # so the saved context must already contain the user's value there.
+    tls_probe = """
+python
+# Keep interrupts masked until this controlled synchronous entry. Replace
+# the first two user instructions with MSR TPIDR_EL0,x0 and SVC #0.
+inferior.write_memory(int(gdb.parse_and_eval('$pc')), bytes.fromhex('40d01bd5010000d4'))
+gdb.execute('set $x0 = 0x12345678')
+gdb.execute('set $x7 = 0')
+gdb.execute('set $cpsr = $cpsr | 0x80')
+end
+thbreak *c_handle_syscall
+continue
+python
+tcb = gdb.parse_and_eval('ksSMP[0].system.ksCurThread').dereference()
+saved = int(tcb['tcbArch']['tcbContext']['registers'][int(gdb.parse_and_eval('TPIDR_EL0'))])
+assert saved == 0x12345678, f'TLS not saved before kernel lock: {saved:#x}'
+print('ARM_TLS: user thread pointer saved before kernel lock: PASS')
+end
+""" if ARM else ""
 
     with tempfile.TemporaryDirectory(prefix="l4h-bootmem-") as tmp:
         work = Path(tmp)
@@ -120,6 +141,7 @@ python
 assert int(gdb.parse_and_eval('$pc')) == {root_entry}, 'root task did not start'
 print('BOOTMEM: dirty RAM cleared; device and live boot memory deferred; first-use watermarks; root-task entry: PASS')
 end
+{tls_probe}
 detach
 quit
 """)
@@ -133,7 +155,9 @@ quit
                     ], stdout=debug_output, stderr=subprocess.STDOUT, text=True, timeout=120)
                 debug_log = log.with_suffix(".gdb.log").read_text()
                 assert result.returncode == 0 and "BOOTMEM:" in debug_log, debug_log
-                print(next(line for line in debug_log.splitlines() if line.startswith("BOOTMEM:")))
+                for line in debug_log.splitlines():
+                    if line.startswith(("BOOTMEM:", "ARM_TLS:")):
+                        print(line)
             finally:
                 proc.terminate()
                 try:

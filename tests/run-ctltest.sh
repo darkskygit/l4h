@@ -29,6 +29,7 @@ slow=throttling.bps-read=2097152
     "$l4h_ctl" "$out/ctlroot/vm.cpio.gz" "$out/host-version" \
     "$out/flags-test" "$out/flagsvm.cpio.gz" >/dev/null
 L4H_DOM0_DISKS=0 L4H_DOM0_MEM_MB=512 \
+L4H_TEST_FAIL_PATTERN='CTLTEST: FAIL:' \
 L4H_QEMU_ARGS="-drive file=$out/ctl.img,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0,disable-legacy=on \
     -drive file=$out/dma1.img,if=none,id=d1,format=raw,$slow -device virtio-blk-pci,drive=d1,disable-legacy=on \
     -drive file=$out/dma2.img,if=none,id=d2,format=raw,$slow -device nvme,drive=d2,serial=l4hdma" \

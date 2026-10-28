@@ -2,6 +2,7 @@
 # Build the guest kernel + root task with a given dom0 initramfs/cmdline and
 # boot it in QEMU.  Usage: run-dom0.sh <initrd> [cmdline] [timeout]
 # L4H_KMODS=1 builds and adds the kernel's module tree (/dev/l4hkmod).
+# L4H_TEST_FAIL_PATTERN stops on a test's explicit failure marker (ERE).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 initrd=$(realpath "$1")
@@ -36,7 +37,9 @@ qemu=$!
 # stopped, or at the timeout.
 end=$((SECONDS + tmo))
 while kill -0 "$qemu" 2>/dev/null; do
-    if grep -aq "l4h-vmmgr: all guests stopped" "$log" || [ "$SECONDS" -ge "$end" ]; then
+    if grep -aq "l4h-vmmgr: all guests stopped" "$log" ||
+       { [ -n "${L4H_TEST_FAIL_PATTERN:-}" ] && grep -aEq -- "$L4H_TEST_FAIL_PATTERN" "$log"; } ||
+       [ "$SECONDS" -ge "$end" ]; then
         sleep 0.5
         kill "$qemu" 2>/dev/null || true
         break
