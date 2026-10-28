@@ -202,7 +202,9 @@ CONFIG_EROFS_FS_ZIP=y
 CONFIG_EROFS_FS_ZIP_LZMA=y
 CONFIG_XFS_FS=y
 CONFIG_XFS_POSIX_ACL=y
-# FAT, for configuration partitions.
+# Configuration partitions and cloud-init seed disks (e.g. NoCloud cidata).
+CONFIG_ISO9660_FS=y
+CONFIG_JOLIET=y
 CONFIG_VFAT_FS=y
 CONFIG_FAT_DEFAULT_UTF8=y
 CONFIG_NLS_CODEPAGE_437=y
