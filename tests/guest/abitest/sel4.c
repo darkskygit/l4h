@@ -631,8 +631,8 @@ static int untyped_copy_test(void)
 	volatile uint64_t *q = abitest_map(f[UT_FRAMES - 2], 1);
 	CHECK(p && q, "cannot map frames", 0);
 	p[0] = 0x1234567890abcdefull;
-	/* A page whose only non-zero word is its last: a reset clears only
-	 * pages that are not zero already, and must find it. */
+	/* A page whose only non-zero word is its last: runtime reset must
+	 * clear the whole region, including the end of each page. */
 	q[511] = 0x5a5a5a5a5a5a5a5aull;
 
 	/* The original is full while the copy exists: it cannot be retyped. */

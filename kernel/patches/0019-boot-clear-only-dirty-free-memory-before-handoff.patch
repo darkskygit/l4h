@@ -1,0 +1,174 @@
+From 7d9fc98b7c2061d88b74094bc69b1e3295580dc7 Mon Sep 17 00:00:00 2001
+From: l4h <l4h@localhost>
+Date: Wed, 28 Oct 2026 04:52:31 -0700
+Subject: [PATCH] boot: clear only dirty free memory before handing out
+ untypeds
+
+Scan ordinary free RAM once while constructing boot untypeds, before any
+user code can create cache aliases. Clear each page only if it contains
+a nonzero word, preserving the hypervisor's shared zero pages. Publish
+these caps with a zero free index so their first use needs no reset.
+
+Keep device memory untouched, and leave recycled kernel boot memory at
+the usual full free index: it still contains executing code and live
+boot data, so it must be cleared by its first runtime retype.
+
+Runtime untyped resets retain seL4's unconditional clearing. There is no
+runtime flag or syscall that can enable the boot-only scan. Reusing RAM
+after revocation, including RAM returned through free page reporting,
+therefore writes zeros normally. The optimization preserves savings for
+first use of boot RAM, not repeated reuse.
+---
+ src/kernel/boot.c | 55 ++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/src/kernel/boot.c b/src/kernel/boot.c
+index 079edbe..007baac 100644
+--- a/src/kernel/boot.c
++++ b/src/kernel/boot.c
+@@ -653,6 +653,30 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
+     return pptr >= PPTR_BASE && pptr < PPTR_TOP;
+ }
+ 
++/* Initialise unused RAM before user code can create aliases of it. Reading
++ * first preserves a hypervisor's shared zero pages; only dirty pages need
++ * backing memory. This must never be used to reset memory after handoff. */
++BOOT_CODE static void clear_boot_memory(pptr_t pptr, word_t bits)
++{
++    word_t step_bits = MIN(bits, (word_t)seL4_PageBits);
++    word_t step = BIT(step_bits);
++
++    for (word_t off = 0; off < BIT(bits); off += step) {
++        word_t *p = WORD_PTR(pptr + off);
++#ifdef CONFIG_ARCH_ARM
++        /* Account for cache state inherited from the boot environment. */
++        cleanInvalidateCacheRange_RAM((word_t)p, (word_t)p + step - 1,
++                                      addrFromPPtr(p));
++#endif
++        for (word_t i = 0; i < step / sizeof(word_t); i++) {
++            if (p[i] != 0) {
++                clearMemory(p, step_bits);
++                break;
++            }
++        }
++    }
++}
++
+ /**
+  * Create an untyped cap, store it in a cnode and mark it in boot info.
+  *
+@@ -661,6 +685,7 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
+  *
+  * @param root_cnode_cap cap to the cnode to store the untyped cap in
+  * @param device_memory true if the cap to create is a device untyped
++ * @param clear_memory true only for unused RAM that can be cleared now
+  * @param pptr the kernel-virtual address of the untyped
+  * @param size_bits the size of the untyped in bits
+  * @param first_untyped_slot next available slot in the boot info structure
+@@ -669,6 +694,7 @@ BOOT_CODE static bool_t pptr_in_kernel_window(pptr_t pptr)
+ BOOT_CODE static bool_t provide_untyped_cap(
+     cap_t      root_cnode_cap,
+     bool_t     device_memory,
++    bool_t     clear_memory,
+     pptr_t     pptr,
+     word_t     size_bits,
+     seL4_SlotPos first_untyped_slot
+@@ -676,6 +702,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
+ {
+     bool_t ret;
+     cap_t ut_cap;
++    assert(!clear_memory || !device_memory);
+ 
+     /* Since we are in boot code, we can do extensive error checking and
+        return failure if anything unexpected happens. */
+@@ -716,7 +743,14 @@ BOOT_CODE static bool_t provide_untyped_cap(
+             .isDevice = device_memory,
+             .padding  = {0}
+         };
+-        ut_cap = cap_untyped_cap_new(MAX_FREE_INDEX(size_bits),
++        word_t free_index = MAX_FREE_INDEX(size_bits);
++        if (clear_memory) {
++            clear_boot_memory(pptr, size_bits);
++            /* First use can start immediately; later resets retain the
++             * normal watermark and unconditional clearing semantics. */
++            free_index = 0;
++        }
++        ut_cap = cap_untyped_cap_new(free_index,
+                                      device_memory, size_bits, pptr);
+         ret = provide_cap(root_cnode_cap, ut_cap);
+     } else {
+@@ -737,6 +771,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
+  *
+  * @param root_cnode_cap Cap to the CNode to store the untypeds in.
+  * @param device_memory  Whether the region is device memory.
++ * @param clear_memory  Clear unused RAM now, never devices or live boot memory.
+  * @param reg Region of kernel-virtual memory. May wrap around.
+  * @param first_untyped_slot First available untyped boot info slot.
+  * @return true on success, false on failure.
+@@ -744,6 +779,7 @@ BOOT_CODE static bool_t provide_untyped_cap(
+ BOOT_CODE static bool_t create_untypeds_for_region(
+     cap_t      root_cnode_cap,
+     bool_t     device_memory,
++    bool_t     clear_memory,
+     region_t   reg,
+     seL4_SlotPos first_untyped_slot
+ )
+@@ -778,7 +814,8 @@ BOOT_CODE static bool_t create_untypeds_for_region(
+          * be used anyway.
+          */
+         if (size_bits >= seL4_MinUntypedBits) {
+-            if (!provide_untyped_cap(root_cnode_cap, device_memory, reg.start, size_bits, first_untyped_slot)) {
++            if (!provide_untyped_cap(root_cnode_cap, device_memory, clear_memory,
++                                     reg.start, size_bits, first_untyped_slot)) {
+                 return false;
+             }
+         }
+@@ -797,7 +834,7 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
+             region_t reg = paddr_to_pptr_reg((p_region_t) {
+                 start, ndks_boot.reserved[i].start
+             });
+-            if (!create_untypeds_for_region(root_cnode_cap, true, reg, first_untyped_slot)) {
++            if (!create_untypeds_for_region(root_cnode_cap, true, false, reg, first_untyped_slot)) {
+                 printf("ERROR: creation of untypeds for device region #%u at"
+                        " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word") failed\n",
+                        (unsigned int)i, reg.start, reg.end);
+@@ -815,7 +852,7 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
+             start, (paddr_t) CONFIG_PADDR_USER_DEVICE_TOP
+         });
+ 
+-        if (!create_untypeds_for_region(root_cnode_cap, true, reg, first_untyped_slot)) {
++        if (!create_untypeds_for_region(root_cnode_cap, true, false, reg, first_untyped_slot)) {
+             printf("ERROR: creation of untypeds for top device region"
+                    " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word") failed\n",
+                    reg.start, reg.end);
+@@ -825,21 +862,23 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap)
+ 
+     /* There is a part of the kernel (code/data) that is only needed for the
+      * boot process. We can create UT objects for these frames, so the memory
+-     * can be reused.
++     * can be reused. It is still executing, so defer its clearing until
++     * the first retype instead of clearing it during boot.
+      */
+     region_t boot_mem_reuse_reg = paddr_to_pptr_reg(get_p_reg_kernel_img_boot());
+-    if (!create_untypeds_for_region(root_cnode_cap, false, boot_mem_reuse_reg, first_untyped_slot)) {
++    if (!create_untypeds_for_region(root_cnode_cap, false, false, boot_mem_reuse_reg, first_untyped_slot)) {
+         printf("ERROR: creation of untypeds for recycled boot memory"
+                " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"] failed\n",
+                boot_mem_reuse_reg.start, boot_mem_reuse_reg.end);
+         return false;
+     }
+ 
+-    /* convert remaining freemem into UT objects and provide the caps */
++    /* Clear ordinary free RAM once, before user code runs, and hand it
++     * out with a zero free index so first use does not clear it again. */
+     for (word_t i = 0; i < ARRAY_SIZE(ndks_boot.freemem); i++) {
+         region_t reg = ndks_boot.freemem[i];
+         ndks_boot.freemem[i] = REG_EMPTY;
+-        if (!create_untypeds_for_region(root_cnode_cap, false, reg, first_untyped_slot)) {
++        if (!create_untypeds_for_region(root_cnode_cap, false, true, reg, first_untyped_slot)) {
+             printf("ERROR: creation of untypeds for free memory region #%u at"
+                    " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word") failed\n",
+                    (unsigned int)i, reg.start, reg.end);
+-- 
+2.47.3
+

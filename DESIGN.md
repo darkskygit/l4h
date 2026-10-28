@@ -377,30 +377,24 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
     does nothing.
   - The 16 MiB fork now takes 6 ms, and the copy-on-write fault after it
     7.7 µs/page instead of 47.
-- **0019, Untyped resets skip memory that is already zero.** Resetting an
-  Untyped wrote zeros over all the memory it had handed out. Under a
-  hypervisor that backs memory on demand, that backs memory nobody uses,
-  including memory l4h reported free (§15.4). The reset now reads each
-  page (or reset chunk) and clears it only if a word is non-zero; reading
-  unbacked memory maps the host's zero page. A reset's duration therefore
-  shows roughly how much of the memory was non-zero, not what it held:
-  a guest that resets a block another guest used learns only that.
-  On Arm each page is first cleaned and invalidated to the point of
-  coherency. The reads go through the kernel window, which is cacheable,
-  and a guest can write its frame through a non-cacheable (Device)
-  mapping, which leaves clean cached copies alone. Those copies read as
-  zero over non-zero memory, the clear was skipped, and whatever was made
-  from the memory next (a CNode, a page table, another guest's frame) saw
-  the guest's data once the lines were evicted. Clearing unconditionally
-  never had this problem: its dirty zeros are the last write. x86 reads
-  without a flush. Write-combining and uncached user mappings alias the
-  write-back kernel window too, which the architecture does not support,
-  but x86 CPUs snoop their caches on such accesses in practice. Flushing
-  every line on every reset would cost about as much as the clear it
-  saves. AMD-Vi page tables set force-coherent (FC), and VT-d sets the
-  snoop bit when the unit supports snoop control. VT-d hardware without
-  snoop control relies on devices issuing coherent DMA. Without an IOMMU
-  devices can already reach all memory.
+- **0019, Clear ordinary free RAM once at boot without backing zero pages.**
+  Before any user code runs, the kernel scans the free RAM it will hand
+  out as Untypeds and clears each page only if a word is non-zero. On Arm
+  the scan first cleans and invalidates the cache range to account for
+  cache state inherited from boot. These initial caps have a zero free
+  index, so their first use does not clear the memory again. Reading
+  unbacked memory maps the hypervisor's shared zero page, preserving the
+  saving until that memory is written.
+  Device regions are never scanned or cleared. Recycled kernel boot
+  memory still contains executing code and live data, so it retains the
+  usual full free index and is cleared on its first retype.
+  The conditional scan is boot code only; runtime Untyped reset is
+  unchanged from seL4 and clears unconditionally. Revoke/retype cannot
+  re-enable the scan, including through copied or split Untypeds. This
+  avoids making runtime clearing depend on reads through the cacheable
+  kernel window after a guest has used other memory types. The scan adds
+  work proportional to all free RAM during boot, and reuse of previously
+  allocated memory backs it again even if it was reported free (§15.4).
 - **0020, framebuffer console (x86).** With the command-line option
   `fb_console`, everything the kernel prints (its own messages and host
   components' debug output) is also drawn on the lower half of the
@@ -3477,20 +3471,33 @@ not given to a guest should not occupy the hypervisor's RAM.
   report when nothing else fits. Reported blocks are used like others: the
   hypervisor has dropped their contents, which read as zero, as seL4 would
   make them anyway. Touching them backs them again.
-- **Zeroing.** Clearing memory that reads as zero would back it again, so
-  kernel patch 0019 makes Untyped resets write only pages that are not
-  zero. This matters for guest RAM too: a guest's RAM block is reset when
-  the guest first retypes it, and pages the guest never writes stay
-  unbacked.
-- **Measured** (`tests/run-balloontest.sh`: QEMU with 4 GiB and KVM,
+- **Zeroing.** Kernel patch 0019 scans ordinary free RAM once during
+  kernel boot, clearing only nonzero pages and issuing Untypeds with a
+  zero free index. Their first use, including splitting into guest RAM
+  blocks, preserves unbacked zero pages. Every runtime reset clears
+  unconditionally, so reusing a previously allocated block backs its
+  reset range again even if QEMU had dropped it. Free page reporting can
+  still release blocks once they are unused.
+- **Historical measurements with the former runtime scan**
+  (`tests/run-balloontest.sh`: QEMU with 4 GiB and KVM,
   256 MiB dom0, a 1 GiB guest that fills 768 MiB of tmpfs, destroyed, all
   twice; QEMU's resident memory):
 
   | | idle | guest filled | guest destroyed |
   |---|---|---|---|
   | before | 618 MiB | 1642 MiB | 1642 MiB |
-  | patch 0019 only | 292 MiB | 1128–1260 MiB | 1128–1260 MiB |
-  | patch 0019 and reporting | 293 MiB | 1133 MiB | 307–310 MiB |
+  | runtime scan only | 292 MiB | 1128–1260 MiB | 1128–1260 MiB |
+  | runtime scan and reporting | 293 MiB | 1133 MiB | 307–310 MiB |
+
+  These measurements predate restricting the scan to boot; they do not
+  describe the memory cost of repeated reuse with unconditional resets.
+
+  With the boot-only scan and reporting, a subsequent run of the same
+  test used 259 MiB idle, 1091 MiB with the first guest and 264 MiB after
+  destroying it; the second guest used 1289 MiB and destruction returned
+  to 265 MiB. Both rounds passed the data-integrity and reclamation
+  checks. The second allocation pays for unconditional reset while
+  initial allocation still benefits from unbacked zero pages.
 
 - **Not covered.** Memory a guest holds but does not use stays backed
   once the guest has written it: guests have no balloon, and their free
