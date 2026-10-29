@@ -2180,8 +2180,28 @@ and IRQ, the framebuffer console and the watchdog) default to the
 `key=value` per line, in lowercase without the prefix (`dom0_mem_mb=1024`,
 `uplink_nic=01:00.1`). GRUB sources the same file for `serial_port` and
 `fb_console`, so it is written as GRUB script: no spaces around `=`, values
-with spaces in double quotes. Root reports unknown keys and bad values
-and keeps the defaults. The user manual lists the settings.
+with spaces in double quotes. Root reports unknown keys and bad scalar values
+and keeps the defaults. Explicit disk windows fail closed as described below. The user manual lists the settings.
+
+For an existing GPT installation, `dom0_disk0_windows=start:count,...`
+exposes each selected partition as a separate filesystem device. Both values
+use 512-byte sectors and must be multiples of eight. Counts must be positive.
+The list replaces disk 0 and requires `dom0_disks` greater than zero and
+`dom0_disk0_mb=0`. Invalid, overlapping, excessive or out-of-bounds ranges stop
+boot. They never grant access to the whole disk. Other host disks retain their
+normal order after these devices.
+
+Read the ranges from the physical partition table before configuring them.
+Use filesystem UUIDs or labels for root, boot and EFI mounts. Partition UUIDs
+and physical device names do not identify these filesystem devices. Include
+only filesystem blocks. If a partition has unaligned trailing padding, verify
+the filesystem size before excluding that padding. GRUB reads the original
+physical GPT before l4h starts. The physical GPT and both headers stay intact.
+Boot native Linux for partition changes or boot loader installation. dom0
+sees filesystem devices, not the physical partition table.
+A storage allocator must use an explicit data range that excludes all system
+partitions, boot loader sectors and GPT metadata. Do not infer a tail pool
+from these separate dom0 mappings.
 
 dom0 can rewrite the EFI partition when it holds the boot disk, so a
 compromised dom0 persists across reboots. That is within dom0's trust

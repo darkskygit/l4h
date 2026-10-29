@@ -106,6 +106,9 @@ pub struct Config {
     /// rest is free for the control API, as windows (§8.2).  0, or more than
     /// the disk: all of it.
     pub dom0_disk0_mb: usize,
+    /// Explicit disk 0 ranges, each exposed as a separate filesystem device.
+    /// Syntax: start:count,... in 512-byte sectors. Replaces disk0_mb.
+    pub dom0_disk0_windows: Option<&'static str>,
     /// vNICs of dom0 on switch 0, which has the first NIC as its uplink.
     pub dom0_nics: usize,
     /// Internal switches, after switch 0 and the second uplink's (1..=n, or
@@ -148,6 +151,7 @@ impl Config {
             dom0_io_pool_mb: parse_usize(option_env!("L4H_DOM0_IO_POOL_MB"), 0),
             dom0_disks: parse_usize(option_env!("L4H_DOM0_DISKS"), 64),
             dom0_disk0_mb: parse_usize(option_env!("L4H_DOM0_DISK0_MB"), 0),
+            dom0_disk0_windows: option_env!("L4H_DOM0_DISK0_WINDOWS"),
             dom0_nics: parse_usize(option_env!("L4H_DOM0_NICS"), 1),
             dom0_internal_switches: parse_usize(option_env!("L4H_DOM0_INTERNAL_SWITCHES"), 0),
             dom0_cmdline: option_env!("L4H_DOM0_CMDLINE").unwrap_or("console=hvc0"),
@@ -198,6 +202,12 @@ impl Config {
             "dom0_io_pool_mb" => num(&mut self.dom0_io_pool_mb),
             "dom0_disks" => num(&mut self.dom0_disks),
             "dom0_disk0_mb" => num(&mut self.dom0_disk0_mb),
+            "dom0_disk0_windows" => {
+                // Validate against disk capacity in dom0_plan. Never ignore
+                // a malformed range and fall back to whole-disk access.
+                self.dom0_disk0_windows = Some(value);
+                true
+            }
             "dom0_nics" => num(&mut self.dom0_nics),
             "dom0_internal_switches" => num(&mut self.dom0_internal_switches),
             "dom0_cmdline" => {

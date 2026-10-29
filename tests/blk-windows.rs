@@ -146,3 +146,20 @@ fn randomized_accepted_requests_stay_in_the_assigned_window_and_pool() {
     }
     assert!(accepted > 100);
 }
+
+#[test]
+fn dom0_partition_windows_preserve_offsets_and_reject_unsafe_ranges() {
+    let (w, len) = DiskWindow::parse_list::<4>("2099200:134217728,10240:217088,227328:1869824", 1887436800).unwrap();
+    assert_eq!(len, 3);
+    assert_eq!(w[0], DiskWindow { start: 2099200, sectors: 134217728 });
+    for invalid in ["", "0:0", "8:0", "1:8", "8:7", "8:16,16:16", "8:18446744073709551608", "8:8,16:8,24:8,32:8,40:8", "8:8,", "8:8:8"] {
+        assert!(DiskWindow::parse_list::<4>(invalid, 1887436800).is_none(), "{invalid}");
+    }
+    assert!(DiskWindow::parse_list::<4>("1887436800:8", 1887436800).is_none());
+    let mut req = request();
+    req.op = OP_WRITE;
+    req.segs[0].flags = 0;
+    assert_eq!(w[0].check_request(&req, pool(), 512, false), Ok(2099200));
+    req.sector = w[0].sectors;
+    assert_eq!(w[0].check_request(&req, pool(), 512, false), Err(STATUS_IOERR));
+}
