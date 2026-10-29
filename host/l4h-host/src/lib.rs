@@ -12,6 +12,7 @@
 
 pub mod blk;
 pub mod fixed;
+pub mod handoff;
 pub mod gpu;
 pub mod iopool;
 pub mod log;

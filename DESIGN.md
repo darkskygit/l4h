@@ -3588,8 +3588,9 @@ Behaviour is unchanged.
   order are on lists linked through their entries: those not reported to
   the hypervisor in the order they were freed, and those reported. So
   taking, freeing and finding a buddy are O(1), taking a block of order k
-  is O(orders), and nothing scans the free blocks except a merge (below)
-  and the report timer, which reads only the blocks it reports.
+  is O(orders), and free-block scans are limited to merging (below),
+  address-constrained allocation and the report timer, which reads only the
+  blocks it reports.
 - **memd's CSpace** is one CNode (`SpawnArgs::cnode_bits`) with a slot
   for every block of every order that fits in the table, at a fixed
   place (`l4h_host::memd::block_slots`): two slots per 2 MiB unit, to
@@ -3602,7 +3603,10 @@ Behaviour is unchanged.
 - **Root's memory** comes in *grants*: when root's free blocks cannot
   meet a request, it takes an untouched Untyped of 16 MiB (or exactly the
   request, if larger; or 2 MiB, if memd has no 16 MiB block) from memd
-  (`MEMD_ALLOC`) and splits it as before.
+  (`MEMD_ALLOC`) and splits it as before. A request confined to a physical
+  window (kexec blocks above its fixed seL4 destinations, and its control
+  block between the next root task's load range and 4 GiB) skips root's blocks outside it and passes it to memd,
+  which selects and splits a block inside it.
   Grants are never merged with each other. When a destroy or a failed
   create leaves root more than 48 MiB of free blocks, it merges them and
   returns whole grants (`MEMD_FREE`) beyond 32 MiB (`Alloc::trim`).
