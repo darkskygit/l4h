@@ -503,14 +503,30 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
         0 => l4h_host::iopool::for_nics(nics, vmmgr::IO_POOL_DEFAULT).min(256 << 20),
         mb => mb << 20,
     };
+    if h.cfg.dom0_disk0_windows.is_some() {
+        assert!(h.cfg.dom0_disks > 0 && !h.disks.is_empty(), "dom0 disk windows need disk 0");
+        assert!(h.cfg.dom0_disk0_mb == 0, "choose disk0_mb or disk0_windows");
+    }
     for d in 0..h.disks.len().min(h.cfg.dom0_disks) {
+        if d == 0 {
+            if let Some(text) = h.cfg.dom0_disk0_windows {
+                h.ensure_disk(d).expect("cannot read disk 0 capacity");
+                let (windows, len) = host::blk::DiskWindow::parse_list::<{ host::vmmgr::DOM0_MAX_DISKS }>(text, h.disks[d].capacity)
+                    .expect("invalid dom0_disk0_windows");
+                for w in &windows[..len] {
+                    plan.disks.push(host::vmmgr::Dom0Disk { disk: 0, start: w.start, sectors: w.sectors })
+                        .ok().expect("too many dom0 disk windows");
+                }
+                continue;
+            }
+        }
         // Of disk 0, only the first dom0_disk0_mb MiB if the disk is larger.
         let mut sectors = 0;
         if d == 0 && h.cfg.dom0_disk0_mb > 0 && h.ensure_disk(d).is_ok() {
             let n = (h.cfg.dom0_disk0_mb as u64) << 11;
             if n < h.disks[d].capacity { sectors = n; }
         }
-        if plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, sectors }).is_err() {
+        if plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, start: 0, sectors }).is_err() {
             log!("l4h-root: dom0 gets the first {} disks only", l4h_host::vmmgr::DOM0_MAX_DISKS);
             break;
         }

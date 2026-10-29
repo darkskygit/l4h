@@ -196,6 +196,25 @@ impl DiskWindow {
             && start.checked_add(sectors)? <= capacity).then_some(Self { start, sectors })
     }
 
+    /// Explicit partition ranges, in 512-byte sectors: start:count,... .
+    /// Invalid input never expands a range to the rest of the disk.
+    pub fn parse_list<const N: usize>(text: &str, capacity: u64) -> Option<([Self; N], usize)> {
+        let mut windows = [Self { start: 0, sectors: 0 }; N];
+        let mut len = 0;
+        for entry in text.split(',') {
+            if len == N { return None; }
+            let (start, sectors) = entry.split_once(':')?;
+            let start = start.parse::<u64>().ok()?;
+            let sectors = sectors.parse::<u64>().ok()?;
+            if sectors == 0 { return None; }
+            let window = Self::new(start, sectors, capacity)?;
+            if windows[..len].iter().any(|w| window.overlaps(*w)) { return None; }
+            windows[len] = window;
+            len += 1;
+        }
+        Some((windows, len))
+    }
+
     pub fn overlaps(self, other: Self) -> bool {
         self.start < other.start + other.sectors && other.start < self.start + self.sectors
     }

@@ -466,7 +466,7 @@ pub fn boot_dom0(h: &mut Vmmgr) {
     // Root chose the disks and the vNICs (and made the switches): like a
     // disk, a vNIC dom0 cannot have (netd has failed: EIO) is left out.
     for d in &h.cfg.dom0_disk[..h.cfg.dom0_disks as usize] {
-        if let Err(e) = h.attach_disk(id, d.disk as usize, false, 0, d.sectors) {
+        if let Err(e) = h.attach_disk(id, d.disk as usize, false, d.start, d.sectors) {
             l4h_rt::log!("l4h-vmmgr: cannot give disk {} to dom0: error {}", d.disk, e);
         }
     }

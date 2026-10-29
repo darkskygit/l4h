@@ -183,11 +183,12 @@ pub struct ModuleRange {
     pub len: u64,
 }
 
-/// One of dom0's disks: host disk `disk`, its first `sectors` (0: all).
+/// One of dom0's disks: a window of host disk `disk` (sectors 0: to end).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Dom0Disk {
     pub disk: u64,
+    pub start: u64,
     pub sectors: u64,
 }
 
