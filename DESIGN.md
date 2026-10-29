@@ -475,6 +475,21 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
   just after exec. The boot regression checks a user-written thread
   pointer in the saved context at the first C syscall entry, before the
   lock can handle a stall.
+- **0026, host kexec handoff (x86_64).** `seL4_X86_Kexec`, an IRQControl
+  invocation on core 0, takes one physical control-page address. Root supplies
+  an identity map, segment list and the libsel4 trampoline and parking code,
+  with all copy sources and control memory outside every destination; a
+  sentinel source zero-fills a run instead. APs acknowledge only after switching
+  to the new page tables and parking code. seL4 masks interrupts and enters
+  the trampoline, which copies or zero-fills the segments and enters the new
+  kernel in 32-bit multiboot2 state with PSE set and SMEP/SMAP clear
+  for its user-mapped 2 MiB boot pages. This is the kernel primitive;
+  `kexec.rs` stages the UEFI image and builds its control pages. Before
+  tearing down devices it measures the new image and passes the kexec log
+  to the next trustd (§9.2). `tests/run-kernel-kexectest.sh`
+  uses a minimal root task to test rejected invocations and the handoff while
+  overwriting the old kernel's memory, and `tests/run-kexec-handofftest.sh`
+  boots a complete second host from a staged EFI.
 - E1 (`trapSyscalls`) is our fix for seL4 issue #477, which is still open
   upstream. Without it, Linux syscalls whose syscall-number register
   happens to hold a valid seL4 syscall number are executed as seL4
@@ -485,7 +500,8 @@ guest. Where there is an AMD-Vi or Intel VT-d IOMMU, root drives it itself (§8.
 **Decision:** l4h carries E1–E3 and the fixes above as patches in
 `kernel/patches/`, and proposes them upstream through the seL4 RFC process. They are designed as independent
 commits. They have no sel4test cases yet: l4h's integration tests
-(`tests/`, e.g. `tests/guest/abitest`) exercise them through the guest.
+(`tests/`, e.g. `tests/guest/abitest`) exercise them through guest workloads
+and focused root tasks.
 
 **Verification note:** the MCS SMP x86_64 configuration is not covered by the
 seL4 proofs today, with or without E1–E3. l4h still benefits from seL4's
