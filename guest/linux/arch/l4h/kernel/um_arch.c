@@ -75,6 +75,12 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 	seq_printf(m, "model name\t: l4h paravirtual vCPU\n");
 	seq_printf(m, "host\t\t: %s\n", host_info);
 #ifdef CONFIG_UML_X86
+	/*
+	 * Report the TSC frequency as the clock speed, as x86 does without
+	 * cpufreq. Userspace such as cAdvisor (kubelet) requires this field.
+	 */
+	seq_printf(m, "cpu MHz\t\t: %llu.%03llu\n",
+		   l4h_tsc_hz / 1000000, (l4h_tsc_hz / 1000) % 1000);
 	seq_printf(m, "fpu\t\t: %s\n", str_yes_no(cpu_has(&boot_cpu_data, X86_FEATURE_FPU)));
 	seq_printf(m, "flags\t\t:");
 	for (i = 0; i < 32*NCAPINTS; i++)
