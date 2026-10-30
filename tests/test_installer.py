@@ -1036,6 +1036,23 @@ class BiosInstallerTests(UpdateChecks, Harness):
         self.assertFalse(any(c[0] == "efibootmgr" for c in self.machine.calls))
         self.assertEqual(before, sorted(str(p) for p in self.root.rglob("*")))
 
+    def test_dom0_window_update_preserves_boot_and_rejects_replacement(self):
+        self.commit()
+        self.machine.dom0()
+        # A filesystem window has no physical GRUB MBR. UUIDs remain stable.
+        self.machine.write("/dev/l4hblk0", bytes(512))
+        original = self.config().read_text() + "dom0_disk0_windows=2048:131072\n"
+        self.config().write_text(original)
+        self.commit()
+        self.assertEqual(self.config().read_text(), original)
+        next(b for b in self.machine.blocks if b.get("uuid") == "1234-abcd")["uuid"] = "dead-beef"
+        self.rejected("root filesystem differs|different boot")
+
+    def test_native_update_still_requires_grub_mbr(self):
+        self.commit()
+        self.machine.write("/dev/vda", bytes(512))
+        self.rejected("MBR does not hold GRUB")
+
     def test_separate_boot_partition(self):
         self.machine.blocks.append(dict(name="/dev/vda3", type="part", pkname="/dev/vda", fstype="xfs",
                                         uuid="5678-boot", **{"maj:min": "252:3"}))
