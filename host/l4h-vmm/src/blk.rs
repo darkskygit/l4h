@@ -48,7 +48,7 @@ struct Inflight {
 
 pub struct Blk {
     chan: *mut Channel,
-    kick: sel4::cap::Notification,
+    kick: Option<sel4::cap::Notification>,
     capacity: u64,
     read_only: bool,
     /// Logical block size of the disk: the guest aligns requests to it.
@@ -66,6 +66,16 @@ pub struct Blk {
 }
 
 impl Blk {
+    /// A failed boot attachment. It advertises zero sectors and completes
+    /// every request locally with an I/O error, without touching hardware.
+    pub fn unavailable(pool: u64) -> Self {
+        Blk {
+            chan: core::ptr::null_mut(), kick: None, capacity: 0, read_only: true,
+            block_size: 512, size_max: size_max(pool),
+            inflight: [None; QUEUE_SIZE as usize], outstanding: 0, generation: 0, stalled: None,
+        }
+    }
+
     /// The channel must be ready.  `pool` is the size of the guest's I/O
     /// pool.
     pub fn new(chan_va: usize, kick: sel4::cap::Notification, pool: u64) -> Self {
@@ -80,7 +90,7 @@ impl Blk {
         };
         Blk {
             chan,
-            kick,
+            kick: Some(kick),
             capacity,
             read_only,
             block_size,
@@ -153,6 +163,10 @@ impl Blk {
         }
         let st = last.unwrap();
         let status_gpa = st.gpa + st.len as u64 - 1;
+        if self.chan.is_null() {
+            Self::finish(mem, q, head, status_gpa, VIRTIO_BLK_S_IOERR, 1);
+            return true;
+        }
         let ty = mem.read::<u32>(bufs[0].gpa);
         let sector = mem.read::<u64>(bufs[0].gpa + 8);
 
@@ -287,12 +301,13 @@ impl Backend for Blk {
             }
         }
         if submitted {
-            self.kick.signal();
+            self.kick.as_ref().expect("live block backend").signal();
         }
         returned
     }
 
     fn complete(&mut self, mem: &GuestMem, queues: &mut [Queue]) -> bool {
+        if self.chan.is_null() { return false; }
         let queue = &mut queues[0];
         let mut returned = false;
         unsafe {
@@ -325,8 +340,8 @@ impl Backend for Blk {
     }
 
     fn pending(&self) -> bool {
-        self.stalled.is_some()
-            || unsafe { addr_of!((*self.chan).cq.tail).read_volatile() != addr_of!((*self.chan).cq.head).read_volatile() }
+        !self.chan.is_null() && (self.stalled.is_some()
+            || unsafe { addr_of!((*self.chan).cq.tail).read_volatile() != addr_of!((*self.chan).cq.head).read_volatile() })
     }
 
     fn drain(&mut self) {

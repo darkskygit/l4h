@@ -508,10 +508,16 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
         assert!(h.cfg.dom0_disk0_mb == 0, "choose disk0_mb or disk0_windows");
     }
     for d in 0..h.disks.len().min(h.cfg.dom0_disks) {
+        if let Err(e) = h.ensure_disk(d) {
+            log!("l4h-root: dom0 disk {} geometry unavailable: error {}", d, e);
+        }
+        let capacity = match h.disks[d].capacity {
+            0 => blkd::UNKNOWN_CAPACITY,
+            n => n,
+        };
         if d == 0 {
             if let Some(text) = h.cfg.dom0_disk0_windows {
-                h.ensure_disk(d).expect("cannot read disk 0 capacity");
-                let (windows, len) = host::blk::DiskWindow::parse_list::<{ host::vmmgr::DOM0_MAX_DISKS }>(text, h.disks[d].capacity)
+                let (windows, len) = host::blk::DiskWindow::parse_list::<{ host::vmmgr::DOM0_MAX_DISKS }>(text, capacity)
                     .expect("invalid dom0_disk0_windows");
                 for w in &windows[..len] {
                     plan.disks.push(host::vmmgr::Dom0Disk { disk: 0, start: w.start, sectors: w.sectors })
@@ -522,14 +528,12 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
         }
         // Of disk 0, only the first dom0_disk0_mb MiB if the disk is larger.
         let mut sectors = 0;
-        if d == 0 && h.cfg.dom0_disk0_mb > 0 && h.ensure_disk(d).is_ok() {
+        if d == 0 && h.cfg.dom0_disk0_mb > 0 {
             let n = (h.cfg.dom0_disk0_mb as u64) << 11;
-            if n < h.disks[d].capacity { sectors = n; }
+            if n < capacity { sectors = n; }
         }
-        if plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, start: 0, sectors }).is_err() {
-            log!("l4h-root: dom0 gets the first {} disks only", l4h_host::vmmgr::DOM0_MAX_DISKS);
-            break;
-        }
+        plan.disks.push(l4h_host::vmmgr::Dom0Disk { disk: d as u64, start: 0, sectors })
+            .ok().expect("too many dom0 disks");
     }
     // Switch 0, with the uplink NIC (if any; by default the first) as its
     // uplink.
@@ -551,9 +555,8 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
         }
     }
     let mut add_nic = |switch: u32, mac: u64| {
-        if plan.nics.push(l4h_host::vmmgr::Dom0Nic { switch: switch as u64, mac }).is_err() {
-            log!("l4h-root: dom0 gets {} vNICs only", l4h_host::vmmgr::DOM0_MAX_NICS);
-        }
+        plan.nics.push(l4h_host::vmmgr::Dom0Nic { switch: switch as u64, mac })
+            .ok().expect("too many dom0 NICs");
     };
     // dom0's first vNIC takes the uplink NIC's MAC address: networks
     // like GCE's only deliver frames for the instance's own address, so
@@ -585,6 +588,16 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
     }
     for i in first..first + h.cfg.dom0_internal_switches {
         add_nic(i as u32, 0);
+    }
+    // Reserve the whole plan before vmmgr can attach anything. Reservations
+    // also cover placeholders and survive dom0 restarts, so no system range
+    // becomes available to another guest or to provisioning on a failure.
+    for d in &plan.disks {
+        let index = d.disk as usize;
+        let disk = &h.disks[index];
+        let capacity = if disk.capacity == 0 { blkd::UNKNOWN_CAPACITY } else { disk.capacity };
+        let window = host::blk::DiskWindow::new(d.start, d.sectors, capacity).expect("invalid dom0 disk window");
+        h.ctrls[disk.ctrl].reserve_dom0(index, window, disk.read_only);
     }
     plan
 }

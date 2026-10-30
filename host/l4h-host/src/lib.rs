@@ -163,6 +163,8 @@ pub const VDEV_CTL: u32 = 3;
 /// bytes), its tables are at gpu::VMM_GPU_STATE_VA, and width and height
 /// are its scanout's.
 pub const VDEV_GPU: u32 = 4;
+/// Zero-capacity virtio-blk placeholder, with no backend channel.
+pub const VDEV_BLK_UNAVAILABLE: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

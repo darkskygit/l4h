@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Production console rings, memory-hotplug scheduling and control failure
-# replies, block-service replies across nested invocations and host log
+# replies, dom0 boot planning, block reservations and service replies, and host log
 # publication, wraparound and concurrent readers/writers. --qemu
 # also checks hypercalls under sustained console kicks.
 set -euo pipefail
@@ -30,6 +30,16 @@ for signature in ['static long mem_call(', 'static void memhp_work_fn(struct wor
 blkd = (root / 'host/l4h-blkd/src/main.rs').read_text()
 start = blkd.index('use core::ops::{Deref, DerefMut};')
 (out / 'blkd-main.inc').write_text(blkd[start:])
+# Keep the production boot sequence and reservation lifecycle intact.
+vmmgr = (root / 'host/l4h-vmmgr/src/main.rs').read_text()
+start = vmmgr.index('pub fn boot_dom0(')
+end = vmmgr.index('\n}', start) + 2
+(out / 'dom0-boot.inc').write_text(vmmgr[start:end])
+blkd = (root / 'host/l4h-root/src/blkd.rs').read_text()
+reservations = blkd[blkd.index('pub struct Attachment {'):blkd.index('struct Blkd {')]
+start = blkd.index('pub fn remove(')
+end = blkd.index('\n}', start) + 2
+(out / 'blk-reservations.inc').write_text(reservations + blkd[start:end])
 PY
 cc -std=c11 -O2 -Wall -Wextra -Werror -I "$root/include" -I "$out" \
     -c "$root/tests/console-guest.c" -o "$out/console-guest.o"
@@ -49,6 +59,12 @@ rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_abi="$out/libl4h_abi.rlib" --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/control-failure.rs" -o "$out/control-failure-tests"
 "$out/control-failure-tests"
+L4H_DOM0_BOOT_TEST_SRC="$out/dom0-boot.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/dom0-boot.rs" -o "$out/dom0-boot-tests"
+"$out/dom0-boot-tests"
+L4H_BLK_RESERVATIONS_TEST_SRC="$out/blk-reservations.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
+    --extern l4h_host="$out/libl4h_host.rlib" "$root/tests/blk-reservations.rs" -o "$out/blk-reservations-tests"
+"$out/blk-reservations-tests"
 L4H_BLKD_TEST_SRC="$out/blkd-main.inc" rustc +stable --edition=2024 --test -L dependency="$out" \
     --extern l4h_host="$out/libl4h_host.rlib" \
     "$root/tests/blk-ipc.rs" -o "$out/blk-ipc-tests"

@@ -1342,6 +1342,17 @@ disks available for other guests, build the host with
 boot disk instead, set \texttt{dom0\_disk0\_mb}: dom0 then has only a window
 at its start, and other guests' windows can take the rest.
 
+Alternatively, \texttt{dom0\_disk0\_windows=start:count,...} gives dom0
+separate filesystem devices from disk 0. Each window consumes one device
+slot. The complete dom0 plan, including its console, control, optional
+memory and attestation devices, disks and NICs, must fit in 16 slots;
+an oversized plan stops boot instead of dropping devices.
+If a boot disk attachment fails, dom0 sees a read-only, zero-capacity disk
+in that position. Its physical window remains reserved, including across
+dom0 restarts, and cannot be provisioned or given to a conflicting guest.
+Later disks keep their device names. A missing root filesystem can still
+prevent Linux from booting; healthy disks or an initramfs remain usable.
+
 \paragraph{Failed disks.}\label{sec:disk-failed} When its owner is
 destroyed, a disk is reset before it becomes free. If the device does not
 complete the reset (an NVMe controller that stays ready past its timeout,

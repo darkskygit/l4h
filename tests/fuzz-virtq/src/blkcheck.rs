@@ -79,6 +79,51 @@ const USED: u64 = POOL + 0x2000;
 const HDR: u64 = POOL + 0x3000;
 const STATUS: u64 = POOL + 0x4000;
 
+#[test]
+fn unavailable_disk_has_zero_capacity_and_completes_io_without_a_backend() {
+    for op in [chan::OP_READ, chan::OP_WRITE, chan::OP_FLUSH, chan::OP_GET_ID, chan::OP_DISCARD] {
+        let mut ram = vec![0u64; 0x8000 / 8];
+        let mem = GuestMem { base: ram.as_mut_ptr() as usize, gpa: POOL, size: 0x8000 };
+        let mut disk = Blk::unavailable(mem.size);
+        let mut config = [0u8; 32];
+        disk.init_config(&mut config);
+        assert_eq!(u64::from_le_bytes(config[..8].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(config[20..24].try_into().unwrap()), 512);
+        assert_eq!(disk.device_id(), 2);
+        assert_eq!(disk.num_queues(), 1);
+        let mut queues = [Queue::default()];
+        assert!(queues[0].setup(&mem, NUM as u32, disk.queue_max(0), DESC, AVAIL, USED));
+        // A valid request header, optional data buffer, then a status byte.
+        mem.write::<u64>(DESC, HDR);
+        mem.write::<u32>(DESC + 8, 16);
+        mem.write::<u16>(DESC + 12, crate::virtq::VIRTQ_DESC_F_NEXT);
+        mem.write::<u16>(DESC + 14, if op == chan::OP_FLUSH { 2 } else { 1 });
+        mem.write::<u64>(DESC + 16, POOL + 0x5000);
+        mem.write::<u32>(DESC + 24, 512);
+        mem.write::<u16>(DESC + 28, crate::virtq::VIRTQ_DESC_F_NEXT |
+            if op == chan::OP_WRITE { 0 } else { crate::virtq::VIRTQ_DESC_F_WRITE });
+        mem.write::<u16>(DESC + 30, 2);
+        mem.write::<u64>(DESC + 32, STATUS);
+        mem.write::<u32>(DESC + 40, 1);
+        mem.write::<u16>(DESC + 44, crate::virtq::VIRTQ_DESC_F_WRITE);
+        mem.write::<u32>(HDR, op);
+        mem.write::<u8>(STATUS, 0xff);
+        mem.write::<u64>(POOL + 0x5000, 0x12345678);
+        mem.write::<u16>(AVAIL + 4, 0);
+        mem.write::<u16>(AVAIL + 2, 1);
+        assert!(disk.kick(&mem, &mut queues, 0));
+        assert_eq!(queues[0].used_idx(), 1);
+        assert_eq!(mem.read::<u8>(STATUS), 1, "operation {op} must fail with I/O error");
+        assert_eq!(mem.read::<u64>(POOL + 0x5000), 0x12345678);
+        assert!(!disk.pending());
+        assert!(!disk.complete(&mem, &mut queues));
+        // There is no fake blkd installed: any yield/channel access fails.
+        disk.drain();
+        disk.reset();
+        assert!(!disk.pending());
+    }
+}
+
 /// Returns the number of requests drained and of chains refused because a
 /// buffer was outside the pool.
 pub fn drain_check(rng: &mut Rng, iterations: u64) -> (u64, u64) {

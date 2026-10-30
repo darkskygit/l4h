@@ -2191,6 +2191,19 @@ The list replaces disk 0 and requires `dom0_disks` greater than zero and
 boot. They never grant access to the whole disk. Other host disks retain their
 normal order after these devices.
 
+The complete dom0 device plan must fit within 16 slots, including console,
+control, memory-hotplug and attestation devices, all disk windows and NICs.
+Oversized plans stop boot; neither the disk nor NIC lists are truncated.
+Root reserves every boot disk range before attaching it and retains those
+reservations across dom0 restarts. If an attachment fails, dom0 receives a
+zero-capacity, read-only virtio-blk device in that position. It completes all
+I/O with errors without a driver channel or DMA mappings, so other disks
+keep their names and dom0 can still boot from healthy storage or an initramfs.
+The reserved range remains unavailable to provisioning and conflicting guest
+attachments. When a failed disk cannot report its capacity, root checks the
+configured ranges for alignment, overflow and overlap and reserves them;
+a whole-disk reservation covers all aligned sectors until host reboot.
+
 Read the ranges from the physical partition table before configuring them.
 Use filesystem UUIDs or labels for root, boot and EFI mounts. Partition UUIDs
 and physical device names do not identify these filesystem devices. Include

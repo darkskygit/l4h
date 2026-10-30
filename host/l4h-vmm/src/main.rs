@@ -104,6 +104,9 @@ fn main(info: &'static Info) -> ! {
         let idx = d.guest_index as usize;
         assert!(idx < host::VMM_MAX_DEVICES, "l4h-vmm: device index {} out of range", idx);
         let dev = match d.kind {
+            host::VDEV_BLK_UNAVAILABLE => Dev::Blk(Device::new(
+                d.page_va as usize, d.event, blk::Blk::unavailable(cfg.io_pool_size),
+            )),
             host::VDEV_BLK => Dev::Blk(Device::new(
                 d.page_va as usize,
                 d.event,

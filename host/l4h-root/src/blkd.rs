@@ -29,6 +29,10 @@ const PAGE: usize = 4096;
 /// (4 KiB), the largest logical block size blkd supports: devices address
 /// whole blocks, so an unaligned window would reach outside itself.
 pub const WINDOW_ALIGN: u64 = 8;
+/// If a boot disk cannot report its geometry, reserve all addressable,
+/// aligned sectors until host reboot. This is never advertised as capacity
+/// to a guest: the failed attachment becomes a zero-capacity device.
+pub const UNKNOWN_CAPACITY: u64 = u64::MAX & !(WINDOW_ALIGN - 1);
 
 /// Mapping attributes for device registers.
 #[cfg(target_arch = "x86_64")]
@@ -98,7 +102,7 @@ impl Disk {
 }
 
 /// The client slots of every controller, in .bss: one controller's are
-/// 20 KiB, too much to pass by value on root's 64 KiB stack.  Controllers
+/// too large to pass by value on root's 64 KiB stack. Controllers
 /// live until reboot, so each takes the next row, CLIENT_ROWS of them.
 static mut CLIENTS: [[Option<Attachment>; blk::MAX_CLIENTS]; pci::MAX_DISK_CTRLS] =
     [const { [const { None }; blk::MAX_CLIENTS] }; pci::MAX_DISK_CTRLS];
@@ -129,6 +133,13 @@ impl Controller {
     /// The first VM disk `disk` is attached to.
     pub fn owner(&self, disk: usize) -> Option<usize> {
         self.attachments(disk).next().map(|(_, a)| a.vm)
+    }
+
+    /// Keep boot ranges owned even when dom0 has no live disk channel.
+    pub fn reserve_dom0(&mut self, disk: usize, window: blk::DiskWindow, read_only: bool) {
+        let i = attachment_slot(self.clients, disk, window, read_only, false)
+            .expect("conflicting or excessive dom0 disk reservations");
+        self.clients[i] = Some(Attachment { vm: 0, disk, window, read_only, reserved: true, pool: None });
     }
 
     /// Ask blkd about `unit`: (disk geometry, number of units), None if
@@ -206,8 +217,28 @@ pub struct Attachment {
     pub disk: usize,
     pub window: blk::DiskWindow,
     pub read_only: bool,
-    /// The client's I/O pool: physical address and size.
-    pool: (usize, usize),
+    /// A dom0 boot range survives failed attachment and dom0 restart.
+    reserved: bool,
+    /// The active client's I/O pool; None for an unattached reservation.
+    pool: Option<(usize, usize)>,
+}
+
+impl Attachment {
+    fn claimable(&self, disk: usize, window: blk::DiskWindow, dom0: bool) -> bool {
+        dom0 && self.reserved && self.pool.is_none() && self.disk == disk && self.window == window
+    }
+}
+
+/// A reservation can only be claimed by dom0 for exactly its planned range.
+/// Other attachments and provisioning still see it as an occupied window.
+pub fn attachment_slot(clients: &[Option<Attachment>], disk: usize, window: blk::DiskWindow,
+    read_only: bool, dom0: bool) -> Result<usize, i64> {
+    if clients.iter().flatten().any(|a| a.disk == disk
+        && window.conflicts(read_only, a.window, a.read_only) && !a.claimable(disk, window, dom0)) {
+        return Err(crate::ctl::EBUSY);
+    }
+    clients.iter().position(|a| a.as_ref().is_some_and(|a| a.claimable(disk, window, dom0)))
+        .or_else(|| clients.iter().position(Option::is_none)).ok_or(crate::ctl::ENOSPC)
 }
 
 struct Blkd {
@@ -371,7 +402,8 @@ fn call(ep: cap::Endpoint, label: u64, args: &[u64]) -> u64 {
 #[allow(clippy::too_many_arguments)]
 pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
     window: blk::DiskWindow, read_only: bool, alloc: &mut Alloc, iommu: &mut Iommu) -> (usize, Channel, cap::Notification) {
-    let i = ctrl.clients.iter().position(Option::is_none).expect("free block client");
+    let i = attachment_slot(ctrl.clients, disk, window, read_only, client.dom0).expect("checked block client");
+    let reserved = ctrl.clients[i].as_ref().is_some_and(|a| a.reserved);
     let driver = ctrl.driver.as_mut().expect("started blkd");
     let chan: Channel = (0..blk::CHANNEL_PAGES)
         .map(|_| client.arena.object_cap::<cap_type::Granule>(alloc, FRAME_BP)).collect();
@@ -390,7 +422,7 @@ pub fn attach(ctrl: &mut Controller, disk: usize, client: &mut RootGuest,
     // Reads write the pool, writes read it.
     let pool = (client.pool.paddr, client.pool.size);
     iommu.map(alloc, ctrl.dom, pool.0, pool.1, true);
-    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, pool });
+    ctrl.clients[i] = Some(Attachment { vm: client.id, disk, window, read_only, reserved, pool: Some(pool) });
     (i, chan, kick)
 }
 
@@ -438,8 +470,9 @@ pub fn remove(disk: &mut Controller, i: usize, pci: &Pci, iommu: &mut Iommu) -> 
         quarantine(disk, pci);
     }
     let _ = disk.driver.as_ref().unwrap().comp.slot(blk::BLKD_SLOT_CLIENT_DONE + i as u64).delete();
-    if let Some(a) = disk.clients[i].take() {
-        iommu.unmap(disk.dom, a.pool.0, a.pool.1);
+    if let Some(mut a) = disk.clients[i].take() {
+        if let Some((pa, len)) = a.pool.take() { iommu.unmap(disk.dom, pa, len); }
+        if a.reserved { disk.clients[i] = Some(a); }
     }
     quiet || disk.dom != Domain::NONE
 }

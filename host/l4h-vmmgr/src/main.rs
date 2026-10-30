@@ -255,6 +255,16 @@ impl Vmmgr {
         .ok_or(ctl::ENOENT)?
     }
 
+    /// Keep a failed boot disk's position without a channel or DMA access.
+    pub fn attach_dummy_disk(&mut self, id: usize) -> Result<(), i64> {
+        self.with_guest(id, |h, g| {
+            if g.state != State::Created { return Err(ctl::EBUSY); }
+            let d = g.add_device(&mut h.alloc, guest::DevKind::Virtio(2)).ok_or(ctl::ENOSPC)?;
+            g.backends.must_push((d, vmm::Backend::UnavailableBlk));
+            Ok(())
+        }).ok_or(ctl::ENOENT)?
+    }
+
     /// Spawn the guest's l4h-vmm; the guest starts when the VMM is ready.
     pub fn start_guest(&mut self, id: usize) -> Result<(), i64> {
         self.with_guest(id, |h, g| {
@@ -463,11 +473,20 @@ pub fn boot_dom0(h: &mut Vmmgr) {
         dom0: true,
     };
     let id = h.create_guest(&cfg).expect("cannot create dom0");
-    // Root chose the disks and the vNICs (and made the switches): like a
-    // disk, a vNIC dom0 cannot have (netd has failed: EIO) is left out.
+    // Count the actual console/control, memory and attestation devices
+    // before attaching anything. A placeholder still needs a device slot.
+    let used = h.guest(id).unwrap().devices.len();
+    let total = used + h.cfg.dom0_disks as usize + h.cfg.dom0_nics as usize;
+    assert!(total <= MAX_GUEST_DEVICES,
+        "dom0 device plan needs {} slots ({} built-in, {} disks, {} NICs); limit is {}",
+        total, used, h.cfg.dom0_disks, h.cfg.dom0_nics, MAX_GUEST_DEVICES);
+    // Root keeps every boot disk range reserved, even if its driver cannot
+    // attach. Preserve the disk's position so later devices keep their names.
     for d in &h.cfg.dom0_disk[..h.cfg.dom0_disks as usize] {
         if let Err(e) = h.attach_disk(id, d.disk as usize, false, d.start, d.sectors) {
-            l4h_rt::log!("l4h-vmmgr: cannot give disk {} to dom0: error {}", d.disk, e);
+            l4h_rt::log!("l4h-vmmgr: disk {} window {}:{} unavailable to dom0: error {}; using zero-capacity device",
+                d.disk, d.start, d.sectors, e);
+            h.attach_dummy_disk(id).expect("cannot create dom0 disk placeholder");
         }
     }
     for n in &h.cfg.dom0_nic[..h.cfg.dom0_nics as usize] {

@@ -60,6 +60,8 @@ pub fn arena_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
 
 /// A device's host-side backend.
 pub enum Backend {
+    /// A boot disk whose attachment failed: no channel, always I/O error.
+    UnavailableBlk,
     Blk {
         /// Frames of the blkd channel, mapped at vmm_chan_va(d).
         chan: ArrayVec<cap::Granule, { host::blk::CHANNEL_PAGES }>,
@@ -158,6 +160,7 @@ fn create(
         dev.event = dev_event(d);
         dev.page_va = host::vmm_device_page_va(d) as u64;
         match b {
+            Backend::UnavailableBlk => dev.kind = host::VDEV_BLK_UNAVAILABLE,
             Backend::Blk { chan, .. } => {
                 dev.kind = host::VDEV_BLK;
                 dev.chan_va = host::vmm_chan_va(d) as u64;
@@ -244,6 +247,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
     }
     for &(d, ref b) in backends.iter() {
         match b {
+            Backend::UnavailableBlk => {},
             Backend::Blk { chan, kick } => {
                 for (i, f) in chan.iter().enumerate() {
                     let fc = crate::component::abs_of(*f);

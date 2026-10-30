@@ -482,10 +482,8 @@ fn disk_attach(h: &mut Host, a: [u64; 8]) -> Result<Vals, i64> {
     let ctrl = &h.ctrls[c];
     let window = l4h_host::blk::DiskWindow::new(lba_start, lba_count, h.disks[disk].capacity).ok_or(ctl::EINVAL)?;
     let read_only = read_only || h.disks[disk].read_only;
-    if ctrl.attachments(disk).any(|(_, a)| window.conflicts(read_only, a.window, a.read_only)) {
-        return Err(ctl::EBUSY);
-    }
-    if ctrl.clients.iter().all(Option::is_some) { return Err(ctl::ENOSPC); }
+    let dom0 = h.guests[id].as_ref().ok_or(ctl::ENOENT)?.dom0;
+    crate::blkd::attachment_slot(ctrl.clients, disk, window, read_only, dom0)?;
     if !h.can_afford(1 << 20, 0, 0) { return Err(ctl::ENOMEM); }
     with_guest(h, id, |h, g| {
         if g.disks.is_full() {
