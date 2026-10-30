@@ -12,7 +12,7 @@ pub mod fixed;
 #[path = "../host/l4h-task/src/mem.rs"]
 mod mem;
 
-pub const MAX_GUEST_DEVICES: usize = 16;
+pub const MAX_GUEST_DEVICES: usize = 64;
 pub const CNODE_SLOTS: usize = 1 << 19;
 pub use init_thread::slot;
 static SLOT_STORAGE: fixed::StaticCell<mem::SlotStorage<{ CNODE_SLOTS / 64 }, CNODE_SLOTS>> =

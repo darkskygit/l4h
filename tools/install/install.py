@@ -455,8 +455,8 @@ class Preflight:
         uplinks = self.network()
         # Reserve slots for console, control, memory hotplug and attestation.
         # Count all disks L4H could attach, not just fstab entries, so the
-        # complete boot plan fits in dom0's 16 device slots.
-        max_disks = 16 - 4 - len(uplinks)
+        # complete boot plan fits in dom0's 64 device slots.
+        max_disks = 64 - 4 - len(uplinks)
         need(sum(b["type"] == "disk" for b in self.blocks.values()) <= max_disks,
              "automatic installation supports at most {} disks with {} uplink(s)".format(max_disks, len(uplinks)))
         need(self.read("/proc/1/comm") == "systemd", "automatic migration currently requires systemd as PID 1")

@@ -1565,6 +1565,9 @@ flush/readback and repeated reuse. Run it with virtio-blk, virtio-scsi (also
 with both disks as LUNs of one controller) and NVMe (512 and 4096 byte
 logical blocks). `tests/blk-windows.rs` exercises the production
 validator on malformed requests and window/pool boundaries.
+`tests/run-devicelimit.sh` fills dom0 and normal guests to 64 devices,
+checks block I/O and networking at high device indices alongside a GPU,
+rejects a 65th device, and restarts dom0 while a full guest survives.
 
 ### 8.3 Network: L2 virtual switches only
 
@@ -1576,8 +1579,9 @@ NAT, DHCP and firewalling belong in a VM.
   and the uplink NIC drivers in one Rust component: modern and legacy
   virtio-net, gVNIC, Amazon ENA and the Intel X550 (below).
 - **Multiple vNICs.** Each vNIC is on one switch and appears as a separate
-  `ethN`. It shares the guest's limit of 16 devices with the console,
-  disks and, in dom0, control device. There are 48 guest ports in all.
+  `ethN`. It shares the guest's limit of 64 devices with the console,
+  memory and attestation devices, disks and, in dom0, control device.
+  There are 48 guest ports in all.
 - **Switches and uplinks.** The API creates switches dynamically, up to
   52 (one per guest port and NIC; switches are not deleted). Each is
   an L2 broadcast domain with its own learned MAC table. A physical NIC
@@ -2191,7 +2195,7 @@ The list replaces disk 0 and requires `dom0_disks` greater than zero and
 boot. They never grant access to the whole disk. Other host disks retain their
 normal order after these devices.
 
-The complete dom0 device plan must fit within 16 slots, including console,
+The complete dom0 device plan must fit within 64 slots, including console,
 control, memory-hotplug and attestation devices, all disk windows and NICs.
 Oversized plans stop boot; neither the disk nor NIC lists are truncated.
 Root reserves every boot disk range before attaching it and retains those

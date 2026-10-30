@@ -31,7 +31,7 @@ pub const VERBOSE: bool = match option_env!("L4H_RELEASE") {
 };
 
 /// Maximum devices attached to one guest.
-pub const MAX_GUEST_DEVICES: usize = 16;
+pub const MAX_GUEST_DEVICES: usize = l4h_abi::MAX_DEVICES;
 
 /// Component address-space layout.
 pub const INFO_VA: usize = 0x1000_0000;
@@ -45,6 +45,8 @@ pub const KEEPER_IPCBUF_VA: usize = IPCBUF_VA + 0x1000;
 /// image lies below INFO_VA.
 pub const STACK_TOP: usize = 0x1100_0000;
 pub const STACK_SIZE: usize = 256 * 1024;
+/// l4h-vmm keeps its device models and in-flight block requests on its stack.
+pub const VMM_STACK_SIZE: usize = 1 << 20;
 pub const KEEPER_STACK_TOP: usize = 0x1080_0000;
 pub const KEEPER_STACK_SIZE: usize = 16 * 1024;
 /// vmmgr's main stack, larger: it builds guests as root did, with root's
@@ -53,11 +55,16 @@ pub const VMMGR_STACK_SIZE: usize = 1 << 20;
 // Unmapped pages below each stack.
 const _: () = assert!(KEEPER_IPCBUF_VA + 0x1000 < KEEPER_STACK_TOP - KEEPER_STACK_SIZE);
 const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - STACK_SIZE);
+const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - VMM_STACK_SIZE);
 const _: () = assert!(KEEPER_STACK_TOP < STACK_TOP - VMMGR_STACK_SIZE);
 
 /// The size of the main stack of a component of `kind`.
 pub const fn stack_size(kind: u32) -> usize {
-    if kind == KIND_VMMGR { VMMGR_STACK_SIZE } else { STACK_SIZE }
+    match kind {
+        KIND_VMM => VMM_STACK_SIZE,
+        KIND_VMMGR => VMMGR_STACK_SIZE,
+        _ => STACK_SIZE,
+    }
 }
 /// Shared regions (device pages, queues, buffers) are mapped from here.
 pub const SHARED_VA: usize = 0x2000_0000_0000;
@@ -152,7 +159,7 @@ pub const ROOT_CALL_ATTEST_DONE: u64 = 6;
 pub const VMM_BADGE_HYPERCALL: u64 = 1 << 63;
 
 /// Per-guest l4h-vmm configuration.
-pub const VMM_MAX_DEVICES: usize = 16;
+pub const VMM_MAX_DEVICES: usize = MAX_GUEST_DEVICES;
 
 /// Device kinds served by l4h-vmm.
 pub const VDEV_CONSOLE: u32 = 0;
@@ -225,11 +232,15 @@ pub struct VmmConfig {
     /// the guest found full has room.
     pub console_event: u32,
 }
+const _: () = assert!(CONFIG_OFFSET + core::mem::size_of::<VmmConfig>() <= INFO_SIZE);
 
 /// The VMM's capability to memd's service endpoint, badged for its guest.
 pub const VMM_SLOT_MEMD_EP: u64 = 30;
 
 pub const VCPU_NTFN_SLOT_BASE: u64 = 64;
+/// Backend kick capabilities follow all vCPU notification capabilities.
+pub const VMM_KICK_SLOT_BASE: u64 = VCPU_NTFN_SLOT_BASE + l4h_abi::MAX_VCPUS as u64;
+const _: () = assert!(VMM_KICK_SLOT_BASE as usize + VMM_MAX_DEVICES <= 1 << CNODE_BITS);
 pub const fn vmm_event_page_va(v: usize) -> usize {
     SHARED_VA + v * 0x1000
 }
@@ -250,9 +261,13 @@ pub struct ConsoleRing {
     pub data: [u8; CONSOLE_RING_DATA],
 }
 
+// 4 MiB holds a netd port or block channel; 64 fit before the GPU display.
+const VMM_CHANNEL_STRIDE: usize = 0x40_0000;
 pub const fn vmm_chan_va(d: usize) -> usize {
-    SHARED_VA + 0x1000_0000 + d * 0x100_0000
+    SHARED_VA + 0x1000_0000 + d * VMM_CHANNEL_STRIDE
 }
+const _: () = assert!(blk::CHANNEL_PAGES * 4096 <= VMM_CHANNEL_STRIDE);
+const _: () = assert!(net::PORT_PAGES * 4096 <= VMM_CHANNEL_STRIDE);
 const _: () = assert!(gpu::SHARED_VA == SHARED_VA && vmm_chan_va(VMM_MAX_DEVICES) <= gpu::VMM_DISPLAY_VA);
 
 // Badges of the VMM's bound notification.  They say what kind of source

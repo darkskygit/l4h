@@ -31,6 +31,7 @@ enum Dev {
     Net(Device<net::Net>),
     Gpu(Device<gpu::Gpu>),
 }
+const _: () = assert!(core::mem::size_of::<[Option<Dev>; host::VMM_MAX_DEVICES]>() + (64 << 10) <= host::VMM_STACK_SIZE);
 
 impl Dev {
     fn op(&mut self, mem: &GuestMem, vcpus: &Vcpus, op: u64, a: u64, b: u64) -> u64 {
@@ -94,8 +95,8 @@ fn main(info: &'static Info) -> ! {
         ntfn.wait();
     }
 
-    // Devices by guest boot info index, which is also the device's bit in
-    // the notification badges.
+    // Devices by guest boot info index. All share kick/done badge bits;
+    // each device checks its own kick word and backend ring for work.
     let mut devs: [Option<Dev>; host::VMM_MAX_DEVICES] = [const { None }; host::VMM_MAX_DEVICES];
     // Receive rings that leave room in the I/O pool for disk requests.
     let nics = devices.iter().filter(|d| d.kind == host::VDEV_NET).count();

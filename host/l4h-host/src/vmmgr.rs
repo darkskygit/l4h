@@ -200,8 +200,8 @@ pub struct Dom0Nic {
     pub mac: u64,
 }
 
-pub const DOM0_MAX_DISKS: usize = 16;
-pub const DOM0_MAX_NICS: usize = 16;
+pub const DOM0_MAX_DISKS: usize = crate::MAX_GUEST_DEVICES;
+pub const DOM0_MAX_NICS: usize = crate::MAX_GUEST_DEVICES;
 
 /// vmmgr's configuration (its info page).
 #[repr(C)]

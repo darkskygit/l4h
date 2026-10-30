@@ -1,0 +1,105 @@
+#!/bin/sh
+# Used by dom0 and its guests in tests/run-devicelimit.sh.
+set -eu
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+fail() { echo "DEVICELIMIT: FAIL $*"; poweroff -f; exit 1; }
+pattern() {
+    dd if=/dev/zero of=/tmp/pattern bs=4096 count=1 2>/dev/null
+    printf '%s\n' "$1" | dd of=/tmp/pattern conv=notrunc 2>/dev/null
+}
+check_disks() {
+    count=0
+    # Write different data to every window, then read them all back: a
+    # mapping alias must not pass just because it reaches some other disk.
+    for path in /sys/block/vd*; do
+        name=${path##*/}
+        [ "$(cat "$path/size")" = 8 ] || fail "capacity $name"
+        pattern "$name"
+        dd if=/tmp/pattern of=/dev/"$name" bs=4096 count=1 oflag=direct conv=fsync 2>/dev/null || fail "write $name"
+        count=$((count + 1))
+    done
+    [ "$count" = "$1" ] || fail "disks $count, expected $1"
+    for path in /sys/block/vd*; do
+        name=${path##*/}
+        pattern "$name"
+        dd if=/dev/"$name" of=/tmp/read bs=4096 count=1 iflag=direct 2>/dev/null || fail "read $name"
+        cmp /tmp/pattern /tmp/read || fail "data $name"
+    done
+}
+waitfor() {
+    l4hctl console "$1" --until "$2" --timeout 60 > /tmp/console || { cat /tmp/console; fail "$2"; }
+    if grep -q 'DEVICELIMIT: FAIL' /tmp/console; then cat /tmp/console; fail guest; fi
+}
+attachments() {
+    l4hctl disks > /tmp/disks
+    grep -q "^disk 0:.*attachments $1\$" /tmp/disks || { cat /tmp/disks; fail attachments; }
+}
+
+if [ ! -e /dev/l4hctl ]; then
+    disks=$(sed -n 's/.*limit_disks=\([0-9]*\).*/\1/p' /proc/cmdline)
+    check_disks "$disks"
+    case " $(cat /proc/cmdline) " in
+    *" limit_mixed=1 "*)
+        ifconfig eth0 192.0.2.2 netmask 255.255.255.0 up || fail guest-nic
+        ping -c 3 -W 3 192.0.2.1 || fail guest-network
+        grep -q '0x0010' /sys/bus/virtio/devices/virtio*/device || fail guest-gpu ;;
+    esac
+    echo "DEVICELIMITVM: ready disks=$disks"
+    while read -r request; do
+        check_disks "$disks"
+        echo 'DEVICELIMITVM: checked'
+    done
+    while :; do sleep 10; done
+fi
+
+# Four built-ins + 59 disks + one NIC: all 64 slots, NIC at index 63.
+phase=$(dd if=/dev/vda bs=1 count=7 2>/dev/null)
+check_disks 59
+ifconfig eth0 192.0.2.1 netmask 255.255.255.0 up || fail dom0-nic
+if [ "$phase" = phase02 ]; then
+    attachments 120
+    l4hctl send 1 check || fail surviving-guest
+    waitfor 1 'DEVICELIMITVM: checked'
+    l4hctl destroy 1 || fail destroy-survivor
+    attachments 59
+    l4hctl disk-zero 0 4096 8 || fail released-guest-window
+    if l4hctl disk-zero 0 8 8 2>/tmp/error; then fail released-dom0-window; fi
+    grep -q busy /tmp/error || fail reservation-error
+    echo 'DEVICELIMIT: PASS 64 slots, block/network/GPU mappings, overflow rejection and dom0 restart'
+    poweroff -f
+fi
+
+# A normal guest has three built-ins. Its 61st disk is at index 63.
+set --
+for i in $(seq 0 60); do set -- "$@" --disk "0,start=$((4096 + 16 * i)),sectors=8"; done
+id=$(l4hctl create blocks --initrd /bin/devicelimitvm.cpio.gz --mem 128 --vcpus 2 "$@" \
+    --cmdline 'console=hvc0 quiet limit_disks=61') || fail create-blocks
+[ "$id" = 1 ] || fail guest-id
+waitfor "$id" 'DEVICELIMITVM: ready disks=61'
+attachments 120
+
+# Place network and GPU devices after 59 block devices, at indices 62/63.
+set --
+for i in $(seq 0 58); do set -- "$@" --disk "0,start=$((8192 + 16 * i)),sectors=8"; done
+mixed=$(l4hctl create mixed --initrd /bin/devicelimitvm.cpio.gz --mem 128 --vcpus 2 "$@" \
+    --nic 0 --gpu 64x64 --cmdline 'console=hvc0 quiet limit_disks=59 limit_mixed=1') || fail create-mixed
+waitfor "$mixed" 'DEVICELIMITVM: ready disks=59'
+ping -c 3 -W 3 192.0.2.2 || fail dom0-network
+attachments 179
+
+# The 65th device must fail cleanly and release all partial attachments.
+set --
+for i in $(seq 0 61); do set -- "$@" --disk "0,start=$((12288 + 16 * i)),sectors=8"; done
+if l4hctl create overflow --initrd /bin/devicelimitvm.cpio.gz --mem 128 "$@" > /tmp/id 2>/tmp/error; then
+    fail accepted-device-65
+fi
+grep -q 'no space for devices' /tmp/error || { cat /tmp/error; fail overflow-error; }
+attachments 179
+l4hctl destroy "$mixed" || fail destroy-mixed
+attachments 120
+printf phase02 | dd of=/dev/vda conv=fsync 2>/dev/null || fail save-phase
+echo 'DEVICELIMIT: restarting full dom0 beside a full guest'
+reboot -f

@@ -50,7 +50,8 @@ impl Cnodes {
 /// page tables for the I/O pool, the VMM image and stack, and mappings of
 /// event pages, device pages and backend channels (including alignment).
 pub fn start_bytes(io_pool: usize, vcpus: usize, devices: usize) -> usize {
-    io_pool / 512 + (3 << 19) + (vcpus + devices * 16) * 2 * PAGE
+    // 1.25 MiB for the image and alignment, with the stack counted separately.
+    io_pool / 512 + (5 << 18) + host::VMM_STACK_SIZE + (vcpus + devices * 16) * 2 * PAGE
 }
 
 /// Untyped memory a guest's arena is expected to need for its l4h-vmm.
@@ -103,8 +104,6 @@ impl Backend {
         }
     }
 }
-
-const SLOT_KICK_BASE: u64 = 32;
 
 /// The VMM's configuration under construction.
 static CONFIG: Scratch<core::mem::MaybeUninit<host::VmmConfig>> = Scratch::new(core::mem::MaybeUninit::zeroed());
@@ -165,13 +164,13 @@ fn create(
                 dev.kind = host::VDEV_BLK;
                 dev.chan_va = host::vmm_chan_va(d) as u64;
                 dev.chan_size = (chan.len() * PAGE) as u64;
-                dev.chan_kick_slot = SLOT_KICK_BASE + d as u64;
+                dev.chan_kick_slot = host::VMM_KICK_SLOT_BASE + d as u64;
             }
             Backend::Net { mac, .. } => {
                 dev.kind = host::VDEV_NET;
                 dev.chan_va = host::vmm_chan_va(d) as u64;
                 dev.chan_size = (host::net::PORT_PAGES * PAGE) as u64;
-                dev.chan_kick_slot = SLOT_KICK_BASE + d as u64;
+                dev.chan_kick_slot = host::VMM_KICK_SLOT_BASE + d as u64;
                 dev.mac[..6].copy_from_slice(mac);
             }
             Backend::Gpu { display_pages, width, height, .. } => {
@@ -253,7 +252,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
                     let fc = crate::component::abs_of(*f);
                     comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, keep_slot());
                 }
-                comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
+                comp.give(host::VMM_KICK_SLOT_BASE + d as u64, *kick, CapRights::write_only());
             }
             Backend::Net { chan, kick, keep, .. } => {
                 for i in 0..host::net::PORT_PAGES {
@@ -261,7 +260,7 @@ fn map(g: &mut Guest, comp: &Component, backends: &[(usize, Backend)], alloc: &m
                     let dst = keep.absolute_cptr_from_bits_with_depth(i as u64, l4h_host::vmmgr::PORT_RADIX);
                     comp.map_copy(alloc, &mut g.arena, &fc, host::vmm_chan_va(d) + i * PAGE, CapRights::read_write(), attrs, dst);
                 }
-                comp.give(SLOT_KICK_BASE + d as u64, *kick, CapRights::write_only());
+                comp.give(host::VMM_KICK_SLOT_BASE + d as u64, *kick, CapRights::write_only());
             }
             Backend::Gpu { frames, keep, radix, display_pages, .. } => {
                 for i in 0..display_pages + host::gpu::STATE_PAGES {

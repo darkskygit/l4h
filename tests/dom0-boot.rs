@@ -133,15 +133,15 @@ fn oversized_explicit_layout_fails_before_any_attachment() {
             for other_disks in 0..=1 {
                 let windows = MAX_GUEST_DEVICES - builtins - nics - other_disks + 1;
                 let mut h = fixture(builtins, windows, other_disks, nics);
-                fails_before_boot(&mut h, "dom0 device plan needs 17 slots");
+                fails_before_boot(&mut h, "dom0 device plan needs 65 slots");
                 assert!(h.disk_attempts.is_empty());
                 assert!(h.nics.is_empty());
             }
         }
     }
-    // The parser's 16-window limit is larger than dom0's available budget.
-    let mut h = fixture(4, 16, 0, 1);
-    fails_before_boot(&mut h, "dom0 device plan needs 21 slots");
+    // The parser's 64-window limit is larger than dom0's available budget.
+    let mut h = fixture(4, 64, 0, 1);
+    fails_before_boot(&mut h, "dom0 device plan needs 69 slots");
     assert!(h.disk_attempts.is_empty());
 }
 
@@ -183,9 +183,23 @@ fn failed_disks_keep_their_positions_and_allow_dom0_to_boot() {
 }
 
 #[test]
+fn placeholders_fit_at_high_device_indices() {
+    let mut h = fixture(4, 59, 0, 1);
+    h.fail_disks = vec![0, 16, 32, 58];
+    boot_dom0(&mut h);
+    assert!(h.started);
+    assert_eq!(h.guest.as_ref().unwrap().devices.len(), 64);
+    assert_eq!(h.disks.len(), 59);
+    for (i, disk) in h.disks.iter().enumerate() {
+        assert_eq!(*disk, (!h.fail_disks.contains(&i)).then_some(h.disk_attempts[i]));
+    }
+    assert_eq!(h.nics, [0]);
+}
+
+#[test]
 fn oversized_whole_disk_plan_is_also_rejected() {
-    let mut h = fixture(4, 0, 16, 1);
-    fails_before_boot(&mut h, "dom0 device plan needs 21 slots");
+    let mut h = fixture(4, 0, 64, 1);
+    fails_before_boot(&mut h, "dom0 device plan needs 69 slots");
     assert!(h.disk_attempts.is_empty());
     assert!(h.nics.is_empty());
 }

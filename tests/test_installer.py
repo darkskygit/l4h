@@ -382,7 +382,7 @@ class InstallerTests(UpdateChecks, Harness):
         config = installer.configuration(plan)
         self.assertIn("root=UUID=1234-abcd", config)
         self.assertIn("l4h.net=52:54:00:12:34:56,ens3", config)
-        self.assertIn("dom0_disks=11\ndom0_nics=1\n", config)
+        self.assertIn("dom0_disks=59\ndom0_nics=1\n", config)
         self.assertNotIn("uplink2_nic", config)
         self.assertEqual(before, sorted(str(p) for p in self.root.rglob("*")))
 
@@ -584,7 +584,7 @@ class InstallerTests(UpdateChecks, Harness):
         config = installer.configuration(plan)
         self.assertIn("uplink_nic=00:03.0\nuplink2_nic=00:05.0\n", config)
         # Two vNICs on switch 0 would connect both networks to the same switch.
-        self.assertIn("dom0_disks=10\ndom0_nics=1\n", config)
+        self.assertIn("dom0_disks=58\ndom0_nics=1\n", config)
         self.assertIn("l4h.net=52:54:00:12:34:57,ens2 l4h.net=52:54:00:12:34:56,ens3", config)
         self.machine.links.reverse()
         self.assertEqual(self.check(), plan)
@@ -668,15 +668,15 @@ class InstallerTests(UpdateChecks, Harness):
 
     def test_disk_capacity_reserves_builtin_devices_and_each_uplink(self):
         disk = self.machine.blocks[0]
-        self.machine.blocks.extend(dict(disk, name="/dev/disk{}".format(i)) for i in range(9))
+        self.machine.blocks.extend(dict(disk, name="/dev/disk{}".format(i)) for i in range(57))
         self.machine.nic("ens4", "00:06.0", "52:54:00:12:34:57")
-        self.check()  # Four built-ins, 10 disks and two vNICs fit.
+        self.check()  # Four built-ins, 58 disks and two vNICs fit.
         self.machine.blocks.append(dict(disk, name="/dev/extra"))
-        self.rejected("at most 10 disks with 2 uplink")
+        self.rejected("at most 58 disks with 2 uplink")
         self.machine.links.pop()
-        self.check()  # Four built-ins, 11 disks and one vNIC fit.
+        self.check()  # Four built-ins, 59 disks and one vNIC fit.
         self.machine.blocks.append(dict(disk, name="/dev/extra2"))
-        self.rejected("at most 11 disks with 1 uplink")
+        self.rejected("at most 59 disks with 1 uplink")
 
     def test_existing_bootnext(self):
         self.machine.boot["next"] = "0002"

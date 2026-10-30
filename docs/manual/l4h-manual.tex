@@ -83,7 +83,8 @@ tree, which also records the status of every part.
     and PCI NICs (virtio-net).
   \item[Guest, or VM.] A Linux system running on l4h. Every guest has a
     name, a numeric id, a number of vCPUs, a fixed amount of RAM, and up to
-    16 devices: a console, disks and network interfaces.
+    64 devices, including its console, memory and attestation devices,
+    disks, network interfaces and display.
   \item[dom0.] The first guest, id 0. It is an ordinary guest with one
     extra device, \file{/dev/l4hctl}, through which it controls the host. Its
     kernel, initramfs and settings sit next to the host image, on its EFI
@@ -584,9 +585,9 @@ be installed. The checks cover:
         includes WireGuard. Automatic migration rejects physical NICs
         enslaved to a master (such as a bond or bridge), changed or duplicate
         MACs, and more than two physical NICs.
-        Dom0's 16 device slots include four built-in devices (console,
+        Dom0's 64 device slots include four built-in devices (console,
         control, memory hotplug and attestation), leaving room for at most
-        11 disks with one NIC, or 10 disks with two.
+        59 disks with one NIC, or 58 disks with two.
 \end{itemize}
 
 For experimental installations on cloud VMs that omit the
@@ -1154,7 +1155,8 @@ fails, it destroys the half-built VM.
     pool is sized for it.
 \end{description}
 
-A VM has at most 16 devices, counting its console.
+A VM has at most 64 devices, counting its console, memory and attestation
+devices and, for dom0, its control device.
 
 Example: a two-vCPU web server with a disk and two networks.
 \begin{lstlisting}
@@ -1346,7 +1348,7 @@ at its start, and other guests' windows can take the rest.
 Alternatively, \texttt{dom0\_disk0\_windows=start:count,...} gives dom0
 separate filesystem devices from disk 0. Each window consumes one device
 slot. The complete dom0 plan, including its console, control, optional
-memory and attestation devices, disks and NICs, must fit in 16 slots;
+memory and attestation devices, disks and NICs, must fit in 64 slots;
 an oversized plan stops boot instead of dropping devices.
 If a boot disk attachment fails, dom0 sees a read-only, zero-capacity disk
 in that position. Its physical window remains reserved, including across
@@ -1791,7 +1793,7 @@ Message & Usual cause \\
 \texttt{invalid argument} & Out-of-range values: 0 or too many vCPUs, RAM
   below 8 MiB, a cap above 100, a multicast MAC, a kernel and initramfs that do not fit in the VM's RAM, or a request
   that targets dom0 itself. \\
-\texttt{no space for devices} & The VM already has 16 devices. \\
+\texttt{no space for devices} & The VM already has 64 devices. \\
 \texttt{I/O error} & The disk failed to reset when its last owner was
   destroyed and is disabled until the host reboots
   (Section~\ref{sec:disk-failed}). \\

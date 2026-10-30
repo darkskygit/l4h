@@ -129,6 +129,7 @@ pub struct GuestDev {
 pub fn dev_event(d: usize) -> u32 {
     16 + d as u32
 }
+const _: () = assert!(16 + MAX_GUEST_DEVICES <= abi::NR_EVENTS);
 
 /// Disjoint ranges of guest RAM, (gpa, len) in order: what was loaded
 /// before boot.  When there are more islands than fit, the two closest
