@@ -371,7 +371,7 @@ class Preflight:
              "cannot determine the ESP partition UUID")
         return dict(esp=esp["target"], esp_disk=disk["name"], esp_part=partnum, esp_partuuid=partuuid)
 
-    def grub(self, physical=True):
+    def grub(self, physical=True, check_mbr=True):
         # The distribution's BIOS GRUB, whose grub.cfg (grub-mkconfig's) sources
         # custom.cfg and consumes a one-time next_entry before it boots it.
         need(not physical or "BOOT_IMAGE=" in self.read("/proc/cmdline"),
@@ -396,10 +396,13 @@ class Preflight:
         if physical:
             self.disk(block)
         disk = self.blocks[block["pkname"]] if block["type"] == "part" else block
-        with self.path(disk["name"]).open("rb") as stream:
-            mbr = stream.read(512)
-        need(len(mbr) == 512 and mbr[510:] == b"\x55\xaa" and b"GRUB" in mbr[:0x1b8],
-             disk["name"] + ": its MBR does not hold GRUB's boot sector; L4H boots through BIOS GRUB")
+        # A dom0 window starts at the filesystem, not the physical disk's MBR.
+        # Its update is bound to the recorded root, boot UUID and GRUB entry below.
+        if check_mbr:
+            with self.path(disk["name"]).open("rb") as stream:
+                mbr = stream.read(512)
+            need(len(mbr) == 512 and mbr[510:] == b"\x55\xaa" and b"GRUB" in mbr[:0x1b8],
+                 disk["name"] + ": its MBR does not hold GRUB's boot sector; L4H boots through BIOS GRUB")
         tool = "grub2-editenv" if grubdir.endswith("grub2") else "grub-editenv"
         env = grub_env(self.run(tool, grubdir + "/grubenv", "list"))
         return dict(grubdir=grubdir, grub_tool=tool, grub_env=env, boot_uuid=block["uuid"],
@@ -528,7 +531,7 @@ class Preflight:
             directory = Path(plan["esp"]) / "l4h"
             payload = Path(plan["esp"]) / "EFI/L4H/l4h.efi"
         else:
-            plan.update(self.grub(physical=False))
+            plan.update(self.grub(physical=False, check_mbr=not dom0))
             need(saved.get("grubdir") == plan["grubdir"] and
                  saved.get("boot_uuid", plan["boot_uuid"]) == plan["boot_uuid"],
                  "existing L4H install uses a different boot configuration")
@@ -671,9 +674,14 @@ def release_file(args, name, dest):
     sums = [line.split() for line in args.checksums.read_text().splitlines()]
     hashes = [line[0] for line in sums if len(line) == 2 and line[1] == name]
     need(len(hashes) == 1 and re.fullmatch(r"[a-f0-9]{64}", hashes[0]), "missing/duplicate checksum for " + name)
-    run("curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https",
-        "--proto-redir", "=https", "--retry", "3", "--output", str(dest),
-        "https://github.com/losfair/l4h/releases/download/" + args.release + "/" + name)
+    if getattr(args, "artifacts", None) is not None:
+        source = args.artifacts / name
+        need(source.is_file() and not source.is_symlink(), "release artifact missing: " + name)
+        shutil.copyfile(source, dest)
+    else:
+        run("curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https",
+            "--proto-redir", "=https", "--retry", "3", "--output", str(dest),
+            "https://github.com/losfair/l4h/releases/download/" + args.release + "/" + name)
     need(digest(dest) == hashes[0], name + ": download checksum mismatch")
 
 
@@ -1042,6 +1050,8 @@ def arguments(argv=None):
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--release")
     parser.add_argument("--checksums", type=Path)
+    parser.add_argument("--artifacts", type=Path,
+                        help="read release artifacts from this directory instead of downloading them")
     parser.add_argument("--esp")
     parser.add_argument("--memory", type=int)
     parser.add_argument("--vcpus", type=int)

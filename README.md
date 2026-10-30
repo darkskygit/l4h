@@ -191,6 +191,11 @@ boot selection**: updates preserve it, and `--make-default` requires native
 Linux. If L4H was only a trial boot, select it again through firmware or
 native Linux to boot the updated release.
 
+BIOS dom0 updates also support partition windows. The updater checks the
+installed root UUID, boot filesystem UUID and managed GRUB entry. It does
+not require a physical MBR at the start of a filesystem window. Updates
+from native Linux still check the GRUB MBR.
+
 ```sh
 # Read-only compatibility check (dependencies must already be installed).
 curl -fsSL https://raw.githubusercontent.com/losfair/l4h/main/tools/install.sh | bash -s -- --check
