@@ -2203,6 +2203,9 @@ The reserved range remains unavailable to provisioning and conflicting guest
 attachments. When a failed disk cannot report its capacity, root checks the
 configured ranges for alignment, overflow and overlap and reserves them;
 a whole-disk reservation covers all aligned sectors until host reboot.
+The same reservation and dummy device apply to an automatically selected
+whole disk whose capacity is not a multiple of eight sectors. This does not
+relax validation of explicit windows against a known capacity.
 
 Read the ranges from the physical partition table before configuring them.
 Use filesystem UUIDs or labels for root, boot and EFI mounts. Partition UUIDs

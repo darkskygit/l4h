@@ -31,6 +31,38 @@ fn reservation() -> Attachment {
 }
 
 #[test]
+fn unusable_whole_disk_geometry_stays_reserved() {
+    for capacity in [0, 1, 7, 131073, u64::MAX] {
+        // The actual whole-disk attachment fails, but planning must succeed
+        // and keep every attachable range owned while dom0 has a dummy disk.
+        assert!(DiskWindow::new(0, 0, capacity).is_none());
+        let window = dom0_reservation(0, 0, capacity).unwrap();
+        let clients = [Some(Attachment { window, ..reservation() })];
+        for start in [0, 8, UNKNOWN_CAPACITY - 8] {
+            let w = DiskWindow::new(start, 8, UNKNOWN_CAPACITY).unwrap();
+            assert!(window.overlaps(w)); // Provisioning checks overlap too.
+            for ro in [false, true] {
+                assert_eq!(attachment_slot(&clients, 0, w, ro, false), Err(ctl::EBUSY));
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_ranges_still_use_the_known_capacity() {
+    assert_eq!(dom0_reservation(0, 0, 131072), DiskWindow::new(0, 0, 131072));
+    // An aligned prefix of an odd-sized disk remains usable, as does the
+    // last complete block. Explicit unaligned or out-of-bounds plans fail.
+    for (start, sectors) in [(0, 2048), (131064, 8)] {
+        assert_eq!(dom0_reservation(start, sectors, 131073), Some(DiskWindow { start, sectors }));
+    }
+    for (start, sectors) in [(1, 8), (8, 7), (0, 131073), (131072, 8), (u64::MAX - 7, 16)] {
+        assert!(dom0_reservation(start, sectors, 131073).is_none());
+    }
+    assert_eq!(dom0_reservation(8, 16, 0), Some(DiskWindow { start: 8, sectors: 16 }));
+}
+
+#[test]
 fn only_dom0_can_claim_the_exact_reserved_range_even_when_table_is_full() {
     let clients = [Some(reservation())];
     let w = clients[0].as_ref().unwrap().window;

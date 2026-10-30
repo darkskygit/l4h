@@ -29,10 +29,22 @@ const PAGE: usize = 4096;
 /// (4 KiB), the largest logical block size blkd supports: devices address
 /// whole blocks, so an unaligned window would reach outside itself.
 pub const WINDOW_ALIGN: u64 = 8;
-/// If a boot disk cannot report its geometry, reserve all addressable,
-/// aligned sectors until host reboot. This is never advertised as capacity
-/// to a guest: the failed attachment becomes a zero-capacity device.
+/// Reserve all addressable, aligned sectors when a boot disk's capacity
+/// is unknown or cannot form an aligned whole-disk window. This is never
+/// advertised as capacity to a guest.
 pub const UNKNOWN_CAPACITY: u64 = u64::MAX & !(WINDOW_ALIGN - 1);
+
+/// An automatic whole-disk plan must remain reserved even if its geometry
+/// cannot be attached. Attachment checks the real capacity and leaves a
+/// dummy device on failure; explicit ranges still use the known capacity.
+pub fn dom0_reservation(start: u64, sectors: u64, capacity: u64) -> Option<blk::DiskWindow> {
+    let capacity = if capacity == 0 || (start == 0 && sectors == 0 && capacity % WINDOW_ALIGN != 0) {
+        UNKNOWN_CAPACITY
+    } else {
+        capacity
+    };
+    blk::DiskWindow::new(start, sectors, capacity)
+}
 
 /// Mapping attributes for device registers.
 #[cfg(target_arch = "x86_64")]

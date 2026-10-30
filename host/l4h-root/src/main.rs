@@ -595,8 +595,7 @@ fn dom0_plan(h: &mut Host) -> Dom0Plan {
     for d in &plan.disks {
         let index = d.disk as usize;
         let disk = &h.disks[index];
-        let capacity = if disk.capacity == 0 { blkd::UNKNOWN_CAPACITY } else { disk.capacity };
-        let window = host::blk::DiskWindow::new(d.start, d.sectors, capacity).expect("invalid dom0 disk window");
+        let window = blkd::dom0_reservation(d.start, d.sectors, disk.capacity).expect("invalid dom0 disk window");
         h.ctrls[disk.ctrl].reserve_dom0(index, window, disk.read_only);
     }
     plan

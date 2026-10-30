@@ -36,7 +36,8 @@ start = vmmgr.index('pub fn boot_dom0(')
 end = vmmgr.index('\n}', start) + 2
 (out / 'dom0-boot.inc').write_text(vmmgr[start:end])
 blkd = (root / 'host/l4h-root/src/blkd.rs').read_text()
-reservations = blkd[blkd.index('pub struct Attachment {'):blkd.index('struct Blkd {')]
+reservations = blkd[blkd.index('pub const WINDOW_ALIGN:'):blkd.index('/// Mapping attributes for device registers.')]
+reservations += blkd[blkd.index('pub struct Attachment {'):blkd.index('struct Blkd {')]
 start = blkd.index('pub fn remove(')
 end = blkd.index('\n}', start) + 2
 (out / 'blk-reservations.inc').write_text(reservations + blkd[start:end])

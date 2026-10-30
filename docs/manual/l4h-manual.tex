@@ -584,8 +584,9 @@ be installed. The checks cover:
         includes WireGuard. Automatic migration rejects physical NICs
         enslaved to a master (such as a bond or bridge), changed or duplicate
         MACs, and more than two physical NICs.
-        Dom0's 16 device slots leave room for at most
-        15 disks with one NIC, or 14 disks with two.
+        Dom0's 16 device slots include four built-in devices (console,
+        control, memory hotplug and attestation), leaving room for at most
+        11 disks with one NIC, or 10 disks with two.
 \end{itemize}
 
 For experimental installations on cloud VMs that omit the
@@ -1352,6 +1353,9 @@ in that position. Its physical window remains reserved, including across
 dom0 restarts, and cannot be provisioned or given to a conflicting guest.
 Later disks keep their device names. A missing root filesystem can still
 prevent Linux from booting; healthy disks or an initramfs remain usable.
+An automatically selected whole disk whose capacity is not a multiple of
+eight sectors also becomes a dummy device, with the whole disk reserved.
+Explicit windows must still be aligned and fit within the known capacity.
 
 \paragraph{Failed disks.}\label{sec:disk-failed} When its owner is
 destroyed, a disk is reset before it becomes free. If the device does not
